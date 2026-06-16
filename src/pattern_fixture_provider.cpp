@@ -190,10 +190,12 @@ namespace {
     }
 
     void append_scan_space(rule_engine::patterns::PatternFixtureSet &set,
+                           std::string subject_id,
                            std::string scan_space,
                            std::string permissions,
                            std::vector<std::byte> bytes) {
         set.scan_spaces.push_back(rule_engine::patterns::PatternScanSpace {
+            .subject_id = std::move(subject_id),
             .scan_space = std::move(scan_space),
             .permissions = std::move(permissions),
             .bytes = std::move(bytes),
@@ -214,9 +216,13 @@ namespace {
 
     [[nodiscard]] rule_engine::PatternValue
     scan_fixture_spaces(const rule_engine::patterns::PatternFixtureSet &fixtures,
-                        const rule_engine::PatternScanPlan &scan_plan) {
+                        const rule_engine::PatternScanPlan &scan_plan,
+                        const std::string_view subject_id) {
         rule_engine::PatternValue out;
         for (const auto &space : fixtures.scan_spaces) {
+            if (!space.subject_id.empty() && space.subject_id != subject_id) {
+                continue;
+            }
             auto scanned = scan_literal_pattern(space.bytes, scan_plan.literal, space.scan_space, space.permissions);
             out.matched = out.matched || scanned.matched;
             out.matches.insert(out.matches.end(),
@@ -350,7 +356,7 @@ namespace rule_engine::patterns {
                                                         "invalid pattern scan_file_space value on line " +
                                                             std::to_string(line_number)));
                 }
-                append_scan_space(out, std::move(scan_space), std::move(permissions), std::move(*bytes));
+                append_scan_space(out, {}, std::move(scan_space), std::move(permissions), std::move(*bytes));
                 continue;
             }
 
@@ -411,7 +417,7 @@ namespace rule_engine::patterns {
             std::optional<PatternValue> derived_pattern;
             if (found == fixtures.patterns.end()) {
                 if (const auto *scan_plan = find_scan_plan(scan_plans, pattern_key); scan_plan != nullptr) {
-                    derived_pattern = scan_fixture_spaces(fixtures, *scan_plan);
+                    derived_pattern = scan_fixture_spaces(fixtures, *scan_plan, key.subject_id);
                 }
             }
             if (is_pattern_match_key(key.key)) {

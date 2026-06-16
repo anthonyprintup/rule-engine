@@ -84,7 +84,7 @@ diagnostics.
     duplicated in local fixture/config files.
 - Support explicit scan spaces:
   - [x] File bytes through fixture `scan_file` directives.
-  - [ ] Process image bytes.
+  - [x] Process image bytes.
   - [ ] Mapped image sections.
   - [ ] Readable memory regions.
 - [x] Preserve match context metadata: offset, length, bytes, before/after context,

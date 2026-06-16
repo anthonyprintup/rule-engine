@@ -175,6 +175,10 @@ scan_file_space file.bytes r-- sample.bin
 When evaluating a rule such as `$needle = "needle" ascii`, the server attaches a
 scan plan for `$needle` to the `endpoint.scan.patterns` request. The client uses
 that literal to scan the configured space and returns ordinary pattern facts.
+When no explicit scan spaces are configured, the default Windows client adds a
+subject-scoped `process.image.bytes` scan space by reading each requested
+process subject's image file, so rules can match literals against process image
+bytes without duplicating those literals in client config.
 
 ## Rule Corpus
 

@@ -35,6 +35,8 @@ namespace asio::detail {
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -258,6 +260,54 @@ namespace {
         return std::nullopt;
     }
 
+    [[nodiscard]] std::optional<std::vector<std::byte>> read_binary_file(const std::filesystem::path &path) {
+        std::ifstream file {path, std::ios::binary};
+        if (!file) {
+            return std::nullopt;
+        }
+
+        std::vector<std::byte> out;
+        char ch {};
+        while (file.get(ch)) {
+            out.push_back(static_cast<std::byte>(static_cast<unsigned char>(ch)));
+        }
+        if (!file.eof()) {
+            return std::nullopt;
+        }
+        return out;
+    }
+
+    void append_process_image_scan_spaces(rule_engine::patterns::PatternFixtureSet &fixtures,
+                                          const std::span<const rule_engine::protocol::FactKey> keys,
+                                          const std::span<const rule_engine::PatternScanPlan> scan_plans) {
+        if (scan_plans.empty()) {
+            return;
+        }
+
+        std::vector<std::string> seen_subjects;
+        for (const auto &key : keys) {
+            if (std::ranges::find(seen_subjects, key.subject_id) != seen_subjects.end()) {
+                continue;
+            }
+            seen_subjects.push_back(key.subject_id);
+
+            auto path = rule_engine::windows::resolve_process_image_path(key.subject_id);
+            if (!path) {
+                continue;
+            }
+            auto bytes = read_binary_file(*path);
+            if (!bytes.has_value()) {
+                continue;
+            }
+            fixtures.scan_spaces.push_back(rule_engine::patterns::PatternScanSpace {
+                .subject_id = key.subject_id,
+                .scan_space = "process.image.bytes",
+                .permissions = "r--",
+                .bytes = std::move(*bytes),
+            });
+        }
+    }
+
     [[nodiscard]] std::vector<rule_engine::Fact>
     process_snapshot_response(const std::span<const rule_engine::protocol::FactKey> keys) {
         const auto process_keys = to_process_keys(keys);
@@ -377,8 +427,12 @@ namespace {
             return response;
         }
         if (request.route == "endpoint.scan.patterns") {
+            auto effective_fixtures = pattern_fixtures;
+            if (effective_fixtures.scan_spaces.empty()) {
+                append_process_image_scan_spaces(effective_fixtures, request.keys, request.scan_plans);
+            }
             response.values =
-                rule_engine::patterns::read_fixture_pattern_facts(request.keys, pattern_fixtures, request.scan_plans);
+                rule_engine::patterns::read_fixture_pattern_facts(request.keys, effective_fixtures, request.scan_plans);
             return response;
         }
         if (extra_handler) {

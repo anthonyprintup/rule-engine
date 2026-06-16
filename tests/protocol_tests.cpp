@@ -2944,6 +2944,36 @@ TEST_CASE("pattern fixture scan spaces use rule-derived scan plans") {
     CHECK(facts[1].value.as_bool() == true);
 }
 
+TEST_CASE("client pattern handler scans current process image bytes") {
+    rule_engine::protocol::FactBatchRequestMessage request;
+    request.route = "endpoint.scan.patterns";
+    request.keys.push_back(rule_engine::protocol::FactKey {
+        .subject_id = "pid:" + std::to_string(GetCurrentProcessId()),
+        .key = "$mz.pattern",
+    });
+    request.keys.push_back(rule_engine::protocol::FactKey {
+        .subject_id = "pid:" + std::to_string(GetCurrentProcessId()),
+        .key = "$mz.matches",
+    });
+    request.expected_types = {rule_engine::ValueType::pattern, rule_engine::ValueType::boolean};
+    request.scan_plans.push_back(rule_engine::PatternScanPlan {
+        .pattern_key = "$mz",
+        .literal = {std::byte {'M'}, std::byte {'Z'}},
+    });
+
+    const auto response = rule_engine::client_protocol::handle_client_fact_batch(request);
+    REQUIRE(response.values.size() == 2u);
+    REQUIRE(response.values[0].status == rule_engine::FactStatus::available);
+    const auto *pattern = response.values[0].value.as_pattern();
+    REQUIRE(pattern != nullptr);
+    REQUIRE(pattern->matched);
+    REQUIRE_FALSE(pattern->matches.empty());
+    CHECK(pattern->matches[0].offset == 0u);
+    CHECK(pattern->matches[0].scan_space == "process.image.bytes");
+    CHECK(pattern->matches[0].region_permissions == "r--");
+    CHECK(response.values[1].value.as_bool() == true);
+}
+
 TEST_CASE("localhost client session evaluates configured pattern fixture facts") {
     const auto fixture_path =
         std::filesystem::temp_directory_path() / ("rule-engine-pattern-fixture-" +
@@ -3151,5 +3181,60 @@ rule rule_derived_scan {
     CHECK(evaluation->final_step.state == rule_engine::EvaluationState::complete);
     REQUIRE(evaluation->final_step.rule_results.size() == 1u);
     CHECK(evaluation->final_step.rule_results[0].identifier == "rule_derived_scan");
+    CHECK(evaluation->final_step.rule_results[0].matched);
+}
+
+TEST_CASE("localhost client session scans process image bytes from rule-derived literals") {
+    constexpr std::string_view source = R"(
+rule process_image_mz {
+    strings:
+        $mz = "MZ" ascii
+    condition:
+        $mz at 0
+}
+)";
+    auto parsed = rule_engine::parse_source("process_image_scan_eval.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+
+    std::promise<std::uint16_t> listening_port;
+    auto listening = listening_port.get_future();
+    std::optional<rule_engine::ErrorSet> server_error;
+
+    std::thread server {[&] {
+        auto result = rule_engine::client_protocol::serve_client_once(
+            rule_engine::client_protocol::ClientListenOptions {
+                .bind_address = "127.0.0.1",
+                .port = 0u,
+                .pattern_fixture_path = {},
+                .io_timeout = std::chrono::milliseconds {5000},
+            },
+            [&](const std::uint16_t port) { listening_port.set_value(port); });
+        if (!result) {
+            server_error = std::move(result.error());
+        }
+    }};
+
+    REQUIRE(listening.wait_for(std::chrono::seconds {5}) == std::future_status::ready);
+    const auto port = listening.get();
+    auto evaluation = rule_engine::client_protocol::evaluate_subject_with_client(
+        rule_engine::client_protocol::ClientConnectionOptions {
+            .host = "127.0.0.1",
+            .port = port,
+            .io_timeout = std::chrono::milliseconds {5000},
+        },
+        *verified,
+        rule_engine::Subject {
+            .kind = "process",
+            .id = "pid:" + std::to_string(GetCurrentProcessId()),
+        });
+
+    server.join();
+    REQUIRE_FALSE(server_error.has_value());
+    REQUIRE(evaluation.has_value());
+    CHECK(evaluation->final_step.state == rule_engine::EvaluationState::complete);
+    REQUIRE(evaluation->final_step.rule_results.size() == 1u);
+    CHECK(evaluation->final_step.rule_results[0].identifier == "process_image_mz");
     CHECK(evaluation->final_step.rule_results[0].matched);
 }

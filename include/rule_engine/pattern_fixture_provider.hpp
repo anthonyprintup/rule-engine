@@ -15,6 +15,7 @@ namespace rule_engine::patterns {
     };
 
     struct PatternScanSpace {
+        std::string subject_id;
         std::string scan_space;
         std::string permissions;
         std::vector<std::byte> bytes;
