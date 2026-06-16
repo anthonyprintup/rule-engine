@@ -46,6 +46,15 @@ namespace {
         return *found;
     }
 
+    [[nodiscard]] std::vector<std::byte> ascii_bytes(const std::string_view text) {
+        std::vector<std::byte> out;
+        out.reserve(text.size());
+        for (const auto ch : text) {
+            out.push_back(static_cast<std::byte>(static_cast<unsigned char>(ch)));
+        }
+        return out;
+    }
+
     struct TemporaryFile {
         std::filesystem::path path;
 
@@ -2972,6 +2981,85 @@ TEST_CASE("client pattern handler scans current process image bytes") {
     CHECK(pattern->matches[0].scan_space == "process.image.bytes");
     CHECK(pattern->matches[0].region_permissions == "r--");
     CHECK(response.values[1].value.as_bool() == true);
+}
+
+TEST_CASE("localhost client session scans mapped image sections from rule-derived literals") {
+    constexpr std::string_view probe = "rule_engine_mapped_section_probe_literal";
+    const auto fixture_path =
+        std::filesystem::temp_directory_path() / ("rule-engine-section-scan-session-" +
+                                                 std::to_string(GetCurrentProcessId()) + ".txt");
+    {
+        std::ofstream fixture {fixture_path};
+        REQUIRE(fixture);
+        fixture << "scan_process_image_sections\n";
+    }
+
+    rule_engine::protocol::FactBatchRequestMessage request;
+    request.route = "endpoint.scan.patterns";
+    request.keys.push_back(rule_engine::protocol::FactKey {
+        .subject_id = "pid:" + std::to_string(GetCurrentProcessId()),
+        .key = "$probe.pattern",
+    });
+    request.keys.push_back(rule_engine::protocol::FactKey {
+        .subject_id = "pid:" + std::to_string(GetCurrentProcessId()),
+        .key = "$probe.matches",
+    });
+    request.expected_types = {rule_engine::ValueType::pattern, rule_engine::ValueType::boolean};
+    request.scan_plans.push_back(rule_engine::PatternScanPlan {
+        .pattern_key = "$probe",
+        .literal = ascii_bytes(probe),
+    });
+
+    std::promise<std::uint16_t> listening_port;
+    auto listening = listening_port.get_future();
+    std::optional<rule_engine::ErrorSet> server_error;
+
+    std::thread server {[&] {
+        auto result = rule_engine::client_protocol::serve_client_once(
+            rule_engine::client_protocol::ClientListenOptions {
+                .bind_address = "127.0.0.1",
+                .port = 0u,
+                .pattern_fixture_path = fixture_path,
+                .io_timeout = std::chrono::milliseconds {5000},
+            },
+            [&](const std::uint16_t port) { listening_port.set_value(port); });
+        if (!result) {
+            server_error = std::move(result.error());
+        }
+    }};
+
+    const auto ready = listening.wait_for(std::chrono::seconds {5});
+    if (ready != std::future_status::ready) {
+        server.join();
+        std::filesystem::remove(fixture_path);
+        REQUIRE_FALSE(server_error.has_value());
+        REQUIRE(ready == std::future_status::ready);
+    }
+    const auto port = listening.get();
+    auto session = rule_engine::client_protocol::run_client_session(
+        rule_engine::client_protocol::ClientConnectionOptions {
+            .host = "127.0.0.1",
+            .port = port,
+            .io_timeout = std::chrono::milliseconds {5000},
+        },
+        std::vector<rule_engine::protocol::FactBatchRequestMessage> {request});
+
+    server.join();
+    std::filesystem::remove(fixture_path);
+    REQUIRE_FALSE(server_error.has_value());
+    REQUIRE(session.has_value());
+    REQUIRE(session->responses.size() == 1u);
+    REQUIRE(session->responses[0].values.size() == 2u);
+
+    const auto *pattern = session->responses[0].values[0].value.as_pattern();
+    REQUIRE(pattern != nullptr);
+    REQUIRE(pattern->matched);
+    const auto section_match = std::ranges::find_if(pattern->matches, [](const auto &match) {
+        return match.scan_space.starts_with("process.image.section.");
+    });
+    REQUIRE(section_match != pattern->matches.end());
+    CHECK(section_match->region_permissions.size() == 3u);
+    CHECK(session->responses[0].values[1].value.as_bool() == true);
 }
 
 TEST_CASE("localhost client session evaluates configured pattern fixture facts") {

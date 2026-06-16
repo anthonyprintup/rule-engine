@@ -179,6 +179,16 @@ When no explicit scan spaces are configured, the default Windows client adds a
 subject-scoped `process.image.bytes` scan space by reading each requested
 process subject's image file, so rules can match literals against process image
 bytes without duplicating those literals in client config.
+To scan mapped image sections instead of the whole image file, enable explicit
+section scan spaces in the pattern fixture file:
+
+```text
+scan_process_image_sections
+```
+
+For each requested process subject, the client parses the image's PE section
+table and returns matches from `process.image.section.<name>` scan spaces with
+`rwx`-style permissions derived from section characteristics.
 
 ## Rule Corpus
 

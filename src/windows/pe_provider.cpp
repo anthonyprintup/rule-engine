@@ -34,6 +34,7 @@ namespace {
     constexpr auto max_certificates = 1024u;
     constexpr auto certificate_alignment = 8u;
     constexpr auto max_tls_callbacks = 4096u;
+    constexpr std::size_t max_section_scan_space_bytes = 128u * 1024u * 1024u;
     constexpr std::uint32_t resource_directory_flag = 0x80000000u;
     constexpr std::uint32_t resource_offset_mask = 0x7fffffffu;
 
@@ -178,6 +179,55 @@ namespace {
         });
     }
 
+    [[nodiscard]] std::string section_permissions(const IMAGE_SECTION_HEADER &section) {
+        std::string out;
+        out.push_back((section.Characteristics & IMAGE_SCN_MEM_READ) != 0u ? 'r' : '-');
+        out.push_back((section.Characteristics & IMAGE_SCN_MEM_WRITE) != 0u ? 'w' : '-');
+        out.push_back((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0u ? 'x' : '-');
+        return out;
+    }
+
+    [[nodiscard]] std::string section_scan_space_name(const IMAGE_SECTION_HEADER &section, const std::size_t index) {
+        auto name = section_name(section);
+        if (name.empty()) {
+            name = "section" + std::to_string(index);
+        }
+        for (auto &ch : name) {
+            const auto value = static_cast<unsigned char>(ch);
+            const auto allowed = (value >= static_cast<unsigned char>('a') && value <= static_cast<unsigned char>('z')) ||
+                                 (value >= static_cast<unsigned char>('A') && value <= static_cast<unsigned char>('Z')) ||
+                                 (value >= static_cast<unsigned char>('0') && value <= static_cast<unsigned char>('9')) ||
+                                 ch == '.' || ch == '_' || ch == '$';
+            if (!allowed) {
+                ch = '_';
+            }
+        }
+        return "process.image.section." + name;
+    }
+
+    [[nodiscard]] std::vector<std::byte> section_mapped_bytes(const std::vector<std::uint8_t> &image,
+                                                              const IMAGE_SECTION_HEADER &section) {
+        const auto raw_offset = static_cast<std::size_t>(section.PointerToRawData);
+        const auto raw_size = static_cast<std::size_t>(section.SizeOfRawData);
+        const auto virtual_size = static_cast<std::size_t>(section.Misc.VirtualSize);
+        const auto mapped_size = (std::max)(raw_size, virtual_size);
+        if (mapped_size == 0u || mapped_size > max_section_scan_space_bytes) {
+            return {};
+        }
+
+        std::vector<std::byte> out(mapped_size, std::byte {0});
+        if (raw_size == 0u || raw_offset >= image.size()) {
+            return out;
+        }
+
+        const auto available = image.size() - raw_offset;
+        const auto copy_size = (std::min)({raw_size, available, mapped_size});
+        for (std::size_t index = 0u; index < copy_size; ++index) {
+            out[index] = static_cast<std::byte>(image[raw_offset + index]);
+        }
+        return out;
+    }
+
     [[nodiscard]] std::expected<ParsedSections, rule_engine::ErrorSet>
     read_sections(const std::vector<std::uint8_t> &bytes,
                   const IMAGE_FILE_HEADER &file_header,
@@ -201,6 +251,27 @@ namespace {
             sections.values.push_back(section_value(*section));
         }
         return sections;
+    }
+
+    [[nodiscard]] std::vector<rule_engine::patterns::PatternScanSpace>
+    section_scan_spaces(const std::string &subject_id,
+                        const std::vector<std::uint8_t> &image,
+                        const std::vector<IMAGE_SECTION_HEADER> &sections) {
+        std::vector<rule_engine::patterns::PatternScanSpace> out;
+        out.reserve(sections.size());
+        for (std::size_t index = 0u; index < sections.size(); ++index) {
+            auto bytes = section_mapped_bytes(image, sections[index]);
+            if (bytes.empty()) {
+                continue;
+            }
+            out.push_back(rule_engine::patterns::PatternScanSpace {
+                .subject_id = subject_id,
+                .scan_space = section_scan_space_name(sections[index], index),
+                .permissions = section_permissions(sections[index]),
+                .bytes = std::move(bytes),
+            });
+        }
+        return out;
     }
 
     [[nodiscard]] std::optional<std::size_t> rva_to_file_offset(const std::vector<std::uint8_t> &bytes,
@@ -1082,6 +1153,64 @@ namespace {
 } // namespace
 
 namespace rule_engine::windows {
+    std::expected<std::vector<patterns::PatternScanSpace>, ErrorSet>
+    read_pe_image_section_scan_spaces(std::string subject_id, const std::filesystem::path &image_path) {
+        auto bytes = read_file_bytes(image_path);
+        if (!bytes) {
+            return std::unexpected(std::move(bytes.error()));
+        }
+
+        const auto dos = read_struct<IMAGE_DOS_HEADER>(*bytes, 0u);
+        if (!dos.has_value() || dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0) {
+            return std::unexpected(single_error("pe", "image is not a PE file"));
+        }
+
+        const auto nt_offset = static_cast<std::size_t>(dos->e_lfanew);
+        const auto signature = read_struct<DWORD>(*bytes, nt_offset);
+        if (!signature.has_value() || *signature != IMAGE_NT_SIGNATURE) {
+            return std::unexpected(single_error("pe", "image has no PE signature"));
+        }
+
+        constexpr auto signature_size = sizeof(DWORD);
+        const auto file_header_offset = nt_offset + signature_size;
+        const auto file_header = read_struct<IMAGE_FILE_HEADER>(*bytes, file_header_offset);
+        if (!file_header.has_value()) {
+            return std::unexpected(single_error("pe", "image has no PE file header"));
+        }
+
+        const auto optional_offset = file_header_offset + sizeof(IMAGE_FILE_HEADER);
+        const auto optional_magic = read_struct<WORD>(*bytes, optional_offset);
+        if (!optional_magic.has_value()) {
+            return std::unexpected(single_error("pe", "image has no PE optional header"));
+        }
+
+        if (*optional_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+            const auto optional_header = read_struct<IMAGE_OPTIONAL_HEADER64>(*bytes, optional_offset);
+            if (!optional_header.has_value()) {
+                return std::unexpected(single_error("pe", "image has a truncated PE32+ optional header"));
+            }
+            auto sections = read_sections(*bytes, *file_header, optional_offset);
+            if (!sections) {
+                return std::unexpected(std::move(sections.error()));
+            }
+            return section_scan_spaces(subject_id, *bytes, sections->headers);
+        }
+
+        if (*optional_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+            const auto optional_header = read_struct<IMAGE_OPTIONAL_HEADER32>(*bytes, optional_offset);
+            if (!optional_header.has_value()) {
+                return std::unexpected(single_error("pe", "image has a truncated PE32 optional header"));
+            }
+            auto sections = read_sections(*bytes, *file_header, optional_offset);
+            if (!sections) {
+                return std::unexpected(std::move(sections.error()));
+            }
+            return section_scan_spaces(subject_id, *bytes, sections->headers);
+        }
+
+        return std::unexpected(single_error("pe", "image has an unsupported PE optional header"));
+    }
+
     std::expected<std::vector<Fact>, ErrorSet> read_pe_image_facts(std::string subject_id,
                                                                    const std::filesystem::path &image_path) {
         auto bytes = read_file_bytes(image_path);

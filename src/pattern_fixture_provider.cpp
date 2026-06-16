@@ -251,6 +251,7 @@ namespace rule_engine::patterns {
                 },
             },
             .scan_spaces = {},
+            .scan_process_image_sections = false,
         };
     }
 
@@ -357,6 +358,11 @@ namespace rule_engine::patterns {
                                                             std::to_string(line_number)));
                 }
                 append_scan_space(out, {}, std::move(scan_space), std::move(permissions), std::move(*bytes));
+                continue;
+            }
+
+            if (directive_or_pattern == "scan_process_image_sections") {
+                out.scan_process_image_sections = true;
                 continue;
             }
 

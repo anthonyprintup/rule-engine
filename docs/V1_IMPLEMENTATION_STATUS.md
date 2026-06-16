@@ -52,6 +52,7 @@ This file tracks current progress against `GOAL.md`. It is intentionally conserv
 - File-backed literal byte scanner in pattern fixture files through `scan_file` directives, resolving relative file paths from the fixture file and returning the same `PatternValue` match metadata.
 - Rule-derived literal scan plans for text string patterns are attached to pattern fact requests and round-trip through the localhost protocol; `scan_file_space` fixture directives provide file-backed scan spaces without duplicating pattern definitions in client config.
 - When no explicit pattern scan spaces are configured, the default Windows client adds subject-scoped `process.image.bytes` scan spaces for pattern requests by reading each requested process image file, with localhost integration coverage for matching the current process PE header.
+- Pattern fixture files can enable explicit mapped PE section scan spaces with `scan_process_image_sections`; the Windows client returns matches from subject-scoped `process.image.section.<name>` spaces with section-derived permissions.
 - One-shot localhost Asio client session for handshake capability advertisement, subject enumeration, batched fact requests, and fact responses.
 - Localhost clients can bind custom fact-batch handlers for descriptor-backed module function routes while keeping clients limited to typed fact responses.
 - Localhost clients can advertise custom provider route capabilities; evaluator orchestration rejects requests for routes missing from the client handshake.

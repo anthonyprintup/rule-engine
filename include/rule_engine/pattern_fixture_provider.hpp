@@ -24,6 +24,7 @@ namespace rule_engine::patterns {
     struct PatternFixtureSet {
         std::vector<PatternFixture> patterns;
         std::vector<PatternScanSpace> scan_spaces;
+        bool scan_process_image_sections {};
     };
 
     [[nodiscard]] PatternFixtureSet default_pattern_fixtures();

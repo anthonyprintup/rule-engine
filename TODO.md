@@ -85,7 +85,7 @@ diagnostics.
 - Support explicit scan spaces:
   - [x] File bytes through fixture `scan_file` directives.
   - [x] Process image bytes.
-  - [ ] Mapped image sections.
+  - [x] Mapped image sections.
   - [ ] Readable memory regions.
 - [x] Preserve match context metadata: offset, length, bytes, before/after context,
   region permissions, and scan-space name.
