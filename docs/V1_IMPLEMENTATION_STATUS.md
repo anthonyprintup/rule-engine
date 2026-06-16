@@ -50,6 +50,7 @@ This file tracks current progress against `GOAL.md`. It is intentionally conserv
 - Configurable pattern fixture text input through `rule_engine_client --pattern-fixture <file>`.
 - Configurable literal byte scanner in pattern fixture files through `scan` directives, returning real offsets, bytes, before/after context, scan-space names, and region permissions as `PatternValue` metadata.
 - File-backed literal byte scanner in pattern fixture files through `scan_file` directives, resolving relative file paths from the fixture file and returning the same `PatternValue` match metadata.
+- Rule-derived literal scan plans for text string patterns are attached to pattern fact requests and round-trip through the localhost protocol; `scan_file_space` fixture directives provide file-backed scan spaces without duplicating pattern definitions in client config.
 - One-shot localhost Asio client session for handshake capability advertisement, subject enumeration, batched fact requests, and fact responses.
 - Localhost clients can bind custom fact-batch handlers for descriptor-backed module function routes while keeping clients limited to typed fact responses.
 - Localhost clients can advertise custom provider route capabilities; evaluator orchestration rejects requests for routes missing from the client handshake.

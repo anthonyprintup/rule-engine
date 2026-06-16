@@ -422,6 +422,42 @@ namespace {
         return out;
     }
 
+    [[nodiscard]] std::optional<rule_engine::PatternScanPlan>
+    pattern_scan_plan_for(const std::vector<rule_engine::ParsedPattern> &patterns, const std::string_view pattern_key) {
+        const auto found = std::ranges::find_if(patterns, [&](const auto &pattern) {
+            return pattern_identifier_key(pattern.identifier) == pattern_key;
+        });
+        if (found == patterns.end() || found->kind != "text" || found->literal.empty()) {
+            return std::nullopt;
+        }
+
+        rule_engine::PatternScanPlan plan;
+        plan.pattern_key = std::string {pattern_key};
+        plan.literal.reserve(found->literal.size());
+        for (const auto ch : found->literal) {
+            plan.literal.push_back(static_cast<std::byte>(static_cast<unsigned char>(ch)));
+        }
+        return plan;
+    }
+
+    [[nodiscard]] rule_engine::RequiredFact pattern_required_fact(
+        const std::string_view pattern_name,
+        const std::string_view suffix,
+        const rule_engine::ValueType type,
+        const std::vector<rule_engine::ParsedPattern> &rule_patterns) {
+        auto pattern_key = pattern_identifier_key(std::string {pattern_name});
+        rule_engine::RequiredFact fact {
+            .key = pattern_key + std::string {suffix},
+            .route = "endpoint.scan.patterns",
+            .ttl = std::chrono::seconds {30},
+            .cheap_prefetch = false,
+            .type = type,
+            .scan_plan = std::nullopt,
+        };
+        fact.scan_plan = pattern_scan_plan_for(rule_patterns, pattern_key);
+        return fact;
+    }
+
     [[nodiscard]] bool is_pattern_placeholder(const rule_engine::Expression &expr) {
         const auto name = !expr.names.empty() ? std::string_view {expr.names[0]} : std::string_view {expr.text};
         return name == "$";
@@ -854,7 +890,7 @@ namespace {
                               const rule_engine::ModuleRegistry &registry,
                               const std::vector<RuleSymbol> &rule_symbols,
                               const std::string_view current_namespace,
-                              const std::vector<std::string> &rule_patterns,
+                              const std::vector<rule_engine::ParsedPattern> &rule_patterns,
                               std::vector<rule_engine::RequiredFact> &facts,
                               std::vector<std::string> &rule_dependencies,
                               rule_engine::ErrorSet &errors,
@@ -896,17 +932,15 @@ namespace {
                                      for_of_body);
             }
 
-            expr.names = expand_pattern_names(expr.names, rule_patterns);
+            std::vector<std::string> rule_pattern_names;
+            rule_pattern_names.reserve(rule_patterns.size());
+            for (const auto &pattern : rule_patterns) {
+                rule_pattern_names.push_back(pattern.identifier);
+            }
+            expr.names = expand_pattern_names(expr.names, rule_pattern_names);
             for (const auto &name : expr.names) {
-                auto key = pattern_identifier_key(name);
-                key += ".pattern";
-                add_fact(facts, rule_engine::RequiredFact {
-                                    .key = key,
-                                    .route = "endpoint.scan.patterns",
-                                    .ttl = std::chrono::seconds {30},
-                                    .cheap_prefetch = false,
-                                    .type = rule_engine::ValueType::pattern,
-                                });
+                add_fact(facts,
+                         pattern_required_fact(name, ".pattern", rule_engine::ValueType::pattern, rule_patterns));
             }
 
             collect_requirements(expr.children[quantifier_children],
@@ -1075,6 +1109,7 @@ namespace {
                                         .timeout = function->timeout,
                                         .cheap_prefetch = true,
                                         .type = function->return_type,
+                                        .scan_plan = std::nullopt,
                                     });
                 }
             }
@@ -1092,6 +1127,7 @@ namespace {
                                     .timeout = field->timeout,
                                     .cheap_prefetch = field->cheap_prefetch,
                                     .type = field->type,
+                                    .scan_plan = std::nullopt,
                                 });
                 return;
             }
@@ -1117,44 +1153,28 @@ namespace {
 
         if (expr.kind == rule_engine::ExpressionKind::pattern_match && !expr.names.empty() &&
             !(for_of_body && is_pattern_placeholder(expr))) {
-            auto key = pattern_identifier_key(expr.names[0]);
-            key += ".matches";
-            add_fact(facts, rule_engine::RequiredFact {
-                                .key = key,
-                                .route = "endpoint.scan.patterns",
-                                .ttl = std::chrono::seconds {30},
-                                .cheap_prefetch = false,
-                                .type = rule_engine::ValueType::boolean,
-                            });
+            add_fact(facts,
+                     pattern_required_fact(expr.names[0], ".matches", rule_engine::ValueType::boolean, rule_patterns));
         }
 
         if ((expr.kind == rule_engine::ExpressionKind::pattern_count ||
              expr.kind == rule_engine::ExpressionKind::pattern_offset ||
              expr.kind == rule_engine::ExpressionKind::pattern_length) &&
             !expr.names.empty() && !(for_of_body && is_pattern_placeholder(expr))) {
-            auto key = pattern_identifier_key(expr.names[0]);
-            key += ".pattern";
-            add_fact(facts, rule_engine::RequiredFact {
-                                .key = key,
-                                .route = "endpoint.scan.patterns",
-                                .ttl = std::chrono::seconds {30},
-                                .cheap_prefetch = false,
-                                .type = rule_engine::ValueType::pattern,
-                            });
+            add_fact(facts,
+                     pattern_required_fact(expr.names[0], ".pattern", rule_engine::ValueType::pattern, rule_patterns));
         }
 
         if (expr.kind == rule_engine::ExpressionKind::of_expr && !expr.names.empty()) {
-            expr.names = expand_pattern_names(expr.names, rule_patterns);
+            std::vector<std::string> rule_pattern_names;
+            rule_pattern_names.reserve(rule_patterns.size());
+            for (const auto &pattern : rule_patterns) {
+                rule_pattern_names.push_back(pattern.identifier);
+            }
+            expr.names = expand_pattern_names(expr.names, rule_pattern_names);
             for (const auto &name : expr.names) {
-                auto key = pattern_identifier_key(name);
-                key += ".pattern";
-                add_fact(facts, rule_engine::RequiredFact {
-                                    .key = key,
-                                    .route = "endpoint.scan.patterns",
-                                    .ttl = std::chrono::seconds {30},
-                                    .cheap_prefetch = false,
-                                    .type = rule_engine::ValueType::pattern,
-                                });
+                add_fact(facts,
+                         pattern_required_fact(name, ".pattern", rule_engine::ValueType::pattern, rule_patterns));
             }
         }
 
@@ -1181,6 +1201,7 @@ namespace {
                                     .timeout = global->timeout,
                                     .cheap_prefetch = global->cheap_prefetch,
                                     .type = global->type,
+                                    .scan_plan = std::nullopt,
                                 });
             } else {
                 errors.diagnostics.push_back(rule_engine::Diagnostic {
@@ -1610,11 +1631,6 @@ namespace rule_engine {
             program.sources.push_back(rules.source_name);
         }
         for (const auto &rule : rules.rules) {
-            std::vector<std::string> rule_patterns;
-            for (const auto &pattern : rule.patterns) {
-                rule_patterns.push_back(pattern.identifier);
-            }
-
             VerifiedRule verified;
             verified.identifier = rule.identifier;
             verified.namespace_name = normalize_namespace_name(rule.namespace_name);
@@ -1629,7 +1645,7 @@ namespace rule_engine {
                                  registry,
                                  rule_symbols,
                                  verified.namespace_name,
-                                 rule_patterns,
+                                 rule.patterns,
                                  verified.facts,
                                  verified.rule_dependencies,
                                  errors,

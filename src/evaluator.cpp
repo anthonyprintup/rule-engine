@@ -1307,6 +1307,7 @@ namespace {
                 .timeout = expr.bound_timeout,
                 .cheap_prefetch = expr.bound_cheap_prefetch,
                 .type = expr.bound_return_type,
+                .scan_plan = std::nullopt,
             });
         }
         if (fact->status != rule_engine::FactStatus::available) {
@@ -1572,6 +1573,9 @@ namespace {
             batch.route = fact.route;
             batch.keys = {fact.key};
             batch.types = {fact.type};
+            if (fact.scan_plan.has_value()) {
+                batch.scan_plans.push_back(*fact.scan_plan);
+            }
             batch.timeout = fact.timeout;
             requests.push_back(std::move(batch));
             return;
@@ -1582,6 +1586,12 @@ namespace {
         if (!std::ranges::contains(found->keys, fact.key)) {
             found->keys.push_back(fact.key);
             found->types.push_back(fact.type);
+        }
+        if (fact.scan_plan.has_value() &&
+            !std::ranges::any_of(found->scan_plans, [&](const auto &existing) {
+                return existing.pattern_key == fact.scan_plan->pattern_key;
+            })) {
+            found->scan_plans.push_back(*fact.scan_plan);
         }
     }
 

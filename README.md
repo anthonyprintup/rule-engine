@@ -165,6 +165,17 @@ file path, and literal needle bytes as lowercase hex. The client only returns
 pattern facts such as `$needle.matches` and `$needle.pattern`; the server still
 evaluates all rule conditions.
 
+For rule-derived literal scan plans, configure only the scan space and let the
+server send the YARA string literal bytes in the fact request:
+
+```text
+scan_file_space file.bytes r-- sample.bin
+```
+
+When evaluating a rule such as `$needle = "needle" ascii`, the server attaches a
+scan plan for `$needle` to the `endpoint.scan.patterns` request. The client uses
+that literal to scan the configured space and returns ordinary pattern facts.
+
 ## Rule Corpus
 
 `examples/rule_corpus/` contains a small checked corpus for the current YARA

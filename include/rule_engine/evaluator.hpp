@@ -35,6 +35,7 @@ namespace rule_engine {
         std::string route;
         std::vector<std::string> keys;
         std::vector<ValueType> types;
+        std::vector<PatternScanPlan> scan_plans;
         std::chrono::seconds timeout {5};
     };
 

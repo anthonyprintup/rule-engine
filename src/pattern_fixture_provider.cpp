@@ -8,6 +8,7 @@
 #include <fstream>
 #include <filesystem>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -188,6 +189,43 @@ namespace {
                                     std::make_move_iterator(value.matches.end()));
     }
 
+    void append_scan_space(rule_engine::patterns::PatternFixtureSet &set,
+                           std::string scan_space,
+                           std::string permissions,
+                           std::vector<std::byte> bytes) {
+        set.scan_spaces.push_back(rule_engine::patterns::PatternScanSpace {
+            .scan_space = std::move(scan_space),
+            .permissions = std::move(permissions),
+            .bytes = std::move(bytes),
+        });
+    }
+
+    [[nodiscard]] const rule_engine::PatternScanPlan *
+    find_scan_plan(const std::span<const rule_engine::PatternScanPlan> scan_plans,
+                   const std::string_view pattern_key) {
+        const auto found = std::ranges::find_if(scan_plans, [&](const auto &plan) {
+            return plan.pattern_key == pattern_key;
+        });
+        if (found == scan_plans.end()) {
+            return nullptr;
+        }
+        return std::addressof(*found);
+    }
+
+    [[nodiscard]] rule_engine::PatternValue
+    scan_fixture_spaces(const rule_engine::patterns::PatternFixtureSet &fixtures,
+                        const rule_engine::PatternScanPlan &scan_plan) {
+        rule_engine::PatternValue out;
+        for (const auto &space : fixtures.scan_spaces) {
+            auto scanned = scan_literal_pattern(space.bytes, scan_plan.literal, space.scan_space, space.permissions);
+            out.matched = out.matched || scanned.matched;
+            out.matches.insert(out.matches.end(),
+                               std::make_move_iterator(scanned.matches.begin()),
+                               std::make_move_iterator(scanned.matches.end()));
+        }
+        return out;
+    }
+
     [[nodiscard]] bool is_pattern_metadata_key(const std::string_view key) noexcept {
         return key.starts_with('$') && key.ends_with(".pattern");
     }
@@ -206,6 +244,7 @@ namespace rule_engine::patterns {
                     .value = fixture_pattern(),
                 },
             },
+            .scan_spaces = {},
         };
     }
 
@@ -291,6 +330,30 @@ namespace rule_engine::patterns {
                 continue;
             }
 
+            if (directive_or_pattern == "scan_file_space") {
+                std::string scan_space;
+                std::string permissions;
+                std::string file_path_text;
+                if (!(stream >> scan_space >> permissions >> file_path_text)) {
+                    return std::unexpected(single_error(path.string(),
+                                                        "invalid pattern scan_file_space line " +
+                                                            std::to_string(line_number)));
+                }
+
+                auto file_path = std::filesystem::path {file_path_text};
+                if (file_path.is_relative()) {
+                    file_path = path.parent_path() / file_path;
+                }
+                auto bytes = read_binary_file(file_path);
+                if (scan_space.empty() || !bytes.has_value()) {
+                    return std::unexpected(single_error(path.string(),
+                                                        "invalid pattern scan_file_space value on line " +
+                                                            std::to_string(line_number)));
+                }
+                append_scan_space(out, std::move(scan_space), std::move(permissions), std::move(*bytes));
+                continue;
+            }
+
             std::string pattern_key;
             std::string matched_text;
             std::string offset_text;
@@ -336,7 +399,8 @@ namespace rule_engine::patterns {
     }
 
     std::vector<Fact> read_fixture_pattern_facts(const std::span<const protocol::FactKey> keys,
-                                                 const PatternFixtureSet &fixtures) {
+                                                 const PatternFixtureSet &fixtures,
+                                                 const std::span<const PatternScanPlan> scan_plans) {
         std::vector<Fact> out;
         out.reserve(keys.size());
         for (const auto &key : keys) {
@@ -344,13 +408,28 @@ namespace rule_engine::patterns {
             const auto found = std::ranges::find_if(fixtures.patterns, [&](const auto &fixture) {
                 return fixture.pattern_key == pattern_key;
             });
+            std::optional<PatternValue> derived_pattern;
+            if (found == fixtures.patterns.end()) {
+                if (const auto *scan_plan = find_scan_plan(scan_plans, pattern_key); scan_plan != nullptr) {
+                    derived_pattern = scan_fixture_spaces(fixtures, *scan_plan);
+                }
+            }
             if (is_pattern_match_key(key.key)) {
-                const auto matched = found != fixtures.patterns.end() && found->value.matched;
+                const auto matched = found != fixtures.patterns.end() ? found->value.matched
+                                                                      : derived_pattern.has_value() &&
+                                                                            derived_pattern->matched;
                 out.push_back(make_fact(key.subject_id, key.key, Value::boolean(matched), FactStatus::available));
                 continue;
             }
             if (is_pattern_metadata_key(key.key)) {
                 if (found == fixtures.patterns.end()) {
+                    if (derived_pattern.has_value()) {
+                        out.push_back(make_fact(key.subject_id,
+                                                key.key,
+                                                Value::pattern(std::move(*derived_pattern)),
+                                                FactStatus::available));
+                        continue;
+                    }
                     out.push_back(make_fact(key.subject_id,
                                             key.key,
                                             Value::pattern(PatternValue {}),

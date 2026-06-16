@@ -80,7 +80,7 @@ diagnostics.
   final `PatternValue` fact schema.
   - [x] Configured literal byte scanner through `--pattern-fixture` `scan`
     directives, returning real offsets and match context metadata.
-  - [ ] Rule-derived scan plans so clients do not need pattern definitions
+  - [x] Rule-derived scan plans so clients do not need pattern definitions
     duplicated in local fixture/config files.
 - Support explicit scan spaces:
   - [x] File bytes through fixture `scan_file` directives.

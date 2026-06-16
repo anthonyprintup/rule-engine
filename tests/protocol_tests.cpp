@@ -524,6 +524,19 @@ TEST_CASE("protocol typed messages round-trip handshake subjects and fact batche
     request.timeout = std::chrono::milliseconds {2500};
     request.keys.push_back(rule_engine::protocol::FactKey {.subject_id = "pid:1", .key = "process.name"});
     request.keys.push_back(rule_engine::protocol::FactKey {.subject_id = "pid:1", .key = "process.pid"});
+    request.expected_types.push_back(rule_engine::ValueType::string);
+    request.expected_types.push_back(rule_engine::ValueType::integer);
+    request.scan_plans.push_back(rule_engine::PatternScanPlan {
+        .pattern_key = "$needle",
+        .literal = {
+            std::byte {'n'},
+            std::byte {'e'},
+            std::byte {'e'},
+            std::byte {'d'},
+            std::byte {'l'},
+            std::byte {'e'},
+        },
+    });
     const auto request_payload = rule_engine::protocol::encode_fact_batch_request(request);
     REQUIRE(request_payload.has_value());
     const auto decoded_request = rule_engine::protocol::decode_fact_batch_request(*request_payload);
@@ -533,6 +546,20 @@ TEST_CASE("protocol typed messages round-trip handshake subjects and fact batche
     REQUIRE(decoded_request->keys.size() == 2u);
     CHECK(decoded_request->keys[0].subject_id == "pid:1");
     CHECK(decoded_request->keys[1].key == "process.pid");
+    CHECK(decoded_request->expected_types == std::vector<rule_engine::ValueType> {
+                                               rule_engine::ValueType::string,
+                                               rule_engine::ValueType::integer,
+                                           });
+    REQUIRE(decoded_request->scan_plans.size() == 1u);
+    CHECK(decoded_request->scan_plans[0].pattern_key == "$needle");
+    CHECK(decoded_request->scan_plans[0].literal == std::vector<std::byte> {
+                                                   std::byte {'n'},
+                                                   std::byte {'e'},
+                                                   std::byte {'e'},
+                                                   std::byte {'d'},
+                                                   std::byte {'l'},
+                                                   std::byte {'e'},
+                                               });
 
     rule_engine::protocol::FactBatchResponseMessage response;
     response.route = "endpoint.process.snapshot";
@@ -2859,6 +2886,64 @@ TEST_CASE("pattern fixture scan_file directives scan file bytes") {
     CHECK(facts[1].value.as_bool() == true);
 }
 
+TEST_CASE("pattern fixture scan spaces use rule-derived scan plans") {
+    const auto data = write_temp_binary(L"rule_engine_rule_scan_space",
+                                        std::vector<std::uint8_t> {
+                                            'A',
+                                            'A',
+                                            'n',
+                                            'e',
+                                            'e',
+                                            'd',
+                                            'l',
+                                            'e',
+                                            'Z',
+                                            'Z',
+                                        });
+    const auto fixture_path =
+        std::filesystem::temp_directory_path() / ("rule-engine-rule-scan-space-" +
+                                                 std::to_string(GetCurrentProcessId()) + ".txt");
+    {
+        std::ofstream fixture {fixture_path};
+        REQUIRE(fixture);
+        fixture << "scan_file_space file.bytes r-- " << data.path.string() << "\n";
+    }
+
+    auto loaded = rule_engine::patterns::load_pattern_fixture_file(fixture_path);
+    std::filesystem::remove(fixture_path);
+    REQUIRE(loaded.has_value());
+
+    const std::vector<rule_engine::PatternScanPlan> scan_plans {
+        rule_engine::PatternScanPlan {
+            .pattern_key = "$rule",
+            .literal = {
+                std::byte {'n'},
+                std::byte {'e'},
+                std::byte {'e'},
+                std::byte {'d'},
+                std::byte {'l'},
+                std::byte {'e'},
+            },
+        },
+    };
+    const auto facts = rule_engine::patterns::read_fixture_pattern_facts(
+        std::array {
+            rule_engine::protocol::FactKey {.subject_id = "pid:42", .key = "$rule.pattern"},
+            rule_engine::protocol::FactKey {.subject_id = "pid:42", .key = "$rule.matches"},
+        },
+        *loaded,
+        scan_plans);
+    REQUIRE(facts.size() == 2u);
+
+    const auto *pattern = facts[0].value.as_pattern();
+    REQUIRE(pattern != nullptr);
+    REQUIRE(pattern->matched);
+    REQUIRE(pattern->matches.size() == 1u);
+    CHECK(pattern->matches[0].offset == 2u);
+    CHECK(pattern->matches[0].scan_space == "file.bytes");
+    CHECK(facts[1].value.as_bool() == true);
+}
+
 TEST_CASE("localhost client session evaluates configured pattern fixture facts") {
     const auto fixture_path =
         std::filesystem::temp_directory_path() / ("rule-engine-pattern-fixture-" +
@@ -2988,5 +3073,83 @@ rule configured_scan {
     CHECK(evaluation->final_step.state == rule_engine::EvaluationState::complete);
     REQUIRE(evaluation->final_step.rule_results.size() == 1u);
     CHECK(evaluation->final_step.rule_results[0].identifier == "configured_scan");
+    CHECK(evaluation->final_step.rule_results[0].matched);
+}
+
+TEST_CASE("localhost client session evaluates rule-derived literal scan plans") {
+    const auto data = write_temp_binary(L"rule_engine_rule_plan_session",
+                                        std::vector<std::uint8_t> {
+                                            'A',
+                                            'A',
+                                            'n',
+                                            'e',
+                                            'e',
+                                            'd',
+                                            'l',
+                                            'e',
+                                            'Z',
+                                            'Z',
+                                        });
+    const auto fixture_path =
+        std::filesystem::temp_directory_path() / ("rule-engine-rule-plan-session-" +
+                                                 std::to_string(GetCurrentProcessId()) + ".txt");
+    {
+        std::ofstream fixture {fixture_path};
+        REQUIRE(fixture);
+        fixture << "scan_file_space file.bytes r-- " << data.path.string() << "\n";
+    }
+
+    constexpr std::string_view source = R"(
+rule rule_derived_scan {
+    strings:
+        $custom = "needle" ascii
+    condition:
+        $custom and #custom == 1 and @custom[1] == 2 and !custom[1] == 6
+}
+)";
+    auto parsed = rule_engine::parse_source("rule_derived_scan_eval.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+
+    std::promise<std::uint16_t> listening_port;
+    auto listening = listening_port.get_future();
+    std::optional<rule_engine::ErrorSet> server_error;
+
+    std::thread server {[&] {
+        auto result = rule_engine::client_protocol::serve_client_once(
+            rule_engine::client_protocol::ClientListenOptions {
+                .bind_address = "127.0.0.1",
+                .port = 0u,
+                .pattern_fixture_path = fixture_path,
+                .io_timeout = std::chrono::milliseconds {5000},
+            },
+            [&](const std::uint16_t port) { listening_port.set_value(port); });
+        if (!result) {
+            server_error = std::move(result.error());
+        }
+    }};
+
+    REQUIRE(listening.wait_for(std::chrono::seconds {5}) == std::future_status::ready);
+    const auto port = listening.get();
+    auto evaluation = rule_engine::client_protocol::evaluate_subject_with_client(
+        rule_engine::client_protocol::ClientConnectionOptions {
+            .host = "127.0.0.1",
+            .port = port,
+            .io_timeout = std::chrono::milliseconds {5000},
+        },
+        *verified,
+        rule_engine::Subject {
+            .kind = "process",
+            .id = "pid:" + std::to_string(GetCurrentProcessId()),
+        });
+
+    server.join();
+    REQUIRE_FALSE(server_error.has_value());
+    std::filesystem::remove(fixture_path);
+    REQUIRE(evaluation.has_value());
+    CHECK(evaluation->final_step.state == rule_engine::EvaluationState::complete);
+    REQUIRE(evaluation->final_step.rule_results.size() == 1u);
+    CHECK(evaluation->final_step.rule_results[0].identifier == "rule_derived_scan");
     CHECK(evaluation->final_step.rule_results[0].matched);
 }

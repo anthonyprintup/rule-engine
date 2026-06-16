@@ -377,7 +377,8 @@ namespace {
             return response;
         }
         if (request.route == "endpoint.scan.patterns") {
-            response.values = rule_engine::patterns::read_fixture_pattern_facts(request.keys, pattern_fixtures);
+            response.values =
+                rule_engine::patterns::read_fixture_pattern_facts(request.keys, pattern_fixtures, request.scan_plans);
             return response;
         }
         if (extra_handler) {
@@ -610,6 +611,14 @@ namespace {
                 found->keys.push_back(std::move(fact_key));
                 const auto type = index < batch.types.size() ? batch.types[index] : rule_engine::ValueType::undefined;
                 found->expected_types.push_back(type);
+            }
+        }
+        for (const auto &scan_plan : batch.scan_plans) {
+            const auto exists = std::ranges::any_of(found->scan_plans, [&](const auto &existing) {
+                return existing.pattern_key == scan_plan.pattern_key;
+            });
+            if (!exists) {
+                found->scan_plans.push_back(scan_plan);
             }
         }
     }

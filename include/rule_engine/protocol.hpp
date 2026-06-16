@@ -35,6 +35,7 @@ namespace rule_engine::protocol {
         std::string route;
         std::vector<FactKey> keys;
         std::vector<ValueType> expected_types;
+        std::vector<PatternScanPlan> scan_plans;
         std::chrono::milliseconds timeout {5000};
     };
 

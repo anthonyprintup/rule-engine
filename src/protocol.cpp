@@ -111,6 +111,36 @@ namespace rule_engine::protocol {
             }
         }
 
+        [[nodiscard]] std::uint8_t value_type_to_wire(const ValueType type) noexcept {
+            switch (type) {
+                case ValueType::boolean: return 1u;
+                case ValueType::integer: return 2u;
+                case ValueType::floating: return 3u;
+                case ValueType::string: return 4u;
+                case ValueType::bytes: return 5u;
+                case ValueType::array: return 6u;
+                case ValueType::pattern: return 7u;
+                case ValueType::object: return 8u;
+                case ValueType::undefined:
+                default: return 0u;
+            }
+        }
+
+        [[nodiscard]] std::optional<ValueType> value_type_from_wire(const std::uint8_t value) noexcept {
+            switch (value) {
+                case 0u: return ValueType::undefined;
+                case 1u: return ValueType::boolean;
+                case 2u: return ValueType::integer;
+                case 3u: return ValueType::floating;
+                case 4u: return ValueType::string;
+                case 5u: return ValueType::bytes;
+                case 6u: return ValueType::array;
+                case 7u: return ValueType::pattern;
+                case 8u: return ValueType::object;
+                default: return std::nullopt;
+            }
+        }
+
         struct Reader {
             std::span<const std::byte> bytes;
             std::size_t offset {};
@@ -468,6 +498,19 @@ namespace rule_engine::protocol {
                 return std::unexpected(std::move(result.error()));
             }
         }
+        append_u32(out, static_cast<std::uint32_t>(message.expected_types.size()));
+        for (const auto type : message.expected_types) {
+            append_u8(out, value_type_to_wire(type));
+        }
+        append_u32(out, static_cast<std::uint32_t>(message.scan_plans.size()));
+        for (const auto &scan_plan : message.scan_plans) {
+            if (auto result = append_string(out, scan_plan.pattern_key); !result) {
+                return std::unexpected(std::move(result.error()));
+            }
+            if (auto result = append_bytes(out, scan_plan.literal); !result) {
+                return std::unexpected(std::move(result.error()));
+            }
+        }
         return out;
     }
 
@@ -494,6 +537,40 @@ namespace rule_engine::protocol {
                 return std::unexpected(single_error("protocol", "truncated fact request key"));
             }
             out.keys.push_back(std::move(key));
+        }
+        std::uint32_t expected_type_count {};
+        if (!reader->read_u32(expected_type_count)) {
+            return std::unexpected(single_error("protocol", "truncated fact request expected type count"));
+        }
+        if (auto count_ok = validate_count(expected_type_count, "fact request expected type"); !count_ok) {
+            return std::unexpected(std::move(count_ok.error()));
+        }
+        out.expected_types.reserve(expected_type_count);
+        for (std::uint32_t index = 0; index < expected_type_count; ++index) {
+            std::uint8_t type {};
+            if (!reader->read_u8(type)) {
+                return std::unexpected(single_error("protocol", "truncated fact request expected type"));
+            }
+            const auto parsed_type = value_type_from_wire(type);
+            if (!parsed_type.has_value()) {
+                return std::unexpected(single_error("protocol", "unknown fact request expected type"));
+            }
+            out.expected_types.push_back(*parsed_type);
+        }
+        std::uint32_t scan_plan_count {};
+        if (!reader->read_u32(scan_plan_count)) {
+            return std::unexpected(single_error("protocol", "truncated fact request scan plan count"));
+        }
+        if (auto count_ok = validate_count(scan_plan_count, "fact request scan plan"); !count_ok) {
+            return std::unexpected(std::move(count_ok.error()));
+        }
+        out.scan_plans.reserve(scan_plan_count);
+        for (std::uint32_t index = 0; index < scan_plan_count; ++index) {
+            PatternScanPlan scan_plan;
+            if (!reader->read_string(scan_plan.pattern_key) || !reader->read_bytes(scan_plan.literal)) {
+                return std::unexpected(single_error("protocol", "truncated fact request scan plan"));
+            }
+            out.scan_plans.push_back(std::move(scan_plan));
         }
         return out;
     }

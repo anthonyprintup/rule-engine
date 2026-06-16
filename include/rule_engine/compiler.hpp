@@ -5,14 +5,21 @@
 #include <rule_engine/modules.hpp>
 
 #include <cstddef>
+#include <chrono>
 #include <expected>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace rule_engine {
+    struct PatternScanPlan {
+        std::string pattern_key;
+        std::vector<std::byte> literal;
+    };
+
     struct ParseOptions {
         std::vector<std::filesystem::path> include_dirs;
         std::string namespace_name {"default"};
@@ -31,6 +38,7 @@ namespace rule_engine {
         std::chrono::seconds timeout {5};
         bool cheap_prefetch {};
         ValueType type {ValueType::undefined};
+        std::optional<PatternScanPlan> scan_plan;
     };
 
     struct VerifiedRule {

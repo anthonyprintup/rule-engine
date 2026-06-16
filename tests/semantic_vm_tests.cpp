@@ -664,6 +664,14 @@ rule pattern_metadata {
     REQUIRE(verified->rules[0].facts.size() == 1u);
     CHECK(verified->rules[0].facts[0].key == "$enc.pattern");
     CHECK(verified->rules[0].facts[0].route == "endpoint.scan.patterns");
+    REQUIRE(verified->rules[0].facts[0].scan_plan.has_value());
+    CHECK(verified->rules[0].facts[0].scan_plan->pattern_key == "$enc");
+    CHECK(verified->rules[0].facts[0].scan_plan->literal == std::vector<std::byte> {
+                                                             std::byte {'-'},
+                                                             std::byte {'e'},
+                                                             std::byte {'n'},
+                                                             std::byte {'c'},
+                                                         });
 
     rule_engine::FactCache facts;
     rule_engine::Evaluator evaluator {*verified, facts};
@@ -671,6 +679,14 @@ rule pattern_metadata {
     REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
     REQUIRE(first.requests.size() == 1u);
     CHECK(first.requests[0].keys == std::vector<std::string> {"$enc.pattern"});
+    REQUIRE(first.requests[0].scan_plans.size() == 1u);
+    CHECK(first.requests[0].scan_plans[0].pattern_key == "$enc");
+    CHECK(first.requests[0].scan_plans[0].literal == std::vector<std::byte> {
+                                                     std::byte {'-'},
+                                                     std::byte {'e'},
+                                                     std::byte {'n'},
+                                                     std::byte {'c'},
+                                                 });
 
     rule_engine::PatternValue pattern;
     pattern.matched = true;
