@@ -7,59 +7,96 @@ diagnostics.
 
 ## Provider And Module Binding Hardening
 
-- Advertise custom module/function provider routes in the client handshake instead
+- [x] Advertise custom module/function provider routes in the client handshake instead
   of only advertising the built-in process, PE, and pattern routes.
-- Validate provider responses against C++ descriptors: returned field facts must
+- [x] Validate provider responses against C++ descriptors: returned field facts must
   match `FieldDescriptor::type`, and returned function facts must match
   `FunctionDescriptor::return_type`.
-- Add a descriptor-level route registry so `rule_engine_server` can detect missing
+- [x] Reject evaluator fact requests for routes that are missing from the
+  connected client's advertised capabilities.
+- [x] Add a descriptor-level route registry so `rule_engine_server` can detect missing
   client capabilities before starting an evaluation session.
-- Add CLI/config support for registering custom module descriptors and client fact
+- [x] Add CLI/config support for registering custom module descriptors and client fact
   handlers without editing the core test harness.
-- Define stable provider key encoding rules for all `ValueType` values, including
+- [x] Define stable provider key encoding rules for all `ValueType` values, including
   bytes, arrays, objects, and explicit undefined arguments.
 
 ## Windows Process Providers
 
-- Implement `process.command_line` with a Windows provider instead of returning a
+- [x] Implement `process.command_line` with a Windows provider instead of returning a
   v1 diagnostic placeholder.
-- Implement `process.handles.count` on `endpoint.process.handles` with structured
+- [x] Implement `process.handles.count` on `endpoint.process.handles` with structured
   access-denied and partial-data diagnostics.
-- Implement `process.signer.status` on `endpoint.process.signer` using Windows
+- [x] Implement `process.signer.status` on `endpoint.process.signer` using Windows
   Authenticode/WinTrust APIs.
-- Add tests for process lifetime races where a process exits between subject
+- [x] Add tests for process lifetime races where a process exits between subject
   enumeration and fact collection.
-- Add richer process facts once the route model is stable: architecture,
-  integrity level, user/session details, loaded modules, token metadata, memory
-  regions, and thread counts.
+- [x] Add richer process facts once the route model is stable:
+  - [x] Thread count via `process.thread_count` on `endpoint.process.snapshot`.
+  - [x] Architecture via `process.architecture` on `endpoint.process.snapshot`.
+  - [x] Integrity level via `process.integrity_level` on `endpoint.process.snapshot`.
+  - [x] User/session basics via `process.session_id`, `process.user.sid`, and
+    `process.user.name` on `endpoint.process.snapshot`.
+  - [x] Loaded modules via `process.modules.count` and `process.modules.names`
+    on `endpoint.process.snapshot`.
+  - [x] Token metadata via `process.token.elevated` and `process.token.type` on
+    `endpoint.process.snapshot`.
+  - [x] Memory regions:
+    - [x] Region counts via `process.memory.regions.count` and
+      `process.memory.regions.readable_count` on `endpoint.process.snapshot`.
+    - [x] Region arrays with base, size, state, protection, type, and scan-space
+      metadata.
 
 ## PE And Image Facts
 
-- Expand the PE provider beyond the current minimal header facts to sections,
-  imports, exports, resources, debug directory, TLS callbacks, certificate table,
-  subsystem, characteristics, and timestamp fields.
-- Add section-level array/object values so rules can iterate over PE sections with
+- [x] Expand the PE provider beyond the current minimal header facts:
+  - [x] Sections via `pe.sections` array objects with name, virtual address/size,
+    raw data offset/size, characteristics, and readable/writable/executable flags.
+  - [x] Imports via `pe.imports` array objects with DLL, name/ordinal, hint,
+    lookup RVA, and IAT RVA fields.
+  - [x] Exports via `pe.exports` array objects with module, name/ordinal, RVA,
+    forwarded flag, and forwarder string fields.
+  - [x] Resources via `pe.resources` array objects with type/name/language,
+    RVA, size, and code-page fields.
+  - [x] Debug directory via `pe.debug_entries` array objects with type,
+    timestamp, version, size, and raw-data location fields.
+  - [x] TLS callbacks via `pe.tls_callbacks` array objects with index, VA,
+    and RVA fields.
+  - [x] Certificate table via `pe.certificates` array objects with file
+    offset, size, revision, type, and payload size fields.
+  - [x] Subsystem via `pe.subsystem`.
+  - [x] Characteristics via `pe.characteristics` and `pe.dll_characteristics`.
+  - [x] Timestamp fields for the COFF image header via `pe.timestamp`.
+- [x] Add section-level array/object values so rules can iterate over PE sections with
   `for in`.
-- Add PE parser regression fixtures for malformed, truncated, non-PE, PE32, and
-  PE32+ images.
-- Separate static image facts from volatile process facts in cache policy tests
-  for richer PE routes.
+- [x] Add PE parser regression fixtures for malformed, truncated, non-PE, PE32,
+  and PE32+ images.
+- [x] Separate static image facts from volatile process facts in cache policy
+  tests for richer PE routes.
 
 ## Pattern Scanning
 
 - Replace fixture-backed pattern facts with a real scanner while preserving the
   final `PatternValue` fact schema.
-- Support explicit scan spaces such as process image bytes, mapped image sections,
-  readable memory regions, and file bytes.
-- Preserve match context metadata: offset, length, bytes, before/after context,
+  - [x] Configured literal byte scanner through `--pattern-fixture` `scan`
+    directives, returning real offsets and match context metadata.
+  - [ ] Rule-derived scan plans so clients do not need pattern definitions
+    duplicated in local fixture/config files.
+- Support explicit scan spaces:
+  - [x] File bytes through fixture `scan_file` directives.
+  - [ ] Process image bytes.
+  - [ ] Mapped image sections.
+  - [ ] Readable memory regions.
+- [x] Preserve match context metadata: offset, length, bytes, before/after context,
   region permissions, and scan-space name.
-- Add scheduling controls for expensive scan routes so cheap process/PE filters
+- [x] Add scheduling controls for expensive scan routes so cheap process/PE filters
   can short-circuit before scanning.
 
 ## YARA Expression Coverage
 
-- Implement currently rejected `of` shapes such as boolean tuple `of` and anchored
-  `of ... at/in` forms.
+- Implement currently rejected `of` shapes:
+  - [x] Boolean tuple `of` expressions such as `any of (true, 1 == 1)`.
+  - [x] Anchored pattern-set `of ... at/in` forms.
 - Add descriptor-backed implementations for useful built-ins such as integer
   readers (`uint8`, `uint16`, `uint32`, etc.) once scan-space byte facts are
   available.
@@ -70,34 +107,36 @@ diagnostics.
 
 ## VM, Scheduler, And Caching
 
-- Add provider return-type enforcement at VM cache-fill boundaries so bad clients
+- [x] Add provider return-type enforcement at VM cache-fill boundaries so bad clients
   fail closed.
-- Prefetch deterministic function facts when all arguments are statically known
+- [x] Prefetch deterministic function facts when all arguments are statically known
   and the descriptor marks the function as cheap.
-- Make provider timeout, retry, and cancellation policy explicit per descriptor.
-- Add replay tests for function-call fact requests and custom provider routes.
+- [x] Make provider timeout policy explicit per descriptor and per route batch.
+- Define descriptor-level retry and cancellation semantics once runtime
+  orchestration supports retries and cancellable in-flight provider requests.
+- [x] Add replay tests for function-call fact requests and custom provider routes.
 - Stabilize the debug IR and trace schemas once the module/provider surface stops
   changing.
 
 ## Client And Server Runtime
 
-- Support multi-session client service mode instead of only one-shot localhost
+- [x] Support multi-session client service mode instead of only one-shot localhost
   smoke sessions.
 - Add graceful shutdown and cancellation paths for long-running provider requests.
-- Make server output available as structured JSON in addition to human-readable
+- [x] Make server output available as structured JSON in addition to human-readable
   text.
-- Add integration tests that evaluate rules against multiple live subjects with
-  custom provider routes and capability negotiation.
-- Keep localhost/plain TCP as the V1 demo path, but document the production
+- [x] Add integration tests that evaluate rules against multiple live subjects
+  with custom provider routes and capability negotiation.
+- [x] Keep localhost/plain TCP as the V1 demo path, but document the production
   transport boundary before adding remote clients.
 
 ## Tooling And Documentation
 
 - Keep `docs/V1_IMPLEMENTATION_STATUS.md` conservative: only mark items complete
   after tests or smoke checks cover them.
-- Add examples for custom module descriptors, function bindings, and client fact
-  handlers.
-- Add a small rule corpus that documents supported and intentionally unsupported
-  YARA constructs.
-- Add a developer guide for updating the Rust bridge and regenerated cbindgen C++
-  header.
+- [x] Add examples for custom module descriptors, function bindings, and client
+  fact handlers.
+- [x] Add a small rule corpus that documents supported and intentionally
+  unsupported YARA constructs.
+- [x] Add a developer guide for updating the Rust bridge and regenerated
+  cbindgen C++ header.

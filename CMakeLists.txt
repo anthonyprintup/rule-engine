@@ -228,12 +228,16 @@ target_compile_definitions(
 
 add_library(
     rule_engine_core
+    src/custom_fact_fixture.cpp
     src/compiler.cpp
     src/evaluator.cpp
     src/modules.cpp
+    src/module_config.cpp
+    src/provider_key.cpp
     src/pattern_fixture_provider.cpp
     src/client_protocol.cpp
     src/protocol.cpp
+    src/server_output.cpp
     src/trace.cpp
     src/windows/pe_provider.cpp
     src/windows/process_provider.cpp
@@ -255,7 +259,7 @@ target_link_libraries(
         asio::asio
 )
 if(WIN32)
-    target_link_libraries(rule_engine_core PRIVATE psapi version wintrust crypt32)
+    target_link_libraries(rule_engine_core PRIVATE psapi version wintrust crypt32 advapi32)
 endif()
 
 add_executable(rule_engine_check src/tools/rule_engine_check.cpp)
@@ -277,6 +281,7 @@ add_executable(
     tests/scheduler_tests.cpp
     tests/protocol_tests.cpp
     tests/runtime_harness_tests.cpp
+    tests/server_output_tests.cpp
     tests/trace_tests.cpp
 )
 target_include_directories(

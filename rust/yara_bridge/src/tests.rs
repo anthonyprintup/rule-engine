@@ -292,6 +292,65 @@ rule for_of_patterns {
 }
 
 #[test]
+fn parses_bool_tuple_of_into_expression_nodes() {
+    let parsed = OwnedParse::parse(
+        br#"
+rule bool_tuple_of {
+    condition:
+        any of (true, false, 1 == 1) and
+        2 of (true, false, true)
+}
+"#,
+    );
+
+    let rule = re_yara_bridge_rule_at(parsed.result.rules, 0);
+    let condition = re_yara_bridge_rule_condition(parsed.result.rules, rule);
+    let first = re_yara_bridge_node_child_at(parsed.result.rules, condition, 0);
+    let first = re_yara_bridge_node_view(parsed.result.rules, first);
+    assert_eq!(first.kind, ReNodeKind::Of);
+    assert_eq!(view_to_str(first.text), "bool_any");
+    assert_eq!(first.children_len, 3);
+
+    let second = re_yara_bridge_node_child_at(parsed.result.rules, condition, 1);
+    let second = re_yara_bridge_node_view(parsed.result.rules, second);
+    assert_eq!(second.kind, ReNodeKind::Of);
+    assert_eq!(view_to_str(second.text), "bool_expr");
+    assert_eq!(second.children_len, 4);
+}
+
+#[test]
+fn parses_anchored_pattern_set_of_into_expression_nodes() {
+    let parsed = OwnedParse::parse(
+        br#"
+rule anchored_of {
+    strings:
+        $a = "alpha" ascii
+        $b = "beta" ascii
+    condition:
+        any of ($a, $b) at 8 and
+        all of them in (4..16)
+}
+"#,
+    );
+
+    let rule = re_yara_bridge_rule_at(parsed.result.rules, 0);
+    let condition = re_yara_bridge_rule_condition(parsed.result.rules, rule);
+    let first = re_yara_bridge_node_child_at(parsed.result.rules, condition, 0);
+    let first = re_yara_bridge_node_view(parsed.result.rules, first);
+    assert_eq!(first.kind, ReNodeKind::Of);
+    assert_eq!(view_to_str(first.text), "at_any");
+    assert_eq!(first.names_len, 2);
+    assert_eq!(first.children_len, 1);
+
+    let second = re_yara_bridge_node_child_at(parsed.result.rules, condition, 1);
+    let second = re_yara_bridge_node_view(parsed.result.rules, second);
+    assert_eq!(second.kind, ReNodeKind::Of);
+    assert_eq!(view_to_str(second.text), "in_all");
+    assert_eq!(second.names_len, 1);
+    assert_eq!(second.children_len, 2);
+}
+
+#[test]
 fn parses_lookup_expression_nodes() {
     let parsed = OwnedParse::parse(
         br#"

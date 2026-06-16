@@ -1,9 +1,14 @@
 #include <rule_engine/compiler.hpp>
 #include <rule_engine/evaluator.hpp>
+#include <rule_engine/module_config.hpp>
 #include <rule_engine/modules.hpp>
+#include <rule_engine/provider_key.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
 #include <filesystem>
 #include <utility>
 #include <vector>
@@ -31,6 +36,25 @@ rule bad_field {
     REQUIRE_FALSE(verified.has_value());
     REQUIRE_FALSE(verified.error().diagnostics.empty());
     CHECK(verified.error().diagnostics[0].message.find("process.no_such_field") != std::string::npos);
+}
+
+TEST_CASE("rule corpus examples match documented support status") {
+    auto supported = rule_engine::parse_file(fixture_path("examples/rule_corpus/supported_process_pe.yar"));
+    REQUIRE(supported.has_value());
+    auto supported_verified = rule_engine::verify(*supported, rule_engine::default_module_registry());
+    REQUIRE(supported_verified.has_value());
+
+    constexpr std::array unsupported {
+        "examples/rule_corpus/unsupported_builtin_reader.yar",
+        "examples/rule_corpus/unsupported_unknown_field.yar",
+    };
+    for (const auto *path : unsupported) {
+        auto parsed = rule_engine::parse_file(fixture_path(path));
+        REQUIRE(parsed.has_value());
+        auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+        REQUIRE_FALSE(verified.has_value());
+        REQUIRE_FALSE(verified.error().diagnostics.empty());
+    }
 }
 
 TEST_CASE("semantic diagnostics preserve included source names") {
@@ -190,11 +214,11 @@ rule suspicious_score {
     REQUIRE(second.state == rule_engine::EvaluationState::waiting_for_facts);
     REQUIRE(second.requests.size() == 1u);
     CHECK(second.requests[0].route == "endpoint.demo.functions");
-    CHECK(second.requests[0].keys == std::vector<std::string> {"demo.score(i:4242,s:alpha)"});
+    CHECK(second.requests[0].keys == std::vector<std::string> {"demo.score(i:4242,s:616c706861)"});
 
     facts.store(rule_engine::Fact {
         .subject_id = "pid:42",
-        .key = "demo.score(i:4242,s:alpha)",
+        .key = "demo.score(i:4242,s:616c706861)",
         .value = rule_engine::Value::integer(9),
         .status = rule_engine::FactStatus::available,
         .diagnostic = {},
@@ -205,6 +229,232 @@ rule suspicious_score {
     REQUIRE(third.state == rule_engine::EvaluationState::complete);
     REQUIRE(third.rule_results.size() == 1u);
     CHECK(third.rule_results[0].matched);
+}
+
+TEST_CASE("cheap static module functions are prefetched before expensive facts") {
+    constexpr auto source = R"(
+import "demo"
+
+rule static_score_then_scan {
+    strings:
+        $enc = "-enc" ascii
+    condition:
+        $enc and demo.score(42, "alpha") > 7
+}
+)";
+
+    auto registry = rule_engine::default_module_registry();
+    registry.modules.push_back(rule_engine::ModuleDescriptor {
+        .name = "demo",
+        .fields = {},
+        .functions = {
+            rule_engine::FunctionDescriptor {
+                .name = "score",
+                .parameters = {rule_engine::ValueType::integer, rule_engine::ValueType::string},
+                .return_type = rule_engine::ValueType::integer,
+                .key_prefix = "demo.score",
+                .route = "endpoint.demo.functions",
+                .ttl = std::chrono::seconds {30},
+                .cheap_prefetch = true,
+            },
+        },
+    });
+
+    auto parsed = rule_engine::parse_source("static_score_then_scan.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, registry);
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+
+    const auto function_fact = std::ranges::find_if(verified->rules[0].facts, [](const auto &fact) {
+        return fact.key == "demo.score(i:42,s:616c706861)";
+    });
+    REQUIRE(function_fact != verified->rules[0].facts.end());
+    CHECK(function_fact->route == "endpoint.demo.functions");
+    CHECK(function_fact->cheap_prefetch);
+    CHECK(function_fact->type == rule_engine::ValueType::integer);
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 1u);
+    CHECK(first.requests[0].route == "endpoint.demo.functions");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"demo.score(i:42,s:616c706861)"});
+    CHECK(first.requests[0].types == std::vector<rule_engine::ValueType> {rule_engine::ValueType::integer});
+
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "demo.score(i:42,s:616c706861)",
+        .value = rule_engine::Value::integer(9),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+        .ttl = std::chrono::seconds {30},
+    });
+
+    const auto second = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(second.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(second.requests.size() == 1u);
+    CHECK(second.requests[0].route == "endpoint.scan.patterns");
+    CHECK(second.requests[0].keys == std::vector<std::string> {"$enc.matches"});
+}
+
+TEST_CASE("descriptor timeouts flow into evaluator request batches") {
+    constexpr auto source = R"(
+import "demo"
+
+rule descriptor_timeouts {
+    condition:
+        demo.weight > 2 and fast_flag and slow_flag and demo.score(42, "alpha") > 7
+}
+)";
+
+    auto registry = rule_engine::default_module_registry();
+    registry.modules.push_back(rule_engine::ModuleDescriptor {
+        .name = "demo",
+        .fields = {
+            rule_engine::FieldDescriptor {
+                .key = "demo.weight",
+                .type = rule_engine::ValueType::integer,
+                .route = "endpoint.demo.fields",
+                .ttl = std::chrono::seconds {30},
+                .timeout = std::chrono::seconds {19},
+                .cheap_prefetch = true,
+            },
+        },
+        .functions = {
+            rule_engine::FunctionDescriptor {
+                .name = "score",
+                .parameters = {rule_engine::ValueType::integer, rule_engine::ValueType::string},
+                .return_type = rule_engine::ValueType::integer,
+                .key_prefix = "demo.score",
+                .route = "endpoint.demo.functions",
+                .ttl = std::chrono::seconds {30},
+                .timeout = std::chrono::seconds {13},
+                .cheap_prefetch = true,
+            },
+        },
+    });
+    registry.globals.push_back(rule_engine::GlobalDescriptor {
+        .name = "fast_flag",
+        .type = rule_engine::ValueType::boolean,
+        .key = "global.fast_flag",
+        .route = "endpoint.globals",
+        .ttl = std::chrono::seconds {30},
+        .timeout = std::chrono::seconds {3},
+        .cheap_prefetch = true,
+    });
+    registry.globals.push_back(rule_engine::GlobalDescriptor {
+        .name = "slow_flag",
+        .type = rule_engine::ValueType::boolean,
+        .key = "global.slow_flag",
+        .route = "endpoint.globals",
+        .ttl = std::chrono::seconds {30},
+        .timeout = std::chrono::seconds {17},
+        .cheap_prefetch = true,
+    });
+
+    auto parsed = rule_engine::parse_source("descriptor_timeouts.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, registry);
+    REQUIRE(verified.has_value());
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 3u);
+
+    const auto fields = std::ranges::find_if(first.requests, [](const auto &request) {
+        return request.route == "endpoint.demo.fields";
+    });
+    REQUIRE(fields != first.requests.end());
+    CHECK(fields->timeout == std::chrono::seconds {19});
+    CHECK(fields->keys == std::vector<std::string> {"demo.weight"});
+
+    const auto globals = std::ranges::find_if(first.requests, [](const auto &request) {
+        return request.route == "endpoint.globals";
+    });
+    REQUIRE(globals != first.requests.end());
+    CHECK(globals->timeout == std::chrono::seconds {17});
+    CHECK(globals->keys == std::vector<std::string> {"global.fast_flag", "global.slow_flag"});
+
+    const auto functions = std::ranges::find_if(first.requests, [](const auto &request) {
+        return request.route == "endpoint.demo.functions";
+    });
+    REQUIRE(functions != first.requests.end());
+    CHECK(functions->timeout == std::chrono::seconds {13});
+    CHECK(functions->keys == std::vector<std::string> {"demo.score(i:42,s:616c706861)"});
+}
+
+TEST_CASE("module config file registers custom module functions for verification") {
+    auto registry = rule_engine::default_module_registry();
+    auto loaded = rule_engine::load_module_config_file(fixture_path("tests/fixtures/custom_binding/demo.module"), registry);
+    REQUIRE(loaded.has_value());
+
+    auto parsed = rule_engine::parse_file(fixture_path("tests/fixtures/custom_binding/demo_rule.yar"));
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, registry);
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].condition.children[0].kind == rule_engine::ExpressionKind::function_call);
+    CHECK(verified->rules[0].condition.children[0].bound_route == "endpoint.demo.functions");
+    CHECK(verified->rules[0].condition.children[0].bound_key_prefix == "demo.score");
+    CHECK(verified->rules[0].condition.children[0].bound_timeout == std::chrono::seconds {12});
+    CHECK(rule_engine::required_provider_routes(*verified) ==
+          std::vector<std::string> {"endpoint.demo.functions"});
+}
+
+TEST_CASE("provider function keys encode every value shape with stable v1 tokens") {
+    rule_engine::PatternValue pattern;
+    pattern.matched = true;
+    pattern.matches.push_back(rule_engine::PatternMatchContext {
+        .offset = 1,
+        .length = 2,
+        .bytes = {std::byte {0x41}},
+        .before = {},
+        .after = {std::byte {0xff}},
+        .scan_space = "image",
+        .region_permissions = "r-x",
+    });
+
+    const auto array = rule_engine::Value::array(std::vector<rule_engine::Value> {
+        rule_engine::Value::integer(7),
+        rule_engine::Value::string("x"),
+        rule_engine::Value::undefined(),
+    });
+    const auto object = rule_engine::Value::object(std::vector<rule_engine::ObjectEntry> {
+        rule_engine::ObjectEntry {
+            .key = "k",
+            .value = rule_engine::Value::boolean(false),
+        },
+        rule_engine::ObjectEntry {
+            .key = "weird,key",
+            .value = rule_engine::Value::bytes(std::vector<std::byte> {std::byte {0x2a}}),
+        },
+    });
+
+    CHECK(rule_engine::provider_argument_key(rule_engine::Value::undefined()) == "u");
+    CHECK(rule_engine::provider_argument_key(rule_engine::Value::boolean(true)) == "b:true");
+    CHECK(rule_engine::provider_argument_key(rule_engine::Value::integer(-42)) == "i:-42");
+    CHECK(rule_engine::provider_argument_key(rule_engine::Value::number(1.5)) == "f:3ff8000000000000");
+    CHECK(rule_engine::provider_argument_key(rule_engine::Value::string("a,b)\\")) == "s:612c62295c");
+    CHECK(rule_engine::provider_argument_key(
+              rule_engine::Value::bytes(std::vector<std::byte> {std::byte {0x00}, std::byte {0x41}, std::byte {0xff}})) ==
+          "x:0041ff");
+    CHECK(rule_engine::provider_argument_key(array) == "a:3[i:7,s:78,u]");
+    CHECK(rule_engine::provider_argument_key(object) == "o:2{s:6b=b:false,s:77656972642c6b6579=x:2a}");
+    CHECK(rule_engine::provider_argument_key(rule_engine::Value::pattern(std::move(pattern))) ==
+          "p:true:1[1:2:41::ff:696d616765:722d78]");
+    CHECK(rule_engine::provider_function_key("demo.complex",
+                                             std::vector<rule_engine::Value> {
+                                                 rule_engine::Value::string("alpha"),
+                                                 array,
+                                                 object,
+                                                 rule_engine::Value::undefined(),
+                                             }) ==
+          "demo.complex(s:616c706861,a:3[i:7,s:78,u],o:2{s:6b=b:false,s:77656972642c6b6579=x:2a},u)");
 }
 
 TEST_CASE("semantic verification rejects statically invalid module function argument types") {
@@ -496,7 +746,7 @@ rule all_patterns {
     REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
     REQUIRE(first.requests.size() == 1u);
     CHECK(first.requests[0].route == "endpoint.scan.patterns");
-    CHECK(first.requests[0].keys == std::vector<std::string> {"$a.pattern", "$b.pattern"});
+    CHECK(first.requests[0].keys == std::vector<std::string> {"$a.pattern"});
 
     rule_engine::PatternValue a;
     a.matched = true;
@@ -535,6 +785,108 @@ rule all_patterns {
     CHECK(second.rule_results[0].matched);
     CHECK(second.rule_results[1].identifier == "all_patterns");
     CHECK_FALSE(second.rule_results[1].matched);
+}
+
+TEST_CASE("VM evaluates boolean tuple of expressions") {
+    constexpr auto source = R"(
+rule bool_tuple_of {
+    condition:
+        any of (false, true, 1 == 2) and
+        all of (true, 1 == 1) and
+        none of (false, 1 == 2) and
+        2 of (true, false, true) and
+        50% of (true, false)
+}
+
+rule bool_tuple_zero {
+    condition:
+        0 of (false, false) and not (0 of (false, true))
+}
+)";
+
+    auto parsed = rule_engine::parse_source("bool_tuple_of_vm.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto step = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(step.state == rule_engine::EvaluationState::complete);
+    REQUIRE(step.rule_results.size() == 2u);
+    CHECK(step.rule_results[0].identifier == "bool_tuple_of");
+    CHECK(step.rule_results[0].matched);
+    CHECK(step.rule_results[1].identifier == "bool_tuple_zero");
+    CHECK(step.rule_results[1].matched);
+}
+
+TEST_CASE("VM evaluates anchored pattern-set of expressions") {
+    constexpr auto source = R"(
+rule anchored_pattern_of {
+    strings:
+        $a = "alpha" ascii
+        $b = "beta" ascii
+    condition:
+        any of ($a, $b) at 8 and
+        2 of them in (4..16) and
+        none of them at 20
+}
+)";
+
+    auto parsed = rule_engine::parse_source("anchored_pattern_of_vm.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 2u);
+
+    rule_engine::PatternValue a;
+    a.matched = true;
+    a.matches.push_back(rule_engine::PatternMatchContext {
+        .offset = 8,
+        .length = 5,
+        .bytes = {},
+        .before = {},
+        .after = {},
+        .scan_space = "process.memory",
+        .region_permissions = "r",
+    });
+    rule_engine::PatternValue b;
+    b.matched = true;
+    b.matches.push_back(rule_engine::PatternMatchContext {
+        .offset = 12,
+        .length = 4,
+        .bytes = {},
+        .before = {},
+        .after = {},
+        .scan_space = "process.memory",
+        .region_permissions = "r",
+    });
+
+    rule_engine::FactCache facts;
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "$a.pattern",
+        .value = rule_engine::Value::pattern(std::move(a)),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+        .ttl = std::chrono::seconds {30},
+    });
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "$b.pattern",
+        .value = rule_engine::Value::pattern(std::move(b)),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+        .ttl = std::chrono::seconds {30},
+    });
+
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto step = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(step.state == rule_engine::EvaluationState::complete);
+    REQUIRE(step.rule_results.size() == 1u);
+    CHECK(step.rule_results[0].identifier == "anchored_pattern_of");
+    CHECK(step.rule_results[0].matched);
 }
 
 TEST_CASE("VM treats zero pattern quantifiers as exactly none matched") {
@@ -653,8 +1005,7 @@ rule string_ops {
     REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
     REQUIRE(first.requests.size() == 1u);
     CHECK(first.requests[0].route == "endpoint.process.snapshot");
-    CHECK(first.requests[0].keys ==
-          std::vector<std::string> {"process.command_line", "process.path", "process.name"});
+    CHECK(first.requests[0].keys == std::vector<std::string> {"process.path", "process.name"});
 
     facts.store(rule_engine::Fact {
         .subject_id = "pid:42",
@@ -682,6 +1033,752 @@ rule string_ops {
     REQUIRE(second.state == rule_engine::EvaluationState::complete);
     REQUIRE(second.rule_results.size() == 1u);
     CHECK(second.rule_results[0].identifier == "string_ops");
+    CHECK(second.rule_results[0].matched);
+}
+
+TEST_CASE("process user detail fields resolve to snapshot facts") {
+    constexpr auto source = R"(
+import "process"
+
+rule process_user_details {
+    condition:
+        process.user.sid startswith "S-" and process.user.name != ""
+}
+)";
+
+    auto parsed = rule_engine::parse_source("process_user_details.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 2u);
+    CHECK(verified->rules[0].facts[0].key == "process.user.sid");
+    CHECK(verified->rules[0].facts[1].key == "process.user.name");
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 1u);
+    CHECK(first.requests[0].route == "endpoint.process.snapshot");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"process.user.sid", "process.user.name"});
+
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "process.user.sid",
+        .value = rule_engine::Value::string("S-1-5-21-1-2-3-1001"),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "process.user.name",
+        .value = rule_engine::Value::string("DOMAIN\\user"),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+
+    const auto second = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(second.state == rule_engine::EvaluationState::complete);
+    REQUIRE(second.rule_results.size() == 1u);
+    CHECK(second.rule_results[0].identifier == "process_user_details");
+    CHECK(second.rule_results[0].matched);
+}
+
+TEST_CASE("process token metadata fields resolve to snapshot facts") {
+    constexpr auto source = R"(
+import "process"
+
+rule process_token_metadata {
+    condition:
+        process.token.elevated and process.token.type == "primary"
+}
+)";
+
+    auto parsed = rule_engine::parse_source("process_token_metadata.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 2u);
+    CHECK(verified->rules[0].facts[0].key == "process.token.elevated");
+    CHECK(verified->rules[0].facts[1].key == "process.token.type");
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 1u);
+    CHECK(first.requests[0].route == "endpoint.process.snapshot");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"process.token.elevated", "process.token.type"});
+
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "process.token.elevated",
+        .value = rule_engine::Value::boolean(true),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "process.token.type",
+        .value = rule_engine::Value::string("primary"),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+
+    const auto second = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(second.state == rule_engine::EvaluationState::complete);
+    REQUIRE(second.rule_results.size() == 1u);
+    CHECK(second.rule_results[0].identifier == "process_token_metadata");
+    CHECK(second.rule_results[0].matched);
+}
+
+TEST_CASE("process loaded module fields resolve to snapshot facts") {
+    constexpr auto source = R"(
+import "process"
+
+rule process_loaded_modules {
+    condition:
+        process.modules.count > 0 and
+        for any module_name in process.modules.names : (module_name == "kernel32.dll")
+}
+)";
+
+    auto parsed = rule_engine::parse_source("process_loaded_modules.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 2u);
+    CHECK(verified->rules[0].facts[0].key == "process.modules.count");
+    CHECK(verified->rules[0].facts[1].key == "process.modules.names");
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 1u);
+    CHECK(first.requests[0].route == "endpoint.process.snapshot");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"process.modules.count"});
+
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "process.modules.count",
+        .value = rule_engine::Value::integer(2),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "process.modules.names",
+        .value = rule_engine::Value::array(std::vector<rule_engine::Value> {
+            rule_engine::Value::string("rule_engine_tests.exe"),
+            rule_engine::Value::string("kernel32.dll"),
+        }),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+
+    const auto second = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(second.state == rule_engine::EvaluationState::complete);
+    REQUIRE(second.rule_results.size() == 1u);
+    CHECK(second.rule_results[0].identifier == "process_loaded_modules");
+    CHECK(second.rule_results[0].matched);
+}
+
+TEST_CASE("process memory region count fields resolve to snapshot facts") {
+    constexpr auto source = R"(
+import "process"
+
+rule process_memory_regions {
+    condition:
+        process.memory.regions.count > 0 and process.memory.regions.readable_count > 0
+}
+)";
+
+    auto parsed = rule_engine::parse_source("process_memory_regions.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 2u);
+    CHECK(verified->rules[0].facts[0].key == "process.memory.regions.count");
+    CHECK(verified->rules[0].facts[1].key == "process.memory.regions.readable_count");
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 1u);
+    CHECK(first.requests[0].route == "endpoint.process.snapshot");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"process.memory.regions.count"});
+
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "process.memory.regions.count",
+        .value = rule_engine::Value::integer(8),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "process.memory.regions.readable_count",
+        .value = rule_engine::Value::integer(4),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+
+    const auto second = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(second.state == rule_engine::EvaluationState::complete);
+    REQUIRE(second.rule_results.size() == 1u);
+    CHECK(second.rule_results[0].identifier == "process_memory_regions");
+    CHECK(second.rule_results[0].matched);
+}
+
+TEST_CASE("process memory region arrays resolve to snapshot facts") {
+    constexpr auto source = R"(
+import "process"
+
+rule process_memory_region_array {
+    condition:
+        for any region in process.memory.regions : (
+            region["scan_space"] == "process.memory" and
+            region["readable"] and
+            region["size"] > 0
+        )
+}
+)";
+
+    auto parsed = rule_engine::parse_source("process_memory_region_array.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 1u);
+    CHECK(verified->rules[0].facts[0].key == "process.memory.regions");
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 1u);
+    CHECK(first.requests[0].route == "endpoint.process.snapshot");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"process.memory.regions"});
+
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "process.memory.regions",
+        .value = rule_engine::Value::array(std::vector<rule_engine::Value> {
+            rule_engine::Value::object(std::vector<rule_engine::ObjectEntry> {
+                rule_engine::ObjectEntry {.key = "base", .value = rule_engine::Value::integer(4096)},
+                rule_engine::ObjectEntry {.key = "size", .value = rule_engine::Value::integer(8192)},
+                rule_engine::ObjectEntry {.key = "state", .value = rule_engine::Value::string("commit")},
+                rule_engine::ObjectEntry {.key = "protection", .value = rule_engine::Value::string("rw")},
+                rule_engine::ObjectEntry {.key = "type", .value = rule_engine::Value::string("private")},
+                rule_engine::ObjectEntry {.key = "readable", .value = rule_engine::Value::boolean(true)},
+                rule_engine::ObjectEntry {.key = "scan_space", .value = rule_engine::Value::string("process.memory")},
+            }),
+        }),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+
+    const auto second = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(second.state == rule_engine::EvaluationState::complete);
+    REQUIRE(second.rule_results.size() == 1u);
+    CHECK(second.rule_results[0].identifier == "process_memory_region_array");
+    CHECK(second.rule_results[0].matched);
+}
+
+TEST_CASE("PE section array resolves to image facts") {
+    constexpr auto source = R"(
+import "pe"
+
+rule pe_section_array {
+    condition:
+        pe.number_of_sections > 0 and
+        for any section in pe.sections : (
+            section["name"] != "" and
+            section["virtual_size"] > 0 and
+            section["readable"]
+        )
+}
+)";
+
+    auto parsed = rule_engine::parse_source("pe_section_array.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 2u);
+    CHECK(verified->rules[0].facts[0].key == "pe.number_of_sections");
+    CHECK(verified->rules[0].facts[1].key == "pe.sections");
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 1u);
+    CHECK(first.requests[0].route == "endpoint.process.image.pe");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"pe.number_of_sections"});
+
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "pe.number_of_sections",
+        .value = rule_engine::Value::integer(1),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "pe.sections",
+        .value = rule_engine::Value::array(std::vector<rule_engine::Value> {
+            rule_engine::Value::object(std::vector<rule_engine::ObjectEntry> {
+                rule_engine::ObjectEntry {.key = "name", .value = rule_engine::Value::string(".text")},
+                rule_engine::ObjectEntry {.key = "virtual_address", .value = rule_engine::Value::integer(4096)},
+                rule_engine::ObjectEntry {.key = "virtual_size", .value = rule_engine::Value::integer(8192)},
+                rule_engine::ObjectEntry {.key = "raw_data_offset", .value = rule_engine::Value::integer(1024)},
+                rule_engine::ObjectEntry {.key = "raw_data_size", .value = rule_engine::Value::integer(8192)},
+                rule_engine::ObjectEntry {.key = "characteristics", .value = rule_engine::Value::integer(0x60000020)},
+                rule_engine::ObjectEntry {.key = "readable", .value = rule_engine::Value::boolean(true)},
+                rule_engine::ObjectEntry {.key = "writable", .value = rule_engine::Value::boolean(false)},
+                rule_engine::ObjectEntry {.key = "executable", .value = rule_engine::Value::boolean(true)},
+            }),
+        }),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+
+    const auto second = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(second.state == rule_engine::EvaluationState::complete);
+    REQUIRE(second.rule_results.size() == 1u);
+    CHECK(second.rule_results[0].identifier == "pe_section_array");
+    CHECK(second.rule_results[0].matched);
+}
+
+TEST_CASE("PE header fields resolve to image facts") {
+    constexpr auto source = R"(
+import "pe"
+
+rule pe_header_fields {
+    condition:
+        pe.subsystem > 0 and
+        pe.characteristics > 0 and
+        pe.dll_characteristics >= 0 and
+        pe.timestamp >= 0
+}
+)";
+
+    auto parsed = rule_engine::parse_source("pe_header_fields.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 4u);
+    CHECK(verified->rules[0].facts[0].key == "pe.subsystem");
+    CHECK(verified->rules[0].facts[1].key == "pe.characteristics");
+    CHECK(verified->rules[0].facts[2].key == "pe.dll_characteristics");
+    CHECK(verified->rules[0].facts[3].key == "pe.timestamp");
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 1u);
+    CHECK(first.requests[0].route == "endpoint.process.image.pe");
+    CHECK(first.requests[0].keys == std::vector<std::string> {
+                                      "pe.subsystem",
+                                      "pe.characteristics",
+                                      "pe.dll_characteristics",
+                                      "pe.timestamp",
+                                  });
+
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "pe.subsystem",
+        .value = rule_engine::Value::integer(3),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+        .ttl = std::chrono::seconds {30},
+    });
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "pe.characteristics",
+        .value = rule_engine::Value::integer(0x22),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+        .ttl = std::chrono::seconds {30},
+    });
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "pe.dll_characteristics",
+        .value = rule_engine::Value::integer(0x8160),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+        .ttl = std::chrono::seconds {30},
+    });
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "pe.timestamp",
+        .value = rule_engine::Value::integer(0),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+        .ttl = std::chrono::seconds {30},
+    });
+
+    const auto second = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(second.state == rule_engine::EvaluationState::complete);
+    REQUIRE(second.rule_results.size() == 1u);
+    CHECK(second.rule_results[0].identifier == "pe_header_fields");
+    CHECK(second.rule_results[0].matched);
+}
+
+TEST_CASE("PE import array resolves to image facts") {
+    constexpr auto source = R"(
+import "pe"
+
+rule pe_import_array {
+    condition:
+        for any imp in pe.imports : (
+            imp["dll"] != "" and
+            imp["name"] == "CreateFileW" and
+            imp["hint"] >= 0 and
+            imp["lookup_rva"] > 0 and
+            imp["iat_rva"] > 0
+        )
+}
+)";
+
+    auto parsed = rule_engine::parse_source("pe_import_array.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 1u);
+    CHECK(verified->rules[0].facts[0].key == "pe.imports");
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 1u);
+    CHECK(first.requests[0].route == "endpoint.process.image.pe");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"pe.imports"});
+
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "pe.imports",
+        .value = rule_engine::Value::array(std::vector<rule_engine::Value> {
+            rule_engine::Value::object(std::vector<rule_engine::ObjectEntry> {
+                rule_engine::ObjectEntry {.key = "dll", .value = rule_engine::Value::string("KERNEL32.dll")},
+                rule_engine::ObjectEntry {.key = "name", .value = rule_engine::Value::string("CreateFileW")},
+                rule_engine::ObjectEntry {.key = "ordinal", .value = rule_engine::Value::undefined()},
+                rule_engine::ObjectEntry {.key = "hint", .value = rule_engine::Value::integer(128)},
+                rule_engine::ObjectEntry {.key = "lookup_rva", .value = rule_engine::Value::integer(8192)},
+                rule_engine::ObjectEntry {.key = "iat_rva", .value = rule_engine::Value::integer(12288)},
+            }),
+        }),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+        .ttl = std::chrono::seconds {30},
+    });
+
+    const auto second = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(second.state == rule_engine::EvaluationState::complete);
+    REQUIRE(second.rule_results.size() == 1u);
+    CHECK(second.rule_results[0].identifier == "pe_import_array");
+    CHECK(second.rule_results[0].matched);
+}
+
+TEST_CASE("PE export array resolves to image facts") {
+    constexpr auto source = R"(
+import "pe"
+
+rule pe_export_array {
+    condition:
+        for any exp in pe.exports : (
+            exp["module"] != "" and
+            exp["name"] == "GetLastError" and
+            exp["ordinal"] > 0 and
+            exp["rva"] > 0 and
+            not exp["forwarded"]
+        )
+}
+)";
+
+    auto parsed = rule_engine::parse_source("pe_export_array.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 1u);
+    CHECK(verified->rules[0].facts[0].key == "pe.exports");
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 1u);
+    CHECK(first.requests[0].route == "endpoint.process.image.pe");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"pe.exports"});
+
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "pe.exports",
+        .value = rule_engine::Value::array(std::vector<rule_engine::Value> {
+            rule_engine::Value::object(std::vector<rule_engine::ObjectEntry> {
+                rule_engine::ObjectEntry {.key = "module", .value = rule_engine::Value::string("KERNEL32.dll")},
+                rule_engine::ObjectEntry {.key = "name", .value = rule_engine::Value::string("GetLastError")},
+                rule_engine::ObjectEntry {.key = "ordinal", .value = rule_engine::Value::integer(512)},
+                rule_engine::ObjectEntry {.key = "rva", .value = rule_engine::Value::integer(4096)},
+                rule_engine::ObjectEntry {.key = "forwarded", .value = rule_engine::Value::boolean(false)},
+                rule_engine::ObjectEntry {.key = "forwarder", .value = rule_engine::Value::undefined()},
+            }),
+        }),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+        .ttl = std::chrono::seconds {30},
+    });
+
+    const auto second = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(second.state == rule_engine::EvaluationState::complete);
+    REQUIRE(second.rule_results.size() == 1u);
+    CHECK(second.rule_results[0].identifier == "pe_export_array");
+    CHECK(second.rule_results[0].matched);
+}
+
+TEST_CASE("PE debug entries resolve to image facts") {
+    constexpr auto source = R"(
+import "pe"
+
+rule pe_debug_entries {
+    condition:
+        for any entry in pe.debug_entries : (
+            entry["type"] == 2 and
+            entry["size"] > 0 and
+            entry["address_of_raw_data"] > 0
+        )
+}
+)";
+
+    auto parsed = rule_engine::parse_source("pe_debug_entries.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 1u);
+    CHECK(verified->rules[0].facts[0].key == "pe.debug_entries");
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 1u);
+    CHECK(first.requests[0].route == "endpoint.process.image.pe");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"pe.debug_entries"});
+
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "pe.debug_entries",
+        .value = rule_engine::Value::array(std::vector<rule_engine::Value> {
+            rule_engine::Value::object(std::vector<rule_engine::ObjectEntry> {
+                rule_engine::ObjectEntry {.key = "type", .value = rule_engine::Value::integer(2)},
+                rule_engine::ObjectEntry {.key = "timestamp", .value = rule_engine::Value::integer(0)},
+                rule_engine::ObjectEntry {.key = "major_version", .value = rule_engine::Value::integer(0)},
+                rule_engine::ObjectEntry {.key = "minor_version", .value = rule_engine::Value::integer(0)},
+                rule_engine::ObjectEntry {.key = "size", .value = rule_engine::Value::integer(128)},
+                rule_engine::ObjectEntry {.key = "address_of_raw_data", .value = rule_engine::Value::integer(4096)},
+                rule_engine::ObjectEntry {.key = "pointer_to_raw_data", .value = rule_engine::Value::integer(8192)},
+            }),
+        }),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+        .ttl = std::chrono::seconds {30},
+    });
+
+    const auto second = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(second.state == rule_engine::EvaluationState::complete);
+    REQUIRE(second.rule_results.size() == 1u);
+    CHECK(second.rule_results[0].identifier == "pe_debug_entries");
+    CHECK(second.rule_results[0].matched);
+}
+
+TEST_CASE("PE resource entries resolve to image facts") {
+    constexpr auto source = R"(
+import "pe"
+
+rule pe_resource_entries {
+    condition:
+        for any resource in pe.resources : (
+            resource["type_id"] == 16 and
+            resource["language_id"] >= 0 and
+            resource["rva"] > 0 and
+            resource["size"] > 0
+        )
+}
+)";
+
+    auto parsed = rule_engine::parse_source("pe_resource_entries.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 1u);
+    CHECK(verified->rules[0].facts[0].key == "pe.resources");
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 1u);
+    CHECK(first.requests[0].route == "endpoint.process.image.pe");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"pe.resources"});
+
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "pe.resources",
+        .value = rule_engine::Value::array(std::vector<rule_engine::Value> {
+            rule_engine::Value::object(std::vector<rule_engine::ObjectEntry> {
+                rule_engine::ObjectEntry {.key = "type_id", .value = rule_engine::Value::integer(16)},
+                rule_engine::ObjectEntry {.key = "type_name", .value = rule_engine::Value::undefined()},
+                rule_engine::ObjectEntry {.key = "name_id", .value = rule_engine::Value::integer(1)},
+                rule_engine::ObjectEntry {.key = "name", .value = rule_engine::Value::undefined()},
+                rule_engine::ObjectEntry {.key = "language_id", .value = rule_engine::Value::integer(1033)},
+                rule_engine::ObjectEntry {.key = "rva", .value = rule_engine::Value::integer(4096)},
+                rule_engine::ObjectEntry {.key = "size", .value = rule_engine::Value::integer(512)},
+                rule_engine::ObjectEntry {.key = "code_page", .value = rule_engine::Value::integer(0)},
+            }),
+        }),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+        .ttl = std::chrono::seconds {30},
+    });
+
+    const auto second = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(second.state == rule_engine::EvaluationState::complete);
+    REQUIRE(second.rule_results.size() == 1u);
+    CHECK(second.rule_results[0].identifier == "pe_resource_entries");
+    CHECK(second.rule_results[0].matched);
+}
+
+TEST_CASE("PE certificate entries resolve to image facts") {
+    constexpr auto source = R"(
+import "pe"
+
+rule pe_certificate_entries {
+    condition:
+        for any certificate in pe.certificates : (
+            certificate["type"] == 2 and
+            certificate["revision"] == 512 and
+            certificate["file_offset"] > 0 and
+            certificate["payload_size"] > 0
+        )
+}
+)";
+
+    auto parsed = rule_engine::parse_source("pe_certificate_entries.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 1u);
+    CHECK(verified->rules[0].facts[0].key == "pe.certificates");
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 1u);
+    CHECK(first.requests[0].route == "endpoint.process.image.pe");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"pe.certificates"});
+
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "pe.certificates",
+        .value = rule_engine::Value::array(std::vector<rule_engine::Value> {
+            rule_engine::Value::object(std::vector<rule_engine::ObjectEntry> {
+                rule_engine::ObjectEntry {.key = "file_offset", .value = rule_engine::Value::integer(1024)},
+                rule_engine::ObjectEntry {.key = "size", .value = rule_engine::Value::integer(32)},
+                rule_engine::ObjectEntry {.key = "revision", .value = rule_engine::Value::integer(512)},
+                rule_engine::ObjectEntry {.key = "type", .value = rule_engine::Value::integer(2)},
+                rule_engine::ObjectEntry {.key = "payload_size", .value = rule_engine::Value::integer(24)},
+            }),
+        }),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+        .ttl = std::chrono::seconds {30},
+    });
+
+    const auto second = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(second.state == rule_engine::EvaluationState::complete);
+    REQUIRE(second.rule_results.size() == 1u);
+    CHECK(second.rule_results[0].identifier == "pe_certificate_entries");
+    CHECK(second.rule_results[0].matched);
+}
+
+TEST_CASE("PE TLS callbacks resolve to image facts") {
+    constexpr auto source = R"(
+import "pe"
+
+rule pe_tls_callbacks {
+    condition:
+        for any callback in pe.tls_callbacks : (
+            callback["index"] == 0 and
+            callback["va"] > callback["rva"] and
+            callback["rva"] == 4660
+        )
+}
+)";
+
+    auto parsed = rule_engine::parse_source("pe_tls_callbacks.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 1u);
+    CHECK(verified->rules[0].facts[0].key == "pe.tls_callbacks");
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 1u);
+    CHECK(first.requests[0].route == "endpoint.process.image.pe");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"pe.tls_callbacks"});
+
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "pe.tls_callbacks",
+        .value = rule_engine::Value::array(std::vector<rule_engine::Value> {
+            rule_engine::Value::object(std::vector<rule_engine::ObjectEntry> {
+                rule_engine::ObjectEntry {.key = "index", .value = rule_engine::Value::integer(0)},
+                rule_engine::ObjectEntry {.key = "va", .value = rule_engine::Value::integer(0x0040'1234)},
+                rule_engine::ObjectEntry {.key = "rva", .value = rule_engine::Value::integer(0x1234)},
+            }),
+        }),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+        .ttl = std::chrono::seconds {30},
+    });
+
+    const auto second = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(second.state == rule_engine::EvaluationState::complete);
+    REQUIRE(second.rule_results.size() == 1u);
+    CHECK(second.rule_results[0].identifier == "pe_tls_callbacks");
     CHECK(second.rule_results[0].matched);
 }
 
@@ -952,7 +2049,7 @@ rule percentage_pattern_body {
     REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
     REQUIRE(first.requests.size() == 1u);
     CHECK(first.requests[0].route == "endpoint.scan.patterns");
-    CHECK(first.requests[0].keys == std::vector<std::string> {"$a.pattern", "$b.pattern"});
+    CHECK(first.requests[0].keys == std::vector<std::string> {"$a.pattern"});
 
     rule_engine::PatternValue a;
     a.matched = true;
@@ -1124,9 +2221,9 @@ rule encoded_powershell {
     rule_engine::Evaluator evaluator {*verified, facts};
     const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
     REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
-    REQUIRE(first.requests.size() == 2u);
+    REQUIRE(first.requests.size() == 1u);
     CHECK(first.requests[0].route == "endpoint.process.snapshot");
-    CHECK(first.requests[1].route == "endpoint.scan.patterns");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"process.name"});
 
     facts.store(rule_engine::Fact {
         .subject_id = "pid:42",
@@ -1193,9 +2290,9 @@ rule encoded_powershell {
     rule_engine::Evaluator evaluator {*verified, facts};
     const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
     REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
-    REQUIRE(first.requests.size() == 2u);
+    REQUIRE(first.requests.size() == 1u);
     CHECK(first.requests[0].route == "endpoint.process.snapshot");
-    CHECK(first.requests[1].route == "endpoint.scan.patterns");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"process.name"});
 
     facts.store(rule_engine::Fact {
         .subject_id = "pid:42",
@@ -1355,6 +2452,70 @@ global rule invalid_gate {
     CHECK(verified.error().diagnostics[0].message.find("non-global rule") != std::string::npos);
 }
 
+TEST_CASE("scheduler defers expensive scan facts behind cheap filters") {
+    constexpr auto source = R"(
+import "process"
+
+rule staged_scan {
+    strings:
+        $enc = "-enc" ascii
+    condition:
+        process.name == "cmd.exe" and $enc
+}
+)";
+
+    auto parsed = rule_engine::parse_source("staged_scan.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 2u);
+
+    rule_engine::FactCache rejected_facts;
+    rule_engine::Evaluator rejected_evaluator {*verified, rejected_facts};
+    const auto rejected_first = rejected_evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(rejected_first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(rejected_first.requests.size() == 1u);
+    CHECK(rejected_first.requests[0].route == "endpoint.process.snapshot");
+    CHECK(rejected_first.requests[0].keys == std::vector<std::string> {"process.name"});
+
+    rejected_facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "process.name",
+        .value = rule_engine::Value::string("powershell.exe"),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+
+    const auto rejected_second = rejected_evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(rejected_second.state == rule_engine::EvaluationState::complete);
+    REQUIRE(rejected_second.rule_results.size() == 1u);
+    CHECK_FALSE(rejected_second.rule_results[0].matched);
+    CHECK(rejected_second.requests.empty());
+
+    rule_engine::FactCache accepted_facts;
+    rule_engine::Evaluator accepted_evaluator {*verified, accepted_facts};
+    const auto accepted_first = accepted_evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:43"});
+    REQUIRE(accepted_first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(accepted_first.requests.size() == 1u);
+    CHECK(accepted_first.requests[0].route == "endpoint.process.snapshot");
+    CHECK(accepted_first.requests[0].keys == std::vector<std::string> {"process.name"});
+
+    accepted_facts.store(rule_engine::Fact {
+        .subject_id = "pid:43",
+        .key = "process.name",
+        .value = rule_engine::Value::string("cmd.exe"),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+
+    const auto accepted_second = accepted_evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:43"});
+    REQUIRE(accepted_second.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(accepted_second.requests.size() == 1u);
+    CHECK(accepted_second.requests[0].route == "endpoint.scan.patterns");
+    CHECK(accepted_second.requests[0].keys == std::vector<std::string> {"$enc.matches"});
+}
+
 TEST_CASE("VM pauses for missing facts and resumes when provider facts arrive") {
     constexpr auto source = R"(
 import "process"
@@ -1376,9 +2537,9 @@ rule encoded_powershell {
     rule_engine::Evaluator evaluator {*verified, facts};
     const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
     REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
-    REQUIRE(first.requests.size() == 2u);
+    REQUIRE(first.requests.size() == 1u);
     CHECK(first.requests[0].route == "endpoint.process.snapshot");
-    CHECK(first.requests[1].route == "endpoint.scan.patterns");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"process.name"});
 
     facts.store(rule_engine::Fact {
         .subject_id = "pid:42",
@@ -1431,4 +2592,90 @@ rule unavailable_command_line {
     REQUIRE(result.rule_results.size() == 1u);
     CHECK_FALSE(result.rule_results[0].matched);
     REQUIRE_FALSE(result.rule_results[0].diagnostics.empty());
+}
+
+TEST_CASE("VM rejects cached field facts with descriptor type mismatches") {
+    constexpr auto source = R"(
+import "process"
+
+rule typed_pid {
+    condition:
+        process.pid > 0
+}
+)";
+
+    auto parsed = rule_engine::parse_source("typed_pid.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+
+    rule_engine::FactCache facts;
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "process.pid",
+        .value = rule_engine::Value::string("not-an-integer"),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto result = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(result.state == rule_engine::EvaluationState::complete);
+    REQUIRE(result.rule_results.size() == 1u);
+    CHECK_FALSE(result.rule_results[0].matched);
+    REQUIRE_FALSE(result.rule_results[0].diagnostics.empty());
+    CHECK(result.rule_results[0].diagnostics[0].message.find("process.pid") != std::string::npos);
+    CHECK(result.rule_results[0].diagnostics[0].message.find("integer") != std::string::npos);
+}
+
+TEST_CASE("VM rejects cached function facts with descriptor return type mismatches") {
+    constexpr auto source = R"(
+import "demo"
+
+rule typed_score {
+    condition:
+        demo.score(42, "alpha") > 7
+}
+)";
+
+    auto registry = rule_engine::default_module_registry();
+    registry.modules.push_back(rule_engine::ModuleDescriptor {
+        .name = "demo",
+        .fields = {},
+        .functions = {
+            rule_engine::FunctionDescriptor {
+                .name = "score",
+                .parameters = {rule_engine::ValueType::integer, rule_engine::ValueType::string},
+                .return_type = rule_engine::ValueType::integer,
+                .key_prefix = "demo.score",
+                .route = "endpoint.demo.functions",
+                .ttl = std::chrono::seconds {30},
+                .cheap_prefetch = false,
+            },
+        },
+    });
+
+    auto parsed = rule_engine::parse_source("typed_score.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, registry);
+    REQUIRE(verified.has_value());
+
+    rule_engine::FactCache facts;
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "demo.score(i:42,s:616c706861)",
+        .value = rule_engine::Value::string("not-an-integer"),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+        .ttl = std::chrono::seconds {30},
+    });
+
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto result = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(result.state == rule_engine::EvaluationState::complete);
+    REQUIRE(result.rule_results.size() == 1u);
+    CHECK_FALSE(result.rule_results[0].matched);
+    REQUIRE_FALSE(result.rule_results[0].diagnostics.empty());
+    CHECK(result.rule_results[0].diagnostics[0].message.find("demo.score") != std::string::npos);
+    CHECK(result.rule_results[0].diagnostics[0].message.find("integer") != std::string::npos);
 }

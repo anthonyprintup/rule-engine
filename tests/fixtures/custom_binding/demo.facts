@@ -1,0 +1,2 @@
+capability endpoint.demo.functions
+fact endpoint.demo.functions demo.score(i:42,s:616c706861) integer 9 30

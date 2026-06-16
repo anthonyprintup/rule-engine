@@ -3,8 +3,11 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <filesystem>
+#include <iterator>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -13,6 +16,7 @@
 
 namespace {
     using namespace std::chrono_literals;
+    constexpr std::size_t pattern_context_bytes = 8u;
 
     [[nodiscard]] rule_engine::Fact make_fact(std::string subject_id,
                                               std::string key,
@@ -83,6 +87,23 @@ namespace {
         return out;
     }
 
+    [[nodiscard]] std::optional<std::vector<std::byte>> read_binary_file(const std::filesystem::path &path) {
+        std::ifstream file {path, std::ios::binary};
+        if (!file) {
+            return std::nullopt;
+        }
+
+        std::vector<std::byte> out;
+        char ch {};
+        while (file.get(ch)) {
+            out.push_back(static_cast<std::byte>(static_cast<unsigned char>(ch)));
+        }
+        if (!file.eof()) {
+            return std::nullopt;
+        }
+        return out;
+    }
+
     template <typename T>
     [[nodiscard]] bool parse_integer(const std::string_view text, T &out) noexcept {
         const auto *first = text.data();
@@ -99,6 +120,72 @@ namespace {
             return false;
         }
         return std::nullopt;
+    }
+
+    [[nodiscard]] std::vector<std::byte> byte_slice(const std::vector<std::byte> &bytes,
+                                                    const std::size_t offset,
+                                                    const std::size_t length) {
+        if (offset >= bytes.size()) {
+            return {};
+        }
+        const auto end = (std::min)(bytes.size(), offset + length);
+        return std::vector<std::byte> {bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                                       bytes.begin() + static_cast<std::ptrdiff_t>(end)};
+    }
+
+    [[nodiscard]] rule_engine::PatternValue scan_literal_pattern(const std::vector<std::byte> &haystack,
+                                                                 const std::vector<std::byte> &needle,
+                                                                 std::string scan_space,
+                                                                 std::string permissions) {
+        rule_engine::PatternValue pattern;
+        if (needle.empty() || haystack.size() < needle.size()) {
+            return pattern;
+        }
+
+        for (std::size_t offset = 0u; offset <= haystack.size() - needle.size(); ++offset) {
+            const auto matches = std::equal(needle.begin(),
+                                            needle.end(),
+                                            haystack.begin() + static_cast<std::ptrdiff_t>(offset));
+            if (!matches) {
+                continue;
+            }
+
+            const auto before_size = (std::min)(offset, pattern_context_bytes);
+            const auto before_offset = offset - before_size;
+            const auto after_offset = offset + needle.size();
+            pattern.matches.push_back(rule_engine::PatternMatchContext {
+                .offset = offset,
+                .length = needle.size(),
+                .bytes = needle,
+                .before = byte_slice(haystack, before_offset, before_size),
+                .after = byte_slice(haystack, after_offset, pattern_context_bytes),
+                .scan_space = scan_space,
+                .region_permissions = permissions,
+            });
+        }
+
+        pattern.matched = !pattern.matches.empty();
+        return pattern;
+    }
+
+    void append_pattern_fixture(rule_engine::patterns::PatternFixtureSet &set,
+                                std::string pattern_key,
+                                rule_engine::PatternValue value) {
+        const auto found = std::ranges::find_if(set.patterns, [&](const auto &fixture) {
+            return fixture.pattern_key == pattern_key;
+        });
+        if (found == set.patterns.end()) {
+            set.patterns.push_back(rule_engine::patterns::PatternFixture {
+                .pattern_key = std::move(pattern_key),
+                .value = std::move(value),
+            });
+            return;
+        }
+
+        found->value.matched = found->value.matched || value.matched;
+        found->value.matches.insert(found->value.matches.end(),
+                                    std::make_move_iterator(value.matches.begin()),
+                                    std::make_move_iterator(value.matches.end()));
     }
 
     [[nodiscard]] bool is_pattern_metadata_key(const std::string_view key) noexcept {
@@ -138,6 +225,72 @@ namespace rule_engine::patterns {
             }
 
             std::istringstream stream {line};
+            std::string directive_or_pattern;
+            stream >> directive_or_pattern;
+
+            if (directive_or_pattern == "scan") {
+                std::string pattern_key;
+                std::string scan_space;
+                std::string permissions;
+                std::string haystack_text;
+                std::string needle_text;
+                if (!(stream >> pattern_key >> scan_space >> permissions >> haystack_text >> needle_text)) {
+                    return std::unexpected(single_error(path.string(),
+                                                        "invalid pattern scan line " + std::to_string(line_number)));
+                }
+
+                auto haystack = parse_hex_bytes(haystack_text);
+                auto needle = parse_hex_bytes(needle_text);
+                if (pattern_key.empty() || !pattern_key.starts_with('$') || !haystack.has_value() ||
+                    !needle.has_value() || needle->empty()) {
+                    return std::unexpected(single_error(path.string(),
+                                                        "invalid pattern scan value on line " +
+                                                            std::to_string(line_number)));
+                }
+
+                append_pattern_fixture(out,
+                                       std::move(pattern_key),
+                                       scan_literal_pattern(*haystack,
+                                                            *needle,
+                                                            std::move(scan_space),
+                                                            std::move(permissions)));
+                continue;
+            }
+
+            if (directive_or_pattern == "scan_file") {
+                std::string pattern_key;
+                std::string scan_space;
+                std::string permissions;
+                std::string file_path_text;
+                std::string needle_text;
+                if (!(stream >> pattern_key >> scan_space >> permissions >> file_path_text >> needle_text)) {
+                    return std::unexpected(single_error(path.string(),
+                                                        "invalid pattern scan_file line " +
+                                                            std::to_string(line_number)));
+                }
+
+                auto file_path = std::filesystem::path {file_path_text};
+                if (file_path.is_relative()) {
+                    file_path = path.parent_path() / file_path;
+                }
+                auto haystack = read_binary_file(file_path);
+                auto needle = parse_hex_bytes(needle_text);
+                if (pattern_key.empty() || !pattern_key.starts_with('$') || !haystack.has_value() ||
+                    !needle.has_value() || needle->empty()) {
+                    return std::unexpected(single_error(path.string(),
+                                                        "invalid pattern scan_file value on line " +
+                                                            std::to_string(line_number)));
+                }
+
+                append_pattern_fixture(out,
+                                       std::move(pattern_key),
+                                       scan_literal_pattern(*haystack,
+                                                            *needle,
+                                                            std::move(scan_space),
+                                                            std::move(permissions)));
+                continue;
+            }
+
             std::string pattern_key;
             std::string matched_text;
             std::string offset_text;
@@ -145,7 +298,8 @@ namespace rule_engine::patterns {
             std::string scan_space;
             std::string permissions;
             std::string bytes_text;
-            if (!(stream >> pattern_key >> matched_text >> offset_text >> length_text >> scan_space >> permissions >>
+            pattern_key = std::move(directive_or_pattern);
+            if (!(stream >> matched_text >> offset_text >> length_text >> scan_space >> permissions >>
                   bytes_text)) {
                 return std::unexpected(single_error(path.string(),
                                                     "invalid pattern fixture line " + std::to_string(line_number)));
@@ -175,10 +329,7 @@ namespace rule_engine::patterns {
                     .region_permissions = std::move(permissions),
                 });
             }
-            out.patterns.push_back(PatternFixture {
-                .pattern_key = std::move(pattern_key),
-                .value = std::move(pattern),
-            });
+            append_pattern_fixture(out, std::move(pattern_key), std::move(pattern));
         }
 
         return out;

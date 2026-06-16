@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -30,8 +31,16 @@ namespace rule_engine {
     struct Value {
         using ArrayPtr = std::shared_ptr<const ArrayValue>;
         using ObjectPtr = std::shared_ptr<const ObjectValue>;
-        using Storage =
-            std::variant<std::monostate, bool, std::int64_t, double, std::string, PatternValue, ArrayPtr, ObjectPtr>;
+        using Bytes = std::vector<std::byte>;
+        using Storage = std::variant<std::monostate,
+                                     bool,
+                                     std::int64_t,
+                                     double,
+                                     std::string,
+                                     Bytes,
+                                     PatternValue,
+                                     ArrayPtr,
+                                     ObjectPtr>;
 
         Storage storage {};
 
@@ -40,6 +49,7 @@ namespace rule_engine {
         static Value integer(const std::int64_t value) { return Value {.storage = value}; }
         static Value number(const double value) { return Value {.storage = value}; }
         static Value string(std::string value) { return Value {.storage = std::move(value)}; }
+        static Value bytes(Bytes value) { return Value {.storage = std::move(value)}; }
         static Value pattern(PatternValue value) { return Value {.storage = std::move(value)}; }
         static Value array(std::vector<Value> values);
         static Value object(std::vector<ObjectEntry> entries);
@@ -49,6 +59,7 @@ namespace rule_engine {
         [[nodiscard]] std::optional<std::int64_t> as_i64() const noexcept;
         [[nodiscard]] std::optional<double> as_f64() const noexcept;
         [[nodiscard]] const std::string *as_string() const noexcept;
+        [[nodiscard]] const Bytes *as_bytes() const noexcept;
         [[nodiscard]] const PatternValue *as_pattern() const noexcept;
         [[nodiscard]] const ArrayValue *as_array() const noexcept;
         [[nodiscard]] const ObjectValue *as_object() const noexcept;

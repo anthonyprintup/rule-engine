@@ -28,7 +28,9 @@ namespace rule_engine {
         std::string key;
         std::string route;
         std::chrono::seconds ttl {};
+        std::chrono::seconds timeout {5};
         bool cheap_prefetch {};
+        ValueType type {ValueType::undefined};
     };
 
     struct VerifiedRule {
@@ -61,4 +63,5 @@ namespace rule_engine {
                                                                     const ParseOptions &options = {});
     [[nodiscard]] std::expected<VerifiedProgram, ErrorSet> verify(const ParsedRuleSet &rules,
                                                                   const ModuleRegistry &registry);
+    [[nodiscard]] std::vector<std::string> required_provider_routes(const VerifiedProgram &program);
 } // namespace rule_engine

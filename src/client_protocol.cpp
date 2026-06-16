@@ -193,6 +193,71 @@ namespace {
         return std::addressof(*found);
     }
 
+    void add_capability(std::vector<rule_engine::protocol::Capability> &capabilities,
+                        rule_engine::protocol::Capability capability) {
+        if (capability.route.empty()) {
+            return;
+        }
+        const auto exists = std::ranges::any_of(capabilities, [&](const auto &existing) {
+            return existing.route == capability.route;
+        });
+        if (exists) {
+            return;
+        }
+        capabilities.push_back(std::move(capability));
+    }
+
+    [[nodiscard]] bool has_capability(const rule_engine::protocol::HandshakeMessage &handshake,
+                                      const std::string_view route) {
+        return std::ranges::any_of(handshake.capabilities, [&](const auto &capability) {
+            return capability.route == route;
+        });
+    }
+
+    [[nodiscard]] std::string value_type_name(const rule_engine::ValueType type) {
+        switch (type) {
+            case rule_engine::ValueType::boolean: return "boolean";
+            case rule_engine::ValueType::integer: return "integer";
+            case rule_engine::ValueType::floating: return "floating";
+            case rule_engine::ValueType::string: return "string";
+            case rule_engine::ValueType::bytes: return "bytes";
+            case rule_engine::ValueType::array: return "array";
+            case rule_engine::ValueType::pattern: return "pattern";
+            case rule_engine::ValueType::object: return "object";
+            case rule_engine::ValueType::undefined: return "undefined";
+            default: return "unknown";
+        }
+    }
+
+    [[nodiscard]] bool value_matches_type(const rule_engine::Value &value, const rule_engine::ValueType type) {
+        switch (type) {
+            case rule_engine::ValueType::boolean: return value.as_bool().has_value();
+            case rule_engine::ValueType::integer: return value.as_i64().has_value();
+            case rule_engine::ValueType::floating: return value.as_f64().has_value();
+            case rule_engine::ValueType::string: return value.as_string() != nullptr;
+            case rule_engine::ValueType::bytes: return value.as_bytes() != nullptr;
+            case rule_engine::ValueType::array: return value.as_array() != nullptr;
+            case rule_engine::ValueType::pattern: return value.as_pattern() != nullptr;
+            case rule_engine::ValueType::object: return value.as_object() != nullptr;
+            case rule_engine::ValueType::undefined: return true;
+            default: return false;
+        }
+    }
+
+    [[nodiscard]] std::optional<rule_engine::ValueType>
+    expected_type_for_fact(const rule_engine::protocol::FactBatchRequestMessage &request,
+                           const rule_engine::protocol::FactKey &key) {
+        if (request.expected_types.size() != request.keys.size()) {
+            return std::nullopt;
+        }
+        for (std::size_t index = 0; index < request.keys.size(); ++index) {
+            if (request.keys[index].subject_id == key.subject_id && request.keys[index].key == key.key) {
+                return request.expected_types[index];
+            }
+        }
+        return std::nullopt;
+    }
+
     [[nodiscard]] std::vector<rule_engine::Fact>
     process_snapshot_response(const std::span<const rule_engine::protocol::FactKey> keys) {
         const auto process_keys = to_process_keys(keys);
@@ -201,6 +266,40 @@ namespace {
             std::vector<rule_engine::Fact> out;
             out.reserve(keys.size());
             const auto diagnostic = facts.error().diagnostics.empty() ? std::string {"process provider failed"}
+                                                                      : facts.error().diagnostics[0].message;
+            for (const auto &key : keys) {
+                out.push_back(make_unavailable_fact(key, diagnostic));
+            }
+            return out;
+        }
+        return *facts;
+    }
+
+    [[nodiscard]] std::vector<rule_engine::Fact>
+    process_handle_response(const std::span<const rule_engine::protocol::FactKey> keys) {
+        const auto process_keys = to_process_keys(keys);
+        auto facts = rule_engine::windows::read_process_handle_facts(process_keys);
+        if (!facts) {
+            std::vector<rule_engine::Fact> out;
+            out.reserve(keys.size());
+            const auto diagnostic = facts.error().diagnostics.empty() ? std::string {"process handle provider failed"}
+                                                                      : facts.error().diagnostics[0].message;
+            for (const auto &key : keys) {
+                out.push_back(make_unavailable_fact(key, diagnostic));
+            }
+            return out;
+        }
+        return *facts;
+    }
+
+    [[nodiscard]] std::vector<rule_engine::Fact>
+    process_signer_response(const std::span<const rule_engine::protocol::FactKey> keys) {
+        const auto process_keys = to_process_keys(keys);
+        auto facts = rule_engine::windows::read_process_signer_facts(process_keys);
+        if (!facts) {
+            std::vector<rule_engine::Fact> out;
+            out.reserve(keys.size());
+            const auto diagnostic = facts.error().diagnostics.empty() ? std::string {"process signer provider failed"}
                                                                       : facts.error().diagnostics[0].message;
             for (const auto &key : keys) {
                 out.push_back(make_unavailable_fact(key, diagnostic));
@@ -265,6 +364,14 @@ namespace {
             response.values = process_snapshot_response(request.keys);
             return response;
         }
+        if (request.route == "endpoint.process.handles") {
+            response.values = process_handle_response(request.keys);
+            return response;
+        }
+        if (request.route == "endpoint.process.signer") {
+            response.values = process_signer_response(request.keys);
+            return response;
+        }
         if (request.route == "endpoint.process.image.pe") {
             response.values = pe_response(request.keys);
             return response;
@@ -291,8 +398,10 @@ namespace {
     }
 
     [[nodiscard]] std::expected<void, rule_engine::ErrorSet>
-    send_handshake_and_subjects(tcp::socket &socket) {
-        auto handshake = rule_engine::protocol::encode_handshake(rule_engine::client_protocol::client_handshake());
+    send_handshake_and_subjects(tcp::socket &socket,
+                                const std::span<const rule_engine::protocol::Capability> extra_capabilities) {
+        auto handshake =
+            rule_engine::protocol::encode_handshake(rule_engine::client_protocol::client_handshake(extra_capabilities));
         if (!handshake) {
             return std::unexpected(std::move(handshake.error()));
         }
@@ -409,6 +518,30 @@ namespace {
     }
 
     [[nodiscard]] std::expected<void, rule_engine::ErrorSet>
+    validate_request_capability(const rule_engine::protocol::HandshakeMessage &handshake,
+                                const rule_engine::protocol::FactBatchRequestMessage &request) {
+        if (has_capability(handshake, request.route)) {
+            return {};
+        }
+        return std::unexpected(rule_engine::single_error("client.evaluator",
+                                                         "client does not advertise provider route " + request.route));
+    }
+
+    [[nodiscard]] std::expected<void, rule_engine::ErrorSet>
+    validate_program_capabilities(const rule_engine::protocol::HandshakeMessage &handshake,
+                                  const rule_engine::VerifiedProgram &program) {
+        for (const auto &route : rule_engine::required_provider_routes(program)) {
+            if (has_capability(handshake, route)) {
+                continue;
+            }
+            return std::unexpected(rule_engine::single_error(
+                "client.evaluator",
+                "client does not advertise required provider route " + route));
+        }
+        return {};
+    }
+
+    [[nodiscard]] std::expected<void, rule_engine::ErrorSet>
     validate_fact_response(const rule_engine::protocol::FactBatchRequestMessage &request,
                            const rule_engine::protocol::FactBatchResponseMessage &response) {
         if (response.route != request.route) {
@@ -430,6 +563,14 @@ namespace {
             if (contains_fact_key(seen, key)) {
                 return std::unexpected(rule_engine::single_error("client.evaluator",
                                                                  "provider returned duplicate fact " + fact.key));
+            }
+            const auto expected_type = expected_type_for_fact(request, key);
+            if (expected_type.has_value() && *expected_type != rule_engine::ValueType::undefined &&
+                fact.status == rule_engine::FactStatus::available && !value_matches_type(fact.value, *expected_type)) {
+                return std::unexpected(rule_engine::single_error(
+                    "client.evaluator",
+                    "provider returned fact " + fact.key + " with wrong type; expected " +
+                        value_type_name(*expected_type)));
             }
             seen.push_back(std::move(key));
         }
@@ -459,13 +600,16 @@ namespace {
         if (found->timeout < timeout) {
             found->timeout = timeout;
         }
-        for (const auto &key : batch.keys) {
+        for (std::size_t index = 0; index < batch.keys.size(); ++index) {
+            const auto &key = batch.keys[index];
             rule_engine::protocol::FactKey fact_key {
                 .subject_id = subject.id,
                 .key = key,
             };
             if (!contains_fact_key(found->keys, fact_key)) {
                 found->keys.push_back(std::move(fact_key));
+                const auto type = index < batch.types.size() ? batch.types[index] : rule_engine::ValueType::undefined;
+                found->expected_types.push_back(type);
             }
         }
     }
@@ -486,13 +630,18 @@ namespace {
 } // namespace
 
 namespace rule_engine::client_protocol {
-    protocol::HandshakeMessage client_handshake() {
+    protocol::HandshakeMessage client_handshake(const std::span<const protocol::Capability> extra_capabilities) {
         protocol::HandshakeMessage message;
         message.protocol = "rule-engine-client";
         message.version = 1u;
-        message.capabilities.push_back(protocol::Capability {.route = "endpoint.process.snapshot"});
-        message.capabilities.push_back(protocol::Capability {.route = "endpoint.process.image.pe"});
-        message.capabilities.push_back(protocol::Capability {.route = "endpoint.scan.patterns"});
+        add_capability(message.capabilities, protocol::Capability {.route = "endpoint.process.snapshot"});
+        add_capability(message.capabilities, protocol::Capability {.route = "endpoint.process.handles"});
+        add_capability(message.capabilities, protocol::Capability {.route = "endpoint.process.signer"});
+        add_capability(message.capabilities, protocol::Capability {.route = "endpoint.process.image.pe"});
+        add_capability(message.capabilities, protocol::Capability {.route = "endpoint.scan.patterns"});
+        for (const auto &capability : extra_capabilities) {
+            add_capability(message.capabilities, capability);
+        }
         return message;
     }
 
@@ -508,8 +657,8 @@ namespace rule_engine::client_protocol {
         return handle_client_fact_batch_with_fixtures(request, patterns::default_pattern_fixtures(), {});
     }
 
-    std::expected<void, ErrorSet> serve_client_once(const ClientListenOptions &options,
-                                                 const ListeningCallback &on_listening) {
+    std::expected<void, ErrorSet> serve_client(const ClientListenOptions &options,
+                                            const ListeningCallback &on_listening) {
         auto pattern_fixtures = patterns::default_pattern_fixtures();
         if (!options.pattern_fixture_path.empty()) {
             auto loaded = patterns::load_pattern_fixture_file(options.pattern_fixture_path);
@@ -553,41 +702,53 @@ namespace rule_engine::client_protocol {
             on_listening(local_endpoint.port());
         }
 
-        tcp::socket socket {io};
-        acceptor.accept(socket, ec);
-        if (ec) {
-            return std::unexpected(asio_error("client.accept", ec));
-        }
-        if (auto result = set_socket_timeouts(socket, options.io_timeout); !result) {
-            return result;
-        }
-
-        if (auto result = send_handshake_and_subjects(socket); !result) {
-            return result;
-        }
-
-        for (;;) {
-            auto payload = read_payload(socket);
-            if (!payload) {
-                return std::unexpected(std::move(payload.error()));
+        for (std::size_t served_sessions = 0u; options.max_sessions == 0u || served_sessions < options.max_sessions;
+             ++served_sessions) {
+            tcp::socket socket {io};
+            acceptor.accept(socket, ec);
+            if (ec) {
+                return std::unexpected(asio_error("client.accept", ec));
             }
-            if (!payload->has_value()) {
-                return {};
-            }
-
-            auto request = protocol::decode_fact_batch_request(**payload);
-            if (!request) {
-                return std::unexpected(std::move(request.error()));
-            }
-            auto response = protocol::encode_fact_batch_response(
-                handle_client_fact_batch_with_fixtures(*request, pattern_fixtures, options.extra_fact_handler));
-            if (!response) {
-                return std::unexpected(std::move(response.error()));
-            }
-            if (auto result = write_payload(socket, *response); !result) {
+            if (auto result = set_socket_timeouts(socket, options.io_timeout); !result) {
                 return result;
             }
+
+            if (auto result = send_handshake_and_subjects(socket, options.extra_capabilities); !result) {
+                return result;
+            }
+
+            for (;;) {
+                auto payload = read_payload(socket);
+                if (!payload) {
+                    return std::unexpected(std::move(payload.error()));
+                }
+                if (!payload->has_value()) {
+                    break;
+                }
+
+                auto request = protocol::decode_fact_batch_request(**payload);
+                if (!request) {
+                    return std::unexpected(std::move(request.error()));
+                }
+                auto response = protocol::encode_fact_batch_response(
+                    handle_client_fact_batch_with_fixtures(*request, pattern_fixtures, options.extra_fact_handler));
+                if (!response) {
+                    return std::unexpected(std::move(response.error()));
+                }
+                if (auto result = write_payload(socket, *response); !result) {
+                    return result;
+                }
+            }
+            close_socket(socket);
         }
+        return {};
+    }
+
+    std::expected<void, ErrorSet> serve_client_once(const ClientListenOptions &options,
+                                                 const ListeningCallback &on_listening) {
+        auto once_options = options;
+        once_options.max_sessions = 1u;
+        return serve_client(once_options, on_listening);
     }
 
     std::expected<ClientSession, ErrorSet>
@@ -612,6 +773,9 @@ namespace rule_engine::client_protocol {
         session.responses.reserve(requests.size());
 
         for (const auto &request : requests) {
+            if (auto valid = validate_request_capability(session.handshake, request); !valid) {
+                return std::unexpected(std::move(valid.error()));
+            }
             auto response = send_request_and_read_response(socket, request);
             if (!response) {
                 return std::unexpected(std::move(response.error()));
@@ -659,6 +823,9 @@ namespace rule_engine::client_protocol {
         auto preamble = read_client_preamble(socket);
         if (!preamble) {
             return std::unexpected(std::move(preamble.error()));
+        }
+        if (auto valid = validate_program_capabilities(preamble->handshake, program); !valid) {
+            return std::unexpected(std::move(valid.error()));
         }
 
         auto requested_subjects = subjects;
@@ -721,6 +888,9 @@ namespace rule_engine::client_protocol {
                 }
 
                 for (const auto &request : requests) {
+                    if (auto valid = validate_request_capability(session.handshake, request); !valid) {
+                        return std::unexpected(std::move(valid.error()));
+                    }
                     auto response = send_request_and_read_response(socket, request);
                     if (!response) {
                         return std::unexpected(std::move(response.error()));

@@ -34,6 +34,7 @@ namespace rule_engine::protocol {
     struct FactBatchRequestMessage {
         std::string route;
         std::vector<FactKey> keys;
+        std::vector<ValueType> expected_types;
         std::chrono::milliseconds timeout {5000};
     };
 

@@ -218,6 +218,69 @@ rule pattern_sets {
     CHECK(condition.children[1].children[0].kind == rule_engine::ExpressionKind::literal_integer);
 }
 
+TEST_CASE("YARA-X bridge preserves boolean tuple of expressions") {
+    constexpr auto source = R"(
+rule bool_tuple_sets {
+    condition:
+        any of (true, false, 1 == 1) and
+        2 of (true, false, true)
+}
+)";
+
+    auto parsed = rule_engine::parse_source("bool_tuple_sets.yar", source);
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->rules.size() == 1u);
+    const auto &condition = parsed->rules[0].condition;
+    REQUIRE(condition.kind == rule_engine::ExpressionKind::and_expr);
+    REQUIRE(condition.children.size() == 2u);
+    CHECK(condition.children[0].kind == rule_engine::ExpressionKind::of_expr);
+    CHECK(condition.children[0].text == "bool_any");
+    CHECK(condition.children[0].names.empty());
+    REQUIRE(condition.children[0].children.size() == 3u);
+    CHECK(condition.children[0].children[0].kind == rule_engine::ExpressionKind::true_expr);
+    CHECK(condition.children[0].children[1].kind == rule_engine::ExpressionKind::false_expr);
+    CHECK(condition.children[0].children[2].kind == rule_engine::ExpressionKind::equal);
+
+    CHECK(condition.children[1].kind == rule_engine::ExpressionKind::of_expr);
+    CHECK(condition.children[1].text == "bool_expr");
+    CHECK(condition.children[1].names.empty());
+    REQUIRE(condition.children[1].children.size() == 4u);
+    CHECK(condition.children[1].children[0].kind == rule_engine::ExpressionKind::literal_integer);
+}
+
+TEST_CASE("YARA-X bridge preserves anchored pattern-set of expressions") {
+    constexpr auto source = R"(
+rule anchored_pattern_sets {
+    strings:
+        $a = "alpha" ascii
+        $b = "beta" ascii
+    condition:
+        any of ($a, $b) at 8 and
+        all of them in (4..16)
+}
+)";
+
+    auto parsed = rule_engine::parse_source("anchored_pattern_sets.yar", source);
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->rules.size() == 1u);
+    const auto &condition = parsed->rules[0].condition;
+    REQUIRE(condition.kind == rule_engine::ExpressionKind::and_expr);
+    REQUIRE(condition.children.size() == 2u);
+
+    CHECK(condition.children[0].kind == rule_engine::ExpressionKind::of_expr);
+    CHECK(condition.children[0].text == "at_any");
+    CHECK(condition.children[0].names == std::vector<std::string> {"$a", "$b"});
+    REQUIRE(condition.children[0].children.size() == 1u);
+    CHECK(condition.children[0].children[0].kind == rule_engine::ExpressionKind::literal_integer);
+
+    CHECK(condition.children[1].kind == rule_engine::ExpressionKind::of_expr);
+    CHECK(condition.children[1].text == "in_all");
+    CHECK(condition.children[1].names == std::vector<std::string> {"them"});
+    REQUIRE(condition.children[1].children.size() == 2u);
+    CHECK(condition.children[1].children[0].kind == rule_engine::ExpressionKind::literal_integer);
+    CHECK(condition.children[1].children[1].kind == rule_engine::ExpressionKind::literal_integer);
+}
+
 TEST_CASE("YARA-X bridge preserves extended string operator nodes") {
     constexpr auto source = R"(
 import "process"

@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -23,7 +24,9 @@ namespace rule_engine::client_protocol {
         std::uint16_t port {31337};
         std::filesystem::path pattern_fixture_path;
         std::chrono::milliseconds io_timeout {5000};
+        std::vector<protocol::Capability> extra_capabilities {};
         ExtraFactBatchHandler extra_fact_handler {};
+        std::size_t max_sessions {1};
     };
 
     struct ClientConnectionOptions {
@@ -62,10 +65,13 @@ namespace rule_engine::client_protocol {
 
     using ListeningCallback = std::function<void(std::uint16_t)>;
 
-    [[nodiscard]] protocol::HandshakeMessage client_handshake();
+    [[nodiscard]] protocol::HandshakeMessage
+    client_handshake(std::span<const protocol::Capability> extra_capabilities = {});
     [[nodiscard]] std::expected<protocol::SubjectListMessage, ErrorSet> enumerate_client_subjects();
     [[nodiscard]] protocol::FactBatchResponseMessage
     handle_client_fact_batch(const protocol::FactBatchRequestMessage &request);
+    [[nodiscard]] std::expected<void, ErrorSet> serve_client(const ClientListenOptions &options,
+                                                            const ListeningCallback &on_listening = {});
     [[nodiscard]] std::expected<void, ErrorSet> serve_client_once(const ClientListenOptions &options,
                                                                 const ListeningCallback &on_listening = {});
     [[nodiscard]] std::expected<ClientSession, ErrorSet>

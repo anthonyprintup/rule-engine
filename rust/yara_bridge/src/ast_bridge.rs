@@ -367,40 +367,55 @@ fn with_node(value: &ast::With<'_>) -> BridgeNode {
 }
 
 fn of_node(value: &ast::Of<'_>) -> BridgeNode {
-    if value.anchor.is_some() {
-        return node(
-            ReNodeKind::Unsupported,
-            "of_anchor",
-            0,
-            0.0,
-            Vec::new(),
-            Vec::new(),
-            value.span(),
-        );
+    let (quantifier, mut children) = quantifier_node(&value.quantifier);
+    match &value.items {
+        ast::OfItems::PatternSet(pattern_set) => {
+            let text = match &value.anchor {
+                Some(ast::MatchAnchor::At(anchor)) => {
+                    children.push(expr_to_node(&anchor.expr));
+                    format!("at_{quantifier}")
+                }
+                Some(ast::MatchAnchor::In(anchor)) => {
+                    children.push(expr_to_node(&anchor.range.lower_bound));
+                    children.push(expr_to_node(&anchor.range.upper_bound));
+                    format!("in_{quantifier}")
+                }
+                None => quantifier.to_string(),
+            };
+            node(
+                ReNodeKind::Of,
+                text,
+                0,
+                0.0,
+                pattern_set_names(pattern_set),
+                children,
+                value.span(),
+            )
+        }
+        ast::OfItems::BoolExprTuple(tuple) => {
+            if value.anchor.is_some() {
+                return node(
+                    ReNodeKind::Unsupported,
+                    "of_bool_tuple_anchor",
+                    0,
+                    0.0,
+                    Vec::new(),
+                    Vec::new(),
+                    value.span(),
+                );
+            }
+            children.extend(tuple.iter().map(expr_to_node));
+            node(
+                ReNodeKind::Of,
+                format!("bool_{quantifier}"),
+                0,
+                0.0,
+                Vec::new(),
+                children,
+                value.span(),
+            )
+        }
     }
-
-    let ast::OfItems::PatternSet(pattern_set) = &value.items else {
-        return node(
-            ReNodeKind::Unsupported,
-            "of_bool_tuple",
-            0,
-            0.0,
-            Vec::new(),
-            Vec::new(),
-            value.span(),
-        );
-    };
-
-    let (quantifier, children) = quantifier_node(&value.quantifier);
-    node(
-        ReNodeKind::Of,
-        quantifier,
-        0,
-        0.0,
-        pattern_set_names(pattern_set),
-        children,
-        value.span(),
-    )
 }
 
 fn quantifier_node(value: &ast::Quantifier<'_>) -> (&'static str, Vec<BridgeNode>) {

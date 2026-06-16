@@ -2,7 +2,6 @@
 
 #include <rule_engine/protocol.hpp>
 
-#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <string_view>
@@ -151,20 +150,6 @@ namespace {
             case 2u: return rule_engine::ExpressionTraceStatus::diagnostic;
             default: return std::nullopt;
         }
-    }
-
-    [[nodiscard]] bool same_fact_identity(const rule_engine::Fact &lhs, const rule_engine::Fact &rhs) {
-        return lhs.subject_id == rhs.subject_id && lhs.key == rhs.key;
-    }
-
-    void append_unique_fact(std::vector<rule_engine::Fact> &facts, rule_engine::Fact fact) {
-        const auto duplicate = std::ranges::any_of(facts, [&](const auto &existing) {
-            return same_fact_identity(existing, fact);
-        });
-        if (duplicate) {
-            return;
-        }
-        facts.push_back(std::move(fact));
     }
 
     [[nodiscard]] std::expected<void, rule_engine::ErrorSet>
@@ -325,15 +310,7 @@ namespace rule_engine {
                                              const FactCache &facts) {
         EvaluationTrace out;
         out.subject = subject;
-
-        for (const auto &rule : program.rules) {
-            for (const auto &required : rule.facts) {
-                auto fact = facts.lookup(subject.id, required.key);
-                if (fact.has_value()) {
-                    append_unique_fact(out.facts, std::move(*fact));
-                }
-            }
-        }
+        out.facts = facts.snapshot_for_subject(subject.id);
 
         const Evaluator evaluator {program, facts, EvaluationOptions {.trace_expressions = true}};
         out.final_step = evaluator.step(subject);

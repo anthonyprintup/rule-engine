@@ -34,6 +34,7 @@ namespace rule_engine {
     struct FactRequestBatch {
         std::string route;
         std::vector<std::string> keys;
+        std::vector<ValueType> types;
         std::chrono::seconds timeout {5};
     };
 
@@ -78,6 +79,7 @@ namespace rule_engine {
     struct FactCache {
         void store(Fact fact);
         [[nodiscard]] std::optional<Fact> lookup(std::string_view subject_id, std::string_view key) const;
+        [[nodiscard]] std::vector<Fact> snapshot_for_subject(std::string_view subject_id) const;
         void expire_volatile();
 
     private:

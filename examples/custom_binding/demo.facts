@@ -1,0 +1,7 @@
+# Custom facts served by rule_engine_client --custom-fact-fixture.
+capability endpoint.demo.fields
+capability endpoint.demo.functions
+capability endpoint.demo.globals
+fact endpoint.demo.fields demo.weight integer 3 30
+fact endpoint.demo.functions demo.score(i:42,s:616c706861) integer 9 30
+fact endpoint.demo.globals global.scan_mode string 70726f63657373 30

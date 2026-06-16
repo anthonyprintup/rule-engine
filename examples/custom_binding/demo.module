@@ -1,0 +1,5 @@
+# Custom module descriptors loaded by rule_engine_server --module-config.
+module demo
+field demo.weight integer endpoint.demo.fields 30 true 5
+function score integer integer,string endpoint.demo.functions demo.score 30 false 12
+global scan_mode string global.scan_mode endpoint.demo.globals 30 true 5

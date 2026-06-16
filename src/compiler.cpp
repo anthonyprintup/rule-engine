@@ -1,5 +1,7 @@
 #include <rule_engine/compiler.hpp>
 
+#include <rule_engine/provider_key.hpp>
+#include <rule_engine/value.hpp>
 #include <rule_engine/yara_bridge.hpp>
 
 #include <algorithm>
@@ -7,6 +9,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -347,6 +350,26 @@ namespace {
         facts.push_back(std::move(fact));
     }
 
+    void add_route(std::vector<std::string> &routes, const std::string_view route) {
+        if (route.empty()) {
+            return;
+        }
+        const auto duplicate = std::ranges::any_of(routes, [&](const auto &existing) { return existing == route; });
+        if (duplicate) {
+            return;
+        }
+        routes.emplace_back(route);
+    }
+
+    void collect_expression_routes(const rule_engine::Expression &expr, std::vector<std::string> &routes) {
+        if (expr.kind == rule_engine::ExpressionKind::function_call) {
+            add_route(routes, expr.bound_route);
+        }
+        for (const auto &child : expr.children) {
+            collect_expression_routes(child, routes);
+        }
+    }
+
     [[nodiscard]] std::string pattern_identifier_key(std::string value) {
         if (value.empty()) {
             return "$";
@@ -423,6 +446,262 @@ namespace {
     static_expression_type(const rule_engine::Expression &expr,
                            const rule_engine::ModuleRegistry &registry,
                            const std::vector<std::string> &local_names);
+
+    [[nodiscard]] std::optional<std::int64_t> checked_add(const std::int64_t lhs,
+                                                          const std::int64_t rhs) noexcept {
+        std::int64_t out {};
+        if (__builtin_add_overflow(lhs, rhs, &out)) {
+            return std::nullopt;
+        }
+        return out;
+    }
+
+    [[nodiscard]] std::optional<std::int64_t> checked_subtract(const std::int64_t lhs,
+                                                               const std::int64_t rhs) noexcept {
+        std::int64_t out {};
+        if (__builtin_sub_overflow(lhs, rhs, &out)) {
+            return std::nullopt;
+        }
+        return out;
+    }
+
+    [[nodiscard]] std::optional<std::int64_t> checked_multiply(const std::int64_t lhs,
+                                                               const std::int64_t rhs) noexcept {
+        std::int64_t out {};
+        if (__builtin_mul_overflow(lhs, rhs, &out)) {
+            return std::nullopt;
+        }
+        return out;
+    }
+
+    [[nodiscard]] std::optional<std::int64_t> checked_divide(const std::int64_t lhs,
+                                                             const std::int64_t rhs) noexcept {
+        if (rhs == 0) {
+            return std::nullopt;
+        }
+        if (lhs == std::numeric_limits<std::int64_t>::min() && rhs == -1) {
+            return std::nullopt;
+        }
+        return lhs / rhs;
+    }
+
+    [[nodiscard]] std::optional<std::int64_t> checked_modulo(const std::int64_t lhs,
+                                                             const std::int64_t rhs) noexcept {
+        if (rhs == 0) {
+            return std::nullopt;
+        }
+        if (lhs == std::numeric_limits<std::int64_t>::min() && rhs == -1) {
+            return std::nullopt;
+        }
+        return lhs % rhs;
+    }
+
+    struct StaticNumericValue {
+        bool floating {};
+        std::int64_t integer {};
+        double number {};
+    };
+
+    [[nodiscard]] std::optional<StaticNumericValue> static_numeric_value(const rule_engine::Value &value) noexcept {
+        if (const auto integer = value.as_i64(); integer.has_value()) {
+            return StaticNumericValue {
+                .floating = false,
+                .integer = *integer,
+                .number = static_cast<double>(*integer),
+            };
+        }
+        if (const auto number = value.as_f64(); number.has_value()) {
+            return StaticNumericValue {.floating = true, .integer = {}, .number = *number};
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<rule_engine::Value> static_expression_value(const rule_engine::Expression &expr);
+
+    [[nodiscard]] std::optional<rule_engine::Value> static_arithmetic_value(const rule_engine::Expression &expr) {
+        using enum rule_engine::ExpressionKind;
+        if (expr.children.empty()) {
+            return std::nullopt;
+        }
+
+        const auto first_value = static_expression_value(expr.children[0]);
+        if (!first_value.has_value()) {
+            return std::nullopt;
+        }
+        auto accumulator = static_numeric_value(*first_value);
+        if (!accumulator.has_value()) {
+            return std::nullopt;
+        }
+
+        if (expr.kind == negate) {
+            if (expr.children.size() != 1u) {
+                return std::nullopt;
+            }
+            if (accumulator->floating) {
+                return rule_engine::Value::number(-accumulator->number);
+            }
+            if (accumulator->integer == std::numeric_limits<std::int64_t>::min()) {
+                return std::nullopt;
+            }
+            return rule_engine::Value::integer(-accumulator->integer);
+        }
+
+        auto floating = accumulator->floating;
+        auto number = accumulator->number;
+        auto integer = accumulator->integer;
+
+        for (std::size_t index = 1; index < expr.children.size(); ++index) {
+            const auto child_value = static_expression_value(expr.children[index]);
+            if (!child_value.has_value()) {
+                return std::nullopt;
+            }
+            const auto operand = static_numeric_value(*child_value);
+            if (!operand.has_value()) {
+                return std::nullopt;
+            }
+
+            if (floating || operand->floating) {
+                floating = true;
+                if (expr.kind == add) {
+                    number += operand->number;
+                } else if (expr.kind == subtract) {
+                    number -= operand->number;
+                } else if (expr.kind == multiply) {
+                    number *= operand->number;
+                } else if (expr.kind == divide) {
+                    if (operand->number == 0.0) {
+                        return std::nullopt;
+                    }
+                    number /= operand->number;
+                } else {
+                    return std::nullopt;
+                }
+                continue;
+            }
+
+            std::optional<std::int64_t> next;
+            if (expr.kind == add) {
+                next = checked_add(integer, operand->integer);
+            } else if (expr.kind == subtract) {
+                next = checked_subtract(integer, operand->integer);
+            } else if (expr.kind == multiply) {
+                next = checked_multiply(integer, operand->integer);
+            } else if (expr.kind == divide) {
+                next = checked_divide(integer, operand->integer);
+            } else if (expr.kind == modulo) {
+                next = checked_modulo(integer, operand->integer);
+            }
+            if (!next.has_value()) {
+                return std::nullopt;
+            }
+            integer = *next;
+            number = static_cast<double>(integer);
+        }
+
+        if (floating) {
+            return rule_engine::Value::number(number);
+        }
+        return rule_engine::Value::integer(integer);
+    }
+
+    [[nodiscard]] std::optional<rule_engine::Value> static_bitwise_value(const rule_engine::Expression &expr) {
+        using enum rule_engine::ExpressionKind;
+        if (expr.children.empty()) {
+            return std::nullopt;
+        }
+
+        const auto lhs_value = static_expression_value(expr.children[0]);
+        if (!lhs_value.has_value()) {
+            return std::nullopt;
+        }
+        const auto left = lhs_value->as_i64();
+        if (!left.has_value()) {
+            return std::nullopt;
+        }
+
+        if (expr.kind == bitwise_not) {
+            if (expr.children.size() != 1u) {
+                return std::nullopt;
+            }
+            return rule_engine::Value::integer(static_cast<std::int64_t>(~static_cast<std::uint64_t>(*left)));
+        }
+
+        if (expr.children.size() != 2u) {
+            return std::nullopt;
+        }
+        const auto rhs_value = static_expression_value(expr.children[1]);
+        if (!rhs_value.has_value()) {
+            return std::nullopt;
+        }
+        const auto right = rhs_value->as_i64();
+        if (!right.has_value()) {
+            return std::nullopt;
+        }
+
+        const auto left_bits = static_cast<std::uint64_t>(*left);
+        const auto right_bits = static_cast<std::uint64_t>(*right);
+        if (expr.kind == bitwise_and) {
+            return rule_engine::Value::integer(static_cast<std::int64_t>(left_bits & right_bits));
+        }
+        if (expr.kind == bitwise_or) {
+            return rule_engine::Value::integer(static_cast<std::int64_t>(left_bits | right_bits));
+        }
+        if (expr.kind == bitwise_xor) {
+            return rule_engine::Value::integer(static_cast<std::int64_t>(left_bits ^ right_bits));
+        }
+        if (*right < 0 || *right >= 64) {
+            return std::nullopt;
+        }
+        if (expr.kind == shift_left) {
+            return rule_engine::Value::integer(static_cast<std::int64_t>(left_bits << *right));
+        }
+        if (expr.kind == shift_right) {
+            return rule_engine::Value::integer(static_cast<std::int64_t>(left_bits >> *right));
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<rule_engine::Value> static_expression_value(const rule_engine::Expression &expr) {
+        using enum rule_engine::ExpressionKind;
+        if (expr.kind == true_expr) {
+            return rule_engine::Value::boolean(true);
+        }
+        if (expr.kind == false_expr) {
+            return rule_engine::Value::boolean(false);
+        }
+        if (expr.kind == literal_string) {
+            return rule_engine::Value::string(expr.text);
+        }
+        if (expr.kind == literal_integer) {
+            return rule_engine::Value::integer(expr.integer);
+        }
+        if (expr.kind == literal_float) {
+            return rule_engine::Value::number(expr.floating);
+        }
+        if (expr.kind == negate || expr.kind == add || expr.kind == subtract || expr.kind == multiply ||
+            expr.kind == divide || expr.kind == modulo) {
+            return static_arithmetic_value(expr);
+        }
+        if (expr.kind == bitwise_not || expr.kind == shift_left || expr.kind == shift_right ||
+            expr.kind == bitwise_and || expr.kind == bitwise_or || expr.kind == bitwise_xor) {
+            return static_bitwise_value(expr);
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<std::vector<rule_engine::Value>>
+    static_function_arguments(const rule_engine::Expression &expr) {
+        std::vector<rule_engine::Value> arguments;
+        arguments.reserve(expr.children.size());
+        for (const auto &child : expr.children) {
+            auto value = static_expression_value(child);
+            if (!value.has_value()) {
+                return std::nullopt;
+            }
+            arguments.push_back(std::move(*value));
+        }
+        return arguments;
+    }
 
     [[nodiscard]] std::optional<rule_engine::ValueType>
     numeric_expression_type(const rule_engine::Expression &expr,
@@ -625,7 +904,8 @@ namespace {
                                     .key = key,
                                     .route = "endpoint.scan.patterns",
                                     .ttl = std::chrono::seconds {30},
-                                    .cheap_prefetch = true,
+                                    .cheap_prefetch = false,
+                                    .type = rule_engine::ValueType::pattern,
                                 });
             }
 
@@ -767,7 +1047,9 @@ namespace {
             expr.bound_key_prefix = function->key_prefix.empty() ? key : function->key_prefix;
             expr.bound_route = function->route;
             expr.bound_ttl = function->ttl;
+            expr.bound_timeout = function->timeout;
             expr.bound_cheap_prefetch = function->cheap_prefetch;
+            expr.bound_return_type = function->return_type;
 
             for (auto &child : expr.children) {
                 collect_requirements(child,
@@ -783,6 +1065,19 @@ namespace {
                                      for_of_body);
             }
             validate_function_arguments(key, expr, *function, registry, errors, source, local_names);
+            if (function->cheap_prefetch) {
+                const auto arguments = static_function_arguments(expr);
+                if (arguments.has_value()) {
+                    add_fact(facts, rule_engine::RequiredFact {
+                                        .key = rule_engine::provider_function_key(expr.bound_key_prefix, *arguments),
+                                        .route = function->route,
+                                        .ttl = function->ttl,
+                                        .timeout = function->timeout,
+                                        .cheap_prefetch = true,
+                                        .type = function->return_type,
+                                    });
+                }
+            }
             return;
         }
 
@@ -794,7 +1089,9 @@ namespace {
                                     .key = field->key,
                                     .route = field->route,
                                     .ttl = field->ttl,
+                                    .timeout = field->timeout,
                                     .cheap_prefetch = field->cheap_prefetch,
+                                    .type = field->type,
                                 });
                 return;
             }
@@ -826,7 +1123,8 @@ namespace {
                                 .key = key,
                                 .route = "endpoint.scan.patterns",
                                 .ttl = std::chrono::seconds {30},
-                                .cheap_prefetch = true,
+                                .cheap_prefetch = false,
+                                .type = rule_engine::ValueType::boolean,
                             });
         }
 
@@ -840,7 +1138,8 @@ namespace {
                                 .key = key,
                                 .route = "endpoint.scan.patterns",
                                 .ttl = std::chrono::seconds {30},
-                                .cheap_prefetch = true,
+                                .cheap_prefetch = false,
+                                .type = rule_engine::ValueType::pattern,
                             });
         }
 
@@ -853,7 +1152,8 @@ namespace {
                                     .key = key,
                                     .route = "endpoint.scan.patterns",
                                     .ttl = std::chrono::seconds {30},
-                                    .cheap_prefetch = true,
+                                    .cheap_prefetch = false,
+                                    .type = rule_engine::ValueType::pattern,
                                 });
             }
         }
@@ -878,7 +1178,9 @@ namespace {
                                     .key = global->key,
                                     .route = global->route,
                                     .ttl = global->ttl,
+                                    .timeout = global->timeout,
                                     .cheap_prefetch = global->cheap_prefetch,
+                                    .type = global->type,
                                 });
             } else {
                 errors.diagnostics.push_back(rule_engine::Diagnostic {
@@ -1365,9 +1667,21 @@ namespace rule_engine {
         return program;
     }
 
+    std::vector<std::string> required_provider_routes(const VerifiedProgram &program) {
+        std::vector<std::string> routes;
+        for (const auto &rule : program.rules) {
+            for (const auto &fact : rule.facts) {
+                add_route(routes, fact.route);
+            }
+            collect_expression_routes(rule.condition, routes);
+        }
+        std::ranges::sort(routes);
+        return routes;
+    }
+
     std::string VerifiedProgram::ir_dump() const {
         std::ostringstream out;
-        out << "rule_engine_ir version=1\n";
+        out << "rule_engine_ir version=2\n";
         for (std::size_t index = 0; index < sources.size(); ++index) {
             out << "source id=" << (index + 1u) << " name=" << sources[index] << '\n';
         }
@@ -1381,7 +1695,7 @@ namespace rule_engine {
     std::vector<std::byte> VerifiedProgram::ir_artifact() const {
         std::vector<std::byte> out;
         append_magic(out, "REIR");
-        append_u32(out, 1u);
+        append_u32(out, 2u);
         append_u32(out, static_cast<std::uint32_t>(sources.size()));
         for (const auto &source : sources) {
             append_string(out, source);
@@ -1399,6 +1713,7 @@ namespace rule_engine {
                 append_string(out, fact.key);
                 append_string(out, fact.route);
                 append_u32(out, static_cast<std::uint32_t>(fact.ttl.count()));
+                append_u32(out, static_cast<std::uint32_t>(fact.timeout.count()));
                 append_u8(out, fact.cheap_prefetch ? 1u : 0u);
             }
         }
@@ -1407,11 +1722,13 @@ namespace rule_engine {
 
     std::string VerifiedProgram::schedule_plan_dump() const {
         std::ostringstream out;
-        out << "schedule version=1\n";
+        out << "schedule version=2\n";
         for (const auto &rule : rules) {
             for (const auto &fact : rule.facts) {
                 out << rule.qualified_identifier << " namespace=" << rule.namespace_name
-                    << " source_id=" << rule.span.source_id << " -> " << fact.route << " :: " << fact.key << '\n';
+                    << " source_id=" << rule.span.source_id << " -> " << fact.route << " :: " << fact.key
+                    << " ttl=" << fact.ttl.count() << "s timeout=" << fact.timeout.count()
+                    << "s cheap=" << (fact.cheap_prefetch ? "true" : "false") << '\n';
             }
         }
         return out.str();
@@ -1420,7 +1737,7 @@ namespace rule_engine {
     std::vector<std::byte> VerifiedProgram::schedule_plan_artifact() const {
         std::vector<std::byte> out;
         append_magic(out, "RESC");
-        append_u32(out, 1u);
+        append_u32(out, 2u);
         std::uint32_t edge_count {};
         for (const auto &rule : rules) {
             edge_count += static_cast<std::uint32_t>(rule.facts.size());
@@ -1435,6 +1752,7 @@ namespace rule_engine {
                 append_string(out, fact.route);
                 append_string(out, fact.key);
                 append_u32(out, static_cast<std::uint32_t>(fact.ttl.count()));
+                append_u32(out, static_cast<std::uint32_t>(fact.timeout.count()));
                 append_u8(out, fact.cheap_prefetch ? 1u : 0u);
             }
         }

@@ -5,6 +5,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <string_view>
 #include <vector>
@@ -114,6 +115,77 @@ rule traced_rule {
     REQUIRE(replayed->rule_results.size() == trace.final_step.rule_results.size());
     CHECK(replayed->rule_results[0].identifier == trace.final_step.rule_results[0].identifier);
     CHECK(replayed->rule_results[0].matched == trace.final_step.rule_results[0].matched);
+}
+
+TEST_CASE("evaluation traces replay custom module function facts") {
+    constexpr std::string_view source = R"(
+import "process"
+import "demo"
+
+rule traced_custom_function {
+    condition:
+        demo.score(process.pid, "alpha") > 7
+}
+)";
+
+    auto registry = rule_engine::default_module_registry();
+    registry.modules.push_back(rule_engine::ModuleDescriptor {
+        .name = "demo",
+        .fields = {},
+        .functions = {
+            rule_engine::FunctionDescriptor {
+                .name = "score",
+                .parameters = {rule_engine::ValueType::integer, rule_engine::ValueType::string},
+                .return_type = rule_engine::ValueType::integer,
+                .key_prefix = "demo.score",
+                .route = "endpoint.demo.functions",
+                .ttl = std::chrono::seconds {30},
+                .cheap_prefetch = false,
+            },
+        },
+    });
+
+    auto parsed = rule_engine::parse_source("trace_custom_function.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, registry);
+    REQUIRE(verified.has_value());
+
+    const rule_engine::Subject subject {.kind = "process", .id = "pid:42"};
+    rule_engine::FactCache facts;
+    facts.store(rule_engine::Fact {
+        .subject_id = subject.id,
+        .key = "process.pid",
+        .value = rule_engine::Value::integer(42),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+        .ttl = std::chrono::seconds {},
+    });
+    facts.store(rule_engine::Fact {
+        .subject_id = subject.id,
+        .key = "demo.score(i:42,s:616c706861)",
+        .value = rule_engine::Value::integer(9),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+        .ttl = std::chrono::seconds {30},
+    });
+
+    const auto trace = rule_engine::capture_evaluation_trace(*verified, subject, facts);
+    REQUIRE(trace.final_step.state == rule_engine::EvaluationState::complete);
+    REQUIRE(trace.final_step.rule_results.size() == 1u);
+    CHECK(trace.final_step.rule_results[0].matched);
+    REQUIRE(trace.facts.size() == 2u);
+
+    const auto encoded = rule_engine::encode_evaluation_trace(trace);
+    REQUIRE(encoded.has_value());
+    const auto decoded = rule_engine::decode_evaluation_trace(*encoded);
+    REQUIRE(decoded.has_value());
+
+    const auto replayed = rule_engine::replay_evaluation_trace(*verified, *decoded);
+    REQUIRE(replayed.has_value());
+    CHECK(replayed->state == rule_engine::EvaluationState::complete);
+    REQUIRE(replayed->rule_results.size() == 1u);
+    CHECK(replayed->rule_results[0].identifier == "traced_custom_function");
+    CHECK(replayed->rule_results[0].matched);
 }
 
 TEST_CASE("trace decoder rejects oversized counts before reading entries") {

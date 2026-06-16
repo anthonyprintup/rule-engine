@@ -25,6 +25,7 @@ namespace rule_engine {
         ValueType type {ValueType::undefined};
         std::string route;
         std::chrono::seconds ttl {};
+        std::chrono::seconds timeout {5};
         bool cheap_prefetch {};
     };
 
@@ -35,6 +36,7 @@ namespace rule_engine {
         std::string key_prefix;
         std::string route;
         std::chrono::seconds ttl {};
+        std::chrono::seconds timeout {5};
         bool cheap_prefetch {};
     };
 
@@ -50,6 +52,7 @@ namespace rule_engine {
         std::string key;
         std::string route;
         std::chrono::seconds ttl {};
+        std::chrono::seconds timeout {5};
         bool cheap_prefetch {};
     };
 

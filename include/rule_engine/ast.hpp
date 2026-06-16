@@ -1,6 +1,7 @@
 #pragma once
 
 #include <rule_engine/diagnostic.hpp>
+#include <rule_engine/modules.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -72,7 +73,9 @@ namespace rule_engine {
         std::string bound_key_prefix;
         std::string bound_route;
         std::chrono::seconds bound_ttl {};
+        std::chrono::seconds bound_timeout {5};
         bool bound_cheap_prefetch {};
+        ValueType bound_return_type {ValueType::undefined};
         SourceSpan span {};
     };
 

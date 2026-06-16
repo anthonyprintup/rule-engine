@@ -1,6 +1,8 @@
 #include <rule_engine/compiler.hpp>
+#include <rule_engine/module_config.hpp>
 #include <rule_engine/modules.hpp>
 #include <rule_engine/client_protocol.hpp>
+#include <rule_engine/server_output.hpp>
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -105,7 +107,8 @@ namespace {
     void print_usage() {
         fmt::print(stderr,
                    "usage: rule_engine_server [--host <host>] [--port <port>] [-I <dir>] [--rule <rule.yar>] "
-                   "[--all-subjects] [--subject-concurrency <n>] [--io-timeout-ms <ms>]\n");
+                   "[--module-config <file>] [--all-subjects] [--subject-concurrency <n>] "
+                   "[--io-timeout-ms <ms>] [--json]\n");
     }
 } // namespace
 
@@ -115,8 +118,10 @@ int main(int argc, char **argv) {
     std::chrono::milliseconds io_timeout {5000};
     std::string host {"127.0.0.1"};
     rule_engine::ParseOptions parse_options;
+    std::vector<std::filesystem::path> module_config_paths;
     std::filesystem::path rule_path;
     bool all_subjects {};
+    bool json_output {};
     for (int index = 1; index < argc; ++index) {
         const std::string_view arg {argv[index]};
         if (wants_help(arg)) {
@@ -150,6 +155,10 @@ int main(int argc, char **argv) {
             all_subjects = true;
             continue;
         }
+        if (arg == "--json") {
+            json_output = true;
+            continue;
+        }
         if ((arg == "-I" || arg == "--include-dir") && index + 1 < argc) {
             ++index;
             parse_options.include_dirs.emplace_back(argv[index]);
@@ -162,6 +171,11 @@ int main(int argc, char **argv) {
         if ((arg == "--rule" || arg == "-r") && index + 1 < argc) {
             ++index;
             rule_path = std::filesystem::path {argv[index]};
+            continue;
+        }
+        if (arg == "--module-config" && index + 1 < argc) {
+            ++index;
+            module_config_paths.emplace_back(argv[index]);
             continue;
         }
         if (!arg.starts_with("-") && rule_path.empty()) {
@@ -182,7 +196,16 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+        auto registry = rule_engine::default_module_registry();
+        for (const auto &module_config_path : module_config_paths) {
+            auto loaded = rule_engine::load_module_config_file(module_config_path, registry);
+            if (!loaded) {
+                print_errors(loaded.error());
+                return 1;
+            }
+        }
+
+        auto verified = rule_engine::verify(*parsed, registry);
         if (!verified) {
             print_rule_diagnostics(verified.error());
             return 1;
@@ -210,6 +233,11 @@ int main(int argc, char **argv) {
         if (!evaluation) {
             print_errors(evaluation.error());
             return 1;
+        }
+
+        if (json_output) {
+            fmt::print("{}\n", rule_engine::server_output::evaluation_session_json(host, port, *evaluation));
+            return 0;
         }
 
         fmt::print("connected to {}:{} protocol={} version={} subjects={} evaluated={}\n",
@@ -263,6 +291,11 @@ int main(int argc, char **argv) {
     if (!session) {
         print_errors(session.error());
         return 1;
+    }
+
+    if (json_output) {
+        fmt::print("{}\n", rule_engine::server_output::client_session_json(host, port, *session));
+        return 0;
     }
 
     fmt::print("connected to {}:{} protocol={} version={} subjects={}\n",

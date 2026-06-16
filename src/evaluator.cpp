@@ -1,4 +1,5 @@
 #include <rule_engine/evaluator.hpp>
+#include <rule_engine/provider_key.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -67,6 +68,46 @@ namespace {
     }
 
     [[nodiscard]] EvalValue undefined_result() { return value_result(rule_engine::Value::undefined()); }
+
+    [[nodiscard]] std::string value_type_name(const rule_engine::ValueType type) {
+        switch (type) {
+            case rule_engine::ValueType::boolean: return "boolean";
+            case rule_engine::ValueType::integer: return "integer";
+            case rule_engine::ValueType::floating: return "floating";
+            case rule_engine::ValueType::string: return "string";
+            case rule_engine::ValueType::bytes: return "bytes";
+            case rule_engine::ValueType::array: return "array";
+            case rule_engine::ValueType::pattern: return "pattern";
+            case rule_engine::ValueType::object: return "object";
+            case rule_engine::ValueType::undefined: return "undefined";
+            default: return "unknown";
+        }
+    }
+
+    [[nodiscard]] bool value_matches_type(const rule_engine::Value &value, const rule_engine::ValueType type) {
+        switch (type) {
+            case rule_engine::ValueType::boolean: return value.as_bool().has_value();
+            case rule_engine::ValueType::integer: return value.as_i64().has_value();
+            case rule_engine::ValueType::floating: return value.as_f64().has_value();
+            case rule_engine::ValueType::string: return value.as_string() != nullptr;
+            case rule_engine::ValueType::bytes: return value.as_bytes() != nullptr;
+            case rule_engine::ValueType::array: return value.as_array() != nullptr;
+            case rule_engine::ValueType::pattern: return value.as_pattern() != nullptr;
+            case rule_engine::ValueType::object: return value.as_object() != nullptr;
+            case rule_engine::ValueType::undefined: return true;
+            default: return false;
+        }
+    }
+
+    [[nodiscard]] std::optional<EvalValue> type_mismatch_result(const std::string_view key,
+                                                                const rule_engine::Value &value,
+                                                                const rule_engine::ValueType expected_type) {
+        if (expected_type == rule_engine::ValueType::undefined || value_matches_type(value, expected_type)) {
+            return std::nullopt;
+        }
+        return diagnostic_result("cached fact " + std::string {key} + " has wrong type; expected " +
+                                 value_type_name(expected_type));
+    }
 
     [[nodiscard]] EvalValue numeric_quantifier_result(const std::int64_t matched, const std::int64_t threshold) {
         if (threshold == 0) {
@@ -163,53 +204,6 @@ namespace {
 
     [[nodiscard]] bool string_iequals(const std::string &lhs, const std::string &rhs) {
         return ascii_lower_copy(lhs) == ascii_lower_copy(rhs);
-    }
-
-    [[nodiscard]] std::string escaped_function_arg_string(const std::string_view value) {
-        std::string out;
-        out.reserve(value.size());
-        for (const auto c : value) {
-            if (c == '\\' || c == ',' || c == ')') {
-                out.push_back('\\');
-            }
-            out.push_back(c);
-        }
-        return out;
-    }
-
-    [[nodiscard]] std::string function_arg_key(const rule_engine::Value &value) {
-        if (const auto boolean = value.as_bool(); boolean.has_value()) {
-            return *boolean ? "b:true" : "b:false";
-        }
-        if (const auto integer = value.as_i64(); integer.has_value()) {
-            return "i:" + std::to_string(*integer);
-        }
-        if (const auto number = value.as_f64(); number.has_value()) {
-            std::ostringstream out;
-            out << "f:" << *number;
-            return out.str();
-        }
-        if (const auto *string = value.as_string(); string != nullptr) {
-            return "s:" + escaped_function_arg_string(*string);
-        }
-        if (value.is_undefined()) {
-            return "u";
-        }
-        return "unsupported";
-    }
-
-    [[nodiscard]] std::string function_fact_key(const rule_engine::Expression &expr,
-                                                const std::vector<rule_engine::Value> &arguments) {
-        std::string out = expr.bound_key_prefix.empty() ? expr.text : expr.bound_key_prefix;
-        out.push_back('(');
-        for (std::size_t index = 0; index < arguments.size(); ++index) {
-            if (index != 0u) {
-                out.push_back(',');
-            }
-            out += function_arg_key(arguments[index]);
-        }
-        out.push_back(')');
-        return out;
     }
 
     [[nodiscard]] std::optional<std::int64_t> checked_add(const std::int64_t lhs, const std::int64_t rhs) noexcept {
@@ -314,7 +308,41 @@ namespace {
         std::vector<std::string> current_patterns;
         std::vector<rule_engine::ExpressionTraceEvent> *expression_traces {};
         std::string current_rule_identifier;
+        std::optional<std::size_t> current_rule_index;
     };
+
+    [[nodiscard]] std::optional<rule_engine::RequiredFact>
+    find_required_fact(const rule_engine::VerifiedRule &rule, const std::string_view key) {
+        const auto found = std::ranges::find_if(rule.facts, [&](const auto &fact) {
+            return fact.key == key;
+        });
+        if (found == rule.facts.end()) {
+            return std::nullopt;
+        }
+        return *found;
+    }
+
+    [[nodiscard]] std::optional<rule_engine::ValueType> expected_type_for_key(const EvalContext &ctx,
+                                                                              const std::string_view key) {
+        if (!ctx.current_rule_index.has_value() || *ctx.current_rule_index >= ctx.program.rules.size()) {
+            return std::nullopt;
+        }
+        const auto fact = find_required_fact(ctx.program.rules[*ctx.current_rule_index], key);
+        if (!fact.has_value()) {
+            return std::nullopt;
+        }
+        return fact->type;
+    }
+
+    [[nodiscard]] std::optional<EvalValue> cached_fact_type_mismatch(const EvalContext &ctx,
+                                                                     const std::string_view key,
+                                                                     const rule_engine::Value &value) {
+        const auto expected_type = expected_type_for_key(ctx, key);
+        if (!expected_type.has_value()) {
+            return std::nullopt;
+        }
+        return type_mismatch_result(key, value, *expected_type);
+    }
 
     [[nodiscard]] const rule_engine::Value *find_local(const EvalContext &ctx, const std::string_view name) {
         for (auto binding = ctx.locals.rbegin(); binding != ctx.locals.rend(); ++binding) {
@@ -600,6 +628,9 @@ namespace {
         if (fact->status != rule_engine::FactStatus::available) {
             return diagnostic_result(fact->diagnostic.empty() ? key + " unavailable" : fact->diagnostic);
         }
+        if (const auto mismatch = cached_fact_type_mismatch(ctx, key, fact->value); mismatch.has_value()) {
+            return *mismatch;
+        }
 
         const auto *pattern = fact->value.as_pattern();
         if (pattern == nullptr) {
@@ -670,7 +701,11 @@ namespace {
         return value_result(rule_engine::Value::integer(*value));
     }
 
-    [[nodiscard]] EvalValue eval_pattern_fact_match(const std::string &name, EvalContext &ctx) {
+    [[nodiscard]] EvalValue eval_pattern_fact_match(const std::string &name,
+                                                    EvalContext &ctx,
+                                                    const std::optional<std::int64_t> at_offset = std::nullopt,
+                                                    const std::optional<std::int64_t> range_lower = std::nullopt,
+                                                    const std::optional<std::int64_t> range_upper = std::nullopt) {
         auto pattern_name = name;
         if (pattern_name == "$" && !current_pattern(ctx).empty()) {
             pattern_name = std::string {current_pattern(ctx)};
@@ -682,6 +717,31 @@ namespace {
         }
         if (fact->status != rule_engine::FactStatus::available) {
             return diagnostic_result(fact->diagnostic.empty() ? key + " unavailable" : fact->diagnostic);
+        }
+        if (const auto mismatch = cached_fact_type_mismatch(ctx, key, fact->value); mismatch.has_value()) {
+            return *mismatch;
+        }
+
+        const auto anchored = at_offset.has_value() || range_lower.has_value() || range_upper.has_value();
+        if (anchored) {
+            const auto *pattern = fact->value.as_pattern();
+            if (pattern == nullptr) {
+                return undefined_result();
+            }
+            for (const auto &match : pattern->matches) {
+                const auto offset = to_i64(match.offset);
+                if (!offset.has_value()) {
+                    return undefined_result();
+                }
+                if (at_offset.has_value() && *offset == *at_offset) {
+                    return bool_result(true);
+                }
+                if (range_lower.has_value() && range_upper.has_value() && *offset >= *range_lower &&
+                    *offset <= *range_upper) {
+                    return bool_result(true);
+                }
+            }
+            return bool_result(false);
         }
 
         if (const auto value = fact->value.as_bool(); value.has_value()) {
@@ -751,9 +811,120 @@ namespace {
     }
 
     [[nodiscard]] EvalValue eval_of_expr(const rule_engine::Expression &expr, EvalContext &ctx) {
+        if (expr.text.starts_with("bool_")) {
+            const std::string_view quantifier {expr.text.data() + 5u, expr.text.size() - 5u};
+            const auto quantifier_children = (quantifier == "expr" || quantifier == "percentage") ? 1u : 0u;
+            if (expr.children.size() <= quantifier_children) {
+                return undefined_result();
+            }
+
+            std::int64_t threshold {};
+            if (quantifier_children == 1u) {
+                auto value = eval_expr(expr.children[0], ctx);
+                if (value.status != EvalStatus::value) {
+                    return value;
+                }
+                const auto integer = value.value.as_i64();
+                if (!integer.has_value()) {
+                    return undefined_result();
+                }
+                threshold = *integer;
+            }
+
+            std::int64_t matched {};
+            for (std::size_t index = quantifier_children; index < expr.children.size(); ++index) {
+                auto value = eval_expr(expr.children[index], ctx);
+                if (value.status != EvalStatus::value) {
+                    return value;
+                }
+                if (value.value.as_bool().value_or(false)) {
+                    ++matched;
+                }
+            }
+
+            const auto total = static_cast<std::int64_t>(expr.children.size() - quantifier_children);
+            if (quantifier == "all") {
+                return bool_result(total > 0 && matched == total);
+            }
+            if (quantifier == "any") {
+                return bool_result(matched > 0);
+            }
+            if (quantifier == "none") {
+                return bool_result(matched == 0);
+            }
+            if (quantifier == "expr") {
+                return numeric_quantifier_result(matched, threshold);
+            }
+            if (quantifier == "percentage") {
+                if (total <= 0) {
+                    return undefined_result();
+                }
+                return bool_result((matched * 100) >= (threshold * total));
+            }
+            return undefined_result();
+        }
+
+        std::string_view quantifier {expr.text};
+        bool anchor_at {};
+        bool anchor_in {};
+        if (quantifier.starts_with("at_")) {
+            quantifier.remove_prefix(3u);
+            anchor_at = true;
+        } else if (quantifier.starts_with("in_")) {
+            quantifier.remove_prefix(3u);
+            anchor_in = true;
+        }
+
+        const auto quantifier_children = (quantifier == "expr" || quantifier == "percentage") ? 1u : 0u;
+        const auto anchor_children = anchor_at ? 1u : (anchor_in ? 2u : 0u);
+        if (expr.children.size() < quantifier_children + anchor_children) {
+            return undefined_result();
+        }
+
+        std::int64_t threshold {};
+        if (quantifier_children == 1u) {
+            auto threshold_value = eval_expr(expr.children[0], ctx);
+            if (threshold_value.status != EvalStatus::value) {
+                return threshold_value;
+            }
+            const auto integer = threshold_value.value.as_i64();
+            if (!integer.has_value()) {
+                return undefined_result();
+            }
+            threshold = *integer;
+        }
+
+        std::optional<std::int64_t> at_offset;
+        std::optional<std::int64_t> range_lower;
+        std::optional<std::int64_t> range_upper;
+        if (anchor_at) {
+            auto value = eval_expr(expr.children[quantifier_children], ctx);
+            if (value.status != EvalStatus::value) {
+                return value;
+            }
+            at_offset = value.value.as_i64();
+            if (!at_offset.has_value()) {
+                return undefined_result();
+            }
+        } else if (anchor_in) {
+            auto lower = eval_expr(expr.children[quantifier_children], ctx);
+            if (lower.status != EvalStatus::value) {
+                return lower;
+            }
+            auto upper = eval_expr(expr.children[quantifier_children + 1u], ctx);
+            if (upper.status != EvalStatus::value) {
+                return upper;
+            }
+            range_lower = lower.value.as_i64();
+            range_upper = upper.value.as_i64();
+            if (!range_lower.has_value() || !range_upper.has_value()) {
+                return undefined_result();
+            }
+        }
+
         std::int64_t matched {};
         for (const auto &name : expr.names) {
-            auto value = eval_pattern_fact_match(name, ctx);
+            auto value = eval_pattern_fact_match(name, ctx, at_offset, range_lower, range_upper);
             if (value.status != EvalStatus::value) {
                 return value;
             }
@@ -763,42 +934,23 @@ namespace {
         }
 
         const auto total = static_cast<std::int64_t>(expr.names.size());
-        if (expr.text == "all") {
+        if (quantifier == "all") {
             return bool_result(total > 0 && matched == total);
         }
-        if (expr.text == "any") {
+        if (quantifier == "any") {
             return bool_result(matched > 0);
         }
-        if (expr.text == "none") {
+        if (quantifier == "none") {
             return bool_result(matched == 0);
         }
-        if (expr.text == "expr") {
-            if (expr.children.empty()) {
-                return undefined_result();
-            }
-            auto threshold = eval_expr(expr.children[0], ctx);
-            if (threshold.status != EvalStatus::value) {
-                return threshold;
-            }
-            const auto value = threshold.value.as_i64();
-            if (!value.has_value()) {
-                return undefined_result();
-            }
-            return numeric_quantifier_result(matched, *value);
+        if (quantifier == "expr") {
+            return numeric_quantifier_result(matched, threshold);
         }
-        if (expr.text == "percentage") {
-            if (expr.children.empty() || total <= 0) {
+        if (quantifier == "percentage") {
+            if (total <= 0) {
                 return undefined_result();
             }
-            auto threshold = eval_expr(expr.children[0], ctx);
-            if (threshold.status != EvalStatus::value) {
-                return threshold;
-            }
-            const auto percent = threshold.value.as_i64();
-            if (!percent.has_value()) {
-                return undefined_result();
-            }
-            return bool_result((matched * 100) >= (*percent * total));
+            return bool_result((matched * 100) >= (threshold * total));
         }
         return undefined_result();
     }
@@ -1059,6 +1211,13 @@ namespace {
         return undefined_result();
     }
 
+    void attach_required_fact_for_missing(const rule_engine::VerifiedRule &rule, EvalValue &eval) {
+        if (eval.status != EvalStatus::missing || eval.missing_fact.has_value() || eval.missing_key.empty()) {
+            return;
+        }
+        eval.missing_fact = find_required_fact(rule, eval.missing_key);
+    }
+
     [[nodiscard]] EvalValue eval_rule(const std::size_t index, EvalContext &ctx) {
         if (index >= ctx.program.rules.size()) {
             return bool_result(false);
@@ -1071,12 +1230,16 @@ namespace {
         }
 
         const auto saved_rule_identifier = ctx.current_rule_identifier;
+        const auto saved_rule_index = ctx.current_rule_index;
         const auto &rule = ctx.program.rules[index];
         ctx.current_rule_identifier = rule.qualified_identifier.empty() ? rule.identifier : rule.qualified_identifier;
+        ctx.current_rule_index = index;
         ctx.active[index] = true;
         auto result = eval_expr(rule.condition, ctx);
         ctx.active[index] = false;
+        ctx.current_rule_index = saved_rule_index;
         ctx.current_rule_identifier = saved_rule_identifier;
+        attach_required_fact_for_missing(rule, result);
         if (result.status == EvalStatus::value) {
             result = bool_result(result.value.as_bool().value_or(false));
         }
@@ -1133,18 +1296,24 @@ namespace {
             arguments.push_back(std::move(value.value));
         }
 
-        const auto key = function_fact_key(expr, arguments);
+        const auto key = rule_engine::provider_function_key(expr.bound_key_prefix.empty() ? expr.text : expr.bound_key_prefix,
+                                                            arguments);
         const auto fact = ctx.facts.lookup(ctx.subject.id, key);
         if (!fact.has_value()) {
             return missing_result(rule_engine::RequiredFact {
                 .key = key,
                 .route = expr.bound_route,
                 .ttl = expr.bound_ttl,
+                .timeout = expr.bound_timeout,
                 .cheap_prefetch = expr.bound_cheap_prefetch,
+                .type = expr.bound_return_type,
             });
         }
         if (fact->status != rule_engine::FactStatus::available) {
             return diagnostic_result(fact->diagnostic.empty() ? key + " unavailable" : fact->diagnostic);
+        }
+        if (const auto mismatch = type_mismatch_result(key, fact->value, expr.bound_return_type); mismatch.has_value()) {
+            return *mismatch;
         }
         return value_result(fact->value);
     }
@@ -1186,6 +1355,9 @@ namespace {
                 if (fact->status != rule_engine::FactStatus::available) {
                     return diagnostic_result(fact->diagnostic.empty() ? key + " unavailable" : fact->diagnostic);
                 }
+                if (const auto mismatch = cached_fact_type_mismatch(ctx, key, fact->value); mismatch.has_value()) {
+                    return *mismatch;
+                }
                 return value_result(fact->value);
             }
             case global: {
@@ -1199,6 +1371,9 @@ namespace {
                 }
                 if (fact->status != rule_engine::FactStatus::available) {
                     return diagnostic_result(fact->diagnostic.empty() ? key + " unavailable" : fact->diagnostic);
+                }
+                if (const auto mismatch = cached_fact_type_mismatch(ctx, key, fact->value); mismatch.has_value()) {
+                    return *mismatch;
                 }
                 return value_result(fact->value);
             }
@@ -1217,6 +1392,9 @@ namespace {
                 }
                 if (fact->status != rule_engine::FactStatus::available) {
                     return diagnostic_result(fact->diagnostic.empty() ? key + " unavailable" : fact->diagnostic);
+                }
+                if (const auto mismatch = cached_fact_type_mismatch(ctx, key, fact->value); mismatch.has_value()) {
+                    return *mismatch;
                 }
                 return value_result(fact->value);
             }
@@ -1393,19 +1571,29 @@ namespace {
             rule_engine::FactRequestBatch batch;
             batch.route = fact.route;
             batch.keys = {fact.key};
+            batch.types = {fact.type};
+            batch.timeout = fact.timeout;
             requests.push_back(std::move(batch));
             return;
         }
+        if (found->timeout < fact.timeout) {
+            found->timeout = fact.timeout;
+        }
         if (!std::ranges::contains(found->keys, fact.key)) {
             found->keys.push_back(fact.key);
+            found->types.push_back(fact.type);
         }
     }
 
     void add_missing_requests_for_rule(std::vector<rule_engine::FactRequestBatch> &requests,
                                        const rule_engine::VerifiedRule &rule,
                                        const rule_engine::Subject &subject,
-                                       const rule_engine::FactCache &facts) {
+                                       const rule_engine::FactCache &facts,
+                                       const bool cheap_only) {
         for (const auto &fact : rule.facts) {
+            if (cheap_only && !fact.cheap_prefetch) {
+                continue;
+            }
             if (!facts.lookup(subject.id, fact.key).has_value()) {
                 add_request(requests, fact);
             }
@@ -1464,6 +1652,8 @@ namespace rule_engine {
 
     const std::string *Value::as_string() const noexcept { return std::get_if<std::string>(&storage); }
 
+    const Value::Bytes *Value::as_bytes() const noexcept { return std::get_if<Bytes>(&storage); }
+
     const PatternValue *Value::as_pattern() const noexcept { return std::get_if<PatternValue>(&storage); }
 
     const ArrayValue *Value::as_array() const noexcept {
@@ -1503,6 +1693,16 @@ namespace rule_engine {
         return *found;
     }
 
+    std::vector<Fact> FactCache::snapshot_for_subject(const std::string_view subject_id) const {
+        std::vector<Fact> out;
+        for (const auto &fact : facts_) {
+            if (fact.subject_id == subject_id) {
+                out.push_back(fact);
+            }
+        }
+        return out;
+    }
+
     void FactCache::expire_volatile() {
         std::erase_if(facts_, [](const auto &fact) { return fact.ttl.count() == 0; });
     }
@@ -1521,11 +1721,12 @@ namespace rule_engine {
             .current_patterns = {},
             .expression_traces = options_.trace_expressions ? &out.expression_traces : nullptr,
             .current_rule_identifier = {},
+            .current_rule_index = std::nullopt,
         };
 
         for (const auto &rule : program_.rules) {
             if (rule.is_global) {
-                add_missing_requests_for_rule(out.requests, rule, subject, facts_);
+                add_missing_requests_for_rule(out.requests, rule, subject, facts_, true);
             }
         }
         if (!out.requests.empty()) {
@@ -1569,7 +1770,7 @@ namespace rule_engine {
 
         for (const auto &rule : program_.rules) {
             if (!rule.is_global && !rule.is_private) {
-                add_missing_requests_for_rule(out.requests, rule, subject, facts_);
+                add_missing_requests_for_rule(out.requests, rule, subject, facts_, true);
             }
         }
         if (!out.requests.empty()) {
