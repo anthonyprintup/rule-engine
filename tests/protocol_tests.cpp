@@ -450,6 +450,23 @@ namespace {
         TestHandle &operator=(TestHandle &&) = delete;
     };
 
+    struct VirtualMemory {
+        void *value {};
+
+        explicit VirtualMemory(const std::size_t size) noexcept {
+            value = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        }
+        ~VirtualMemory() noexcept {
+            if (value != nullptr) {
+                VirtualFree(value, 0u, MEM_RELEASE);
+            }
+        }
+        VirtualMemory(const VirtualMemory &) = delete;
+        VirtualMemory &operator=(const VirtualMemory &) = delete;
+        VirtualMemory(VirtualMemory &&) = delete;
+        VirtualMemory &operator=(VirtualMemory &&) = delete;
+    };
+
     [[nodiscard]] std::uint32_t start_and_wait_for_exited_process() {
         std::wstring system_dir;
         system_dir.resize(MAX_PATH);
@@ -3046,6 +3063,9 @@ TEST_CASE("localhost client session scans mapped image sections from rule-derive
 
     server.join();
     std::filesystem::remove(fixture_path);
+    if (server_error.has_value() && !server_error->diagnostics.empty()) {
+        INFO(server_error->diagnostics[0].message);
+    }
     REQUIRE_FALSE(server_error.has_value());
     REQUIRE(session.has_value());
     REQUIRE(session->responses.size() == 1u);
@@ -3059,6 +3079,91 @@ TEST_CASE("localhost client session scans mapped image sections from rule-derive
     });
     REQUIRE(section_match != pattern->matches.end());
     CHECK(section_match->region_permissions.size() == 3u);
+    CHECK(session->responses[0].values[1].value.as_bool() == true);
+}
+
+TEST_CASE("localhost client session scans readable memory regions from rule-derived literals") {
+    const auto probe = std::string {"rule_engine_readable_memory_probe_literal_"} +
+                       std::to_string(GetCurrentProcessId()) + "_" + std::to_string(GetCurrentThreadId());
+    VirtualMemory memory {4096u};
+    REQUIRE(memory.value != nullptr);
+    std::memcpy(memory.value, probe.data(), probe.size());
+
+    const auto fixture_path =
+        std::filesystem::temp_directory_path() / ("rule-engine-memory-scan-session-" +
+                                                 std::to_string(GetCurrentProcessId()) + ".txt");
+    {
+        std::ofstream fixture {fixture_path};
+        REQUIRE(fixture);
+        fixture << "scan_readable_memory_regions " << reinterpret_cast<std::uintptr_t>(memory.value) << " 4096\n";
+    }
+
+    rule_engine::protocol::FactBatchRequestMessage request;
+    request.route = "endpoint.scan.patterns";
+    request.keys.push_back(rule_engine::protocol::FactKey {
+        .subject_id = "pid:" + std::to_string(GetCurrentProcessId()),
+        .key = "$probe.pattern",
+    });
+    request.keys.push_back(rule_engine::protocol::FactKey {
+        .subject_id = "pid:" + std::to_string(GetCurrentProcessId()),
+        .key = "$probe.matches",
+    });
+    request.expected_types = {rule_engine::ValueType::pattern, rule_engine::ValueType::boolean};
+    request.scan_plans.push_back(rule_engine::PatternScanPlan {
+        .pattern_key = "$probe",
+        .literal = ascii_bytes(probe),
+    });
+
+    std::promise<std::uint16_t> listening_port;
+    auto listening = listening_port.get_future();
+    std::optional<rule_engine::ErrorSet> server_error;
+
+    std::thread server {[&] {
+        auto result = rule_engine::client_protocol::serve_client_once(
+            rule_engine::client_protocol::ClientListenOptions {
+                .bind_address = "127.0.0.1",
+                .port = 0u,
+                .pattern_fixture_path = fixture_path,
+                .io_timeout = std::chrono::milliseconds {5000},
+            },
+            [&](const std::uint16_t port) { listening_port.set_value(port); });
+        if (!result) {
+            server_error = std::move(result.error());
+        }
+    }};
+
+    const auto ready = listening.wait_for(std::chrono::seconds {5});
+    if (ready != std::future_status::ready) {
+        server.join();
+        std::filesystem::remove(fixture_path);
+        REQUIRE_FALSE(server_error.has_value());
+        REQUIRE(ready == std::future_status::ready);
+    }
+    const auto port = listening.get();
+    auto session = rule_engine::client_protocol::run_client_session(
+        rule_engine::client_protocol::ClientConnectionOptions {
+            .host = "127.0.0.1",
+            .port = port,
+            .io_timeout = std::chrono::milliseconds {5000},
+        },
+        std::vector<rule_engine::protocol::FactBatchRequestMessage> {request});
+
+    server.join();
+    std::filesystem::remove(fixture_path);
+    REQUIRE_FALSE(server_error.has_value());
+    REQUIRE(session.has_value());
+    REQUIRE(session->responses.size() == 1u);
+    REQUIRE(session->responses[0].values.size() == 2u);
+
+    const auto *pattern = session->responses[0].values[0].value.as_pattern();
+    REQUIRE(pattern != nullptr);
+    REQUIRE(pattern->matched);
+    const auto memory_match = std::ranges::find_if(pattern->matches, [](const auto &match) {
+        return match.scan_space.starts_with("process.memory.region.");
+    });
+    REQUIRE(memory_match != pattern->matches.end());
+    CHECK(memory_match->bytes == ascii_bytes(probe));
+    CHECK_FALSE(memory_match->region_permissions.empty());
     CHECK(session->responses[0].values[1].value.as_bool() == true);
 }
 

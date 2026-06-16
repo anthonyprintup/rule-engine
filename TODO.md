@@ -86,7 +86,7 @@ diagnostics.
   - [x] File bytes through fixture `scan_file` directives.
   - [x] Process image bytes.
   - [x] Mapped image sections.
-  - [ ] Readable memory regions.
+  - [x] Readable memory regions.
 - [x] Preserve match context metadata: offset, length, bytes, before/after context,
   region permissions, and scan-space name.
 - [x] Add scheduling controls for expensive scan routes so cheap process/PE filters

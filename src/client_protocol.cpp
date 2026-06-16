@@ -336,6 +336,38 @@ namespace {
         }
     }
 
+    void append_readable_memory_scan_spaces(rule_engine::patterns::PatternFixtureSet &fixtures,
+                                            const std::span<const rule_engine::protocol::FactKey> keys,
+                                            const std::span<const rule_engine::PatternScanPlan> scan_plans) {
+        if (!fixtures.scan_readable_memory_regions || scan_plans.empty()) {
+            return;
+        }
+
+        std::vector<std::string> seen_subjects;
+        for (const auto &key : keys) {
+            if (std::ranges::find(seen_subjects, key.subject_id) != seen_subjects.end()) {
+                continue;
+            }
+            seen_subjects.push_back(key.subject_id);
+
+            auto spaces = rule_engine::windows::read_process_readable_memory_scan_spaces(
+                key.subject_id,
+                scan_plans,
+                fixtures.readable_memory_scopes);
+            if (!spaces) {
+                continue;
+            }
+            fixtures.scan_spaces.insert(fixtures.scan_spaces.end(),
+                                         std::make_move_iterator(spaces->begin()),
+                                         std::make_move_iterator(spaces->end()));
+        }
+    }
+
+    [[nodiscard]] bool has_explicit_scan_space_config(const rule_engine::patterns::PatternFixtureSet &fixtures) {
+        return !fixtures.scan_spaces.empty() || fixtures.scan_process_image_sections ||
+               fixtures.scan_readable_memory_regions;
+    }
+
     [[nodiscard]] std::vector<rule_engine::Fact>
     process_snapshot_response(const std::span<const rule_engine::protocol::FactKey> keys) {
         const auto process_keys = to_process_keys(keys);
@@ -457,7 +489,8 @@ namespace {
         if (request.route == "endpoint.scan.patterns") {
             auto effective_fixtures = pattern_fixtures;
             append_process_image_section_scan_spaces(effective_fixtures, request.keys, request.scan_plans);
-            if (effective_fixtures.scan_spaces.empty()) {
+            append_readable_memory_scan_spaces(effective_fixtures, request.keys, request.scan_plans);
+            if (!has_explicit_scan_space_config(pattern_fixtures)) {
                 append_process_image_scan_spaces(effective_fixtures, request.keys, request.scan_plans);
             }
             response.values =

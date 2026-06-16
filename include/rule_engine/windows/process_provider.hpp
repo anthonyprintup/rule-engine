@@ -2,6 +2,7 @@
 
 #include <rule_engine/diagnostic.hpp>
 #include <rule_engine/evaluator.hpp>
+#include <rule_engine/pattern_fixture_provider.hpp>
 
 #include <expected>
 #include <filesystem>
@@ -24,4 +25,8 @@ namespace rule_engine::windows {
     [[nodiscard]] std::expected<std::vector<Fact>, ErrorSet>
     read_process_signer_facts(std::span<const ProcessFactKey> keys);
     [[nodiscard]] std::expected<std::filesystem::path, ErrorSet> resolve_process_image_path(std::string_view subject_id);
+    [[nodiscard]] std::expected<std::vector<patterns::PatternScanSpace>, ErrorSet>
+    read_process_readable_memory_scan_spaces(std::string subject_id,
+                                             std::span<const PatternScanPlan> scan_plans,
+                                             std::span<const patterns::ReadableMemoryScanScope> scopes = {});
 } // namespace rule_engine::windows

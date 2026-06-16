@@ -189,6 +189,17 @@ scan_process_image_sections
 For each requested process subject, the client parses the image's PE section
 table and returns matches from `process.image.section.<name>` scan spaces with
 `rwx`-style permissions derived from section characteristics.
+Readable process memory scan spaces are also explicit. Use the directive without
+arguments to scan committed readable regions, or pass a decimal base address and
+size to scope the scan:
+
+```text
+scan_readable_memory_regions
+scan_readable_memory_regions 140737488355328 4096
+```
+
+Matching chunks are returned as subject-scoped `process.memory.region.<address>`
+scan spaces with the Windows protection string as region permissions.
 
 ## Rule Corpus
 

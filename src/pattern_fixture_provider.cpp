@@ -252,6 +252,8 @@ namespace rule_engine::patterns {
             },
             .scan_spaces = {},
             .scan_process_image_sections = false,
+            .scan_readable_memory_regions = false,
+            .readable_memory_scopes = {},
         };
     }
 
@@ -363,6 +365,27 @@ namespace rule_engine::patterns {
 
             if (directive_or_pattern == "scan_process_image_sections") {
                 out.scan_process_image_sections = true;
+                continue;
+            }
+
+            if (directive_or_pattern == "scan_readable_memory_regions") {
+                out.scan_readable_memory_regions = true;
+                std::string base_text;
+                if (stream >> base_text) {
+                    std::string size_text;
+                    std::uintptr_t base {};
+                    std::size_t size {};
+                    if (!(stream >> size_text) || !parse_integer(base_text, base) || !parse_integer(size_text, size) ||
+                        size == 0u) {
+                        return std::unexpected(single_error(path.string(),
+                                                            "invalid pattern scan_readable_memory_regions value on line " +
+                                                                std::to_string(line_number)));
+                    }
+                    out.readable_memory_scopes.push_back(ReadableMemoryScanScope {
+                        .base = base,
+                        .size = size,
+                    });
+                }
                 continue;
             }
 

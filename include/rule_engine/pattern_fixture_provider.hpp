@@ -2,6 +2,8 @@
 
 #include <rule_engine/protocol.hpp>
 
+#include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <span>
@@ -21,10 +23,17 @@ namespace rule_engine::patterns {
         std::vector<std::byte> bytes;
     };
 
+    struct ReadableMemoryScanScope {
+        std::uintptr_t base {};
+        std::size_t size {};
+    };
+
     struct PatternFixtureSet {
         std::vector<PatternFixture> patterns;
         std::vector<PatternScanSpace> scan_spaces;
         bool scan_process_image_sections {};
+        bool scan_readable_memory_regions {};
+        std::vector<ReadableMemoryScanScope> readable_memory_scopes;
     };
 
     [[nodiscard]] PatternFixtureSet default_pattern_fixtures();

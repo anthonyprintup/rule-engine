@@ -11,6 +11,7 @@
 #include <WinTrust.h>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -95,6 +96,9 @@ namespace {
         std::uint64_t total {};
         std::uint64_t readable {};
     };
+
+    constexpr std::size_t memory_scan_chunk_bytes = 256u * 1024u;
+    constexpr std::size_t max_memory_scan_spaces = 4096u;
 
     using NtQueryInformationProcessFn = LONG(WINAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
     using IsWow64Process2Fn = BOOL(WINAPI *)(HANDLE, USHORT *, USHORT *);
@@ -895,6 +899,85 @@ namespace {
         }
     }
 
+    [[nodiscard]] std::string hex_address(const std::uintptr_t value) {
+        std::array<char, sizeof(std::uintptr_t) * 2u> buffer {};
+        auto *first = buffer.data();
+        auto *last = buffer.data() + buffer.size();
+        const auto result = std::to_chars(first, last, value, 16);
+        if (result.ec != std::errc {}) {
+            return "0";
+        }
+        return std::string {first, result.ptr};
+    }
+
+    [[nodiscard]] std::string memory_scan_space_name(const std::uintptr_t address) {
+        return "process.memory.region." + hex_address(address);
+    }
+
+    [[nodiscard]] bool contains_scan_plan_literal(const std::span<const std::byte> bytes,
+                                                  const std::span<const rule_engine::PatternScanPlan> scan_plans) {
+        if (bytes.empty()) {
+            return false;
+        }
+        return std::ranges::any_of(scan_plans, [&](const auto &plan) {
+            if (plan.literal.empty() || plan.literal.size() > bytes.size()) {
+                return false;
+            }
+            const auto found = std::search(bytes.begin(), bytes.end(), plan.literal.begin(), plan.literal.end());
+            return found != bytes.end();
+        });
+    }
+
+    [[nodiscard]] std::optional<std::vector<std::byte>>
+    read_memory_chunk(HANDLE process, const std::uintptr_t address, const std::size_t size) {
+        if (size == 0u) {
+            return std::nullopt;
+        }
+
+        std::vector<std::byte> out(size);
+        SIZE_T bytes_read {};
+        if (ReadProcessMemory(process,
+                              reinterpret_cast<LPCVOID>(address),
+                              out.data(),
+                              static_cast<SIZE_T>(out.size()),
+                              std::addressof(bytes_read)) == FALSE ||
+            bytes_read == 0u) {
+            return std::nullopt;
+        }
+        out.resize(bytes_read);
+        return out;
+    }
+
+    void append_matching_memory_chunks(std::vector<rule_engine::patterns::PatternScanSpace> &out,
+                                       HANDLE process,
+                                       const std::string &subject_id,
+                                       const std::span<const rule_engine::PatternScanPlan> scan_plans,
+                                       const std::uintptr_t base,
+                                       const std::uintptr_t size,
+                                       const DWORD protection) {
+        std::uintptr_t offset {};
+        while (offset < size && out.size() < max_memory_scan_spaces) {
+            const auto remaining = size - offset;
+            const auto chunk_size =
+                static_cast<std::size_t>((std::min)(remaining, static_cast<std::uintptr_t>(memory_scan_chunk_bytes)));
+            if (chunk_size == 0u || base > (std::numeric_limits<std::uintptr_t>::max)() - offset) {
+                break;
+            }
+
+            const auto chunk_address = base + offset;
+            auto chunk = read_memory_chunk(process, chunk_address, chunk_size);
+            if (chunk.has_value() && contains_scan_plan_literal(*chunk, scan_plans)) {
+                out.push_back(rule_engine::patterns::PatternScanSpace {
+                    .subject_id = subject_id,
+                    .scan_space = memory_scan_space_name(chunk_address),
+                    .permissions = memory_protection_name(protection),
+                    .bytes = std::move(*chunk),
+                });
+            }
+            offset += static_cast<std::uintptr_t>(chunk_size);
+        }
+    }
+
     [[nodiscard]] std::optional<std::int64_t> uintptr_to_i64(const std::uintptr_t value) noexcept {
         if (value > static_cast<std::uintptr_t>((std::numeric_limits<std::int64_t>::max)())) {
             return std::nullopt;
@@ -1214,6 +1297,122 @@ namespace {
 } // namespace
 
 namespace rule_engine::windows {
+    std::expected<std::vector<patterns::PatternScanSpace>, ErrorSet>
+    read_process_readable_memory_scan_spaces(std::string subject_id,
+                                             const std::span<const PatternScanPlan> scan_plans,
+                                             const std::span<const patterns::ReadableMemoryScanScope> scopes) {
+        if (scan_plans.empty()) {
+            return std::vector<patterns::PatternScanSpace> {};
+        }
+
+        const auto pid = parse_pid_subject(subject_id);
+        if (!pid.has_value()) {
+            return std::unexpected(single_error("process", "unsupported process subject id"));
+        }
+
+        UniqueHandle process {OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, static_cast<DWORD>(*pid))};
+        if (process.handle == nullptr) {
+            return std::unexpected(single_error("process", win32_diagnostic("OpenProcess for process memory scan",
+                                                                            GetLastError())));
+        }
+
+        SYSTEM_INFO info {};
+        GetNativeSystemInfo(std::addressof(info));
+
+        auto address = reinterpret_cast<std::uintptr_t>(info.lpMinimumApplicationAddress);
+        const auto max_address = reinterpret_cast<std::uintptr_t>(info.lpMaximumApplicationAddress);
+        std::vector<patterns::PatternScanSpace> out;
+
+        if (!scopes.empty()) {
+            for (const auto &scope : scopes) {
+                if (scope.size == 0u) {
+                    continue;
+                }
+                if (scope.base > (std::numeric_limits<std::uintptr_t>::max)() -
+                                     static_cast<std::uintptr_t>(scope.size)) {
+                    continue;
+                }
+
+                const auto scope_end = scope.base + static_cast<std::uintptr_t>(scope.size);
+                auto address_in_scope = scope.base;
+                while (address_in_scope < scope_end && out.size() < max_memory_scan_spaces) {
+                    MEMORY_BASIC_INFORMATION region {};
+                    const auto queried = VirtualQueryEx(process.handle,
+                                                        reinterpret_cast<LPCVOID>(address_in_scope),
+                                                        std::addressof(region),
+                                                        static_cast<SIZE_T>(sizeof(region)));
+                    if (queried == 0u) {
+                        break;
+                    }
+
+                    const auto base = reinterpret_cast<std::uintptr_t>(region.BaseAddress);
+                    const auto region_size = static_cast<std::uintptr_t>(region.RegionSize);
+                    if (region_size == 0u || base > (std::numeric_limits<std::uintptr_t>::max)() - region_size) {
+                        break;
+                    }
+
+                    const auto region_end = base + region_size;
+                    const auto scan_base = (std::max)(address_in_scope, base);
+                    const auto scan_end = (std::min)(scope_end, region_end);
+                    if (scan_base < scan_end && region.State == MEM_COMMIT && is_readable_protection(region.Protect)) {
+                        append_matching_memory_chunks(out,
+                                                      process.handle,
+                                                      subject_id,
+                                                      scan_plans,
+                                                      scan_base,
+                                                      scan_end - scan_base,
+                                                      region.Protect);
+                    }
+
+                    if (region_end <= address_in_scope) {
+                        break;
+                    }
+                    address_in_scope = region_end;
+                }
+            }
+            return out;
+        }
+
+        while (address < max_address && out.size() < max_memory_scan_spaces) {
+            MEMORY_BASIC_INFORMATION region {};
+            const auto queried = VirtualQueryEx(process.handle,
+                                                reinterpret_cast<LPCVOID>(address),
+                                                std::addressof(region),
+                                                static_cast<SIZE_T>(sizeof(region)));
+            if (queried == 0u) {
+                const auto error = GetLastError();
+                if (error == ERROR_INVALID_PARAMETER) {
+                    break;
+                }
+                return std::unexpected(single_error("process", win32_diagnostic("VirtualQueryEx", error)));
+            }
+
+            const auto base = reinterpret_cast<std::uintptr_t>(region.BaseAddress);
+            const auto region_size = static_cast<std::uintptr_t>(region.RegionSize);
+            if (region.State == MEM_COMMIT && is_readable_protection(region.Protect) && region_size > 0u) {
+                append_matching_memory_chunks(out,
+                                              process.handle,
+                                              subject_id,
+                                              scan_plans,
+                                              base,
+                                              region_size,
+                                              region.Protect);
+            }
+
+            if (region_size == 0u || base > (std::numeric_limits<std::uintptr_t>::max)() - region_size) {
+                break;
+            }
+
+            const auto next = base + region_size;
+            if (next <= address) {
+                break;
+            }
+            address = next;
+        }
+
+        return out;
+    }
+
     std::expected<std::vector<Subject>, ErrorSet> enumerate_process_subjects() {
         auto entries = enumerate_process_entries();
         if (!entries) {
