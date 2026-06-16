@@ -24,6 +24,49 @@ See [GOAL.md](GOAL.md) for the project target and
 [docs/V1_IMPLEMENTATION_STATUS.md](docs/V1_IMPLEMENTATION_STATUS.md) for the
 current implementation checklist.
 
+## Execution Model
+
+The rule engine treats YARA rules as symbolic programs over facts. Parsing starts
+in the Rust `yara-x-parser` bridge, but the bridge only returns syntax. C++ then
+verifies imports, module fields, module functions, globals, rule references, and
+unsupported expression forms against `ModuleRegistry` descriptors.
+
+Descriptors are the contract between rule syntax and providers:
+
+- `FieldDescriptor` maps a visible field such as `process.pid` to a typed fact
+  key, provider route, TTL, and prefetch cost hint.
+- `FunctionDescriptor` maps a visible function such as `demo.score(...)` to a
+  return type, argument types, provider route, TTL, and a stable fact-key prefix.
+- `GlobalDescriptor` maps bare external/global names to provider-backed facts.
+
+Verification lowers descriptor-backed expressions into requirements, not values.
+For example, `process.name` becomes a requirement for the `process.name` fact on
+`endpoint.process.snapshot`. A module function call remains symbolic until its
+arguments are evaluated; `demo.score(process.pid, "alpha")` first asks for
+`process.pid`, then derives a typed function fact key such as
+`demo.score(i:4242,s:alpha)`.
+
+The VM is synchronous and resumable. `Evaluator::step(subject)` either returns a
+complete set of rule results or returns `waiting_for_facts` with missing fact
+batches grouped by provider route. The caller sends those batches to a client,
+stores returned facts in the session `FactCache`, and calls `step` again. This
+keeps async I/O out of the VM while still allowing facts to arrive later from
+local or remote handlers.
+
+Facts carry a subject id, key, typed `Value`, status, diagnostic text, and TTL.
+Available facts participate in expression evaluation. Unavailable or
+access-denied facts produce per-rule diagnostics and no-match results. Undefined
+values propagate with YARA-like semantics: boolean `and`/`or` treat undefined
+operands as false, while comparisons and string predicates return undefined when
+their operands are undefined.
+
+Clients are provider endpoints only. A localhost client advertises capabilities,
+enumerates subjects, receives fact-batch requests, and returns typed facts or
+structured diagnostics. It never evaluates predicates or decides rule matches.
+Built-in routes serve process snapshot facts, PE image facts, and fixture-backed
+pattern facts. Custom C++ handlers can be bound for descriptor-backed module
+function routes while preserving the same trust boundary.
+
 ## Repository Layout
 
 - `include/rule_engine/` - public C++ headers for the core engine and providers.
