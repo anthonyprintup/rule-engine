@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package rule_engine.protocol;
+
+message Capability {
+  string route = 1;
+}
+
+message Handshake {
+  string protocol = 1;
+  uint32 version = 2;
+  repeated Capability capabilities = 3;
+}
+
+message Subject {
+  string kind = 1;
+  string id = 2;
+}
+
+message FactKey {
+  string subject_id = 1;
+  string key = 2;
+}
+
+message FactBatchRequest {
+  string route = 1;
+  repeated FactKey keys = 2;
+  uint32 timeout_ms = 3;
+}
+
+message FactValue {
+  string key = 1;
+  string status = 2;
+  string string_value = 3;
+  int64 int_value = 4;
+  bool bool_value = 5;
+  string diagnostic = 6;
+}
+
+message FactBatchResponse {
+  string route = 1;
+  repeated FactValue values = 2;
+}
