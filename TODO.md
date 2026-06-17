@@ -29,6 +29,18 @@ diagnostics.
   access-denied and partial-data diagnostics.
 - [x] Implement `process.signer.status` on `endpoint.process.signer` using Windows
   Authenticode/WinTrust APIs.
+- Add a first-class unsigned-process matching fact on `endpoint.process.signer`:
+  - Expose a simple boolean process fact such as `process.signer.is_signed` so
+    rules can match unsigned processes directly without string-comparing
+    provider status values.
+  - Treat both embedded PE signatures and Windows catalog signatures as valid
+    signing sources; a process image should be considered unsigned only when
+    neither path provides a usable signature.
+  - Keep unavailable, inaccessible, timed-out, malformed-image, and verification
+    diagnostic states distinct from a definitive unsigned result.
+  - Add regression coverage for embedded-signed images, catalog-signed images,
+    unsigned images, inaccessible/exited processes, and wrong-typed cached
+    signer facts.
 - [x] Add tests for process lifetime races where a process exits between subject
   enumeration and fact collection.
 - [x] Add richer process facts once the route model is stable:
@@ -117,6 +129,164 @@ diagnostics.
 - [x] Add replay tests for function-call fact requests and custom provider routes.
 - Stabilize the debug IR and trace schemas once the module/provider surface stops
   changing.
+
+## VM Optimization Roadmap
+
+Design goal: optimize for thousands of rules evaluated against every process
+subject reported by many connected clients. Clients should report minimal
+inventory first, server-side C++ must still own rule semantics and match
+decisions, and evaluation should aggressively early-reject rules that cannot
+match without materializing broad per-process metadata.
+
+Important workload assumptions:
+
+- A connected client rearms its next evaluation after the current evaluation
+  finishes, nominally on a five-minute cadence.
+- Server scheduling must jitter and backpressure those client timers so many
+  clients do not synchronize into one evaluation spike.
+- A single client evaluation may contain many process subjects and thousands of
+  rules.
+- Most rules are expected to start with useful process, PE, signer, module,
+  memory, or scan-space filters.
+- Some intentionally broad rules will match many processes early, such as
+  filters over common image names or broad PE validity checks, so the optimizer
+  cannot rely on every first predicate being selective.
+- Client-side coarse candidate providers are allowed when they expose generic
+  inventory facts or subject sets, but they must not expose rule identity,
+  hidden rule branches, exact YARA pattern intent, or client-owned match
+  decisions.
+
+Approved direction: evolve the current interpreter into a Phreak-inspired lazy,
+goal-oriented optimizer backed by a canonical predicate DAG and adaptive
+candidate sets. Keep the existing exact VM semantics as the final evaluator and
+fallback path while adding shared predicate execution in front of it.
+
+- Add a lightweight performance baseline before structural rewrites:
+  - Measure per-client sweep time for synthetic and fixture-backed workloads
+    with many subjects and thousands of rules.
+  - Track number of provider rounds, facts requested, facts returned, VM
+    expression evaluations, rules eliminated before exact VM evaluation, and
+    rules that reach expensive providers.
+  - Include adversarial cases with nonselective filters such as common process
+    names, broad `pe.is_valid` checks, and rules whose cheap filters all pass.
+  - Include selective cases where many rules share identical first filters, such
+    as repeated `process.name == "powershell.exe"` or repeated PE/header
+    predicates.
+- Replace flat fact lookup on hot paths:
+  - Change `FactCache` from linear subject/key scans to an indexed structure
+    keyed by subject id and fact key.
+  - Preserve TTL expiration semantics for volatile process facts and static PE
+    facts.
+  - Preserve trace replay behavior and deterministic fact snapshots.
+  - Keep memory bounded per active client sweep; do not create an always-on
+    cache of all process metadata for all clients.
+- Add canonical predicate IDs:
+  - Lower simple, side-effect-free condition fragments into canonical predicate
+    forms, independent of source spelling where semantics are equivalent.
+  - Canonicalize descriptor-backed comparisons such as field/global/function
+    fact compared with a literal or small literal set.
+  - Include predicate source spans and owning rule references so diagnostics and
+    optimized traces can point back to original rule text.
+  - Treat expressions with local bindings, loops, dynamic function arguments,
+    pattern metadata, or unsupported shapes as exact-VM-only until explicitly
+    lifted into the optimizer.
+- Add cost and selectivity metadata:
+  - Assign descriptor-level cost classes such as inventory, cheap process
+    snapshot, static image header, broad image array, handle/signer, memory
+    region, and pattern scan.
+  - Allow boolean condition reordering for commutative `and` and `or`
+    expressions when it is semantically safe.
+  - Prefer low-cost, high-selectivity predicates before expensive or broad
+    predicates.
+  - Update selectivity estimates from observed sweep results without relying on
+    clients to make semantic decisions.
+  - Record the chosen predicate order in opt-in traces.
+- Build a shared predicate DAG:
+  - Deduplicate identical predicate nodes across all rules in a verified
+    program.
+  - Represent rule conditions as references into the DAG plus exact-VM fallback
+    continuations for complex leaves.
+  - Evaluate a predicate node at most once per subject or per candidate set in a
+    sweep.
+  - Store only compact node results needed for the active sweep, not full
+    metadata snapshots for every process.
+  - Preserve rule reference and global rule semantics while allowing shared
+    predicate nodes below them.
+- Add adaptive candidate sets:
+  - Represent the current process universe for a client sweep as compact subject
+    ids plus bitsets or compressed bitsets.
+  - Evaluate shared predicates into candidate sets and combine them with fast
+    set operations for `and`, `or`, and safe complements.
+  - Use dense bitsets for small or dense subject sets and compressed/adaptive
+    bitsets for large or sparse sets.
+  - Drop rule branches immediately when their candidate set becomes empty.
+  - Detect nonselective predicates and avoid spending memory retaining useless
+    large intermediate sets unless they are needed for downstream branching.
+- Add lazy provider expansion:
+  - Start each sweep from minimal client inventory, such as process subject ids
+    and cheap identity fields.
+  - Request additional facts only for candidate subjects that survive earlier
+    predicate nodes.
+  - Batch requests by provider route across surviving subjects.
+  - Avoid requesting expensive arrays, memory-region lists, PE imports/exports,
+    signer data, handle counts, or pattern scans for eliminated subjects.
+  - Keep provider request types generic; clients return typed facts or generic
+    candidate sets, never rule decisions.
+- Add generic client-side candidate providers where useful:
+  - Support provider routes that return generic subject sets, such as processes
+    with valid base image PE headers, processes grouped by image name, processes
+    with readable image bytes, or processes with coarse architecture/session
+    traits.
+  - Ensure candidate providers are optional optimizations; the server must be
+    able to fall back to per-subject facts and server-side candidate-set
+    construction.
+  - Do not expose exact rule names, full condition branches, private strings, or
+    pattern literals through these routes unless that data is already part of a
+    normal provider request by design.
+  - Treat broad candidate provider output as a signal to continue narrowing on
+    the server rather than as a failure.
+- Preserve exact VM semantics:
+  - Use the optimized DAG only to prune impossible rules, reorder safe
+    predicates, and reduce provider requests.
+  - Run the existing exact VM or a semantically equivalent lowered VM for final
+    rule results when a rule remains possible.
+  - Keep undefined, unavailable, access-denied, timeout, global-rule gating,
+    private-rule suppression, rule references, `with`, `for`, `of`, and pattern
+    metadata behavior identical to the current VM.
+  - Add differential tests that compare optimized and unoptimized evaluation
+    results over the same verified program and fact responses.
+- Add optimized diagnostics and traces:
+  - Emit opt-in traces that show canonical predicate ids, source spans, chosen
+    cost order, requested fact batches, candidate-set sizes, and prune reasons.
+  - Explain when a rule was not run by the exact VM because an earlier shared
+    predicate made it impossible.
+  - Explain when a broad predicate was evaluated but retained too many subjects
+    to be useful for pruning.
+  - Keep trace output machine-readable and readable enough to debug rule
+    authorship and optimizer decisions.
+- Add server scheduling controls for the target deployment model:
+  - Add jittered client evaluation timers so 10,000 clients do not wake at the
+    same wall-clock boundary.
+  - Add backpressure for provider rounds and VM work queues when the server is
+    saturated.
+  - Separate network I/O readiness from CPU-bound VM/provider orchestration with
+    a bounded worker pool.
+  - Track queue depth, active client sweeps, active provider requests, average
+    sweep duration, and deadline misses.
+  - Keep per-client state small enough that many connected idle clients do not
+    imply many threads or large metadata snapshots.
+- Add production-scale test fixtures:
+  - Generate synthetic rule packs with shared first predicates, mixed predicate
+    ordering, broad filters, expensive scan leaves, and complex exact-VM-only
+    leaves.
+  - Generate synthetic client inventories with many processes and controlled
+    selectivity distributions.
+  - Test that optimized evaluation requests fewer facts and performs fewer
+    expression evaluations than the baseline on selective packs.
+  - Test that broad-rule packs still complete correctly and do not retain
+    unbounded candidate-set state.
+  - Test that optimized and unoptimized modes produce identical final rule
+    results and diagnostics for the same inputs.
 
 ## Client And Server Runtime
 
