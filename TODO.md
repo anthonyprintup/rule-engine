@@ -245,6 +245,89 @@ fallback path while adding shared predicate execution in front of it.
     normal provider request by design.
   - Treat broad candidate provider output as a signal to continue narrowing on
     the server rather than as a failure.
+- Add discovery gates for rule packs and expensive rule families:
+  - Let the compiler derive cheap pack-level gates from predicates that are
+    shared by many rules, such as required modules, process-kind constraints,
+    architecture/session constraints, base-image PE validity, or known provider
+    capability requirements.
+  - Run discovery gates before building full per-process candidate sets for a
+    rule pack; skip the pack when its gates prove that no rule in it can match
+    the current client inventory.
+  - Keep discovery gates server-owned and source-linked. They are optimizer
+    predicates, not client-owned rule decisions.
+  - Example: a pack whose rules all require `pe.is_valid` can first ask for a
+    generic `valid_base_pe_subjects` candidate set. If the set is empty, the
+    whole pack can be skipped with a trace entry.
+  - Example: a pack whose rules only apply to 64-bit user processes can first
+    intersect cheap inventory sets for `process.architecture == "x64"` and
+    `process.integrity_level != "system"` before any signer, import, memory, or
+    pattern routes are considered.
+  - Example: a rule family that requires process image bytes can be gated by a
+    generic provider capability and a cheap image-path/readability check before
+    any scan plans are emitted.
+- Add provider-scope filtering as a generic candidate provider pattern:
+  - Allow the server to request coarse, reusable provider filters that are
+    independent of exact rule identity, exact private strings, and full
+    condition branches.
+  - Keep the client limited to inventory and fact production; the server still
+    combines provider-scope filter output with the rule predicate DAG and exact
+    VM.
+  - Example: request `process.inventory.by_image_name("chrome.exe")` to get a
+    candidate subject set. If it returns many processes, the server continues
+    narrowing with signer, parent, command-line, module, PE, memory, or pattern
+    predicates.
+  - Example: request `process.inventory.valid_base_pe_subjects` to get processes
+    whose base image appears to be a readable, parseable PE, without revealing
+    whether a specific rule is testing `pe.is_valid`.
+  - Example: request `process.inventory.with_readable_image_bytes` before
+    emitting literal scan requests, so subjects whose image cannot be read are
+    eliminated or diagnosed before expensive pattern routes.
+  - Model provider-scope filter output as typed facts or subject sets with
+    diagnostics, TTLs, and traces, not as rule results.
+  - Add a server-side fallback path that builds the same candidate sets from
+    per-subject facts when a client does not advertise a candidate provider.
+- Add demand-driven feature materialization:
+  - Do not compute or request hashes, PE imports/exports/resources, debug
+    entries, certificates, signer/catalog data, handle counts, memory-region
+    arrays, loaded-module arrays, command lines, or pattern scans until a
+    surviving predicate branch requires them.
+  - Mark each descriptor with a materialization class and expected payload cost
+    so the optimizer can keep cheap scalar inventory separate from expensive
+    arrays, file reads, signature verification, and scans.
+  - Keep expensive materialized values scoped to the active sweep unless their
+    TTL and cache key make cross-subject or cross-sweep reuse safe.
+  - Add tests that prove selective rules do not materialize expensive facts for
+    eliminated subjects.
+- Add route and predicate watchdogs:
+  - Track per-route and per-predicate elapsed time, bytes returned, subjects
+    touched, candidate-set reduction, and diagnostic rate during each sweep.
+  - Put predicates or provider routes into a bounded cool-down when they exceed
+    CPU, latency, payload-size, or low-selectivity budgets repeatedly.
+  - During cool-down, either defer the expensive branch, request a cheaper
+    substitute gate, or complete with a traceable budget diagnostic according to
+    rule/policy settings.
+  - Never silently skip a rule because of budget pressure; final no-match,
+    timeout, unavailable, or deferred states must be explicit.
+  - Add adversarial tests for rules that force broad signer, memory, import, or
+    scan work across most process subjects.
+- Add content-addressed fact caches where safe:
+  - Cache static image facts by stable file identity rather than only process
+    subject id when the provider can verify that the underlying file content has
+    not changed.
+  - Candidate cache keys include path or file id, size, timestamps, content hash
+    when already available, signature/catalog identity, and scan-space version.
+  - Reuse PE header, import/export/resource/debug/certificate, signer/catalog,
+    and hash facts across multiple processes that map the same unchanged image.
+  - Keep volatile process facts, command lines, handles, tokens, parent/child
+    relationships, and live memory facts subject-scoped.
+  - Add invalidation and trace entries whenever a reused static fact is accepted
+    or rejected because its file identity changed.
+- Defer event/delta streams until after snapshot optimization is stable:
+  - Keep the current roadmap based on jittered five-minute snapshot sweeps.
+  - Do not require process/file/image-load event streams for the predicate DAG,
+    candidate providers, or exact VM fallback to work.
+  - Reserve a future design for incremental inventory updates that invalidate
+    affected predicate nodes and candidate sets between snapshot sweeps.
 - Preserve exact VM semantics:
   - Use the optimized DAG only to prune impossible rules, reorder safe
     predicates, and reduce provider requests.
