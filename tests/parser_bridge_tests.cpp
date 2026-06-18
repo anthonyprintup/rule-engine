@@ -52,8 +52,8 @@ rule encoded_powershell {
 }
 )";
 
-    const OwnedBridgeParse parsed {re_yara_bridge_parse(reinterpret_cast<const std::uint8_t *>(source.data()),
-                                                        source.size())};
+    const OwnedBridgeParse parsed {
+        re_yara_bridge_parse(reinterpret_cast<const std::uint8_t *>(source.data()), source.size())};
     REQUIRE(parsed.result.status == ReParseStatus::Ok);
     REQUIRE(parsed.result.rules != nullptr);
     CHECK(re_yara_bridge_version(parsed.result.rules) == 1u);
@@ -444,6 +444,28 @@ rule function_filter {
     CHECK(call.children[0].kind == rule_engine::ExpressionKind::field);
     CHECK(call.children[0].names == std::vector<std::string> {"process", "pid"});
     CHECK(call.children[1].kind == rule_engine::ExpressionKind::literal_string);
+}
+
+TEST_CASE("YARA-X bridge preserves bare builtin reader call expressions") {
+    constexpr auto source = R"(
+rule builtin_reader {
+    condition:
+        uint32(0) == 0x5A4D
+}
+)";
+
+    auto parsed = rule_engine::parse_source("builtin_reader.yar", source);
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->rules.size() == 1u);
+    const auto &condition = parsed->rules[0].condition;
+    REQUIRE(condition.kind == rule_engine::ExpressionKind::equal);
+    REQUIRE(condition.children.size() == 2u);
+    const auto &call = condition.children[0];
+    REQUIRE(call.kind == rule_engine::ExpressionKind::function_call);
+    CHECK(call.text == "uint32");
+    CHECK(call.names == std::vector<std::string> {"uint32"});
+    REQUIRE(call.children.size() == 1u);
+    CHECK(call.children[0].kind == rule_engine::ExpressionKind::literal_integer);
 }
 
 TEST_CASE("YARA-X bridge reports parse diagnostics without throwing") {

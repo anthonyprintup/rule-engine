@@ -23,7 +23,13 @@ namespace rule_engine::windows {
     [[nodiscard]] std::expected<std::vector<Fact>, ErrorSet>
     read_process_handle_facts(std::span<const ProcessFactKey> keys);
     [[nodiscard]] std::expected<std::vector<Fact>, ErrorSet>
-    read_process_signer_facts(std::span<const ProcessFactKey> keys);
+    read_process_signer_facts(std::span<const ProcessFactKey> keys,
+                              std::chrono::milliseconds timeout = std::chrono::milliseconds {5000});
+    [[nodiscard]] std::expected<std::vector<Fact>, ErrorSet>
+    read_process_signer_image_facts(std::string_view subject_id,
+                                    const std::filesystem::path &image_path,
+                                    std::span<const ProcessFactKey> keys,
+                                    std::chrono::milliseconds timeout = std::chrono::milliseconds {5000});
     [[nodiscard]] std::expected<std::filesystem::path, ErrorSet> resolve_process_image_path(std::string_view subject_id);
     [[nodiscard]] std::expected<std::vector<patterns::PatternScanSpace>, ErrorSet>
     read_process_readable_memory_scan_spaces(std::string subject_id,

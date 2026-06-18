@@ -40,9 +40,7 @@ namespace {
         return out;
     }
 
-    [[nodiscard]] EvalValue bool_result(const bool value) {
-        return value_result(rule_engine::Value::boolean(value));
-    }
+    [[nodiscard]] EvalValue bool_result(const bool value) { return value_result(rule_engine::Value::boolean(value)); }
 
     [[nodiscard]] EvalValue missing_result(std::string key) {
         EvalValue out;
@@ -68,6 +66,49 @@ namespace {
     }
 
     [[nodiscard]] EvalValue undefined_result() { return value_result(rule_engine::Value::undefined()); }
+
+    constexpr std::string_view process_image_bytes_key {"process.image.bytes"};
+    constexpr std::string_view scan_pattern_route {"endpoint.scan.patterns"};
+
+    struct IntegerReaderSpec {
+        std::size_t width {};
+        bool signed_value {};
+        bool big_endian {};
+    };
+
+    [[nodiscard]] std::optional<IntegerReaderSpec> integer_reader_spec(const std::string_view name) noexcept {
+        if (name == "uint8") {
+            return IntegerReaderSpec {.width = 1u, .signed_value = false, .big_endian = false};
+        }
+        if (name == "int8") {
+            return IntegerReaderSpec {.width = 1u, .signed_value = true, .big_endian = false};
+        }
+        if (name == "uint16" || name == "uint16le") {
+            return IntegerReaderSpec {.width = 2u, .signed_value = false, .big_endian = false};
+        }
+        if (name == "int16" || name == "int16le") {
+            return IntegerReaderSpec {.width = 2u, .signed_value = true, .big_endian = false};
+        }
+        if (name == "uint32" || name == "uint32le") {
+            return IntegerReaderSpec {.width = 4u, .signed_value = false, .big_endian = false};
+        }
+        if (name == "int32" || name == "int32le") {
+            return IntegerReaderSpec {.width = 4u, .signed_value = true, .big_endian = false};
+        }
+        if (name == "uint16be") {
+            return IntegerReaderSpec {.width = 2u, .signed_value = false, .big_endian = true};
+        }
+        if (name == "int16be") {
+            return IntegerReaderSpec {.width = 2u, .signed_value = true, .big_endian = true};
+        }
+        if (name == "uint32be") {
+            return IntegerReaderSpec {.width = 4u, .signed_value = false, .big_endian = true};
+        }
+        if (name == "int32be") {
+            return IntegerReaderSpec {.width = 4u, .signed_value = true, .big_endian = true};
+        }
+        return std::nullopt;
+    }
 
     [[nodiscard]] std::string value_type_name(const rule_engine::ValueType type) {
         switch (type) {
@@ -163,15 +204,11 @@ namespace {
     [[nodiscard]] std::string ascii_lower_copy(const std::string_view value) {
         std::string out;
         out.reserve(value.size());
-        for (const auto c : value) {
-            out.push_back(ascii_lower(c));
-        }
+        for (const auto c : value) { out.push_back(ascii_lower(c)); }
         return out;
     }
 
-    [[nodiscard]] bool string_contains(const std::string &lhs,
-                                       const std::string &rhs,
-                                       const bool case_insensitive) {
+    [[nodiscard]] bool string_contains(const std::string &lhs, const std::string &rhs, const bool case_insensitive) {
         if (!case_insensitive) {
             return lhs.find(rhs) != std::string::npos;
         }
@@ -180,9 +217,7 @@ namespace {
         return folded_lhs.find(folded_rhs) != std::string::npos;
     }
 
-    [[nodiscard]] bool string_starts_with(const std::string &lhs,
-                                          const std::string &rhs,
-                                          const bool case_insensitive) {
+    [[nodiscard]] bool string_starts_with(const std::string &lhs, const std::string &rhs, const bool case_insensitive) {
         if (!case_insensitive) {
             return lhs.starts_with(rhs);
         }
@@ -191,9 +226,7 @@ namespace {
         return folded_lhs.starts_with(folded_rhs);
     }
 
-    [[nodiscard]] bool string_ends_with(const std::string &lhs,
-                                        const std::string &rhs,
-                                        const bool case_insensitive) {
+    [[nodiscard]] bool string_ends_with(const std::string &lhs, const std::string &rhs, const bool case_insensitive) {
         if (!case_insensitive) {
             return lhs.ends_with(rhs);
         }
@@ -232,8 +265,7 @@ namespace {
         return out;
     }
 
-    [[nodiscard]] std::optional<std::int64_t> checked_divide(const std::int64_t lhs,
-                                                             const std::int64_t rhs) noexcept {
+    [[nodiscard]] std::optional<std::int64_t> checked_divide(const std::int64_t lhs, const std::int64_t rhs) noexcept {
         if (rhs == 0) {
             return std::nullopt;
         }
@@ -243,8 +275,7 @@ namespace {
         return lhs / rhs;
     }
 
-    [[nodiscard]] std::optional<std::int64_t> checked_modulo(const std::int64_t lhs,
-                                                             const std::int64_t rhs) noexcept {
+    [[nodiscard]] std::optional<std::int64_t> checked_modulo(const std::int64_t lhs, const std::int64_t rhs) noexcept {
         if (rhs == 0) {
             return std::nullopt;
         }
@@ -298,6 +329,15 @@ namespace {
         return key;
     }
 
+    [[nodiscard]] std::string cache_index_key(const std::string_view subject_id, const std::string_view fact_key) {
+        std::string out;
+        out.reserve(subject_id.size() + fact_key.size() + 1u);
+        out.append(subject_id);
+        out.push_back('\0');
+        out.append(fact_key);
+        return out;
+    }
+
     struct EvalContext {
         const rule_engine::VerifiedProgram &program;
         const rule_engine::Subject &subject;
@@ -307,15 +347,14 @@ namespace {
         std::vector<LocalBinding> locals;
         std::vector<std::string> current_patterns;
         std::vector<rule_engine::ExpressionTraceEvent> *expression_traces {};
+        rule_engine::EvaluationInstrumentation *instrumentation {};
         std::string current_rule_identifier;
         std::optional<std::size_t> current_rule_index;
     };
 
-    [[nodiscard]] std::optional<rule_engine::RequiredFact>
-    find_required_fact(const rule_engine::VerifiedRule &rule, const std::string_view key) {
-        const auto found = std::ranges::find_if(rule.facts, [&](const auto &fact) {
-            return fact.key == key;
-        });
+    [[nodiscard]] std::optional<rule_engine::RequiredFact> find_required_fact(const rule_engine::VerifiedRule &rule,
+                                                                              const std::string_view key) {
+        const auto found = std::ranges::find_if(rule.facts, [&](const auto &fact) { return fact.key == key; });
         if (found == rule.facts.end()) {
             return std::nullopt;
         }
@@ -334,8 +373,7 @@ namespace {
         return fact->type;
     }
 
-    [[nodiscard]] std::optional<EvalValue> cached_fact_type_mismatch(const EvalContext &ctx,
-                                                                     const std::string_view key,
+    [[nodiscard]] std::optional<EvalValue> cached_fact_type_mismatch(const EvalContext &ctx, const std::string_view key,
                                                                      const rule_engine::Value &value) {
         const auto expected_type = expected_type_for_key(ctx, key);
         if (!expected_type.has_value()) {
@@ -363,8 +401,8 @@ namespace {
     [[nodiscard]] std::optional<std::size_t> rule_index_by_name(const rule_engine::VerifiedProgram &program,
                                                                 const std::string_view name) {
         const auto found = std::ranges::find_if(program.rules, [&](const auto &rule) {
-            const auto rule_key = rule.qualified_identifier.empty() ? std::string_view {rule.identifier}
-                                                                    : std::string_view {rule.qualified_identifier};
+            const auto rule_key = rule.qualified_identifier.empty() ? std::string_view {rule.identifier} :
+                                                                      std::string_view {rule.qualified_identifier};
             return rule_key == name;
         });
         if (found == program.rules.end()) {
@@ -451,9 +489,7 @@ namespace {
         return out;
     }
 
-    void insert_expression_trace(EvalContext &ctx,
-                                 const std::size_t index,
-                                 const rule_engine::Expression &expr,
+    void insert_expression_trace(EvalContext &ctx, const std::size_t index, const rule_engine::Expression &expr,
                                  const EvalValue &value) {
         if (ctx.expression_traces == nullptr) {
             return;
@@ -579,7 +615,8 @@ namespace {
             if (expr.children.size() != 1u) {
                 return undefined_result();
             }
-            return value_result(rule_engine::Value::integer(static_cast<std::int64_t>(~static_cast<std::uint64_t>(*left))));
+            return value_result(
+                rule_engine::Value::integer(static_cast<std::int64_t>(~static_cast<std::uint64_t>(*left))));
         }
 
         if (expr.children.size() != 2u) {
@@ -701,8 +738,7 @@ namespace {
         return value_result(rule_engine::Value::integer(*value));
     }
 
-    [[nodiscard]] EvalValue eval_pattern_fact_match(const std::string &name,
-                                                    EvalContext &ctx,
+    [[nodiscard]] EvalValue eval_pattern_fact_match(const std::string &name, EvalContext &ctx,
                                                     const std::optional<std::int64_t> at_offset = std::nullopt,
                                                     const std::optional<std::int64_t> range_lower = std::nullopt,
                                                     const std::optional<std::int64_t> range_upper = std::nullopt) {
@@ -968,9 +1004,7 @@ namespace {
     [[nodiscard]] IterableEval iterable_values(std::vector<rule_engine::Value> values) {
         IterableEval out;
         out.items.reserve(values.size());
-        for (auto &value : values) {
-            out.items.push_back(IterableItem {.bindings = {std::move(value)}});
-        }
+        for (auto &value : values) { out.items.push_back(IterableItem {.bindings = {std::move(value)}}); }
         return out;
     }
 
@@ -987,8 +1021,7 @@ namespace {
         return out;
     }
 
-    [[nodiscard]] IterableEval eval_iterable(const rule_engine::Expression &expr,
-                                             EvalContext &ctx,
+    [[nodiscard]] IterableEval eval_iterable(const rule_engine::Expression &expr, EvalContext &ctx,
                                              const std::size_t binding_count) {
         using enum rule_engine::ExpressionKind;
         if (binding_count == 0u || binding_count > 2u) {
@@ -1065,10 +1098,11 @@ namespace {
                         continue;
                     }
                     items.push_back(IterableItem {
-                        .bindings = {
-                            rule_engine::Value::integer(static_cast<std::int64_t>(index)),
-                            array->values[index],
-                        },
+                        .bindings =
+                            {
+                                rule_engine::Value::integer(static_cast<std::int64_t>(index)),
+                                array->values[index],
+                            },
                     });
                 }
                 return iterable_items(std::move(items));
@@ -1083,10 +1117,11 @@ namespace {
                         continue;
                     }
                     items.push_back(IterableItem {
-                        .bindings = {
-                            rule_engine::Value::string(entry.key),
-                            entry.value,
-                        },
+                        .bindings =
+                            {
+                                rule_engine::Value::string(entry.key),
+                                entry.value,
+                            },
                     });
                 }
                 return iterable_items(std::move(items));
@@ -1201,7 +1236,8 @@ namespace {
             if (key == nullptr) {
                 return undefined_result();
             }
-            const auto found = std::ranges::find_if(object->entries, [&](const auto &entry) { return entry.key == *key; });
+            const auto found =
+                std::ranges::find_if(object->entries, [&](const auto &entry) { return entry.key == *key; });
             if (found == object->entries.end()) {
                 return undefined_result();
             }
@@ -1209,6 +1245,94 @@ namespace {
         }
 
         return undefined_result();
+    }
+
+    [[nodiscard]] std::optional<std::int64_t> read_integer_value(const rule_engine::Value::Bytes &bytes,
+                                                                 const std::int64_t offset,
+                                                                 const IntegerReaderSpec spec) noexcept {
+        if (offset < 0) {
+            return std::nullopt;
+        }
+
+        const auto start = static_cast<std::size_t>(offset);
+        if (start > bytes.size() || spec.width > bytes.size() - start) {
+            return std::nullopt;
+        }
+
+        std::uint64_t raw {};
+        for (std::size_t index = 0u; index < spec.width; ++index) {
+            const auto byte_offset = spec.big_endian ? index : spec.width - index - 1u;
+            raw <<= 8u;
+            raw |= static_cast<std::uint64_t>(std::to_integer<unsigned int>(bytes[start + byte_offset]));
+        }
+
+        if (!spec.signed_value) {
+            return static_cast<std::int64_t>(raw);
+        }
+
+        const auto bit_count = spec.width * 8u;
+        const auto sign_bit = std::uint64_t {1} << (bit_count - 1u);
+        if ((raw & sign_bit) == 0u) {
+            return static_cast<std::int64_t>(raw);
+        }
+
+        const auto range = std::uint64_t {1} << bit_count;
+        return static_cast<std::int64_t>(raw) - static_cast<std::int64_t>(range);
+    }
+
+    [[nodiscard]] EvalValue eval_integer_reader(const rule_engine::Expression &expr, EvalContext &ctx) {
+        if (expr.children.size() != 1u) {
+            return undefined_result();
+        }
+
+        const auto spec = integer_reader_spec(expr.text);
+        if (!spec.has_value()) {
+            return diagnostic_result("unsupported integer reader " + expr.text);
+        }
+
+        auto offset = eval_expr(expr.children[0], ctx);
+        if (offset.status != EvalStatus::value) {
+            return offset;
+        }
+        const auto offset_value = offset.value.as_i64();
+        if (!offset_value.has_value()) {
+            return undefined_result();
+        }
+
+        const auto key = expr.bound_key_prefix.empty() ? std::string {process_image_bytes_key} : expr.bound_key_prefix;
+        const auto fact = ctx.facts.lookup(ctx.subject.id, key);
+        if (!fact.has_value()) {
+            return missing_result(rule_engine::RequiredFact {
+                .key = key,
+                .route = expr.bound_route.empty() ? std::string {scan_pattern_route} : expr.bound_route,
+                .ttl = expr.bound_ttl,
+                .timeout = expr.bound_timeout,
+                .retry_policy = expr.bound_retry_policy,
+                .retry_budget = expr.bound_retry_budget,
+                .cancellation_diagnostic = expr.bound_cancellation_diagnostic,
+                .cheap_prefetch = expr.bound_cheap_prefetch,
+                .type = rule_engine::ValueType::bytes,
+                .scan_plan = std::nullopt,
+                .cost_class = expr.bound_cost_class,
+            });
+        }
+        if (fact->status != rule_engine::FactStatus::available) {
+            return diagnostic_result(fact->diagnostic.empty() ? key + " unavailable" : fact->diagnostic);
+        }
+        if (const auto mismatch = cached_fact_type_mismatch(ctx, key, fact->value); mismatch.has_value()) {
+            return *mismatch;
+        }
+
+        const auto *bytes = fact->value.as_bytes();
+        if (bytes == nullptr) {
+            return diagnostic_result("cached fact " + key + " has wrong type; expected bytes");
+        }
+
+        const auto value = read_integer_value(*bytes, *offset_value, *spec);
+        if (!value.has_value()) {
+            return undefined_result();
+        }
+        return value_result(rule_engine::Value::integer(*value));
     }
 
     void attach_required_fact_for_missing(const rule_engine::VerifiedRule &rule, EvalValue &eval) {
@@ -1296,8 +1420,8 @@ namespace {
             arguments.push_back(std::move(value.value));
         }
 
-        const auto key = rule_engine::provider_function_key(expr.bound_key_prefix.empty() ? expr.text : expr.bound_key_prefix,
-                                                            arguments);
+        const auto key = rule_engine::provider_function_key(
+            expr.bound_key_prefix.empty() ? expr.text : expr.bound_key_prefix, arguments);
         const auto fact = ctx.facts.lookup(ctx.subject.id, key);
         if (!fact.has_value()) {
             return missing_result(rule_engine::RequiredFact {
@@ -1305,15 +1429,20 @@ namespace {
                 .route = expr.bound_route,
                 .ttl = expr.bound_ttl,
                 .timeout = expr.bound_timeout,
+                .retry_policy = expr.bound_retry_policy,
+                .retry_budget = expr.bound_retry_budget,
+                .cancellation_diagnostic = expr.bound_cancellation_diagnostic,
                 .cheap_prefetch = expr.bound_cheap_prefetch,
                 .type = expr.bound_return_type,
                 .scan_plan = std::nullopt,
+                .cost_class = expr.bound_cost_class,
             });
         }
         if (fact->status != rule_engine::FactStatus::available) {
             return diagnostic_result(fact->diagnostic.empty() ? key + " unavailable" : fact->diagnostic);
         }
-        if (const auto mismatch = type_mismatch_result(key, fact->value, expr.bound_return_type); mismatch.has_value()) {
+        if (const auto mismatch = type_mismatch_result(key, fact->value, expr.bound_return_type);
+            mismatch.has_value()) {
             return *mismatch;
         }
         return value_result(fact->value);
@@ -1332,15 +1461,13 @@ namespace {
             case subtract:
             case multiply:
             case divide:
-            case modulo:
-                return eval_arithmetic(expr, ctx);
+            case modulo: return eval_arithmetic(expr, ctx);
             case bitwise_not:
             case shift_left:
             case shift_right:
             case bitwise_and:
             case bitwise_or:
-            case bitwise_xor:
-                return eval_bitwise(expr, ctx);
+            case bitwise_xor: return eval_bitwise(expr, ctx);
             case field: {
                 std::string key;
                 for (const auto &name : expr.names) {
@@ -1401,24 +1528,17 @@ namespace {
             }
             case pattern_count:
             case pattern_offset:
-            case pattern_length:
-                return eval_pattern_metadata(expr, ctx);
-            case of_expr:
-                return eval_of_expr(expr, ctx);
-            case for_of_expr:
-                return eval_for_of_expr(expr, ctx);
-            case with_expr:
-                return eval_with_expr(expr, ctx);
-            case for_in_expr:
-                return eval_for_in_expr(expr, ctx);
+            case pattern_length: return eval_pattern_metadata(expr, ctx);
+            case of_expr: return eval_of_expr(expr, ctx);
+            case for_of_expr: return eval_for_of_expr(expr, ctx);
+            case with_expr: return eval_with_expr(expr, ctx);
+            case for_in_expr: return eval_for_in_expr(expr, ctx);
             case range_expr:
             case tuple_expr:
-            case iterable_expr:
-                return undefined_result();
-            case lookup_expr:
-                return eval_lookup_expr(expr, ctx);
-            case function_call:
-                return eval_function_call(expr, ctx);
+            case iterable_expr: return undefined_result();
+            case lookup_expr: return eval_lookup_expr(expr, ctx);
+            case integer_reader: return eval_integer_reader(expr, ctx);
+            case function_call: return eval_function_call(expr, ctx);
             case and_expr: {
                 for (const auto &child : expr.children) {
                     auto value = eval_expr(child, ctx);
@@ -1554,12 +1674,14 @@ namespace {
                 return eval_rule_reference(*index, ctx);
             }
             case unsupported:
-            default:
-                return bool_result(false);
+            default: return bool_result(false);
         }
     }
 
     [[nodiscard]] EvalValue eval_expr(const rule_engine::Expression &expr, EvalContext &ctx) {
+        if (ctx.instrumentation != nullptr) {
+            ++ctx.instrumentation->expression_evaluations;
+        }
         const auto trace_index = ctx.expression_traces == nullptr ? 0u : ctx.expression_traces->size();
         auto result = eval_expr_impl(expr, ctx);
         insert_expression_trace(ctx, trace_index, expr, result);
@@ -1573,6 +1695,9 @@ namespace {
             batch.route = fact.route;
             batch.keys = {fact.key};
             batch.types = {fact.type};
+            batch.retry_policies = {fact.retry_policy};
+            batch.retry_budgets = {fact.retry_budget};
+            batch.cancellation_diagnostics = {fact.cancellation_diagnostic};
             if (fact.scan_plan.has_value()) {
                 batch.scan_plans.push_back(*fact.scan_plan);
             }
@@ -1583,12 +1708,26 @@ namespace {
         if (found->timeout < fact.timeout) {
             found->timeout = fact.timeout;
         }
-        if (!std::ranges::contains(found->keys, fact.key)) {
+        const auto key_index = std::ranges::find(found->keys, fact.key);
+        if (key_index == found->keys.end()) {
             found->keys.push_back(fact.key);
             found->types.push_back(fact.type);
+            found->retry_policies.push_back(fact.retry_policy);
+            found->retry_budgets.push_back(fact.retry_budget);
+            found->cancellation_diagnostics.push_back(fact.cancellation_diagnostic);
+        } else {
+            const auto index = static_cast<std::size_t>(std::distance(found->keys.begin(), key_index));
+            if (index < found->retry_budgets.size()) {
+                found->retry_budgets[index] = std::max(found->retry_budgets[index], fact.retry_budget);
+            }
+            if (index < found->retry_policies.size() && found->retry_policies[index] == rule_engine::ProviderRetryPolicy::none) {
+                found->retry_policies[index] = fact.retry_policy;
+            }
+            if (index < found->cancellation_diagnostics.size() && found->cancellation_diagnostics[index].empty()) {
+                found->cancellation_diagnostics[index] = fact.cancellation_diagnostic;
+            }
         }
-        if (fact.scan_plan.has_value() &&
-            !std::ranges::any_of(found->scan_plans, [&](const auto &existing) {
+        if (fact.scan_plan.has_value() && !std::ranges::any_of(found->scan_plans, [&](const auto &existing) {
                 return existing.pattern_key == fact.scan_plan->pattern_key;
             })) {
             found->scan_plans.push_back(*fact.scan_plan);
@@ -1596,10 +1735,8 @@ namespace {
     }
 
     void add_missing_requests_for_rule(std::vector<rule_engine::FactRequestBatch> &requests,
-                                       const rule_engine::VerifiedRule &rule,
-                                       const rule_engine::Subject &subject,
-                                       const rule_engine::FactCache &facts,
-                                       const bool cheap_only) {
+                                       const rule_engine::VerifiedRule &rule, const rule_engine::Subject &subject,
+                                       const rule_engine::FactCache &facts, const bool cheap_only) {
         for (const auto &fact : rule.facts) {
             if (cheap_only && !fact.cheap_prefetch) {
                 continue;
@@ -1627,6 +1764,20 @@ namespace {
         }
         result.matched = eval.status == EvalStatus::value && eval.value.as_bool().value_or(false);
         return result;
+    }
+
+    [[nodiscard]] std::string rule_identifier(const rule_engine::VerifiedRule &rule) {
+        return rule.qualified_identifier.empty() ? rule.identifier : rule.qualified_identifier;
+    }
+
+    [[nodiscard]] bool rule_enabled(const rule_engine::VerifiedRule &rule,
+                                    const rule_engine::EvaluationOptions &options) {
+        if (options.enabled_rule_identifiers == nullptr) {
+            return true;
+        }
+        const auto identifier = rule_identifier(rule);
+        return std::ranges::find(*options.enabled_rule_identifiers, identifier) !=
+               options.enabled_rule_identifiers->end();
     }
 } // namespace
 
@@ -1683,24 +1834,26 @@ namespace rule_engine {
     }
 
     void FactCache::store(Fact fact) {
-        const auto found = std::ranges::find_if(facts_, [&](const auto &existing) {
-            return existing.subject_id == fact.subject_id && existing.key == fact.key;
-        });
-        if (found == facts_.end()) {
+        const auto index_key = cache_index_key(fact.subject_id, fact.key);
+        const auto found = fact_index_.find(index_key);
+        if (found == fact_index_.end()) {
+            fact_index_.emplace(index_key, facts_.size());
             facts_.push_back(std::move(fact));
             return;
         }
-        *found = std::move(fact);
+        facts_[found->second] = std::move(fact);
     }
 
     std::optional<Fact> FactCache::lookup(const std::string_view subject_id, const std::string_view key) const {
-        const auto found = std::ranges::find_if(facts_, [&](const auto &fact) {
-            return fact.subject_id == subject_id && fact.key == key;
-        });
-        if (found == facts_.end()) {
+        ++stats_.lookups;
+        ++stats_.lookup_probes;
+        const auto found = fact_index_.find(cache_index_key(subject_id, key));
+        if (found == fact_index_.end()) {
+            ++stats_.misses;
             return std::nullopt;
         }
-        return *found;
+        ++stats_.hits;
+        return facts_[found->second];
     }
 
     std::vector<Fact> FactCache::snapshot_for_subject(const std::string_view subject_id) const {
@@ -1715,7 +1868,13 @@ namespace rule_engine {
 
     void FactCache::expire_volatile() {
         std::erase_if(facts_, [](const auto &fact) { return fact.ttl.count() == 0; });
+        fact_index_.clear();
+        for (std::size_t index = 0; index < facts_.size(); ++index) {
+            fact_index_.emplace(cache_index_key(facts_[index].subject_id, facts_[index].key), index);
+        }
     }
+
+    FactCacheStats FactCache::stats() const noexcept { return stats_; }
 
     EvaluationStep Evaluator::step(const Subject &subject) const {
         EvaluationStep out;
@@ -1730,6 +1889,7 @@ namespace rule_engine {
             .locals = {},
             .current_patterns = {},
             .expression_traces = options_.trace_expressions ? &out.expression_traces : nullptr,
+            .instrumentation = options_.instrumentation,
             .current_rule_identifier = {},
             .current_rule_index = std::nullopt,
         };
@@ -1766,11 +1926,11 @@ namespace rule_engine {
 
         if (!globals_satisfied) {
             for (const auto &rule : program_.rules) {
-                if (rule.is_global || rule.is_private) {
+                if (rule.is_global || rule.is_private || !rule_enabled(rule, options_)) {
                     continue;
                 }
                 RuleResult result;
-                result.identifier = rule.qualified_identifier.empty() ? rule.identifier : rule.qualified_identifier;
+                result.identifier = rule_identifier(rule);
                 result.matched = false;
                 out.rule_results.push_back(std::move(result));
             }
@@ -1779,7 +1939,7 @@ namespace rule_engine {
         }
 
         for (const auto &rule : program_.rules) {
-            if (!rule.is_global && !rule.is_private) {
+            if (!rule.is_global && !rule.is_private && rule_enabled(rule, options_)) {
                 add_missing_requests_for_rule(out.requests, rule, subject, facts_, true);
             }
         }
@@ -1791,7 +1951,7 @@ namespace rule_engine {
 
         for (std::size_t index = 0; index < program_.rules.size(); ++index) {
             const auto &rule = program_.rules[index];
-            if (rule.is_global || rule.is_private) {
+            if (rule.is_global || rule.is_private || !rule_enabled(rule, options_)) {
                 continue;
             }
 

@@ -2,19 +2,66 @@
 #include <rule_engine/custom_fact_fixture.hpp>
 #include <rule_engine/windows/process_provider.hpp>
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <Windows.h>
+
 #include <fmt/format.h>
 
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <stop_token>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 namespace {
+    std::atomic<std::stop_source *> active_stop_source {};
+
+    BOOL WINAPI console_control_handler(const DWORD control_type) {
+        switch (control_type) {
+            case CTRL_C_EVENT:
+            case CTRL_BREAK_EVENT:
+            case CTRL_CLOSE_EVENT:
+            case CTRL_SHUTDOWN_EVENT:
+                if (auto *source = active_stop_source.load(std::memory_order_acquire); source != nullptr) {
+                    source->request_stop();
+                    return TRUE;
+                }
+                return FALSE;
+            default: return FALSE;
+        }
+    }
+
+    struct ConsoleStopRegistration {
+        std::stop_source source;
+        bool installed {};
+
+        ConsoleStopRegistration() {
+            active_stop_source.store(&source, std::memory_order_release);
+            installed = SetConsoleCtrlHandler(console_control_handler, TRUE) != FALSE;
+        }
+
+        ~ConsoleStopRegistration() noexcept {
+            if (installed) {
+                SetConsoleCtrlHandler(console_control_handler, FALSE);
+            }
+            active_stop_source.store(nullptr, std::memory_order_release);
+        }
+
+        ConsoleStopRegistration(const ConsoleStopRegistration &) = delete;
+        ConsoleStopRegistration &operator=(const ConsoleStopRegistration &) = delete;
+    };
+
     [[nodiscard]] bool parse_port(const std::string_view text, std::uint16_t &out) noexcept {
         std::uint32_t value {};
         const auto *first = text.data();
@@ -39,6 +86,13 @@ namespace {
         return true;
     }
 
+    [[nodiscard]] bool parse_positive_size(const std::string_view text, std::size_t &out) noexcept {
+        if (!parse_session_count(text, out)) {
+            return false;
+        }
+        return out != 0u;
+    }
+
     [[nodiscard]] bool parse_milliseconds(const std::string_view text, std::chrono::milliseconds &out) noexcept {
         std::uint32_t value {};
         const auto *first = text.data();
@@ -58,7 +112,7 @@ namespace {
     void print_usage() {
         fmt::print("usage: rule_engine_client [--port <port>] [--pattern-fixture <file>] "
                    "[--custom-fact-fixture <file>] [--io-timeout-ms <ms>] "
-                   "[--max-sessions <n>|--serve] [--enumerate]\n");
+                   "[--max-sessions <n>|--serve] [--session-workers <n>] [--enumerate]\n");
     }
 
     void print_errors(const rule_engine::ErrorSet &errors) {
@@ -73,6 +127,7 @@ int main(int argc, char **argv) {
     std::uint16_t port {31337};
     std::chrono::milliseconds io_timeout {5000};
     std::size_t max_sessions {1};
+    std::size_t max_session_workers {1};
     std::filesystem::path pattern_fixture_path;
     std::filesystem::path custom_fact_fixture_path;
     for (int index = 1; index < argc; ++index) {
@@ -106,6 +161,12 @@ int main(int argc, char **argv) {
         if (arg == "--serve") {
             max_sessions = 0u;
             continue;
+        }
+        if (arg == "--session-workers" && index + 1 < argc) {
+            ++index;
+            if (parse_positive_size(argv[index], max_session_workers)) {
+                continue;
+            }
         }
         if (arg == "--pattern-fixture" && index + 1 < argc) {
             ++index;
@@ -150,6 +211,7 @@ int main(int argc, char **argv) {
         };
     }
 
+    ConsoleStopRegistration stop_registration;
     auto result = rule_engine::client_protocol::serve_client(
         rule_engine::client_protocol::ClientListenOptions {
             .bind_address = "127.0.0.1",
@@ -159,6 +221,8 @@ int main(int argc, char **argv) {
             .extra_capabilities = std::move(extra_capabilities),
             .extra_fact_handler = std::move(extra_handler),
             .max_sessions = max_sessions,
+            .max_session_workers = max_session_workers,
+            .stop_token = stop_registration.source.get_token(),
         },
         [](const std::uint16_t actual_port) {
             fmt::print("rule_engine_client v1 listening on 127.0.0.1:{}\n", actual_port);

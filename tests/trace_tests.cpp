@@ -34,6 +34,19 @@ namespace {
         out.insert(out.end(), value.begin(), value.end());
     }
 
+    [[nodiscard]] bool artifact_contains(const std::vector<std::byte> &artifact, const std::string_view needle) {
+        const auto *data = reinterpret_cast<const char *>(artifact.data());
+        const std::string_view haystack {data, artifact.size()};
+        return haystack.find(needle) != std::string_view::npos;
+    }
+
+    [[nodiscard]] std::uint32_t little_u32_at(const std::vector<std::byte> &artifact, const std::size_t offset) {
+        return static_cast<std::uint32_t>(artifact[offset]) |
+               (static_cast<std::uint32_t>(artifact[offset + 1u]) << 8u) |
+               (static_cast<std::uint32_t>(artifact[offset + 2u]) << 16u) |
+               (static_cast<std::uint32_t>(artifact[offset + 3u]) << 24u);
+    }
+
     [[nodiscard]] std::vector<std::byte> empty_trace_fact_payload() {
         std::vector<std::byte> out;
         out.push_back(static_cast<std::byte>('R'));
@@ -100,6 +113,8 @@ rule traced_rule {
     REQUIRE(encoded.has_value());
     REQUIRE(encoded->size() > 8u);
     CHECK(std::string_view {reinterpret_cast<const char *>(encoded->data()), 4u} == "RETR");
+    CHECK(little_u32_at(*encoded, 4u) == 3u);
+    CHECK(artifact_contains(*encoded, "rule-engine-evaluation-trace.v1"));
 
     const auto decoded = rule_engine::decode_evaluation_trace(*encoded);
     REQUIRE(decoded.has_value());
@@ -115,6 +130,21 @@ rule traced_rule {
     REQUIRE(replayed->rule_results.size() == trace.final_step.rule_results.size());
     CHECK(replayed->rule_results[0].identifier == trace.final_step.rule_results[0].identifier);
     CHECK(replayed->rule_results[0].matched == trace.final_step.rule_results[0].matched);
+}
+
+TEST_CASE("trace decoder rejects schema drift before replaying facts") {
+    std::vector<std::byte> artifact;
+    artifact.push_back(static_cast<std::byte>('R'));
+    artifact.push_back(static_cast<std::byte>('E'));
+    artifact.push_back(static_cast<std::byte>('T'));
+    artifact.push_back(static_cast<std::byte>('R'));
+    append_u32(artifact, 3u);
+    append_string(artifact, "rule-engine-evaluation-trace.drift");
+
+    const auto decoded = rule_engine::decode_evaluation_trace(artifact);
+    REQUIRE_FALSE(decoded.has_value());
+    REQUIRE_FALSE(decoded.error().diagnostics.empty());
+    CHECK(decoded.error().diagnostics[0].message.find("unsupported trace artifact schema") != std::string::npos);
 }
 
 TEST_CASE("evaluation traces replay custom module function facts") {
@@ -194,7 +224,8 @@ TEST_CASE("trace decoder rejects oversized counts before reading entries") {
     artifact.push_back(static_cast<std::byte>('E'));
     artifact.push_back(static_cast<std::byte>('T'));
     artifact.push_back(static_cast<std::byte>('R'));
-    append_u32(artifact, 2u);
+    append_u32(artifact, 3u);
+    append_string(artifact, "rule-engine-evaluation-trace.v1");
     append_string(artifact, "process");
     append_string(artifact, "pid:1");
     append_bytes(artifact, empty_trace_fact_payload());

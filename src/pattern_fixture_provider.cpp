@@ -5,8 +5,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <fstream>
 #include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -19,11 +19,8 @@ namespace {
     using namespace std::chrono_literals;
     constexpr std::size_t pattern_context_bytes = 8u;
 
-    [[nodiscard]] rule_engine::Fact make_fact(std::string subject_id,
-                                              std::string key,
-                                              rule_engine::Value value,
-                                              const rule_engine::FactStatus status,
-                                              std::string diagnostic = {}) {
+    [[nodiscard]] rule_engine::Fact make_fact(std::string subject_id, std::string key, rule_engine::Value value,
+                                              const rule_engine::FactStatus status, std::string diagnostic = {}) {
         return rule_engine::Fact {
             .subject_id = std::move(subject_id),
             .key = std::move(key),
@@ -36,10 +33,7 @@ namespace {
 
     [[nodiscard]] rule_engine::Fact unavailable_fact(const rule_engine::protocol::FactKey &key,
                                                      std::string diagnostic) {
-        return make_fact(key.subject_id,
-                         key.key,
-                         rule_engine::Value::undefined(),
-                         rule_engine::FactStatus::unavailable,
+        return make_fact(key.subject_id, key.key, rule_engine::Value::undefined(), rule_engine::FactStatus::unavailable,
                          std::move(diagnostic));
     }
 
@@ -49,7 +43,8 @@ namespace {
         pattern.matches.push_back(rule_engine::PatternMatchContext {
             .offset = 4096u,
             .length = 6u,
-            .bytes = {std::byte {'n'}, std::byte {'e'}, std::byte {'e'}, std::byte {'d'}, std::byte {'l'}, std::byte {'e'}},
+            .bytes = {std::byte {'n'}, std::byte {'e'}, std::byte {'e'}, std::byte {'d'}, std::byte {'l'},
+                      std::byte {'e'}},
             .before = {std::byte {0x90}, std::byte {0x90}},
             .after = {std::byte {0xcc}},
             .scan_space = "fixture.process.memory",
@@ -96,17 +91,14 @@ namespace {
 
         std::vector<std::byte> out;
         char ch {};
-        while (file.get(ch)) {
-            out.push_back(static_cast<std::byte>(static_cast<unsigned char>(ch)));
-        }
+        while (file.get(ch)) { out.push_back(static_cast<std::byte>(static_cast<unsigned char>(ch))); }
         if (!file.eof()) {
             return std::nullopt;
         }
         return out;
     }
 
-    template <typename T>
-    [[nodiscard]] bool parse_integer(const std::string_view text, T &out) noexcept {
+    template<typename T> [[nodiscard]] bool parse_integer(const std::string_view text, T &out) noexcept {
         const auto *first = text.data();
         const auto *last = first + text.size();
         const auto [ptr, ec] = std::from_chars(first, last, out);
@@ -123,35 +115,32 @@ namespace {
         return std::nullopt;
     }
 
-    [[nodiscard]] std::vector<std::byte> byte_slice(const std::vector<std::byte> &bytes,
-                                                    const std::size_t offset,
+    [[nodiscard]] std::vector<std::byte> byte_slice(const std::vector<std::byte> &bytes, const std::size_t offset,
                                                     const std::size_t length) {
         if (offset >= bytes.size()) {
             return {};
         }
-        const auto end = (std::min)(bytes.size(), offset + length);
+        const auto end = (std::min) (bytes.size(), offset + length);
         return std::vector<std::byte> {bytes.begin() + static_cast<std::ptrdiff_t>(offset),
                                        bytes.begin() + static_cast<std::ptrdiff_t>(end)};
     }
 
     [[nodiscard]] rule_engine::PatternValue scan_literal_pattern(const std::vector<std::byte> &haystack,
                                                                  const std::vector<std::byte> &needle,
-                                                                 std::string scan_space,
-                                                                 std::string permissions) {
+                                                                 std::string scan_space, std::string permissions) {
         rule_engine::PatternValue pattern;
         if (needle.empty() || haystack.size() < needle.size()) {
             return pattern;
         }
 
         for (std::size_t offset = 0u; offset <= haystack.size() - needle.size(); ++offset) {
-            const auto matches = std::equal(needle.begin(),
-                                            needle.end(),
-                                            haystack.begin() + static_cast<std::ptrdiff_t>(offset));
+            const auto matches =
+                std::equal(needle.begin(), needle.end(), haystack.begin() + static_cast<std::ptrdiff_t>(offset));
             if (!matches) {
                 continue;
             }
 
-            const auto before_size = (std::min)(offset, pattern_context_bytes);
+            const auto before_size = (std::min) (offset, pattern_context_bytes);
             const auto before_offset = offset - before_size;
             const auto after_offset = offset + needle.size();
             pattern.matches.push_back(rule_engine::PatternMatchContext {
@@ -169,12 +158,10 @@ namespace {
         return pattern;
     }
 
-    void append_pattern_fixture(rule_engine::patterns::PatternFixtureSet &set,
-                                std::string pattern_key,
+    void append_pattern_fixture(rule_engine::patterns::PatternFixtureSet &set, std::string pattern_key,
                                 rule_engine::PatternValue value) {
-        const auto found = std::ranges::find_if(set.patterns, [&](const auto &fixture) {
-            return fixture.pattern_key == pattern_key;
-        });
+        const auto found =
+            std::ranges::find_if(set.patterns, [&](const auto &fixture) { return fixture.pattern_key == pattern_key; });
         if (found == set.patterns.end()) {
             set.patterns.push_back(rule_engine::patterns::PatternFixture {
                 .pattern_key = std::move(pattern_key),
@@ -184,16 +171,12 @@ namespace {
         }
 
         found->value.matched = found->value.matched || value.matched;
-        found->value.matches.insert(found->value.matches.end(),
-                                    std::make_move_iterator(value.matches.begin()),
+        found->value.matches.insert(found->value.matches.end(), std::make_move_iterator(value.matches.begin()),
                                     std::make_move_iterator(value.matches.end()));
     }
 
-    void append_scan_space(rule_engine::patterns::PatternFixtureSet &set,
-                           std::string subject_id,
-                           std::string scan_space,
-                           std::string permissions,
-                           std::vector<std::byte> bytes) {
+    void append_scan_space(rule_engine::patterns::PatternFixtureSet &set, std::string subject_id,
+                           std::string scan_space, std::string permissions, std::vector<std::byte> bytes) {
         set.scan_spaces.push_back(rule_engine::patterns::PatternScanSpace {
             .subject_id = std::move(subject_id),
             .scan_space = std::move(scan_space),
@@ -203,11 +186,9 @@ namespace {
     }
 
     [[nodiscard]] const rule_engine::PatternScanPlan *
-    find_scan_plan(const std::span<const rule_engine::PatternScanPlan> scan_plans,
-                   const std::string_view pattern_key) {
-        const auto found = std::ranges::find_if(scan_plans, [&](const auto &plan) {
-            return plan.pattern_key == pattern_key;
-        });
+    find_scan_plan(const std::span<const rule_engine::PatternScanPlan> scan_plans, const std::string_view pattern_key) {
+        const auto found =
+            std::ranges::find_if(scan_plans, [&](const auto &plan) { return plan.pattern_key == pattern_key; });
         if (found == scan_plans.end()) {
             return nullptr;
         }
@@ -216,8 +197,7 @@ namespace {
 
     [[nodiscard]] rule_engine::PatternValue
     scan_fixture_spaces(const rule_engine::patterns::PatternFixtureSet &fixtures,
-                        const rule_engine::PatternScanPlan &scan_plan,
-                        const std::string_view subject_id) {
+                        const rule_engine::PatternScanPlan &scan_plan, const std::string_view subject_id) {
         rule_engine::PatternValue out;
         for (const auto &space : fixtures.scan_spaces) {
             if (!space.subject_id.empty() && space.subject_id != subject_id) {
@@ -225,11 +205,28 @@ namespace {
             }
             auto scanned = scan_literal_pattern(space.bytes, scan_plan.literal, space.scan_space, space.permissions);
             out.matched = out.matched || scanned.matched;
-            out.matches.insert(out.matches.end(),
-                               std::make_move_iterator(scanned.matches.begin()),
+            out.matches.insert(out.matches.end(), std::make_move_iterator(scanned.matches.begin()),
                                std::make_move_iterator(scanned.matches.end()));
         }
         return out;
+    }
+
+    [[nodiscard]] const rule_engine::patterns::PatternScanSpace *
+    find_scan_space(const rule_engine::patterns::PatternFixtureSet &fixtures, const std::string_view subject_id,
+                    const std::string_view scan_space) {
+        const rule_engine::patterns::PatternScanSpace *fallback {};
+        for (const auto &space : fixtures.scan_spaces) {
+            if (space.scan_space != scan_space) {
+                continue;
+            }
+            if (space.subject_id == subject_id) {
+                return std::addressof(space);
+            }
+            if (space.subject_id.empty() && fallback == nullptr) {
+                fallback = std::addressof(space);
+            }
+        }
+        return fallback;
     }
 
     [[nodiscard]] bool is_pattern_metadata_key(const std::string_view key) noexcept {
@@ -244,12 +241,13 @@ namespace {
 namespace rule_engine::patterns {
     PatternFixtureSet default_pattern_fixtures() {
         return PatternFixtureSet {
-            .patterns = {
-                PatternFixture {
-                    .pattern_key = "$needle",
-                    .value = fixture_pattern(),
+            .patterns =
+                {
+                    PatternFixture {
+                        .pattern_key = "$needle",
+                        .value = fixture_pattern(),
+                    },
                 },
-            },
             .scan_spaces = {},
             .scan_process_image_sections = false,
             .scan_readable_memory_regions = false,
@@ -283,25 +281,21 @@ namespace rule_engine::patterns {
                 std::string haystack_text;
                 std::string needle_text;
                 if (!(stream >> pattern_key >> scan_space >> permissions >> haystack_text >> needle_text)) {
-                    return std::unexpected(single_error(path.string(),
-                                                        "invalid pattern scan line " + std::to_string(line_number)));
+                    return std::unexpected(
+                        single_error(path.string(), "invalid pattern scan line " + std::to_string(line_number)));
                 }
 
                 auto haystack = parse_hex_bytes(haystack_text);
                 auto needle = parse_hex_bytes(needle_text);
                 if (pattern_key.empty() || !pattern_key.starts_with('$') || !haystack.has_value() ||
                     !needle.has_value() || needle->empty()) {
-                    return std::unexpected(single_error(path.string(),
-                                                        "invalid pattern scan value on line " +
-                                                            std::to_string(line_number)));
+                    return std::unexpected(single_error(path.string(), "invalid pattern scan value on line " +
+                                                                           std::to_string(line_number)));
                 }
 
-                append_pattern_fixture(out,
-                                       std::move(pattern_key),
-                                       scan_literal_pattern(*haystack,
-                                                            *needle,
-                                                            std::move(scan_space),
-                                                            std::move(permissions)));
+                append_pattern_fixture(
+                    out, std::move(pattern_key),
+                    scan_literal_pattern(*haystack, *needle, std::move(scan_space), std::move(permissions)));
                 continue;
             }
 
@@ -312,9 +306,8 @@ namespace rule_engine::patterns {
                 std::string file_path_text;
                 std::string needle_text;
                 if (!(stream >> pattern_key >> scan_space >> permissions >> file_path_text >> needle_text)) {
-                    return std::unexpected(single_error(path.string(),
-                                                        "invalid pattern scan_file line " +
-                                                            std::to_string(line_number)));
+                    return std::unexpected(
+                        single_error(path.string(), "invalid pattern scan_file line " + std::to_string(line_number)));
                 }
 
                 auto file_path = std::filesystem::path {file_path_text};
@@ -325,17 +318,13 @@ namespace rule_engine::patterns {
                 auto needle = parse_hex_bytes(needle_text);
                 if (pattern_key.empty() || !pattern_key.starts_with('$') || !haystack.has_value() ||
                     !needle.has_value() || needle->empty()) {
-                    return std::unexpected(single_error(path.string(),
-                                                        "invalid pattern scan_file value on line " +
-                                                            std::to_string(line_number)));
+                    return std::unexpected(single_error(path.string(), "invalid pattern scan_file value on line " +
+                                                                           std::to_string(line_number)));
                 }
 
-                append_pattern_fixture(out,
-                                       std::move(pattern_key),
-                                       scan_literal_pattern(*haystack,
-                                                            *needle,
-                                                            std::move(scan_space),
-                                                            std::move(permissions)));
+                append_pattern_fixture(
+                    out, std::move(pattern_key),
+                    scan_literal_pattern(*haystack, *needle, std::move(scan_space), std::move(permissions)));
                 continue;
             }
 
@@ -344,9 +333,8 @@ namespace rule_engine::patterns {
                 std::string permissions;
                 std::string file_path_text;
                 if (!(stream >> scan_space >> permissions >> file_path_text)) {
-                    return std::unexpected(single_error(path.string(),
-                                                        "invalid pattern scan_file_space line " +
-                                                            std::to_string(line_number)));
+                    return std::unexpected(single_error(path.string(), "invalid pattern scan_file_space line " +
+                                                                           std::to_string(line_number)));
                 }
 
                 auto file_path = std::filesystem::path {file_path_text};
@@ -355,9 +343,8 @@ namespace rule_engine::patterns {
                 }
                 auto bytes = read_binary_file(file_path);
                 if (scan_space.empty() || !bytes.has_value()) {
-                    return std::unexpected(single_error(path.string(),
-                                                        "invalid pattern scan_file_space value on line " +
-                                                            std::to_string(line_number)));
+                    return std::unexpected(single_error(
+                        path.string(), "invalid pattern scan_file_space value on line " + std::to_string(line_number)));
                 }
                 append_scan_space(out, {}, std::move(scan_space), std::move(permissions), std::move(*bytes));
                 continue;
@@ -377,9 +364,9 @@ namespace rule_engine::patterns {
                     std::size_t size {};
                     if (!(stream >> size_text) || !parse_integer(base_text, base) || !parse_integer(size_text, size) ||
                         size == 0u) {
-                        return std::unexpected(single_error(path.string(),
-                                                            "invalid pattern scan_readable_memory_regions value on line " +
-                                                                std::to_string(line_number)));
+                        return std::unexpected(
+                            single_error(path.string(), "invalid pattern scan_readable_memory_regions value on line " +
+                                                            std::to_string(line_number)));
                     }
                     out.readable_memory_scopes.push_back(ReadableMemoryScanScope {
                         .base = base,
@@ -397,10 +384,9 @@ namespace rule_engine::patterns {
             std::string permissions;
             std::string bytes_text;
             pattern_key = std::move(directive_or_pattern);
-            if (!(stream >> matched_text >> offset_text >> length_text >> scan_space >> permissions >>
-                  bytes_text)) {
-                return std::unexpected(single_error(path.string(),
-                                                    "invalid pattern fixture line " + std::to_string(line_number)));
+            if (!(stream >> matched_text >> offset_text >> length_text >> scan_space >> permissions >> bytes_text)) {
+                return std::unexpected(
+                    single_error(path.string(), "invalid pattern fixture line " + std::to_string(line_number)));
             }
 
             const auto matched = parse_bool(matched_text);
@@ -409,9 +395,8 @@ namespace rule_engine::patterns {
             auto bytes = parse_hex_bytes(bytes_text);
             if (pattern_key.empty() || !pattern_key.starts_with('$') || !matched.has_value() ||
                 !parse_integer(offset_text, offset) || !parse_integer(length_text, length) || !bytes.has_value()) {
-                return std::unexpected(single_error(path.string(),
-                                                    "invalid pattern fixture value on line " +
-                                                        std::to_string(line_number)));
+                return std::unexpected(single_error(path.string(), "invalid pattern fixture value on line " +
+                                                                       std::to_string(line_number)));
             }
 
             PatternValue pattern;
@@ -439,10 +424,15 @@ namespace rule_engine::patterns {
         std::vector<Fact> out;
         out.reserve(keys.size());
         for (const auto &key : keys) {
+            if (const auto *scan_space = find_scan_space(fixtures, key.subject_id, key.key); scan_space != nullptr) {
+                out.push_back(
+                    make_fact(key.subject_id, key.key, Value::bytes(scan_space->bytes), FactStatus::available));
+                continue;
+            }
+
             const auto pattern_key = key.key.substr(0, key.key.find('.'));
-            const auto found = std::ranges::find_if(fixtures.patterns, [&](const auto &fixture) {
-                return fixture.pattern_key == pattern_key;
-            });
+            const auto found = std::ranges::find_if(
+                fixtures.patterns, [&](const auto &fixture) { return fixture.pattern_key == pattern_key; });
             std::optional<PatternValue> derived_pattern;
             if (found == fixtures.patterns.end()) {
                 if (const auto *scan_plan = find_scan_plan(scan_plans, pattern_key); scan_plan != nullptr) {
@@ -450,26 +440,21 @@ namespace rule_engine::patterns {
                 }
             }
             if (is_pattern_match_key(key.key)) {
-                const auto matched = found != fixtures.patterns.end() ? found->value.matched
-                                                                      : derived_pattern.has_value() &&
-                                                                            derived_pattern->matched;
+                const auto matched = found != fixtures.patterns.end() ?
+                                         found->value.matched :
+                                         derived_pattern.has_value() && derived_pattern->matched;
                 out.push_back(make_fact(key.subject_id, key.key, Value::boolean(matched), FactStatus::available));
                 continue;
             }
             if (is_pattern_metadata_key(key.key)) {
                 if (found == fixtures.patterns.end()) {
                     if (derived_pattern.has_value()) {
-                        out.push_back(make_fact(key.subject_id,
-                                                key.key,
-                                                Value::pattern(std::move(*derived_pattern)),
+                        out.push_back(make_fact(key.subject_id, key.key, Value::pattern(std::move(*derived_pattern)),
                                                 FactStatus::available));
                         continue;
                     }
-                    out.push_back(make_fact(key.subject_id,
-                                            key.key,
-                                            Value::pattern(PatternValue {}),
-                                            FactStatus::available,
-                                            "pattern fixture not found"));
+                    out.push_back(make_fact(key.subject_id, key.key, Value::pattern(PatternValue {}),
+                                            FactStatus::available, "pattern fixture not found"));
                     continue;
                 }
                 out.push_back(make_fact(key.subject_id, key.key, Value::pattern(found->value), FactStatus::available));

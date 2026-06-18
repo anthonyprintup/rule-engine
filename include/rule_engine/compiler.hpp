@@ -36,9 +36,13 @@ namespace rule_engine {
         std::string route;
         std::chrono::seconds ttl {};
         std::chrono::seconds timeout {5};
+        ProviderRetryPolicy retry_policy {ProviderRetryPolicy::none};
+        std::uint8_t retry_budget {};
+        std::string cancellation_diagnostic {};
         bool cheap_prefetch {};
         ValueType type {ValueType::undefined};
         std::optional<PatternScanPlan> scan_plan;
+        FactCostClass cost_class {FactCostClass::custom};
     };
 
     struct VerifiedRule {

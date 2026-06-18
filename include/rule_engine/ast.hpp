@@ -58,6 +58,7 @@ namespace rule_engine {
         literal_float,
         identifier,
         function_call,
+        integer_reader,
         global,
         defined,
         unsupported,
@@ -74,8 +75,12 @@ namespace rule_engine {
         std::string bound_route;
         std::chrono::seconds bound_ttl {};
         std::chrono::seconds bound_timeout {5};
+        ProviderRetryPolicy bound_retry_policy {ProviderRetryPolicy::none};
+        std::uint8_t bound_retry_budget {};
+        std::string bound_cancellation_diagnostic {};
         bool bound_cheap_prefetch {};
         ValueType bound_return_type {ValueType::undefined};
+        FactCostClass bound_cost_class {FactCostClass::custom};
         SourceSpan span {};
     };
 

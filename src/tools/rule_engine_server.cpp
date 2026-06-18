@@ -108,13 +108,16 @@ namespace {
         fmt::print(stderr,
                    "usage: rule_engine_server [--host <host>] [--port <port>] [-I <dir>] [--rule <rule.yar>] "
                    "[--module-config <file>] [--all-subjects] [--subject-concurrency <n>] "
-                   "[--io-timeout-ms <ms>] [--json]\n");
+                   "[--vm-backpressure-subject-threshold <n>] "
+                   "[--provider-backpressure-request-threshold <n>] [--io-timeout-ms <ms>] [--json]\n");
     }
 } // namespace
 
 int main(int argc, char **argv) {
     std::uint16_t port {31337};
     std::size_t subject_concurrency {1};
+    std::size_t vm_backpressure_subject_threshold {};
+    std::size_t provider_backpressure_request_threshold {};
     std::chrono::milliseconds io_timeout {5000};
     std::string host {"127.0.0.1"};
     rule_engine::ParseOptions parse_options;
@@ -142,6 +145,18 @@ int main(int argc, char **argv) {
         if (arg == "--subject-concurrency" && index + 1 < argc) {
             ++index;
             if (parse_size(argv[index], subject_concurrency)) {
+                continue;
+            }
+        }
+        if (arg == "--vm-backpressure-subject-threshold" && index + 1 < argc) {
+            ++index;
+            if (parse_size(argv[index], vm_backpressure_subject_threshold)) {
+                continue;
+            }
+        }
+        if (arg == "--provider-backpressure-request-threshold" && index + 1 < argc) {
+            ++index;
+            if (parse_size(argv[index], provider_backpressure_request_threshold)) {
                 continue;
             }
         }
@@ -219,6 +234,7 @@ int main(int argc, char **argv) {
                                    .id = subject_id,
                                },
                            };
+        rule_engine::client_protocol::ClientEvaluationInstrumentation instrumentation;
         auto evaluation = rule_engine::client_protocol::evaluate_subjects_with_client(
             rule_engine::client_protocol::ClientConnectionOptions {
                 .host = host,
@@ -229,6 +245,9 @@ int main(int argc, char **argv) {
             requested_subjects,
             rule_engine::client_protocol::ClientEvaluationOptions {
                 .max_subject_concurrency = subject_concurrency,
+                .vm_backpressure_subject_threshold = vm_backpressure_subject_threshold,
+                .provider_backpressure_request_threshold = provider_backpressure_request_threshold,
+                .instrumentation = &instrumentation,
             });
         if (!evaluation) {
             print_errors(evaluation.error());
@@ -236,7 +255,10 @@ int main(int argc, char **argv) {
         }
 
         if (json_output) {
-            fmt::print("{}\n", rule_engine::server_output::evaluation_session_json(host, port, *evaluation));
+            fmt::print("{}\n", rule_engine::server_output::evaluation_session_json(host,
+                                                                                   port,
+                                                                                   *evaluation,
+                                                                                   &instrumentation));
             return 0;
         }
 
@@ -247,6 +269,18 @@ int main(int argc, char **argv) {
                    evaluation->handshake.version,
                    evaluation->subjects.subjects.size(),
                    evaluation->evaluations.size());
+        fmt::print("instrumentation provider_rounds={} provider_requests={} peak_vm_subjects={} peak_provider_requests={} "
+                   "vm_backpressure_events={} provider_backpressure_events={} static_cache_hits={} "
+                   "static_cache_invalidations={} static_cache_provider_fact_keys_avoided={}\n",
+                   instrumentation.provider_rounds,
+                   instrumentation.provider_requests,
+                   instrumentation.peak_pending_vm_subjects,
+                   instrumentation.peak_pending_provider_requests,
+                   instrumentation.vm_backpressure_events,
+                   instrumentation.provider_backpressure_events,
+                   instrumentation.static_fact_cache_hits,
+                   instrumentation.static_fact_cache_invalidations,
+                   instrumentation.static_fact_cache_provider_fact_keys_avoided);
         for (const auto &subject_evaluation : evaluation->evaluations) {
             fmt::print("subject {}\n", subject_evaluation.subject.id);
             for (const auto &result : subject_evaluation.final_step.rule_results) {

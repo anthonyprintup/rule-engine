@@ -64,6 +64,12 @@ TEST_CASE("server client model exposes rule_engine_client executable") {
     CHECK(file_exists(client_path));
 }
 
+TEST_CASE("benchmark model exposes rule_engine_benchmark executable") {
+    const auto benchmark_path = sibling_executable_path(L"rule_engine_benchmark.exe");
+    REQUIRE_FALSE(benchmark_path.empty());
+    CHECK(file_exists(benchmark_path));
+}
+
 TEST_CASE("Windows abort probe exits without opening an interactive CRT dialog") {
     const auto probe_path = sibling_executable_path(L"rule_engine_abort_probe.exe");
     REQUIRE_FALSE(probe_path.empty());

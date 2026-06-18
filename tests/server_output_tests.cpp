@@ -72,6 +72,57 @@ TEST_CASE("server JSON output serializes evaluation sessions") {
     CHECK(contains(json, R"("message":"bad\nfact")"));
 }
 
+TEST_CASE("server JSON output serializes evaluation instrumentation") {
+    rule_engine::client_protocol::ClientMultiEvaluationSession session;
+    session.handshake.protocol = "rule-engine-client";
+    session.handshake.version = 1u;
+    session.subjects.subjects = {
+        rule_engine::Subject {.kind = "process", .id = "pid:1"},
+    };
+
+    rule_engine::client_protocol::ClientEvaluationInstrumentation instrumentation {
+        .peak_pending_vm_subjects = 4u,
+        .vm_backpressure_events = 2u,
+        .peak_pending_provider_requests = 3u,
+        .provider_backpressure_events = 1u,
+        .provider_rounds = 5u,
+        .provider_requests = 7u,
+        .provider_fact_keys_requested = 11u,
+        .provider_facts_returned = 9u,
+        .provider_elapsed_us = 1234u,
+        .static_fact_cache_lookups = 6u,
+        .static_fact_cache_hits = 4u,
+        .static_fact_cache_misses = 2u,
+        .static_fact_cache_reuses = 4u,
+        .static_fact_cache_invalidations = 1u,
+        .static_fact_cache_subject_scoped = 3u,
+        .static_fact_cache_provider_fact_keys_avoided = 5u,
+    };
+
+    const auto json = rule_engine::server_output::evaluation_session_json("127.0.0.1",
+                                                                          31337u,
+                                                                          session,
+                                                                          &instrumentation);
+
+    CHECK(contains(json, R"("instrumentation":{)"));
+    CHECK(contains(json, R"("peakPendingVmSubjects":4)"));
+    CHECK(contains(json, R"("vmBackpressureEvents":2)"));
+    CHECK(contains(json, R"("peakPendingProviderRequests":3)"));
+    CHECK(contains(json, R"("providerBackpressureEvents":1)"));
+    CHECK(contains(json, R"("providerRounds":5)"));
+    CHECK(contains(json, R"("providerRequests":7)"));
+    CHECK(contains(json, R"("providerFactKeysRequested":11)"));
+    CHECK(contains(json, R"("providerFactsReturned":9)"));
+    CHECK(contains(json, R"("providerElapsedUs":1234)"));
+    CHECK(contains(json, R"("staticFactCacheLookups":6)"));
+    CHECK(contains(json, R"("staticFactCacheHits":4)"));
+    CHECK(contains(json, R"("staticFactCacheMisses":2)"));
+    CHECK(contains(json, R"("staticFactCacheReuses":4)"));
+    CHECK(contains(json, R"("staticFactCacheInvalidations":1)"));
+    CHECK(contains(json, R"("staticFactCacheSubjectScoped":3)"));
+    CHECK(contains(json, R"("staticFactCacheProviderFactKeysAvoided":5)"));
+}
+
 TEST_CASE("server JSON output serializes client smoke facts with typed values") {
     rule_engine::client_protocol::ClientSession session;
     session.handshake.protocol = "rule-engine-client";

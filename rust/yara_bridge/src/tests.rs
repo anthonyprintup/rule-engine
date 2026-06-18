@@ -408,6 +408,34 @@ rule function_call {
 }
 
 #[test]
+fn parses_builtin_reader_calls_into_expression_nodes() {
+    let parsed = OwnedParse::parse(
+        br#"
+rule builtin_reader {
+    condition:
+        uint32(0) == 0x5A4D
+}
+"#,
+    );
+
+    let rule = re_yara_bridge_rule_at(parsed.result.rules, 0);
+    let condition = re_yara_bridge_rule_condition(parsed.result.rules, rule);
+    let equal = re_yara_bridge_node_view(parsed.result.rules, condition);
+    assert_eq!(equal.kind, ReNodeKind::Equal);
+
+    let call = re_yara_bridge_node_child_at(parsed.result.rules, condition, 0);
+    let call_view = re_yara_bridge_node_view(parsed.result.rules, call);
+    assert_eq!(call_view.kind, ReNodeKind::FunctionCall);
+    assert_eq!(view_to_str(call_view.text), "uint32");
+    assert_eq!(call_view.names_len, 1);
+    assert_eq!(
+        view_to_str(re_yara_bridge_node_name_at(parsed.result.rules, call, 0)),
+        "uint32"
+    );
+    assert_eq!(call_view.children_len, 1);
+}
+
+#[test]
 fn reports_invalid_yara_rule_as_error_payload() {
     let parsed = OwnedParse::parse(b"rule bad { condition: and }");
 

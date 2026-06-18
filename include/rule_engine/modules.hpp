@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <optional>
 #include <span>
 #include <string>
@@ -20,13 +21,37 @@ namespace rule_engine {
         undefined,
     };
 
+    enum struct FactCostClass {
+        inventory,
+        cheap_process_snapshot,
+        static_image_header,
+        process_array,
+        broad_image_array,
+        handle_signer,
+        memory_region,
+        pattern_scan,
+        custom,
+    };
+
+    enum struct ProviderRetryPolicy {
+        none,
+        timed_out,
+    };
+
+    [[nodiscard]] std::string_view fact_cost_class_name(FactCostClass cost_class) noexcept;
+    [[nodiscard]] std::string_view provider_retry_policy_name(ProviderRetryPolicy retry_policy) noexcept;
+
     struct FieldDescriptor {
         std::string key;
         ValueType type {ValueType::undefined};
         std::string route;
         std::chrono::seconds ttl {};
         std::chrono::seconds timeout {5};
+        ProviderRetryPolicy retry_policy {ProviderRetryPolicy::none};
+        std::uint8_t retry_budget {};
+        std::string cancellation_diagnostic {};
         bool cheap_prefetch {};
+        FactCostClass cost_class {FactCostClass::custom};
     };
 
     struct FunctionDescriptor {
@@ -37,7 +62,11 @@ namespace rule_engine {
         std::string route;
         std::chrono::seconds ttl {};
         std::chrono::seconds timeout {5};
+        ProviderRetryPolicy retry_policy {ProviderRetryPolicy::none};
+        std::uint8_t retry_budget {};
+        std::string cancellation_diagnostic {};
         bool cheap_prefetch {};
+        FactCostClass cost_class {FactCostClass::custom};
     };
 
     struct ModuleDescriptor {
@@ -53,7 +82,11 @@ namespace rule_engine {
         std::string route;
         std::chrono::seconds ttl {};
         std::chrono::seconds timeout {5};
+        ProviderRetryPolicy retry_policy {ProviderRetryPolicy::none};
+        std::uint8_t retry_budget {};
+        std::string cancellation_diagnostic {};
         bool cheap_prefetch {};
+        FactCostClass cost_class {FactCostClass::custom};
     };
 
     struct ModuleRegistry {

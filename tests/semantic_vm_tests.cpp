@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <utility>
 #include <vector>
@@ -39,13 +40,18 @@ rule bad_field {
 }
 
 TEST_CASE("rule corpus examples match documented support status") {
-    auto supported = rule_engine::parse_file(fixture_path("examples/rule_corpus/supported_process_pe.yar"));
-    REQUIRE(supported.has_value());
-    auto supported_verified = rule_engine::verify(*supported, rule_engine::default_module_registry());
-    REQUIRE(supported_verified.has_value());
+    constexpr std::array supported {
+        "examples/rule_corpus/supported_process_pe.yar",
+        "examples/rule_corpus/supported_builtin_reader.yar",
+    };
+    for (const auto *path : supported) {
+        auto parsed = rule_engine::parse_file(fixture_path(path));
+        REQUIRE(parsed.has_value());
+        auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+        REQUIRE(verified.has_value());
+    }
 
     constexpr std::array unsupported {
-        "examples/rule_corpus/unsupported_builtin_reader.yar",
         "examples/rule_corpus/unsupported_unknown_field.yar",
     };
     for (const auto *path : unsupported) {
@@ -167,17 +173,18 @@ rule suspicious_score {
     registry.modules.push_back(rule_engine::ModuleDescriptor {
         .name = "demo",
         .fields = {},
-        .functions = {
-            rule_engine::FunctionDescriptor {
-                .name = "score",
-                .parameters = {rule_engine::ValueType::integer, rule_engine::ValueType::string},
-                .return_type = rule_engine::ValueType::integer,
-                .key_prefix = "demo.score",
-                .route = "endpoint.demo.functions",
-                .ttl = std::chrono::seconds {30},
-                .cheap_prefetch = false,
+        .functions =
+            {
+                rule_engine::FunctionDescriptor {
+                    .name = "score",
+                    .parameters = {rule_engine::ValueType::integer, rule_engine::ValueType::string},
+                    .return_type = rule_engine::ValueType::integer,
+                    .key_prefix = "demo.score",
+                    .route = "endpoint.demo.functions",
+                    .ttl = std::chrono::seconds {30},
+                    .cheap_prefetch = false,
+                },
             },
-        },
     });
 
     auto parsed = rule_engine::parse_source("functions.yar", source);
@@ -247,17 +254,18 @@ rule static_score_then_scan {
     registry.modules.push_back(rule_engine::ModuleDescriptor {
         .name = "demo",
         .fields = {},
-        .functions = {
-            rule_engine::FunctionDescriptor {
-                .name = "score",
-                .parameters = {rule_engine::ValueType::integer, rule_engine::ValueType::string},
-                .return_type = rule_engine::ValueType::integer,
-                .key_prefix = "demo.score",
-                .route = "endpoint.demo.functions",
-                .ttl = std::chrono::seconds {30},
-                .cheap_prefetch = true,
+        .functions =
+            {
+                rule_engine::FunctionDescriptor {
+                    .name = "score",
+                    .parameters = {rule_engine::ValueType::integer, rule_engine::ValueType::string},
+                    .return_type = rule_engine::ValueType::integer,
+                    .key_prefix = "demo.score",
+                    .route = "endpoint.demo.functions",
+                    .ttl = std::chrono::seconds {30},
+                    .cheap_prefetch = true,
+                },
             },
-        },
     });
 
     auto parsed = rule_engine::parse_source("static_score_then_scan.yar", source);
@@ -266,9 +274,8 @@ rule static_score_then_scan {
     REQUIRE(verified.has_value());
     REQUIRE(verified->rules.size() == 1u);
 
-    const auto function_fact = std::ranges::find_if(verified->rules[0].facts, [](const auto &fact) {
-        return fact.key == "demo.score(i:42,s:616c706861)";
-    });
+    const auto function_fact = std::ranges::find_if(
+        verified->rules[0].facts, [](const auto &fact) { return fact.key == "demo.score(i:42,s:616c706861)"; });
     REQUIRE(function_fact != verified->rules[0].facts.end());
     CHECK(function_fact->route == "endpoint.demo.functions");
     CHECK(function_fact->cheap_prefetch);
@@ -312,28 +319,36 @@ rule descriptor_timeouts {
     auto registry = rule_engine::default_module_registry();
     registry.modules.push_back(rule_engine::ModuleDescriptor {
         .name = "demo",
-        .fields = {
-            rule_engine::FieldDescriptor {
-                .key = "demo.weight",
-                .type = rule_engine::ValueType::integer,
-                .route = "endpoint.demo.fields",
-                .ttl = std::chrono::seconds {30},
-                .timeout = std::chrono::seconds {19},
-                .cheap_prefetch = true,
+        .fields =
+            {
+                rule_engine::FieldDescriptor {
+                    .key = "demo.weight",
+                    .type = rule_engine::ValueType::integer,
+                    .route = "endpoint.demo.fields",
+                    .ttl = std::chrono::seconds {30},
+                    .timeout = std::chrono::seconds {19},
+                    .retry_policy = rule_engine::ProviderRetryPolicy::timed_out,
+                    .retry_budget = 2u,
+                    .cancellation_diagnostic = "demo weight cancelled",
+                    .cheap_prefetch = true,
+                },
             },
-        },
-        .functions = {
-            rule_engine::FunctionDescriptor {
-                .name = "score",
-                .parameters = {rule_engine::ValueType::integer, rule_engine::ValueType::string},
-                .return_type = rule_engine::ValueType::integer,
-                .key_prefix = "demo.score",
-                .route = "endpoint.demo.functions",
-                .ttl = std::chrono::seconds {30},
-                .timeout = std::chrono::seconds {13},
-                .cheap_prefetch = true,
+        .functions =
+            {
+                rule_engine::FunctionDescriptor {
+                    .name = "score",
+                    .parameters = {rule_engine::ValueType::integer, rule_engine::ValueType::string},
+                    .return_type = rule_engine::ValueType::integer,
+                    .key_prefix = "demo.score",
+                    .route = "endpoint.demo.functions",
+                    .ttl = std::chrono::seconds {30},
+                    .timeout = std::chrono::seconds {13},
+                    .retry_policy = rule_engine::ProviderRetryPolicy::timed_out,
+                    .retry_budget = 1u,
+                    .cancellation_diagnostic = "demo score cancelled",
+                    .cheap_prefetch = true,
+                },
             },
-        },
     });
     registry.globals.push_back(rule_engine::GlobalDescriptor {
         .name = "fast_flag",
@@ -342,6 +357,9 @@ rule descriptor_timeouts {
         .route = "endpoint.globals",
         .ttl = std::chrono::seconds {30},
         .timeout = std::chrono::seconds {3},
+        .retry_policy = rule_engine::ProviderRetryPolicy::none,
+        .retry_budget = 0u,
+        .cancellation_diagnostic = "fast flag cancelled",
         .cheap_prefetch = true,
     });
     registry.globals.push_back(rule_engine::GlobalDescriptor {
@@ -351,6 +369,9 @@ rule descriptor_timeouts {
         .route = "endpoint.globals",
         .ttl = std::chrono::seconds {30},
         .timeout = std::chrono::seconds {17},
+        .retry_policy = rule_engine::ProviderRetryPolicy::timed_out,
+        .retry_budget = 3u,
+        .cancellation_diagnostic = "slow flag cancelled",
         .cheap_prefetch = true,
     });
 
@@ -365,31 +386,46 @@ rule descriptor_timeouts {
     REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
     REQUIRE(first.requests.size() == 3u);
 
-    const auto fields = std::ranges::find_if(first.requests, [](const auto &request) {
-        return request.route == "endpoint.demo.fields";
-    });
+    const auto fields = std::ranges::find_if(
+        first.requests, [](const auto &request) { return request.route == "endpoint.demo.fields"; });
     REQUIRE(fields != first.requests.end());
     CHECK(fields->timeout == std::chrono::seconds {19});
     CHECK(fields->keys == std::vector<std::string> {"demo.weight"});
+    CHECK(fields->retry_policies == std::vector<rule_engine::ProviderRetryPolicy> {
+                                        rule_engine::ProviderRetryPolicy::timed_out,
+                                    });
+    CHECK(fields->retry_budgets == std::vector<std::uint8_t> {2u});
+    CHECK(fields->cancellation_diagnostics == std::vector<std::string> {"demo weight cancelled"});
 
-    const auto globals = std::ranges::find_if(first.requests, [](const auto &request) {
-        return request.route == "endpoint.globals";
-    });
+    const auto globals =
+        std::ranges::find_if(first.requests, [](const auto &request) { return request.route == "endpoint.globals"; });
     REQUIRE(globals != first.requests.end());
     CHECK(globals->timeout == std::chrono::seconds {17});
     CHECK(globals->keys == std::vector<std::string> {"global.fast_flag", "global.slow_flag"});
+    CHECK(globals->retry_policies == std::vector<rule_engine::ProviderRetryPolicy> {
+                                         rule_engine::ProviderRetryPolicy::none,
+                                         rule_engine::ProviderRetryPolicy::timed_out,
+                                     });
+    CHECK(globals->retry_budgets == std::vector<std::uint8_t> {0u, 3u});
+    CHECK(globals->cancellation_diagnostics ==
+          std::vector<std::string> {"fast flag cancelled", "slow flag cancelled"});
 
-    const auto functions = std::ranges::find_if(first.requests, [](const auto &request) {
-        return request.route == "endpoint.demo.functions";
-    });
+    const auto functions = std::ranges::find_if(
+        first.requests, [](const auto &request) { return request.route == "endpoint.demo.functions"; });
     REQUIRE(functions != first.requests.end());
     CHECK(functions->timeout == std::chrono::seconds {13});
     CHECK(functions->keys == std::vector<std::string> {"demo.score(i:42,s:616c706861)"});
+    CHECK(functions->retry_policies == std::vector<rule_engine::ProviderRetryPolicy> {
+                                           rule_engine::ProviderRetryPolicy::timed_out,
+                                       });
+    CHECK(functions->retry_budgets == std::vector<std::uint8_t> {1u});
+    CHECK(functions->cancellation_diagnostics == std::vector<std::string> {"demo score cancelled"});
 }
 
 TEST_CASE("module config file registers custom module functions for verification") {
     auto registry = rule_engine::default_module_registry();
-    auto loaded = rule_engine::load_module_config_file(fixture_path("tests/fixtures/custom_binding/demo.module"), registry);
+    auto loaded =
+        rule_engine::load_module_config_file(fixture_path("tests/fixtures/custom_binding/demo.module"), registry);
     REQUIRE(loaded.has_value());
 
     auto parsed = rule_engine::parse_file(fixture_path("tests/fixtures/custom_binding/demo_rule.yar"));
@@ -402,8 +438,35 @@ TEST_CASE("module config file registers custom module functions for verification
     CHECK(verified->rules[0].condition.children[0].bound_route == "endpoint.demo.functions");
     CHECK(verified->rules[0].condition.children[0].bound_key_prefix == "demo.score");
     CHECK(verified->rules[0].condition.children[0].bound_timeout == std::chrono::seconds {12});
-    CHECK(rule_engine::required_provider_routes(*verified) ==
-          std::vector<std::string> {"endpoint.demo.functions"});
+    CHECK(rule_engine::required_provider_routes(*verified) == std::vector<std::string> {"endpoint.demo.functions"});
+}
+
+TEST_CASE("module config file registers provider retry and cancellation metadata") {
+    auto registry = rule_engine::default_module_registry();
+    auto loaded =
+        rule_engine::load_module_config_file(fixture_path("tests/fixtures/custom_binding/retry_policy.module"), registry);
+    REQUIRE(loaded.has_value());
+
+    const auto *field = registry.find_field("retrydemo.value");
+    REQUIRE(field != nullptr);
+    CHECK(field->timeout == std::chrono::seconds {9});
+    CHECK(field->retry_policy == rule_engine::ProviderRetryPolicy::timed_out);
+    CHECK(field->retry_budget == 2u);
+    CHECK(field->cancellation_diagnostic == "retrydemo_value_cancelled");
+
+    const auto *function = registry.find_function("retrydemo.score");
+    REQUIRE(function != nullptr);
+    CHECK(function->timeout == std::chrono::seconds {7});
+    CHECK(function->retry_policy == rule_engine::ProviderRetryPolicy::timed_out);
+    CHECK(function->retry_budget == 1u);
+    CHECK(function->cancellation_diagnostic == "retrydemo_score_cancelled");
+
+    const auto *global = registry.find_global("retry_flag");
+    REQUIRE(global != nullptr);
+    CHECK(global->timeout == std::chrono::seconds {6});
+    CHECK(global->retry_policy == rule_engine::ProviderRetryPolicy::timed_out);
+    CHECK(global->retry_budget == 3u);
+    CHECK(global->cancellation_diagnostic == "retry_flag_cancelled");
 }
 
 TEST_CASE("provider function keys encode every value shape with stable v1 tokens") {
@@ -440,9 +503,8 @@ TEST_CASE("provider function keys encode every value shape with stable v1 tokens
     CHECK(rule_engine::provider_argument_key(rule_engine::Value::integer(-42)) == "i:-42");
     CHECK(rule_engine::provider_argument_key(rule_engine::Value::number(1.5)) == "f:3ff8000000000000");
     CHECK(rule_engine::provider_argument_key(rule_engine::Value::string("a,b)\\")) == "s:612c62295c");
-    CHECK(rule_engine::provider_argument_key(
-              rule_engine::Value::bytes(std::vector<std::byte> {std::byte {0x00}, std::byte {0x41}, std::byte {0xff}})) ==
-          "x:0041ff");
+    CHECK(rule_engine::provider_argument_key(rule_engine::Value::bytes(
+              std::vector<std::byte> {std::byte {0x00}, std::byte {0x41}, std::byte {0xff}})) == "x:0041ff");
     CHECK(rule_engine::provider_argument_key(array) == "a:3[i:7,s:78,u]");
     CHECK(rule_engine::provider_argument_key(object) == "o:2{s:6b=b:false,s:77656972642c6b6579=x:2a}");
     CHECK(rule_engine::provider_argument_key(rule_engine::Value::pattern(std::move(pattern))) ==
@@ -472,17 +534,18 @@ rule bad_function_argument {
     registry.modules.push_back(rule_engine::ModuleDescriptor {
         .name = "demo",
         .fields = {},
-        .functions = {
-            rule_engine::FunctionDescriptor {
-                .name = "score",
-                .parameters = {rule_engine::ValueType::integer, rule_engine::ValueType::string},
-                .return_type = rule_engine::ValueType::integer,
-                .key_prefix = "demo.score",
-                .route = "endpoint.demo.functions",
-                .ttl = std::chrono::seconds {30},
-                .cheap_prefetch = false,
+        .functions =
+            {
+                rule_engine::FunctionDescriptor {
+                    .name = "score",
+                    .parameters = {rule_engine::ValueType::integer, rule_engine::ValueType::string},
+                    .return_type = rule_engine::ValueType::integer,
+                    .key_prefix = "demo.score",
+                    .route = "endpoint.demo.functions",
+                    .ttl = std::chrono::seconds {30},
+                    .cheap_prefetch = false,
+                },
             },
-        },
     });
 
     auto parsed = rule_engine::parse_source("bad_function_argument.yar", source);
@@ -491,8 +554,47 @@ rule bad_function_argument {
     auto verified = rule_engine::verify(*parsed, registry);
     REQUIRE_FALSE(verified.has_value());
     REQUIRE_FALSE(verified.error().diagnostics.empty());
-    CHECK(verified.error().diagnostics[0].message.find("function demo.score argument 1 expects integer but got string") !=
-          std::string::npos);
+    CHECK(verified.error().diagnostics[0].message.find(
+              "function demo.score argument 1 expects integer but got string") != std::string::npos);
+}
+
+TEST_CASE("semantic verification infers with-local alias types for function arguments") {
+    constexpr auto source = R"(
+import "process"
+import "demo"
+
+rule bad_local_alias_argument {
+    condition:
+        with pid_alias = process.pid : (demo.score(pid_alias, "alpha") > 7)
+}
+)";
+
+    auto registry = rule_engine::default_module_registry();
+    registry.modules.push_back(rule_engine::ModuleDescriptor {
+        .name = "demo",
+        .fields = {},
+        .functions =
+            {
+                rule_engine::FunctionDescriptor {
+                    .name = "score",
+                    .parameters = {rule_engine::ValueType::string, rule_engine::ValueType::string},
+                    .return_type = rule_engine::ValueType::integer,
+                    .key_prefix = "demo.score",
+                    .route = "endpoint.demo.functions",
+                    .ttl = std::chrono::seconds {30},
+                    .cheap_prefetch = false,
+                },
+            },
+    });
+
+    auto parsed = rule_engine::parse_source("bad_local_alias_argument.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, registry);
+    REQUIRE_FALSE(verified.has_value());
+    REQUIRE_FALSE(verified.error().diagnostics.empty());
+    CHECK(verified.error().diagnostics[0].message.find(
+              "function demo.score argument 1 expects string but got integer") != std::string::npos);
 }
 
 TEST_CASE("semantic verification rejects unknown and unsupported function calls") {
@@ -501,7 +603,7 @@ import "process"
 
 rule bad_function {
     condition:
-        uint16(0) == 0
+        no_such_function(0) == 0
 }
 )";
 
@@ -510,7 +612,77 @@ rule bad_function {
     auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
     REQUIRE_FALSE(verified.has_value());
     REQUIRE_FALSE(verified.error().diagnostics.empty());
-    CHECK(verified.error().diagnostics[0].message.find("unknown function uint16") != std::string::npos);
+    CHECK(verified.error().diagnostics[0].message.find("unknown function no_such_function") != std::string::npos);
+}
+
+TEST_CASE("builtin integer readers request process image bytes and evaluate in the VM") {
+    constexpr auto source = R"(
+rule mz_header {
+    condition:
+        uint8(0) == 0x4D and int8(4) == -2 and
+        uint16(0) == 0x5A4D and uint16be(0) == 0x4D5A and int16(4) == -2 and
+        uint32(0) == 0x00905A4D and uint32be(0) == 0x4D5A9000
+}
+)";
+
+    auto parsed = rule_engine::parse_source("builtin_integer_readers.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 1u);
+    CHECK(verified->rules[0].facts[0].key == "process.image.bytes");
+    CHECK(verified->rules[0].facts[0].route == "endpoint.scan.patterns");
+    CHECK(verified->rules[0].facts[0].type == rule_engine::ValueType::bytes);
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 1u);
+    CHECK(first.requests[0].route == "endpoint.scan.patterns");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"process.image.bytes"});
+    CHECK(first.requests[0].types == std::vector<rule_engine::ValueType> {rule_engine::ValueType::bytes});
+
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "process.image.bytes",
+        .value = rule_engine::Value::bytes(std::vector<std::byte> {
+            std::byte {0x4d},
+            std::byte {0x5a},
+            std::byte {0x90},
+            std::byte {0x00},
+            std::byte {0xfe},
+            std::byte {0xff},
+        }),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+
+    const auto second = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(second.state == rule_engine::EvaluationState::complete);
+    REQUIRE(second.rule_results.size() == 1u);
+    CHECK(second.rule_results[0].identifier == "mz_header");
+    CHECK(second.rule_results[0].matched);
+}
+
+TEST_CASE("semantic verification rejects non-integer builtin reader offsets") {
+    constexpr auto source = R"(
+rule bad_reader_offset {
+    condition:
+        uint16("0") == 0
+}
+)";
+
+    auto parsed = rule_engine::parse_source("bad_reader_offset.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE_FALSE(verified.has_value());
+    REQUIRE_FALSE(verified.error().diagnostics.empty());
+    CHECK(verified.error().diagnostics[0].message.find("function uint16 argument 1 expects integer but got string") !=
+          std::string::npos);
 }
 
 TEST_CASE("VM follows YARA-X undefined operator semantics") {
@@ -667,11 +839,11 @@ rule pattern_metadata {
     REQUIRE(verified->rules[0].facts[0].scan_plan.has_value());
     CHECK(verified->rules[0].facts[0].scan_plan->pattern_key == "$enc");
     CHECK(verified->rules[0].facts[0].scan_plan->literal == std::vector<std::byte> {
-                                                             std::byte {'-'},
-                                                             std::byte {'e'},
-                                                             std::byte {'n'},
-                                                             std::byte {'c'},
-                                                         });
+                                                                std::byte {'-'},
+                                                                std::byte {'e'},
+                                                                std::byte {'n'},
+                                                                std::byte {'c'},
+                                                            });
 
     rule_engine::FactCache facts;
     rule_engine::Evaluator evaluator {*verified, facts};
@@ -682,11 +854,11 @@ rule pattern_metadata {
     REQUIRE(first.requests[0].scan_plans.size() == 1u);
     CHECK(first.requests[0].scan_plans[0].pattern_key == "$enc");
     CHECK(first.requests[0].scan_plans[0].literal == std::vector<std::byte> {
-                                                     std::byte {'-'},
-                                                     std::byte {'e'},
-                                                     std::byte {'n'},
-                                                     std::byte {'c'},
-                                                 });
+                                                         std::byte {'-'},
+                                                         std::byte {'e'},
+                                                         std::byte {'n'},
+                                                         std::byte {'c'},
+                                                     });
 
     rule_engine::PatternValue pattern;
     pattern.matched = true;
@@ -1152,6 +1324,50 @@ rule process_token_metadata {
     CHECK(second.rule_results[0].matched);
 }
 
+TEST_CASE("process signer boolean field resolves to signer facts") {
+    constexpr auto source = R"(
+import "process"
+
+rule unsigned_process {
+    condition:
+        not process.signer.is_signed
+}
+)";
+
+    auto parsed = rule_engine::parse_source("process_signer_is_signed.yar", source);
+    REQUIRE(parsed.has_value());
+
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    REQUIRE(verified->rules.size() == 1u);
+    REQUIRE(verified->rules[0].facts.size() == 1u);
+    CHECK(verified->rules[0].facts[0].key == "process.signer.is_signed");
+    CHECK(verified->rules[0].facts[0].route == "endpoint.process.signer");
+    CHECK(verified->rules[0].facts[0].type == rule_engine::ValueType::boolean);
+
+    rule_engine::FactCache facts;
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto first = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(first.state == rule_engine::EvaluationState::waiting_for_facts);
+    REQUIRE(first.requests.size() == 1u);
+    CHECK(first.requests[0].route == "endpoint.process.signer");
+    CHECK(first.requests[0].keys == std::vector<std::string> {"process.signer.is_signed"});
+
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "process.signer.is_signed",
+        .value = rule_engine::Value::boolean(false),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+
+    const auto second = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(second.state == rule_engine::EvaluationState::complete);
+    REQUIRE(second.rule_results.size() == 1u);
+    CHECK(second.rule_results[0].identifier == "unsigned_process");
+    CHECK(second.rule_results[0].matched);
+}
+
 TEST_CASE("process loaded module fields resolve to snapshot facts") {
     constexpr auto source = R"(
 import "process"
@@ -1411,11 +1627,11 @@ rule pe_header_fields {
     REQUIRE(first.requests.size() == 1u);
     CHECK(first.requests[0].route == "endpoint.process.image.pe");
     CHECK(first.requests[0].keys == std::vector<std::string> {
-                                      "pe.subsystem",
-                                      "pe.characteristics",
-                                      "pe.dll_characteristics",
-                                      "pe.timestamp",
-                                  });
+                                        "pe.subsystem",
+                                        "pe.characteristics",
+                                        "pe.dll_characteristics",
+                                        "pe.timestamp",
+                                    });
 
     facts.store(rule_engine::Fact {
         .subject_id = "pid:42",
@@ -2644,6 +2860,40 @@ rule typed_pid {
     CHECK(result.rule_results[0].diagnostics[0].message.find("integer") != std::string::npos);
 }
 
+TEST_CASE("VM rejects cached signer boolean facts with descriptor type mismatches") {
+    constexpr auto source = R"(
+import "process"
+
+rule typed_signer {
+    condition:
+        process.signer.is_signed
+}
+)";
+
+    auto parsed = rule_engine::parse_source("typed_signer.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+
+    rule_engine::FactCache facts;
+    facts.store(rule_engine::Fact {
+        .subject_id = "pid:42",
+        .key = "process.signer.is_signed",
+        .value = rule_engine::Value::string("unsigned"),
+        .status = rule_engine::FactStatus::available,
+        .diagnostic = {},
+    });
+
+    rule_engine::Evaluator evaluator {*verified, facts};
+    const auto result = evaluator.step(rule_engine::Subject {.kind = "process", .id = "pid:42"});
+    REQUIRE(result.state == rule_engine::EvaluationState::complete);
+    REQUIRE(result.rule_results.size() == 1u);
+    CHECK_FALSE(result.rule_results[0].matched);
+    REQUIRE_FALSE(result.rule_results[0].diagnostics.empty());
+    CHECK(result.rule_results[0].diagnostics[0].message.find("process.signer.is_signed") != std::string::npos);
+    CHECK(result.rule_results[0].diagnostics[0].message.find("boolean") != std::string::npos);
+}
+
 TEST_CASE("VM rejects cached function facts with descriptor return type mismatches") {
     constexpr auto source = R"(
 import "demo"
@@ -2658,17 +2908,18 @@ rule typed_score {
     registry.modules.push_back(rule_engine::ModuleDescriptor {
         .name = "demo",
         .fields = {},
-        .functions = {
-            rule_engine::FunctionDescriptor {
-                .name = "score",
-                .parameters = {rule_engine::ValueType::integer, rule_engine::ValueType::string},
-                .return_type = rule_engine::ValueType::integer,
-                .key_prefix = "demo.score",
-                .route = "endpoint.demo.functions",
-                .ttl = std::chrono::seconds {30},
-                .cheap_prefetch = false,
+        .functions =
+            {
+                rule_engine::FunctionDescriptor {
+                    .name = "score",
+                    .parameters = {rule_engine::ValueType::integer, rule_engine::ValueType::string},
+                    .return_type = rule_engine::ValueType::integer,
+                    .key_prefix = "demo.score",
+                    .route = "endpoint.demo.functions",
+                    .ttl = std::chrono::seconds {30},
+                    .cheap_prefetch = false,
+                },
             },
-        },
     });
 
     auto parsed = rule_engine::parse_source("typed_score.yar", source);

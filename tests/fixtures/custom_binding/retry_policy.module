@@ -1,0 +1,4 @@
+module retrydemo
+field retrydemo.value integer endpoint.retry.fields 30 true 9 timed_out 2 retrydemo_value_cancelled
+function score integer integer endpoint.retry.functions retrydemo.score 30 false 7 timed_out 1 retrydemo_score_cancelled
+global retry_flag boolean global.retry_flag endpoint.retry.globals 30 true 6 timed_out 3 retry_flag_cancelled

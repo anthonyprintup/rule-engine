@@ -228,11 +228,14 @@ target_compile_definitions(
 
 add_library(
     rule_engine_core
+    src/benchmark.cpp
     src/custom_fact_fixture.cpp
     src/compiler.cpp
+    src/evaluation_scheduler.cpp
     src/evaluator.cpp
     src/modules.cpp
     src/module_config.cpp
+    src/optimizer.cpp
     src/provider_key.cpp
     src/pattern_fixture_provider.cpp
     src/client_protocol.cpp
@@ -271,6 +274,9 @@ target_link_libraries(rule_engine_server PRIVATE rule_engine::core rule_engine::
 add_executable(rule_engine_client src/tools/rule_engine_client.cpp)
 target_link_libraries(rule_engine_client PRIVATE rule_engine::core rule_engine::cli11 rule_engine::fmt asio::asio)
 
+add_executable(rule_engine_benchmark src/tools/rule_engine_benchmark.cpp)
+target_link_libraries(rule_engine_benchmark PRIVATE rule_engine::core rule_engine::fmt)
+
 enable_testing()
 
 add_executable(
@@ -282,6 +288,8 @@ add_executable(
     tests/protocol_tests.cpp
     tests/runtime_harness_tests.cpp
     tests/server_output_tests.cpp
+    tests/optimizer_tests.cpp
+    tests/benchmark_tests.cpp
     tests/trace_tests.cpp
 )
 target_include_directories(
@@ -293,6 +301,7 @@ target_include_directories(
 target_link_libraries(rule_engine_tests PRIVATE rule_engine::core Catch2::Catch2 asio::asio)
 add_dependencies(rule_engine_tests rule_engine_yara_bridge_build)
 add_dependencies(rule_engine_tests rule_engine_client)
+add_dependencies(rule_engine_tests rule_engine_benchmark)
 target_compile_definitions(rule_engine_tests PRIVATE RULE_ENGINE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_options(
     rule_engine_tests

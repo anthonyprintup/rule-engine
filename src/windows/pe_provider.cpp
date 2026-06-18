@@ -37,6 +37,14 @@ namespace {
     constexpr std::size_t max_section_scan_space_bytes = 128u * 1024u * 1024u;
     constexpr std::uint32_t resource_directory_flag = 0x80000000u;
     constexpr std::uint32_t resource_offset_mask = 0x7fffffffu;
+    constexpr const char *pe_identity_path_key = "pe.identity.path";
+    constexpr const char *pe_identity_file_id_key = "pe.identity.file_id";
+    constexpr const char *pe_identity_file_size_key = "pe.identity.file_size";
+    constexpr const char *pe_identity_last_write_time_key = "pe.identity.last_write_time";
+    constexpr const char *pe_identity_scan_space_name_key = "pe.identity.scan_space_name";
+    constexpr const char *pe_identity_scan_space_version_key = "pe.identity.scan_space_version";
+    constexpr const char *pe_identity_scan_space_name = "process.image.pe";
+    constexpr const char *pe_identity_scan_space_version = "v1";
 
     struct ParsedSections {
         std::vector<IMAGE_SECTION_HEADER> headers;
@@ -54,6 +62,33 @@ namespace {
         std::uint16_t type;
     };
 
+    struct UniqueHandle {
+        HANDLE handle {INVALID_HANDLE_VALUE};
+
+        explicit UniqueHandle(HANDLE value) noexcept: handle {value} {}
+        ~UniqueHandle() noexcept {
+            if (handle != nullptr && handle != INVALID_HANDLE_VALUE) {
+                CloseHandle(handle);
+            }
+        }
+
+        UniqueHandle(const UniqueHandle &) = delete;
+        UniqueHandle &operator=(const UniqueHandle &) = delete;
+    };
+
+    struct FileIdentity {
+        std::string path;
+        std::string file_id;
+        std::uint64_t file_size {};
+        std::uint64_t last_write_time {};
+    };
+
+    struct FileIdentityObservation {
+        std::optional<FileIdentity> identity;
+        rule_engine::FactStatus status {rule_engine::FactStatus::unavailable};
+        std::string diagnostic;
+    };
+
     [[nodiscard]] rule_engine::Fact make_fact(std::string subject_id,
                                               std::string key,
                                               rule_engine::Value value,
@@ -69,9 +104,142 @@ namespace {
         };
     }
 
+    [[nodiscard]] std::uint64_t high_low_u64(const DWORD high, const DWORD low) noexcept {
+        return (static_cast<std::uint64_t>(high) << 32u) | static_cast<std::uint64_t>(low);
+    }
+
+    [[nodiscard]] rule_engine::FactStatus identity_failure_status(const DWORD error) noexcept {
+        if (error == ERROR_ACCESS_DENIED) {
+            return rule_engine::FactStatus::access_denied;
+        }
+        return rule_engine::FactStatus::unavailable;
+    }
+
+    [[nodiscard]] std::string win32_identity_diagnostic(const char *operation, const DWORD error) {
+        return std::string {operation} + " failed with Win32 error " + std::to_string(error);
+    }
+
+    [[nodiscard]] FileIdentityObservation read_file_identity(const std::filesystem::path &path) {
+        UniqueHandle file {CreateFileW(path.c_str(),
+                                       FILE_READ_ATTRIBUTES,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                       nullptr,
+                                       OPEN_EXISTING,
+                                       FILE_ATTRIBUTE_NORMAL,
+                                       nullptr)};
+        if (file.handle == INVALID_HANDLE_VALUE) {
+            const auto error = GetLastError();
+            return FileIdentityObservation {
+                .identity = std::nullopt,
+                .status = identity_failure_status(error),
+                .diagnostic = win32_identity_diagnostic("Open PE image identity", error),
+            };
+        }
+
+        BY_HANDLE_FILE_INFORMATION info {};
+        if (GetFileInformationByHandle(file.handle, &info) == FALSE) {
+            const auto error = GetLastError();
+            return FileIdentityObservation {
+                .identity = std::nullopt,
+                .status = identity_failure_status(error),
+                .diagnostic = win32_identity_diagnostic("Read PE image identity", error),
+            };
+        }
+
+        const auto file_size = high_low_u64(info.nFileSizeHigh, info.nFileSizeLow);
+        const auto last_write_time =
+            high_low_u64(info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime);
+        if (file_size > static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)()) ||
+            last_write_time > static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)())) {
+            return FileIdentityObservation {
+                .identity = std::nullopt,
+                .status = rule_engine::FactStatus::unavailable,
+                .diagnostic = "PE image identity exceeds integer fact range",
+            };
+        }
+
+        const auto file_index = high_low_u64(info.nFileIndexHigh, info.nFileIndexLow);
+        return FileIdentityObservation {
+            .identity =
+                FileIdentity {
+                    .path = path.string(),
+                    .file_id = "volume:" + std::to_string(info.dwVolumeSerialNumber) +
+                               ":index:" + std::to_string(file_index),
+                    .file_size = file_size,
+                    .last_write_time = last_write_time,
+                },
+            .status = rule_engine::FactStatus::available,
+            .diagnostic = {},
+        };
+    }
+
+    void append_identity_facts(std::vector<rule_engine::Fact> &out, const std::string &subject_id,
+                               const FileIdentityObservation &observation) {
+        if (!observation.identity.has_value()) {
+            out.push_back(make_fact(subject_id,
+                                    pe_identity_path_key,
+                                    rule_engine::Value::undefined(),
+                                    observation.status,
+                                    observation.diagnostic));
+            out.push_back(make_fact(subject_id,
+                                    pe_identity_file_id_key,
+                                    rule_engine::Value::undefined(),
+                                    observation.status,
+                                    observation.diagnostic));
+            out.push_back(make_fact(subject_id,
+                                    pe_identity_file_size_key,
+                                    rule_engine::Value::undefined(),
+                                    observation.status,
+                                    observation.diagnostic));
+            out.push_back(make_fact(subject_id,
+                                    pe_identity_last_write_time_key,
+                                    rule_engine::Value::undefined(),
+                                    observation.status,
+                                    observation.diagnostic));
+            out.push_back(make_fact(subject_id,
+                                    pe_identity_scan_space_name_key,
+                                    rule_engine::Value::undefined(),
+                                    observation.status,
+                                    observation.diagnostic));
+            out.push_back(make_fact(subject_id,
+                                    pe_identity_scan_space_version_key,
+                                    rule_engine::Value::undefined(),
+                                    observation.status,
+                                    observation.diagnostic));
+            return;
+        }
+
+        const auto &identity = *observation.identity;
+        out.push_back(make_fact(subject_id,
+                                pe_identity_path_key,
+                                rule_engine::Value::string(identity.path),
+                                rule_engine::FactStatus::available));
+        out.push_back(make_fact(subject_id,
+                                pe_identity_file_id_key,
+                                rule_engine::Value::string(identity.file_id),
+                                rule_engine::FactStatus::available));
+        out.push_back(make_fact(subject_id,
+                                pe_identity_file_size_key,
+                                rule_engine::Value::integer(static_cast<std::int64_t>(identity.file_size)),
+                                rule_engine::FactStatus::available));
+        out.push_back(make_fact(subject_id,
+                                pe_identity_last_write_time_key,
+                                rule_engine::Value::integer(static_cast<std::int64_t>(identity.last_write_time)),
+                                rule_engine::FactStatus::available));
+        out.push_back(make_fact(subject_id,
+                                pe_identity_scan_space_name_key,
+                                rule_engine::Value::string(pe_identity_scan_space_name),
+                                rule_engine::FactStatus::available));
+        out.push_back(make_fact(subject_id,
+                                pe_identity_scan_space_version_key,
+                                rule_engine::Value::string(pe_identity_scan_space_version),
+                                rule_engine::FactStatus::available));
+    }
+
     [[nodiscard]] std::vector<rule_engine::Fact> diagnostic_facts(const std::string &subject_id,
                                                                   const rule_engine::FactStatus status,
-                                                                  std::string diagnostic) {
+                                                                  std::string diagnostic,
+                                                                  const FileIdentityObservation &identity) {
         std::vector<rule_engine::Fact> out;
         out.push_back(make_fact(subject_id, "pe.is_valid", rule_engine::Value::boolean(false), status, diagnostic));
         out.push_back(make_fact(subject_id, "pe.machine", rule_engine::Value::undefined(), status, diagnostic));
@@ -91,6 +259,7 @@ namespace {
         out.push_back(make_fact(subject_id, "pe.resources", rule_engine::Value::undefined(), status, diagnostic));
         out.push_back(make_fact(subject_id, "pe.certificates", rule_engine::Value::undefined(), status, diagnostic));
         out.push_back(make_fact(subject_id, "pe.tls_callbacks", rule_engine::Value::undefined(), status, diagnostic));
+        append_identity_facts(out, subject_id, identity);
         return out;
     }
 
@@ -1082,7 +1251,8 @@ namespace {
                                                                 std::vector<rule_engine::Value> debug_entries,
                                                                 std::vector<rule_engine::Value> resources,
                                                                 std::vector<rule_engine::Value> certificates,
-                                                                std::vector<rule_engine::Value> tls_callbacks) {
+                                                                std::vector<rule_engine::Value> tls_callbacks,
+                                                                const FileIdentityObservation &identity) {
         std::vector<rule_engine::Fact> out;
         out.push_back(make_fact(subject_id,
                                 "pe.is_valid",
@@ -1120,6 +1290,7 @@ namespace {
                                 "pe.timestamp",
                                 rule_engine::Value::integer(static_cast<std::int64_t>(file_header.TimeDateStamp)),
                                 rule_engine::FactStatus::available));
+        append_identity_facts(out, subject_id, identity);
         out.push_back(make_fact(subject_id,
                                 "pe.sections",
                                 rule_engine::Value::array(std::move(sections)),
@@ -1153,6 +1324,15 @@ namespace {
 } // namespace
 
 namespace rule_engine::windows {
+    std::expected<std::vector<Fact>, ErrorSet> read_pe_image_identity_facts(std::string subject_id,
+                                                                            const std::filesystem::path &image_path) {
+        auto identity = read_file_identity(image_path);
+        std::vector<Fact> out;
+        out.reserve(6u);
+        append_identity_facts(out, subject_id, identity);
+        return out;
+    }
+
     std::expected<std::vector<patterns::PatternScanSpace>, ErrorSet>
     read_pe_image_section_scan_spaces(std::string subject_id, const std::filesystem::path &image_path) {
         auto bytes = read_file_bytes(image_path);
@@ -1213,47 +1393,49 @@ namespace rule_engine::windows {
 
     std::expected<std::vector<Fact>, ErrorSet> read_pe_image_facts(std::string subject_id,
                                                                    const std::filesystem::path &image_path) {
+        const auto identity = read_file_identity(image_path);
         auto bytes = read_file_bytes(image_path);
         if (!bytes) {
             const auto diagnostic = bytes.error().diagnostics.empty() ? std::string {"failed to read PE image"}
                                                                       : bytes.error().diagnostics[0].message;
-            return diagnostic_facts(subject_id, FactStatus::unavailable, diagnostic);
+            return diagnostic_facts(subject_id, FactStatus::unavailable, diagnostic, identity);
         }
 
         const auto dos = read_struct<IMAGE_DOS_HEADER>(*bytes, 0u);
         if (!dos.has_value() || dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0) {
-            return diagnostic_facts(subject_id, FactStatus::available, "image is not a PE file");
+            return diagnostic_facts(subject_id, FactStatus::available, "image is not a PE file", identity);
         }
 
         const auto nt_offset = static_cast<std::size_t>(dos->e_lfanew);
         const auto signature = read_struct<DWORD>(*bytes, nt_offset);
         if (!signature.has_value() || *signature != IMAGE_NT_SIGNATURE) {
-            return diagnostic_facts(subject_id, FactStatus::available, "image has no PE signature");
+            return diagnostic_facts(subject_id, FactStatus::available, "image has no PE signature", identity);
         }
 
         constexpr auto signature_size = sizeof(DWORD);
         const auto file_header_offset = nt_offset + signature_size;
         const auto file_header = read_struct<IMAGE_FILE_HEADER>(*bytes, file_header_offset);
         if (!file_header.has_value()) {
-            return diagnostic_facts(subject_id, FactStatus::available, "image has no PE file header");
+            return diagnostic_facts(subject_id, FactStatus::available, "image has no PE file header", identity);
         }
 
         const auto optional_offset = file_header_offset + sizeof(IMAGE_FILE_HEADER);
         const auto optional_magic = read_struct<WORD>(*bytes, optional_offset);
         if (!optional_magic.has_value()) {
-            return diagnostic_facts(subject_id, FactStatus::available, "image has no PE optional header");
+            return diagnostic_facts(subject_id, FactStatus::available, "image has no PE optional header", identity);
         }
 
         if (*optional_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
             const auto optional_header = read_struct<IMAGE_OPTIONAL_HEADER64>(*bytes, optional_offset);
             if (!optional_header.has_value()) {
-                return diagnostic_facts(subject_id, FactStatus::available, "image has a truncated PE32+ optional header");
+                return diagnostic_facts(
+                    subject_id, FactStatus::available, "image has a truncated PE32+ optional header", identity);
             }
             auto sections = read_sections(*bytes, *file_header, optional_offset);
             if (!sections) {
                 const auto diagnostic = sections.error().diagnostics.empty() ? std::string {"failed to read PE sections"}
                                                                              : sections.error().diagnostics[0].message;
-                return diagnostic_facts(subject_id, FactStatus::available, diagnostic);
+                return diagnostic_facts(subject_id, FactStatus::available, diagnostic, identity);
             }
             auto imports = read_imports(
                 *bytes,
@@ -1263,7 +1445,7 @@ namespace rule_engine::windows {
             if (!imports) {
                 const auto diagnostic = imports.error().diagnostics.empty() ? std::string {"failed to read PE imports"}
                                                                             : imports.error().diagnostics[0].message;
-                return diagnostic_facts(subject_id, FactStatus::available, diagnostic);
+                return diagnostic_facts(subject_id, FactStatus::available, diagnostic, identity);
             }
             auto exports = read_exports(
                 *bytes,
@@ -1273,7 +1455,7 @@ namespace rule_engine::windows {
             if (!exports) {
                 const auto diagnostic = exports.error().diagnostics.empty() ? std::string {"failed to read PE exports"}
                                                                             : exports.error().diagnostics[0].message;
-                return diagnostic_facts(subject_id, FactStatus::available, diagnostic);
+                return diagnostic_facts(subject_id, FactStatus::available, diagnostic, identity);
             }
             auto debug_entries = read_debug_entries(
                 *bytes,
@@ -1284,7 +1466,7 @@ namespace rule_engine::windows {
                 const auto diagnostic = debug_entries.error().diagnostics.empty()
                                             ? std::string {"failed to read PE debug directory"}
                                             : debug_entries.error().diagnostics[0].message;
-                return diagnostic_facts(subject_id, FactStatus::available, diagnostic);
+                return diagnostic_facts(subject_id, FactStatus::available, diagnostic, identity);
             }
             auto resources = read_resources(
                 *bytes,
@@ -1295,7 +1477,7 @@ namespace rule_engine::windows {
                 const auto diagnostic = resources.error().diagnostics.empty()
                                             ? std::string {"failed to read PE resources"}
                                             : resources.error().diagnostics[0].message;
-                return diagnostic_facts(subject_id, FactStatus::available, diagnostic);
+                return diagnostic_facts(subject_id, FactStatus::available, diagnostic, identity);
             }
             auto certificates = read_certificates(
                 *bytes,
@@ -1305,7 +1487,7 @@ namespace rule_engine::windows {
                 const auto diagnostic = certificates.error().diagnostics.empty()
                                             ? std::string {"failed to read PE certificates"}
                                             : certificates.error().diagnostics[0].message;
-                return diagnostic_facts(subject_id, FactStatus::available, diagnostic);
+                return diagnostic_facts(subject_id, FactStatus::available, diagnostic, identity);
             }
             auto tls_callbacks = read_tls_callbacks<IMAGE_TLS_DIRECTORY64, std::uint64_t>(
                 *bytes,
@@ -1317,7 +1499,7 @@ namespace rule_engine::windows {
                 const auto diagnostic = tls_callbacks.error().diagnostics.empty()
                                             ? std::string {"failed to read PE TLS callbacks"}
                                             : tls_callbacks.error().diagnostics[0].message;
-                return diagnostic_facts(subject_id, FactStatus::available, diagnostic);
+                return diagnostic_facts(subject_id, FactStatus::available, diagnostic, identity);
             }
             return valid_pe_facts(
                 subject_id,
@@ -1332,19 +1514,21 @@ namespace rule_engine::windows {
                 std::move(*debug_entries),
                 std::move(*resources),
                 std::move(*certificates),
-                std::move(*tls_callbacks));
+                std::move(*tls_callbacks),
+                identity);
         }
 
         if (*optional_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
             const auto optional_header = read_struct<IMAGE_OPTIONAL_HEADER32>(*bytes, optional_offset);
             if (!optional_header.has_value()) {
-                return diagnostic_facts(subject_id, FactStatus::available, "image has a truncated PE32 optional header");
+                return diagnostic_facts(
+                    subject_id, FactStatus::available, "image has a truncated PE32 optional header", identity);
             }
             auto sections = read_sections(*bytes, *file_header, optional_offset);
             if (!sections) {
                 const auto diagnostic = sections.error().diagnostics.empty() ? std::string {"failed to read PE sections"}
                                                                              : sections.error().diagnostics[0].message;
-                return diagnostic_facts(subject_id, FactStatus::available, diagnostic);
+                return diagnostic_facts(subject_id, FactStatus::available, diagnostic, identity);
             }
             auto imports = read_imports(
                 *bytes,
@@ -1354,7 +1538,7 @@ namespace rule_engine::windows {
             if (!imports) {
                 const auto diagnostic = imports.error().diagnostics.empty() ? std::string {"failed to read PE imports"}
                                                                             : imports.error().diagnostics[0].message;
-                return diagnostic_facts(subject_id, FactStatus::available, diagnostic);
+                return diagnostic_facts(subject_id, FactStatus::available, diagnostic, identity);
             }
             auto exports = read_exports(
                 *bytes,
@@ -1364,7 +1548,7 @@ namespace rule_engine::windows {
             if (!exports) {
                 const auto diagnostic = exports.error().diagnostics.empty() ? std::string {"failed to read PE exports"}
                                                                             : exports.error().diagnostics[0].message;
-                return diagnostic_facts(subject_id, FactStatus::available, diagnostic);
+                return diagnostic_facts(subject_id, FactStatus::available, diagnostic, identity);
             }
             auto debug_entries = read_debug_entries(
                 *bytes,
@@ -1375,7 +1559,7 @@ namespace rule_engine::windows {
                 const auto diagnostic = debug_entries.error().diagnostics.empty()
                                             ? std::string {"failed to read PE debug directory"}
                                             : debug_entries.error().diagnostics[0].message;
-                return diagnostic_facts(subject_id, FactStatus::available, diagnostic);
+                return diagnostic_facts(subject_id, FactStatus::available, diagnostic, identity);
             }
             auto resources = read_resources(
                 *bytes,
@@ -1386,7 +1570,7 @@ namespace rule_engine::windows {
                 const auto diagnostic = resources.error().diagnostics.empty()
                                             ? std::string {"failed to read PE resources"}
                                             : resources.error().diagnostics[0].message;
-                return diagnostic_facts(subject_id, FactStatus::available, diagnostic);
+                return diagnostic_facts(subject_id, FactStatus::available, diagnostic, identity);
             }
             auto certificates = read_certificates(
                 *bytes,
@@ -1396,7 +1580,7 @@ namespace rule_engine::windows {
                 const auto diagnostic = certificates.error().diagnostics.empty()
                                             ? std::string {"failed to read PE certificates"}
                                             : certificates.error().diagnostics[0].message;
-                return diagnostic_facts(subject_id, FactStatus::available, diagnostic);
+                return diagnostic_facts(subject_id, FactStatus::available, diagnostic, identity);
             }
             auto tls_callbacks = read_tls_callbacks<IMAGE_TLS_DIRECTORY32, std::uint32_t>(
                 *bytes,
@@ -1408,7 +1592,7 @@ namespace rule_engine::windows {
                 const auto diagnostic = tls_callbacks.error().diagnostics.empty()
                                             ? std::string {"failed to read PE TLS callbacks"}
                                             : tls_callbacks.error().diagnostics[0].message;
-                return diagnostic_facts(subject_id, FactStatus::available, diagnostic);
+                return diagnostic_facts(subject_id, FactStatus::available, diagnostic, identity);
             }
             return valid_pe_facts(
                 subject_id,
@@ -1423,9 +1607,11 @@ namespace rule_engine::windows {
                 std::move(*debug_entries),
                 std::move(*resources),
                 std::move(*certificates),
-                std::move(*tls_callbacks));
+                std::move(*tls_callbacks),
+                identity);
         }
 
-        return diagnostic_facts(subject_id, FactStatus::available, "image has an unsupported PE optional header");
+        return diagnostic_facts(
+            subject_id, FactStatus::available, "image has an unsupported PE optional header", identity);
     }
 } // namespace rule_engine::windows

@@ -14,6 +14,8 @@ namespace rule_engine::protocol {
             subject_list = 2,
             fact_batch_request = 3,
             fact_batch_response = 4,
+            candidate_provider_request = 5,
+            candidate_provider_response = 6,
         };
 
         enum struct ValueKind : std::uint8_t {
@@ -23,10 +25,14 @@ namespace rule_engine::protocol {
             floating = 3,
             string = 4,
             pattern = 5,
+            bytes = 6,
+            array = 7,
+            object = 8,
         };
 
         constexpr std::uint32_t protocol_version {1};
         constexpr std::uint32_t max_collection_count {65536};
+        constexpr std::uint32_t max_value_nesting_depth {32};
 
         void append_u8(std::vector<std::byte> &out, const std::uint8_t value) {
             out.push_back(static_cast<std::byte>(value));
@@ -233,7 +239,12 @@ namespace rule_engine::protocol {
             return reader;
         }
 
-        [[nodiscard]] std::expected<void, ErrorSet> append_value(std::vector<std::byte> &out, const Value &value) {
+        [[nodiscard]] std::expected<void, ErrorSet> append_value(std::vector<std::byte> &out,
+                                                                 const Value &value,
+                                                                 const std::uint32_t depth = 0u) {
+            if (depth > max_value_nesting_depth) {
+                return std::unexpected(single_error("protocol", "fact value nesting exceeds v1 limit"));
+            }
             if (value.is_undefined()) {
                 append_u8(out, static_cast<std::uint8_t>(ValueKind::undefined));
                 return {};
@@ -256,6 +267,10 @@ namespace rule_engine::protocol {
             if (const auto *string = value.as_string(); string != nullptr) {
                 append_u8(out, static_cast<std::uint8_t>(ValueKind::string));
                 return append_string(out, *string);
+            }
+            if (const auto *bytes = value.as_bytes(); bytes != nullptr) {
+                append_u8(out, static_cast<std::uint8_t>(ValueKind::bytes));
+                return append_bytes(out, *bytes);
             }
             if (const auto *pattern = value.as_pattern(); pattern != nullptr) {
                 if (pattern->matches.size() > std::numeric_limits<std::uint32_t>::max()) {
@@ -285,10 +300,42 @@ namespace rule_engine::protocol {
                 }
                 return {};
             }
+            if (const auto *array = value.as_array(); array != nullptr) {
+                if (array->values.size() > max_collection_count) {
+                    return std::unexpected(single_error("protocol", "array value count exceeds v1 limit"));
+                }
+                append_u8(out, static_cast<std::uint8_t>(ValueKind::array));
+                append_u32(out, static_cast<std::uint32_t>(array->values.size()));
+                for (const auto &entry : array->values) {
+                    if (auto result = append_value(out, entry, depth + 1u); !result) {
+                        return result;
+                    }
+                }
+                return {};
+            }
+            if (const auto *object = value.as_object(); object != nullptr) {
+                if (object->entries.size() > max_collection_count) {
+                    return std::unexpected(single_error("protocol", "object value count exceeds v1 limit"));
+                }
+                append_u8(out, static_cast<std::uint8_t>(ValueKind::object));
+                append_u32(out, static_cast<std::uint32_t>(object->entries.size()));
+                for (const auto &entry : object->entries) {
+                    if (auto result = append_string(out, entry.key); !result) {
+                        return result;
+                    }
+                    if (auto result = append_value(out, entry.value, depth + 1u); !result) {
+                        return result;
+                    }
+                }
+                return {};
+            }
             return std::unexpected(single_error("protocol", "unsupported v1 fact value type"));
         }
 
-        [[nodiscard]] std::expected<Value, ErrorSet> read_value(Reader &reader) {
+        [[nodiscard]] std::expected<Value, ErrorSet> read_value(Reader &reader, const std::uint32_t depth = 0u) {
+            if (depth > max_value_nesting_depth) {
+                return std::unexpected(single_error("protocol", "fact value nesting exceeds v1 limit"));
+            }
             std::uint8_t kind {};
             if (!reader.read_u8(kind)) {
                 return std::unexpected(single_error("protocol", "truncated fact value type"));
@@ -325,6 +372,13 @@ namespace rule_engine::protocol {
                 }
                 return Value::string(std::move(value));
             }
+            if (kind == static_cast<std::uint8_t>(ValueKind::bytes)) {
+                std::vector<std::byte> value;
+                if (!reader.read_bytes(value)) {
+                    return std::unexpected(single_error("protocol", "truncated byte fact value"));
+                }
+                return Value::bytes(std::move(value));
+            }
             if (kind == static_cast<std::uint8_t>(ValueKind::pattern)) {
                 std::uint8_t matched {};
                 std::uint32_t count {};
@@ -348,6 +402,49 @@ namespace rule_engine::protocol {
                     pattern.matches.push_back(std::move(match));
                 }
                 return Value::pattern(std::move(pattern));
+            }
+            if (kind == static_cast<std::uint8_t>(ValueKind::array)) {
+                std::uint32_t count {};
+                if (!reader.read_u32(count)) {
+                    return std::unexpected(single_error("protocol", "truncated array fact value"));
+                }
+                if (auto count_ok = validate_count(count, "array value"); !count_ok) {
+                    return std::unexpected(std::move(count_ok.error()));
+                }
+                std::vector<Value> values;
+                values.reserve(count);
+                for (std::uint32_t index = 0; index < count; ++index) {
+                    auto value = read_value(reader, depth + 1u);
+                    if (!value) {
+                        return std::unexpected(std::move(value.error()));
+                    }
+                    values.push_back(std::move(*value));
+                }
+                return Value::array(std::move(values));
+            }
+            if (kind == static_cast<std::uint8_t>(ValueKind::object)) {
+                std::uint32_t count {};
+                if (!reader.read_u32(count)) {
+                    return std::unexpected(single_error("protocol", "truncated object fact value"));
+                }
+                if (auto count_ok = validate_count(count, "object value"); !count_ok) {
+                    return std::unexpected(std::move(count_ok.error()));
+                }
+                std::vector<ObjectEntry> entries;
+                entries.reserve(count);
+                for (std::uint32_t index = 0; index < count; ++index) {
+                    ObjectEntry entry;
+                    if (!reader.read_string(entry.key)) {
+                        return std::unexpected(single_error("protocol", "truncated object fact entry"));
+                    }
+                    auto value = read_value(reader, depth + 1u);
+                    if (!value) {
+                        return std::unexpected(std::move(value.error()));
+                    }
+                    entry.value = std::move(*value);
+                    entries.push_back(std::move(entry));
+                }
+                return Value::object(std::move(entries));
             }
             return std::unexpected(single_error("protocol", "unknown fact value type"));
         }
@@ -413,6 +510,16 @@ namespace rule_engine::protocol {
             if (auto result = append_string(out, capability.route); !result) {
                 return std::unexpected(std::move(result.error()));
             }
+            if (auto result = append_string(out, capability.filter_key); !result) {
+                return std::unexpected(std::move(result.error()));
+            }
+            append_u32(out, static_cast<std::uint32_t>(capability.argument_types.size()));
+            for (const auto type : capability.argument_types) {
+                append_u8(out, value_type_to_wire(type));
+            }
+            if (auto result = append_string(out, capability.result_kind); !result) {
+                return std::unexpected(std::move(result.error()));
+            }
         }
         return out;
     }
@@ -434,8 +541,28 @@ namespace rule_engine::protocol {
         out.capabilities.reserve(capability_count);
         for (std::uint32_t index = 0; index < capability_count; ++index) {
             Capability capability;
-            if (!reader->read_string(capability.route)) {
+            std::uint32_t argument_type_count {};
+            if (!reader->read_string(capability.route) || !reader->read_string(capability.filter_key) ||
+                !reader->read_u32(argument_type_count)) {
                 return std::unexpected(single_error("protocol", "truncated handshake capability"));
+            }
+            if (auto count_ok = validate_count(argument_type_count, "handshake capability argument type"); !count_ok) {
+                return std::unexpected(std::move(count_ok.error()));
+            }
+            capability.argument_types.reserve(argument_type_count);
+            for (std::uint32_t type_index = 0; type_index < argument_type_count; ++type_index) {
+                std::uint8_t type {};
+                if (!reader->read_u8(type)) {
+                    return std::unexpected(single_error("protocol", "truncated handshake capability argument type"));
+                }
+                const auto parsed_type = value_type_from_wire(type);
+                if (!parsed_type.has_value()) {
+                    return std::unexpected(single_error("protocol", "unknown handshake capability argument type"));
+                }
+                capability.argument_types.push_back(*parsed_type);
+            }
+            if (!reader->read_string(capability.result_kind)) {
+                return std::unexpected(single_error("protocol", "truncated handshake capability result kind"));
             }
             out.capabilities.push_back(std::move(capability));
         }
@@ -612,6 +739,139 @@ namespace rule_engine::protocol {
                 return std::unexpected(std::move(fact.error()));
             }
             out.values.push_back(std::move(*fact));
+        }
+        return out;
+    }
+
+    std::expected<std::vector<std::byte>, ErrorSet>
+    encode_candidate_provider_request(const CandidateProviderRequestMessage &message) {
+        std::vector<std::byte> out;
+        append_header(out, MessageKind::candidate_provider_request);
+        if (auto result = append_string(out, message.route); !result) {
+            return std::unexpected(std::move(result.error()));
+        }
+        append_u32(out, static_cast<std::uint32_t>(message.timeout.count()));
+        append_u32(out, static_cast<std::uint32_t>(message.filters.size()));
+        for (const auto &filter : message.filters) {
+            if (auto result = append_string(out, filter.request_id); !result) {
+                return std::unexpected(std::move(result.error()));
+            }
+            if (auto result = append_string(out, filter.filter_key); !result) {
+                return std::unexpected(std::move(result.error()));
+            }
+            if (auto result = append_string(out, filter.argument_kind); !result) {
+                return std::unexpected(std::move(result.error()));
+            }
+            if (auto result = append_string(out, filter.argument_value); !result) {
+                return std::unexpected(std::move(result.error()));
+            }
+        }
+        return out;
+    }
+
+    std::expected<CandidateProviderRequestMessage, ErrorSet>
+    decode_candidate_provider_request(const std::span<const std::byte> payload) {
+        auto reader = reader_for(payload, MessageKind::candidate_provider_request);
+        if (!reader) {
+            return std::unexpected(std::move(reader.error()));
+        }
+        std::uint32_t timeout {};
+        std::uint32_t filter_count {};
+        CandidateProviderRequestMessage out;
+        if (!reader->read_string(out.route) || !reader->read_u32(timeout) || !reader->read_u32(filter_count)) {
+            return std::unexpected(single_error("protocol", "truncated candidate provider request message"));
+        }
+        out.timeout = std::chrono::milliseconds {timeout};
+        if (auto count_ok = validate_count(filter_count, "candidate provider request filter"); !count_ok) {
+            return std::unexpected(std::move(count_ok.error()));
+        }
+        out.filters.reserve(filter_count);
+        for (std::uint32_t index = 0; index < filter_count; ++index) {
+            CandidateProviderFilterRequest filter;
+            if (!reader->read_string(filter.request_id) || !reader->read_string(filter.filter_key) ||
+                !reader->read_string(filter.argument_kind) || !reader->read_string(filter.argument_value)) {
+                return std::unexpected(single_error("protocol", "truncated candidate provider request filter"));
+            }
+            out.filters.push_back(std::move(filter));
+        }
+        return out;
+    }
+
+    std::expected<std::vector<std::byte>, ErrorSet>
+    encode_candidate_provider_response(const CandidateProviderResponseMessage &message) {
+        std::vector<std::byte> out;
+        append_header(out, MessageKind::candidate_provider_response);
+        if (auto result = append_string(out, message.route); !result) {
+            return std::unexpected(std::move(result.error()));
+        }
+        append_u32(out, static_cast<std::uint32_t>(message.results.size()));
+        for (const auto &result : message.results) {
+            if (auto append_result = append_string(out, result.request_id); !append_result) {
+                return std::unexpected(std::move(append_result.error()));
+            }
+            if (auto append_result = append_string(out, result.filter_key); !append_result) {
+                return std::unexpected(std::move(append_result.error()));
+            }
+            append_u8(out, status_to_wire(result.status));
+            append_u32(out, static_cast<std::uint32_t>(result.subject_ids.size()));
+            for (const auto &subject_id : result.subject_ids) {
+                if (auto append_result = append_string(out, subject_id); !append_result) {
+                    return std::unexpected(std::move(append_result.error()));
+                }
+            }
+            if (auto append_result = append_string(out, result.diagnostic); !append_result) {
+                return std::unexpected(std::move(append_result.error()));
+            }
+            append_u32(out, static_cast<std::uint32_t>(result.ttl.count()));
+        }
+        return out;
+    }
+
+    std::expected<CandidateProviderResponseMessage, ErrorSet>
+    decode_candidate_provider_response(const std::span<const std::byte> payload) {
+        auto reader = reader_for(payload, MessageKind::candidate_provider_response);
+        if (!reader) {
+            return std::unexpected(std::move(reader.error()));
+        }
+        std::uint32_t result_count {};
+        CandidateProviderResponseMessage out;
+        if (!reader->read_string(out.route) || !reader->read_u32(result_count)) {
+            return std::unexpected(single_error("protocol", "truncated candidate provider response message"));
+        }
+        if (auto count_ok = validate_count(result_count, "candidate provider response result"); !count_ok) {
+            return std::unexpected(std::move(count_ok.error()));
+        }
+        out.results.reserve(result_count);
+        for (std::uint32_t index = 0; index < result_count; ++index) {
+            CandidateProviderSubjectSet result;
+            std::uint8_t status {};
+            std::uint32_t subject_count {};
+            if (!reader->read_string(result.request_id) || !reader->read_string(result.filter_key) ||
+                !reader->read_u8(status) || !reader->read_u32(subject_count)) {
+                return std::unexpected(single_error("protocol", "truncated candidate provider response result"));
+            }
+            const auto parsed_status = status_from_wire(status);
+            if (!parsed_status.has_value()) {
+                return std::unexpected(single_error("protocol", "unknown candidate provider response status"));
+            }
+            result.status = *parsed_status;
+            if (auto count_ok = validate_count(subject_count, "candidate provider response subject"); !count_ok) {
+                return std::unexpected(std::move(count_ok.error()));
+            }
+            result.subject_ids.reserve(subject_count);
+            for (std::uint32_t subject_index = 0; subject_index < subject_count; ++subject_index) {
+                std::string subject_id;
+                if (!reader->read_string(subject_id)) {
+                    return std::unexpected(single_error("protocol", "truncated candidate provider response subject"));
+                }
+                result.subject_ids.push_back(std::move(subject_id));
+            }
+            std::uint32_t ttl {};
+            if (!reader->read_string(result.diagnostic) || !reader->read_u32(ttl)) {
+                return std::unexpected(single_error("protocol", "truncated candidate provider response metadata"));
+            }
+            result.ttl = std::chrono::seconds {ttl};
+            out.results.push_back(std::move(result));
         }
         return out;
     }

@@ -8,7 +8,8 @@
 #include <utility>
 
 namespace {
-    constexpr std::uint32_t trace_version {2};
+    constexpr std::uint32_t trace_version {3};
+    constexpr std::string_view trace_schema {"rule-engine-evaluation-trace.v1"};
     constexpr std::uint32_t max_trace_collection_count {65536};
 
     void append_u8(std::vector<std::byte> &out, const std::uint8_t value) {
@@ -324,6 +325,9 @@ namespace rule_engine {
         out.push_back(static_cast<std::byte>('T'));
         out.push_back(static_cast<std::byte>('R'));
         append_u32(out, trace_version);
+        if (auto result = append_string(out, trace_schema); !result) {
+            return std::unexpected(std::move(result.error()));
+        }
         if (auto result = append_string(out, trace.subject.kind); !result) {
             return std::unexpected(std::move(result.error()));
         }
@@ -378,6 +382,13 @@ namespace rule_engine {
         }
         if (version != trace_version) {
             return std::unexpected(single_error("trace", "unsupported trace artifact version"));
+        }
+        std::string schema;
+        if (!reader.read_string(schema)) {
+            return std::unexpected(single_error("trace", "truncated trace artifact schema"));
+        }
+        if (schema != trace_schema) {
+            return std::unexpected(single_error("trace", "unsupported trace artifact schema"));
         }
 
         EvaluationTrace out;

@@ -1,6 +1,7 @@
 #include <rule_engine/module_config.hpp>
 
 #include <charconv>
+#include <cstdint>
 #include <fstream>
 #include <optional>
 #include <sstream>
@@ -80,6 +81,35 @@ namespace {
             return false;
         }
         return std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<rule_engine::ProviderRetryPolicy>
+    parse_retry_policy(const std::string_view token) noexcept {
+        if (token == "none") {
+            return rule_engine::ProviderRetryPolicy::none;
+        }
+        if (token == "timed_out") {
+            return rule_engine::ProviderRetryPolicy::timed_out;
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<std::uint8_t> parse_retry_budget(const std::string_view token) noexcept {
+        std::uint32_t value {};
+        const auto *first = token.data();
+        const auto *last = first + token.size();
+        const auto [ptr, ec] = std::from_chars(first, last, value);
+        if (ec != std::errc {} || ptr != last || value > 255u) {
+            return std::nullopt;
+        }
+        return static_cast<std::uint8_t>(value);
+    }
+
+    [[nodiscard]] std::string parse_cancellation_diagnostic(const std::string_view token) {
+        if (token == "-") {
+            return {};
+        }
+        return std::string {token};
     }
 
     [[nodiscard]] std::optional<std::vector<rule_engine::ValueType>>
@@ -164,12 +194,13 @@ namespace rule_engine {
                     add_error(errors, path, line_number, "function line must follow a module line");
                     continue;
                 }
-                if (tokens.size() != 8u && tokens.size() != 9u) {
+                if (tokens.size() < 8u || tokens.size() > 12u) {
                     add_error(errors,
                               path,
                               line_number,
                               "function line expects: function <name> <return-type> <arg-types|-> <route> "
-                              "<key-prefix> <ttl-seconds> <cheap> [timeout-seconds]");
+                              "<key-prefix> <ttl-seconds> <cheap> [timeout-seconds] [retry-policy] "
+                              "[retry-budget] [cancel-diagnostic]");
                     continue;
                 }
                 const auto return_type = parse_value_type(tokens[2]);
@@ -177,15 +208,28 @@ namespace rule_engine {
                 const auto ttl = parse_seconds(tokens[6]);
                 const auto cheap = parse_bool(tokens[7]);
                 std::optional<std::chrono::seconds> timeout = std::chrono::seconds {5};
-                if (tokens.size() == 9u) {
+                if (tokens.size() >= 9u) {
                     timeout = parse_seconds(tokens[8]);
                 }
+                std::optional<ProviderRetryPolicy> retry_policy = ProviderRetryPolicy::none;
+                if (tokens.size() >= 10u) {
+                    retry_policy = parse_retry_policy(tokens[9]);
+                }
+                std::optional<std::uint8_t> retry_budget = static_cast<std::uint8_t>(0u);
+                if (tokens.size() >= 11u) {
+                    retry_budget = parse_retry_budget(tokens[10]);
+                }
+                std::string cancellation_diagnostic;
+                if (tokens.size() >= 12u) {
+                    cancellation_diagnostic = parse_cancellation_diagnostic(tokens[11]);
+                }
                 if (!return_type.has_value() || !parameters.has_value() || !ttl.has_value() || !cheap.has_value() ||
-                    !timeout.has_value()) {
+                    !timeout.has_value() || !retry_policy.has_value() || !retry_budget.has_value()) {
                     add_error(errors,
                               path,
                               line_number,
-                              "function line contains an invalid type, ttl, boolean, or timeout");
+                              "function line contains an invalid type, ttl, boolean, timeout, retry policy, or retry "
+                              "budget");
                     continue;
                 }
                 registry.modules[*module_index].functions.push_back(FunctionDescriptor {
@@ -196,6 +240,9 @@ namespace rule_engine {
                     .route = tokens[4],
                     .ttl = *ttl,
                     .timeout = *timeout,
+                    .retry_policy = *retry_policy,
+                    .retry_budget = *retry_budget,
+                    .cancellation_diagnostic = std::move(cancellation_diagnostic),
                     .cheap_prefetch = *cheap,
                 });
                 continue;
@@ -206,22 +253,40 @@ namespace rule_engine {
                     add_error(errors, path, line_number, "field line must follow a module line");
                     continue;
                 }
-                if (tokens.size() != 6u && tokens.size() != 7u) {
+                if (tokens.size() < 6u || tokens.size() > 10u) {
                     add_error(errors,
                               path,
                               line_number,
-                              "field line expects: field <key> <type> <route> <ttl> <cheap> [timeout]");
+                              "field line expects: field <key> <type> <route> <ttl> <cheap> [timeout] "
+                              "[retry-policy] [retry-budget] [cancel-diagnostic]");
                     continue;
                 }
                 const auto type = parse_value_type(tokens[2]);
                 const auto ttl = parse_seconds(tokens[4]);
                 const auto cheap = parse_bool(tokens[5]);
                 std::optional<std::chrono::seconds> timeout = std::chrono::seconds {5};
-                if (tokens.size() == 7u) {
+                if (tokens.size() >= 7u) {
                     timeout = parse_seconds(tokens[6]);
                 }
-                if (!type.has_value() || !ttl.has_value() || !cheap.has_value() || !timeout.has_value()) {
-                    add_error(errors, path, line_number, "field line contains an invalid type, ttl, boolean, or timeout");
+                std::optional<ProviderRetryPolicy> retry_policy = ProviderRetryPolicy::none;
+                if (tokens.size() >= 8u) {
+                    retry_policy = parse_retry_policy(tokens[7]);
+                }
+                std::optional<std::uint8_t> retry_budget = static_cast<std::uint8_t>(0u);
+                if (tokens.size() >= 9u) {
+                    retry_budget = parse_retry_budget(tokens[8]);
+                }
+                std::string cancellation_diagnostic;
+                if (tokens.size() >= 10u) {
+                    cancellation_diagnostic = parse_cancellation_diagnostic(tokens[9]);
+                }
+                if (!type.has_value() || !ttl.has_value() || !cheap.has_value() || !timeout.has_value() ||
+                    !retry_policy.has_value() || !retry_budget.has_value()) {
+                    add_error(errors,
+                              path,
+                              line_number,
+                              "field line contains an invalid type, ttl, boolean, timeout, retry policy, or retry "
+                              "budget");
                     continue;
                 }
                 registry.modules[*module_index].fields.push_back(FieldDescriptor {
@@ -230,28 +295,49 @@ namespace rule_engine {
                     .route = tokens[3],
                     .ttl = *ttl,
                     .timeout = *timeout,
+                    .retry_policy = *retry_policy,
+                    .retry_budget = *retry_budget,
+                    .cancellation_diagnostic = std::move(cancellation_diagnostic),
                     .cheap_prefetch = *cheap,
                 });
                 continue;
             }
 
             if (tokens[0] == "global") {
-                if (tokens.size() != 7u && tokens.size() != 8u) {
+                if (tokens.size() < 7u || tokens.size() > 11u) {
                     add_error(errors,
                               path,
                               line_number,
-                              "global line expects: global <name> <type> <key> <route> <ttl> <cheap> [timeout]");
+                              "global line expects: global <name> <type> <key> <route> <ttl> <cheap> [timeout] "
+                              "[retry-policy] [retry-budget] [cancel-diagnostic]");
                     continue;
                 }
                 const auto type = parse_value_type(tokens[2]);
                 const auto ttl = parse_seconds(tokens[5]);
                 const auto cheap = parse_bool(tokens[6]);
                 std::optional<std::chrono::seconds> timeout = std::chrono::seconds {5};
-                if (tokens.size() == 8u) {
+                if (tokens.size() >= 8u) {
                     timeout = parse_seconds(tokens[7]);
                 }
-                if (!type.has_value() || !ttl.has_value() || !cheap.has_value() || !timeout.has_value()) {
-                    add_error(errors, path, line_number, "global line contains an invalid type, ttl, boolean, or timeout");
+                std::optional<ProviderRetryPolicy> retry_policy = ProviderRetryPolicy::none;
+                if (tokens.size() >= 9u) {
+                    retry_policy = parse_retry_policy(tokens[8]);
+                }
+                std::optional<std::uint8_t> retry_budget = static_cast<std::uint8_t>(0u);
+                if (tokens.size() >= 10u) {
+                    retry_budget = parse_retry_budget(tokens[9]);
+                }
+                std::string cancellation_diagnostic;
+                if (tokens.size() >= 11u) {
+                    cancellation_diagnostic = parse_cancellation_diagnostic(tokens[10]);
+                }
+                if (!type.has_value() || !ttl.has_value() || !cheap.has_value() || !timeout.has_value() ||
+                    !retry_policy.has_value() || !retry_budget.has_value()) {
+                    add_error(errors,
+                              path,
+                              line_number,
+                              "global line contains an invalid type, ttl, boolean, timeout, retry policy, or retry "
+                              "budget");
                     continue;
                 }
                 registry.globals.push_back(GlobalDescriptor {
@@ -261,6 +347,9 @@ namespace rule_engine {
                     .route = tokens[4],
                     .ttl = *ttl,
                     .timeout = *timeout,
+                    .retry_policy = *retry_policy,
+                    .retry_budget = *retry_budget,
+                    .cancellation_diagnostic = std::move(cancellation_diagnostic),
                     .cheap_prefetch = *cheap,
                 });
                 continue;

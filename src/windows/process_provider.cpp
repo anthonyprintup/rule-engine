@@ -22,6 +22,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -1175,13 +1176,22 @@ namespace {
                result == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION);
     }
 
+    [[nodiscard]] bool is_unsigned_wintrust_status(const LONG status) noexcept {
+        const auto result = static_cast<HRESULT>(status);
+        return result == TRUST_E_NOSIGNATURE || result == TRUST_E_SUBJECT_FORM_UNKNOWN ||
+               result == TRUST_E_PROVIDER_UNKNOWN;
+    }
+
+    [[nodiscard]] bool is_process_signer_fact(const std::string_view key) noexcept {
+        return key == "process.signer.status" || key == "process.signer.is_signed";
+    }
+
     [[nodiscard]] std::string signer_status_name(const LONG status) {
         const auto result = static_cast<HRESULT>(status);
         if (result == static_cast<HRESULT>(ERROR_SUCCESS)) {
             return "trusted";
         }
-        if (result == TRUST_E_NOSIGNATURE || result == TRUST_E_SUBJECT_FORM_UNKNOWN ||
-            result == TRUST_E_PROVIDER_UNKNOWN) {
+        if (is_unsigned_wintrust_status(status)) {
             return "unsigned";
         }
         if (result == CERT_E_EXPIRED) {
@@ -1225,6 +1235,181 @@ namespace {
         return status;
     }
 
+    struct SignerEvaluation {
+        std::optional<LONG> wintrust_status;
+        rule_engine::FactStatus failure_status {rule_engine::FactStatus::unavailable};
+        std::string diagnostic;
+    };
+
+    struct SignerImagePreflight {
+        std::optional<SignerEvaluation> failure;
+        bool has_embedded_signature {};
+    };
+
+    using SignerEvaluationCache = std::unordered_map<std::string_view, SignerEvaluation>;
+
+    [[nodiscard]] SignerEvaluation signer_failure(const rule_engine::FactStatus status, std::string diagnostic) {
+        return SignerEvaluation {
+            .wintrust_status = std::nullopt,
+            .failure_status = status,
+            .diagnostic = std::move(diagnostic),
+        };
+    }
+
+    [[nodiscard]] SignerEvaluation signer_timeout_failure() {
+        return signer_failure(rule_engine::FactStatus::timed_out, "process signer verification timed out");
+    }
+
+    [[nodiscard]] std::chrono::steady_clock::time_point signer_deadline(
+        const std::chrono::milliseconds timeout) noexcept {
+        const auto now = std::chrono::steady_clock::now();
+        if (timeout <= 0ms) {
+            return now;
+        }
+        return now + timeout;
+    }
+
+    [[nodiscard]] bool deadline_expired(const std::chrono::steady_clock::time_point deadline) noexcept {
+        return std::chrono::steady_clock::now() >= deadline;
+    }
+
+    [[nodiscard]] bool read_file_value_at(HANDLE file,
+                                          const std::uint64_t offset,
+                                          void *out,
+                                          const DWORD size) noexcept {
+        LARGE_INTEGER position {};
+        position.QuadPart = static_cast<LONGLONG>(offset);
+        if (SetFilePointerEx(file, position, nullptr, FILE_BEGIN) == FALSE) {
+            return false;
+        }
+
+        DWORD bytes_read {};
+        return ReadFile(file, out, size, std::addressof(bytes_read), nullptr) != FALSE && bytes_read == size;
+    }
+
+    template <typename T>
+    [[nodiscard]] bool read_file_value_at(HANDLE file, const std::uint64_t offset, T &out) noexcept {
+        return read_file_value_at(file, offset, std::addressof(out), static_cast<DWORD>(sizeof(T)));
+    }
+
+    [[nodiscard]] SignerImagePreflight validate_pe_image_for_signer(const std::filesystem::path &path) {
+        UniqueHandle file {CreateFileW(path.c_str(),
+                                       GENERIC_READ,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                       nullptr,
+                                       OPEN_EXISTING,
+                                       FILE_ATTRIBUTE_NORMAL,
+                                       nullptr)};
+        if (file.handle == INVALID_HANDLE_VALUE) {
+            const auto error = GetLastError();
+            const auto status = error == ERROR_ACCESS_DENIED ? rule_engine::FactStatus::access_denied
+                                                             : rule_engine::FactStatus::unavailable;
+            return SignerImagePreflight {
+                .failure = signer_failure(status, win32_diagnostic("Open process image for signer verification", error)),
+            };
+        }
+
+        IMAGE_DOS_HEADER dos {};
+        if (!read_file_value_at(file.handle, 0u, dos)) {
+            return SignerImagePreflight {
+                .failure = signer_failure(rule_engine::FactStatus::unavailable, "truncated PE DOS header"),
+            };
+        }
+        if (dos.e_magic != IMAGE_DOS_SIGNATURE) {
+            return SignerImagePreflight {
+                .failure = signer_failure(rule_engine::FactStatus::unavailable, "image is not a PE file"),
+            };
+        }
+        if (dos.e_lfanew < 0) {
+            return SignerImagePreflight {
+                .failure = signer_failure(rule_engine::FactStatus::unavailable,
+                                          "image has invalid PE header offset"),
+            };
+        }
+
+        const auto nt_offset = static_cast<std::uint64_t>(dos.e_lfanew);
+        DWORD signature {};
+        if (!read_file_value_at(file.handle, nt_offset, signature)) {
+            return SignerImagePreflight {
+                .failure = signer_failure(rule_engine::FactStatus::unavailable, "truncated PE signature"),
+            };
+        }
+        if (signature != IMAGE_NT_SIGNATURE) {
+            return SignerImagePreflight {
+                .failure = signer_failure(rule_engine::FactStatus::unavailable, "image is not a PE file"),
+            };
+        }
+
+        IMAGE_FILE_HEADER file_header {};
+        constexpr auto file_header_offset = sizeof(DWORD);
+        if (!read_file_value_at(file.handle, nt_offset + file_header_offset, file_header)) {
+            return SignerImagePreflight {
+                .failure = signer_failure(rule_engine::FactStatus::unavailable, "truncated PE file header"),
+            };
+        }
+        if (file_header.SizeOfOptionalHeader < sizeof(WORD)) {
+            return SignerImagePreflight {
+                .failure = signer_failure(rule_engine::FactStatus::unavailable, "truncated PE optional header"),
+            };
+        }
+
+        WORD optional_magic {};
+        constexpr auto optional_header_offset = sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER);
+        if (!read_file_value_at(file.handle, nt_offset + optional_header_offset, optional_magic)) {
+            return SignerImagePreflight {
+                .failure = signer_failure(rule_engine::FactStatus::unavailable, "truncated PE optional header"),
+            };
+        }
+
+        if (optional_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+            if (file_header.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER32)) {
+                return SignerImagePreflight {
+                    .failure = signer_failure(rule_engine::FactStatus::unavailable,
+                                              "truncated PE32 optional header"),
+                };
+            }
+
+            IMAGE_OPTIONAL_HEADER32 optional_header {};
+            if (!read_file_value_at(file.handle, nt_offset + optional_header_offset, optional_header)) {
+                return SignerImagePreflight {
+                    .failure = signer_failure(rule_engine::FactStatus::unavailable,
+                                              "truncated PE32 optional header"),
+                };
+            }
+            const auto &certificate_table = optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
+            return SignerImagePreflight {
+                .failure = std::nullopt,
+                .has_embedded_signature = certificate_table.VirtualAddress != 0u && certificate_table.Size != 0u,
+            };
+        }
+
+        if (optional_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+            if (file_header.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64)) {
+                return SignerImagePreflight {
+                    .failure = signer_failure(rule_engine::FactStatus::unavailable,
+                                              "truncated PE32+ optional header"),
+                };
+            }
+
+            IMAGE_OPTIONAL_HEADER64 optional_header {};
+            if (!read_file_value_at(file.handle, nt_offset + optional_header_offset, optional_header)) {
+                return SignerImagePreflight {
+                    .failure = signer_failure(rule_engine::FactStatus::unavailable,
+                                              "truncated PE32+ optional header"),
+                };
+            }
+            const auto &certificate_table = optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
+            return SignerImagePreflight {
+                .failure = std::nullopt,
+                .has_embedded_signature = certificate_table.VirtualAddress != 0u && certificate_table.Size != 0u,
+            };
+        }
+
+        return SignerImagePreflight {
+            .failure = signer_failure(rule_engine::FactStatus::unavailable, "unsupported PE optional header"),
+        };
+    }
+
     [[nodiscard]] rule_engine::Fact handle_count_fact(const rule_engine::windows::ProcessFactKey &key,
                                                       const std::uint32_t pid) {
         UniqueHandle process {OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid))};
@@ -1261,38 +1446,99 @@ namespace {
                          rule_engine::FactStatus::available);
     }
 
-    [[nodiscard]] rule_engine::Fact signer_status_fact(const rule_engine::windows::ProcessFactKey &key) {
-        auto path = rule_engine::windows::resolve_process_image_path(key.subject_id);
+    [[nodiscard]] SignerEvaluation evaluate_image_signer(const std::filesystem::path &image_path,
+                                                         const std::chrono::steady_clock::time_point deadline) {
+        if (deadline_expired(deadline)) {
+            return signer_timeout_failure();
+        }
+
+        const auto preflight = validate_pe_image_for_signer(image_path);
+        if (preflight.failure.has_value()) {
+            return *preflight.failure;
+        }
+        if (deadline_expired(deadline)) {
+            return signer_timeout_failure();
+        }
+
+        const auto status = verify_authenticode_status(image_path);
+        if (deadline_expired(deadline)) {
+            return signer_timeout_failure();
+        }
+        if (preflight.has_embedded_signature && is_unsigned_wintrust_status(status)) {
+            return signer_failure(rule_engine::FactStatus::unavailable,
+                                  wintrust_diagnostic("WinVerifyTrust embedded signature", status));
+        }
+        if (is_wintrust_access_denied(status)) {
+            return signer_failure(rule_engine::FactStatus::access_denied,
+                                  wintrust_diagnostic("WinVerifyTrust", status));
+        }
+        if (is_wintrust_file_unavailable(status)) {
+            return signer_failure(rule_engine::FactStatus::unavailable,
+                                  wintrust_diagnostic("WinVerifyTrust", status));
+        }
+
+        return SignerEvaluation {
+            .wintrust_status = status,
+            .failure_status = rule_engine::FactStatus::unavailable,
+            .diagnostic = {},
+        };
+    }
+
+    [[nodiscard]] SignerEvaluation evaluate_process_signer(const std::string_view subject_id,
+                                                           const std::chrono::steady_clock::time_point deadline) {
+        if (deadline_expired(deadline)) {
+            return signer_timeout_failure();
+        }
+
+        auto path = rule_engine::windows::resolve_process_image_path(subject_id);
         if (!path) {
             const auto diagnostic = path.error().diagnostics.empty() ? std::string {"failed to resolve process image"}
                                                                      : path.error().diagnostics[0].message;
-            return make_fact(key.subject_id,
-                             key.key,
-                             rule_engine::Value::undefined(),
-                             rule_engine::FactStatus::access_denied,
-                             diagnostic);
+            return signer_failure(rule_engine::FactStatus::access_denied, diagnostic);
         }
 
-        const auto status = verify_authenticode_status(*path);
-        if (is_wintrust_access_denied(status)) {
-            return make_fact(key.subject_id,
-                             key.key,
-                             rule_engine::Value::undefined(),
-                             rule_engine::FactStatus::access_denied,
-                             wintrust_diagnostic("WinVerifyTrust", status));
-        }
-        if (is_wintrust_file_unavailable(status)) {
-            return make_fact(key.subject_id,
-                             key.key,
-                             rule_engine::Value::undefined(),
-                             rule_engine::FactStatus::unavailable,
-                             wintrust_diagnostic("WinVerifyTrust", status));
+        return evaluate_image_signer(*path, deadline);
+    }
+
+    [[nodiscard]] const SignerEvaluation &
+    signer_evaluation_for(SignerEvaluationCache &cache,
+                          const std::string_view subject_id,
+                          const std::chrono::steady_clock::time_point deadline) {
+        const auto found = cache.find(subject_id);
+        if (found != cache.end()) {
+            return found->second;
         }
 
-        return make_fact(key.subject_id,
-                         key.key,
-                         rule_engine::Value::string(signer_status_name(status)),
-                         rule_engine::FactStatus::available);
+        const auto [entry, inserted] = cache.emplace(subject_id, evaluate_process_signer(subject_id, deadline));
+        static_cast<void>(inserted);
+        return entry->second;
+    }
+
+    [[nodiscard]] rule_engine::Fact signer_fact(const rule_engine::windows::ProcessFactKey &key,
+                                                const SignerEvaluation &evaluation) {
+        if (!evaluation.wintrust_status.has_value()) {
+            return make_fact(key.subject_id,
+                             key.key,
+                             rule_engine::Value::undefined(),
+                             evaluation.failure_status,
+                             evaluation.diagnostic);
+        }
+
+        if (key.key == "process.signer.status") {
+            return make_fact(key.subject_id,
+                             key.key,
+                             rule_engine::Value::string(signer_status_name(*evaluation.wintrust_status)),
+                             rule_engine::FactStatus::available);
+        }
+        if (key.key == "process.signer.is_signed") {
+            return make_fact(
+                key.subject_id,
+                key.key,
+                rule_engine::Value::boolean(!is_unsigned_wintrust_status(*evaluation.wintrust_status)),
+                rule_engine::FactStatus::available);
+        }
+
+        return unavailable_fact(key, "unsupported process signer fact");
     }
 } // namespace
 
@@ -1562,7 +1808,8 @@ namespace rule_engine::windows {
         return out;
     }
 
-    std::expected<std::vector<Fact>, ErrorSet> read_process_signer_facts(const std::span<const ProcessFactKey> keys) {
+    std::expected<std::vector<Fact>, ErrorSet> read_process_signer_facts(const std::span<const ProcessFactKey> keys,
+                                                                         const std::chrono::milliseconds timeout) {
         auto entries = enumerate_process_entries();
         if (!entries) {
             return std::unexpected(std::move(entries.error()));
@@ -1570,6 +1817,8 @@ namespace rule_engine::windows {
 
         std::vector<Fact> out;
         out.reserve(keys.size());
+        SignerEvaluationCache signer_cache;
+        const auto deadline = signer_deadline(timeout);
         for (const auto &key : keys) {
             const auto pid = parse_pid_subject(key.subject_id);
             if (!pid.has_value()) {
@@ -1583,12 +1832,41 @@ namespace rule_engine::windows {
                 continue;
             }
 
-            if (key.key == "process.signer.status") {
-                out.push_back(signer_status_fact(key));
+            if (is_process_signer_fact(key.key)) {
+                out.push_back(signer_fact(key, signer_evaluation_for(signer_cache, key.subject_id, deadline)));
                 continue;
             }
 
             out.push_back(unavailable_fact(key, "unsupported process signer fact"));
+        }
+
+        return out;
+    }
+
+    std::expected<std::vector<Fact>, ErrorSet>
+    read_process_signer_image_facts(const std::string_view subject_id,
+                                    const std::filesystem::path &image_path,
+                                    const std::span<const ProcessFactKey> keys,
+                                    const std::chrono::milliseconds timeout) {
+        std::vector<Fact> out;
+        out.reserve(keys.size());
+        std::optional<SignerEvaluation> signer;
+        const auto deadline = signer_deadline(timeout);
+
+        for (const auto &key : keys) {
+            if (key.subject_id != subject_id) {
+                out.push_back(unavailable_fact(key, "process signer image subject mismatch"));
+                continue;
+            }
+            if (!is_process_signer_fact(key.key)) {
+                out.push_back(unavailable_fact(key, "unsupported process signer fact"));
+                continue;
+            }
+
+            if (!signer.has_value()) {
+                signer = evaluate_image_signer(image_path, deadline);
+            }
+            out.push_back(signer_fact(key, *signer));
         }
 
         return out;

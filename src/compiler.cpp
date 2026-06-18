@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -188,8 +189,50 @@ namespace {
         return out;
     }
 
-    [[nodiscard]] rule_engine::SourceSpan bridge_span(const bridge::ReSpan span,
-                                                      const std::string_view source_name,
+    constexpr std::string_view process_image_bytes_key {"process.image.bytes"};
+    constexpr std::string_view scan_pattern_route {"endpoint.scan.patterns"};
+
+    struct IntegerReaderSpec {
+        std::size_t width {};
+        bool signed_value {};
+        bool big_endian {};
+    };
+
+    [[nodiscard]] std::optional<IntegerReaderSpec> integer_reader_spec(const std::string_view name) noexcept {
+        if (name == "uint8") {
+            return IntegerReaderSpec {.width = 1u, .signed_value = false, .big_endian = false};
+        }
+        if (name == "int8") {
+            return IntegerReaderSpec {.width = 1u, .signed_value = true, .big_endian = false};
+        }
+        if (name == "uint16" || name == "uint16le") {
+            return IntegerReaderSpec {.width = 2u, .signed_value = false, .big_endian = false};
+        }
+        if (name == "int16" || name == "int16le") {
+            return IntegerReaderSpec {.width = 2u, .signed_value = true, .big_endian = false};
+        }
+        if (name == "uint32" || name == "uint32le") {
+            return IntegerReaderSpec {.width = 4u, .signed_value = false, .big_endian = false};
+        }
+        if (name == "int32" || name == "int32le") {
+            return IntegerReaderSpec {.width = 4u, .signed_value = true, .big_endian = false};
+        }
+        if (name == "uint16be") {
+            return IntegerReaderSpec {.width = 2u, .signed_value = false, .big_endian = true};
+        }
+        if (name == "int16be") {
+            return IntegerReaderSpec {.width = 2u, .signed_value = true, .big_endian = true};
+        }
+        if (name == "uint32be") {
+            return IntegerReaderSpec {.width = 4u, .signed_value = false, .big_endian = true};
+        }
+        if (name == "int32be") {
+            return IntegerReaderSpec {.width = 4u, .signed_value = true, .big_endian = true};
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] rule_engine::SourceSpan bridge_span(const bridge::ReSpan span, const std::string_view source_name,
                                                       const std::uint32_t source_id) {
         return rule_engine::SourceSpan {
             .source_id = source_id,
@@ -199,8 +242,7 @@ namespace {
         };
     }
 
-    [[nodiscard]] std::string diagnostic_source(const rule_engine::SourceSpan &span,
-                                                const std::string_view fallback) {
+    [[nodiscard]] std::string diagnostic_source(const rule_engine::SourceSpan &span, const std::string_view fallback) {
         if (!span.source.empty()) {
             return span.source;
         }
@@ -271,8 +313,7 @@ namespace {
     }
 
     [[nodiscard]] rule_engine::ParsedRule bridge_rule(const bridge::ReParsedRuleSet *rules,
-                                                      const bridge::ReRuleView rule,
-                                                      const std::string_view source_name,
+                                                      const bridge::ReRuleView rule, const std::string_view source_name,
                                                       const std::uint32_t source_id) {
         rule_engine::ParsedRule out;
         out.identifier = to_string(rule.identifier);
@@ -303,31 +344,28 @@ namespace {
 
     [[nodiscard]] bool contains_rule_symbol(const std::vector<RuleSymbol> &symbols,
                                             const std::string_view qualified_identifier) {
-        return std::ranges::any_of(symbols, [&](const auto &symbol) {
-            return symbol.qualified_identifier == qualified_identifier;
-        });
+        return std::ranges::any_of(
+            symbols, [&](const auto &symbol) { return symbol.qualified_identifier == qualified_identifier; });
     }
 
-    [[nodiscard]] std::optional<std::string>
-    resolve_rule_reference(const std::vector<RuleSymbol> &symbols,
-                           const std::string_view current_namespace,
-                           const std::string_view name) {
+    [[nodiscard]] std::optional<std::string> resolve_rule_reference(const std::vector<RuleSymbol> &symbols,
+                                                                    const std::string_view current_namespace,
+                                                                    const std::string_view name) {
         if (name.empty()) {
             return std::nullopt;
         }
-        const auto candidate =
-            name.find('.') != std::string_view::npos ? std::string {name}
-                                                     : qualified_rule_identifier(current_namespace, name);
+        const auto candidate = name.find('.') != std::string_view::npos ?
+                                   std::string {name} :
+                                   qualified_rule_identifier(current_namespace, name);
         if (!contains_rule_symbol(symbols, candidate)) {
             return std::nullopt;
         }
         return candidate;
     }
 
-    [[nodiscard]] std::optional<std::string>
-    resolve_rule_reference(const std::vector<RuleSymbol> &symbols,
-                           const std::string_view current_namespace,
-                           const std::vector<std::string> &names) {
+    [[nodiscard]] std::optional<std::string> resolve_rule_reference(const std::vector<RuleSymbol> &symbols,
+                                                                    const std::string_view current_namespace,
+                                                                    const std::vector<std::string> &names) {
         if (names.size() == 1u) {
             return resolve_rule_reference(symbols, current_namespace, names[0]);
         }
@@ -343,7 +381,8 @@ namespace {
     }
 
     void add_fact(std::vector<rule_engine::RequiredFact> &facts, rule_engine::RequiredFact fact) {
-        const auto duplicate = std::ranges::any_of(facts, [&](const auto &existing) { return existing.key == fact.key; });
+        const auto duplicate =
+            std::ranges::any_of(facts, [&](const auto &existing) { return existing.key == fact.key; });
         if (duplicate) {
             return;
         }
@@ -365,9 +404,7 @@ namespace {
         if (expr.kind == rule_engine::ExpressionKind::function_call) {
             add_route(routes, expr.bound_route);
         }
-        for (const auto &child : expr.children) {
-            collect_expression_routes(child, routes);
-        }
+        for (const auto &child : expr.children) { collect_expression_routes(child, routes); }
     }
 
     [[nodiscard]] std::string pattern_identifier_key(std::string value) {
@@ -400,9 +437,7 @@ namespace {
         };
         for (const auto &name : names) {
             if (name == "them") {
-                for (const auto &pattern : rule_patterns) {
-                    add_pattern(pattern_identifier_key(pattern));
-                }
+                for (const auto &pattern : rule_patterns) { add_pattern(pattern_identifier_key(pattern)); }
                 continue;
             }
 
@@ -424,9 +459,8 @@ namespace {
 
     [[nodiscard]] std::optional<rule_engine::PatternScanPlan>
     pattern_scan_plan_for(const std::vector<rule_engine::ParsedPattern> &patterns, const std::string_view pattern_key) {
-        const auto found = std::ranges::find_if(patterns, [&](const auto &pattern) {
-            return pattern_identifier_key(pattern.identifier) == pattern_key;
-        });
+        const auto found = std::ranges::find_if(
+            patterns, [&](const auto &pattern) { return pattern_identifier_key(pattern.identifier) == pattern_key; });
         if (found == patterns.end() || found->kind != "text" || found->literal.empty()) {
             return std::nullopt;
         }
@@ -440,11 +474,10 @@ namespace {
         return plan;
     }
 
-    [[nodiscard]] rule_engine::RequiredFact pattern_required_fact(
-        const std::string_view pattern_name,
-        const std::string_view suffix,
-        const rule_engine::ValueType type,
-        const std::vector<rule_engine::ParsedPattern> &rule_patterns) {
+    [[nodiscard]] rule_engine::RequiredFact
+    pattern_required_fact(const std::string_view pattern_name, const std::string_view suffix,
+                          const rule_engine::ValueType type,
+                          const std::vector<rule_engine::ParsedPattern> &rule_patterns) {
         auto pattern_key = pattern_identifier_key(std::string {pattern_name});
         rule_engine::RequiredFact fact {
             .key = pattern_key + std::string {suffix},
@@ -453,6 +486,7 @@ namespace {
             .cheap_prefetch = false,
             .type = type,
             .scan_plan = std::nullopt,
+            .cost_class = rule_engine::FactCostClass::pattern_scan,
         };
         fact.scan_plan = pattern_scan_plan_for(rule_patterns, pattern_key);
         return fact;
@@ -478,13 +512,31 @@ namespace {
         }
     }
 
-    [[nodiscard]] std::optional<rule_engine::ValueType>
-    static_expression_type(const rule_engine::Expression &expr,
-                           const rule_engine::ModuleRegistry &registry,
-                           const std::vector<std::string> &local_names);
+    struct LocalType {
+        std::string name;
+        std::optional<rule_engine::ValueType> type;
+    };
 
-    [[nodiscard]] std::optional<std::int64_t> checked_add(const std::int64_t lhs,
-                                                          const std::int64_t rhs) noexcept {
+    [[nodiscard]] const LocalType *find_local_type(const std::vector<LocalType> &local_types,
+                                                   const std::string_view name) noexcept {
+        for (auto candidate = local_types.rbegin(); candidate != local_types.rend(); ++candidate) {
+            if (candidate->name == name) {
+                return std::addressof(*candidate);
+            }
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] bool contains_local_type(const std::vector<LocalType> &local_types,
+                                           const std::string_view name) noexcept {
+        return find_local_type(local_types, name) != nullptr;
+    }
+
+    [[nodiscard]] std::optional<rule_engine::ValueType>
+    static_expression_type(const rule_engine::Expression &expr, const rule_engine::ModuleRegistry &registry,
+                           const std::vector<LocalType> &local_types);
+
+    [[nodiscard]] std::optional<std::int64_t> checked_add(const std::int64_t lhs, const std::int64_t rhs) noexcept {
         std::int64_t out {};
         if (__builtin_add_overflow(lhs, rhs, &out)) {
             return std::nullopt;
@@ -510,8 +562,7 @@ namespace {
         return out;
     }
 
-    [[nodiscard]] std::optional<std::int64_t> checked_divide(const std::int64_t lhs,
-                                                             const std::int64_t rhs) noexcept {
+    [[nodiscard]] std::optional<std::int64_t> checked_divide(const std::int64_t lhs, const std::int64_t rhs) noexcept {
         if (rhs == 0) {
             return std::nullopt;
         }
@@ -521,8 +572,7 @@ namespace {
         return lhs / rhs;
     }
 
-    [[nodiscard]] std::optional<std::int64_t> checked_modulo(const std::int64_t lhs,
-                                                             const std::int64_t rhs) noexcept {
+    [[nodiscard]] std::optional<std::int64_t> checked_modulo(const std::int64_t lhs, const std::int64_t rhs) noexcept {
         if (rhs == 0) {
             return std::nullopt;
         }
@@ -740,12 +790,11 @@ namespace {
     }
 
     [[nodiscard]] std::optional<rule_engine::ValueType>
-    numeric_expression_type(const rule_engine::Expression &expr,
-                            const rule_engine::ModuleRegistry &registry,
-                            const std::vector<std::string> &local_names) {
+    numeric_expression_type(const rule_engine::Expression &expr, const rule_engine::ModuleRegistry &registry,
+                            const std::vector<LocalType> &local_types) {
         bool saw_floating {};
         for (const auto &child : expr.children) {
-            const auto child_type = static_expression_type(child, registry, local_names);
+            const auto child_type = static_expression_type(child, registry, local_types);
             if (!child_type.has_value()) {
                 return std::nullopt;
             }
@@ -761,9 +810,8 @@ namespace {
     }
 
     [[nodiscard]] std::optional<rule_engine::ValueType>
-    static_expression_type(const rule_engine::Expression &expr,
-                           const rule_engine::ModuleRegistry &registry,
-                           const std::vector<std::string> &local_names) {
+    static_expression_type(const rule_engine::Expression &expr, const rule_engine::ModuleRegistry &registry,
+                           const std::vector<LocalType> &local_types) {
         using enum rule_engine::ExpressionKind;
 
         switch (expr.kind) {
@@ -789,10 +837,8 @@ namespace {
             case iends_with:
             case iequals:
             case pattern_match:
-            case defined:
-                return rule_engine::ValueType::boolean;
-            case literal_string:
-                return rule_engine::ValueType::string;
+            case defined: return rule_engine::ValueType::boolean;
+            case literal_string: return rule_engine::ValueType::string;
             case literal_integer:
             case bitwise_not:
             case shift_left:
@@ -803,20 +849,17 @@ namespace {
             case pattern_count:
             case pattern_offset:
             case pattern_length:
-                return rule_engine::ValueType::integer;
-            case literal_float:
-                return rule_engine::ValueType::floating;
+            case integer_reader: return rule_engine::ValueType::integer;
+            case literal_float: return rule_engine::ValueType::floating;
             case negate:
             case add:
             case subtract:
             case multiply:
             case divide:
-            case modulo:
-                return numeric_expression_type(expr, registry, local_names);
+            case modulo: return numeric_expression_type(expr, registry, local_types);
             case range_expr:
             case tuple_expr:
-            case iterable_expr:
-                return rule_engine::ValueType::array;
+            case iterable_expr: return rule_engine::ValueType::array;
             case field: {
                 const auto *field = registry.find_field(join_names(expr.names));
                 if (field == nullptr) {
@@ -826,8 +869,8 @@ namespace {
             }
             case identifier: {
                 const auto name = !expr.names.empty() ? std::string_view {expr.names[0]} : std::string_view {expr.text};
-                if (contains_name(local_names, name)) {
-                    return std::nullopt;
+                if (const auto *local = find_local_type(local_types, name); local != nullptr) {
+                    return local->type;
                 }
                 const auto *global = registry.find_global(name);
                 if (global == nullptr) {
@@ -837,6 +880,9 @@ namespace {
             }
             case function_call: {
                 const auto key = !expr.names.empty() ? join_names(expr.names) : expr.text;
+                if (integer_reader_spec(key).has_value()) {
+                    return rule_engine::ValueType::integer;
+                }
                 const auto *function = registry.find_function(key);
                 if (function == nullptr || function->return_type == rule_engine::ValueType::undefined) {
                     return std::nullopt;
@@ -856,20 +902,40 @@ namespace {
             case with_expr:
             case lookup_expr:
             case unsupported:
-            default:
-                return std::nullopt;
+            default: return std::nullopt;
         }
     }
 
-    void validate_function_arguments(const std::string &key,
-                                     const rule_engine::Expression &expr,
+    void validate_integer_reader_arguments(const std::string &key, const rule_engine::Expression &expr,
+                                           const rule_engine::ModuleRegistry &registry, rule_engine::ErrorSet &errors,
+                                           const std::string_view source, const std::vector<LocalType> &local_types) {
+        if (expr.children.size() != 1u) {
+            errors.diagnostics.push_back(rule_engine::Diagnostic {
+                .source = diagnostic_source(expr.span, source),
+                .span = expr.span,
+                .message = "function " + key + " expects 1 argument(s)",
+            });
+            return;
+        }
+
+        const auto actual_type = static_expression_type(expr.children[0], registry, local_types);
+        if (!actual_type.has_value() || *actual_type == rule_engine::ValueType::integer) {
+            return;
+        }
+
+        errors.diagnostics.push_back(rule_engine::Diagnostic {
+            .source = diagnostic_source(expr.children[0].span, source),
+            .span = expr.children[0].span,
+            .message = "function " + key + " argument 1 expects integer but got " + value_type_name(*actual_type),
+        });
+    }
+
+    void validate_function_arguments(const std::string &key, const rule_engine::Expression &expr,
                                      const rule_engine::FunctionDescriptor &function,
-                                     const rule_engine::ModuleRegistry &registry,
-                                     rule_engine::ErrorSet &errors,
-                                     const std::string_view source,
-                                     const std::vector<std::string> &local_names) {
+                                     const rule_engine::ModuleRegistry &registry, rule_engine::ErrorSet &errors,
+                                     const std::string_view source, const std::vector<LocalType> &local_types) {
         for (std::size_t index = 0; index < expr.children.size(); ++index) {
-            const auto actual_type = static_expression_type(expr.children[index], registry, local_names);
+            const auto actual_type = static_expression_type(expr.children[index], registry, local_types);
             if (!actual_type.has_value()) {
                 continue;
             }
@@ -886,23 +952,19 @@ namespace {
         }
     }
 
-    void collect_requirements(rule_engine::Expression &expr,
-                              const rule_engine::ModuleRegistry &registry,
-                              const std::vector<RuleSymbol> &rule_symbols,
-                              const std::string_view current_namespace,
+    void collect_requirements(rule_engine::Expression &expr, const rule_engine::ModuleRegistry &registry,
+                              const std::vector<RuleSymbol> &rule_symbols, const std::string_view current_namespace,
                               const std::vector<rule_engine::ParsedPattern> &rule_patterns,
                               std::vector<rule_engine::RequiredFact> &facts,
-                              std::vector<std::string> &rule_dependencies,
-                              rule_engine::ErrorSet &errors,
-                              std::string_view source,
-                              const std::vector<std::string> &local_names = {},
+                              std::vector<std::string> &rule_dependencies, rule_engine::ErrorSet &errors,
+                              std::string_view source, const std::vector<LocalType> &local_types = {},
                               const bool for_of_body = false) {
         if (expr.kind == rule_engine::ExpressionKind::unsupported) {
             errors.diagnostics.push_back(rule_engine::Diagnostic {
                 .source = diagnostic_source(expr.span, source),
                 .span = expr.span,
-                .message = expr.text.empty() ? std::string {"unsupported YARA expression"}
-                                             : "unsupported YARA expression " + expr.text,
+                .message = expr.text.empty() ? std::string {"unsupported YARA expression"} :
+                                               "unsupported YARA expression " + expr.text,
             });
             return;
         }
@@ -919,41 +981,21 @@ namespace {
             }
 
             if (quantifier_children == 1u) {
-                collect_requirements(expr.children[0],
-                                     registry,
-                                     rule_symbols,
-                                     current_namespace,
-                                     rule_patterns,
-                                     facts,
-                                     rule_dependencies,
-                                     errors,
-                                     source,
-                                     local_names,
-                                     for_of_body);
+                collect_requirements(expr.children[0], registry, rule_symbols, current_namespace, rule_patterns, facts,
+                                     rule_dependencies, errors, source, local_types, for_of_body);
             }
 
             std::vector<std::string> rule_pattern_names;
             rule_pattern_names.reserve(rule_patterns.size());
-            for (const auto &pattern : rule_patterns) {
-                rule_pattern_names.push_back(pattern.identifier);
-            }
+            for (const auto &pattern : rule_patterns) { rule_pattern_names.push_back(pattern.identifier); }
             expr.names = expand_pattern_names(expr.names, rule_pattern_names);
             for (const auto &name : expr.names) {
                 add_fact(facts,
                          pattern_required_fact(name, ".pattern", rule_engine::ValueType::pattern, rule_patterns));
             }
 
-            collect_requirements(expr.children[quantifier_children],
-                                 registry,
-                                 rule_symbols,
-                                 current_namespace,
-                                 rule_patterns,
-                                 facts,
-                                 rule_dependencies,
-                                 errors,
-                                 source,
-                                 local_names,
-                                 true);
+            collect_requirements(expr.children[quantifier_children], registry, rule_symbols, current_namespace,
+                                 rule_patterns, facts, rule_dependencies, errors, source, local_types, true);
             return;
         }
 
@@ -969,48 +1011,22 @@ namespace {
             }
 
             if (quantifier_children == 1u) {
-                collect_requirements(expr.children[0],
-                                     registry,
-                                     rule_symbols,
-                                     current_namespace,
-                                     rule_patterns,
-                                     facts,
-                                     rule_dependencies,
-                                     errors,
-                                     source,
-                                     local_names,
-                                     for_of_body);
+                collect_requirements(expr.children[0], registry, rule_symbols, current_namespace, rule_patterns, facts,
+                                     rule_dependencies, errors, source, local_types, for_of_body);
             }
 
-            collect_requirements(expr.children[quantifier_children],
-                                 registry,
-                                 rule_symbols,
-                                 current_namespace,
-                                 rule_patterns,
-                                 facts,
-                                 rule_dependencies,
-                                 errors,
-                                 source,
-                                 local_names,
-                                 for_of_body);
+            collect_requirements(expr.children[quantifier_children], registry, rule_symbols, current_namespace,
+                                 rule_patterns, facts, rule_dependencies, errors, source, local_types, for_of_body);
 
-            auto loop_locals = local_names;
+            auto loop_locals = local_types;
             for (const auto &name : expr.names) {
-                if (!contains_name(loop_locals, name)) {
-                    loop_locals.push_back(name);
-                }
+                loop_locals.push_back(LocalType {
+                    .name = name,
+                    .type = std::nullopt,
+                });
             }
-            collect_requirements(expr.children[quantifier_children + 1u],
-                                 registry,
-                                 rule_symbols,
-                                 current_namespace,
-                                 rule_patterns,
-                                 facts,
-                                 rule_dependencies,
-                                 errors,
-                                 source,
-                                 loop_locals,
-                                 for_of_body);
+            collect_requirements(expr.children[quantifier_children + 1u], registry, rule_symbols, current_namespace,
+                                 rule_patterns, facts, rule_dependencies, errors, source, loop_locals, for_of_body);
             return;
         }
 
@@ -1024,40 +1040,57 @@ namespace {
                 return;
             }
 
-            auto with_locals = local_names;
+            auto with_locals = local_types;
             for (std::size_t index = 0; index < expr.names.size(); ++index) {
-                collect_requirements(expr.children[index],
-                                     registry,
-                                     rule_symbols,
-                                     current_namespace,
-                                     rule_patterns,
-                                     facts,
-                                     rule_dependencies,
-                                     errors,
-                                     source,
-                                     with_locals,
-                                     for_of_body);
-                if (!contains_name(with_locals, expr.names[index])) {
-                    with_locals.push_back(expr.names[index]);
-                }
+                collect_requirements(expr.children[index], registry, rule_symbols, current_namespace, rule_patterns,
+                                     facts, rule_dependencies, errors, source, with_locals, for_of_body);
+                with_locals.push_back(LocalType {
+                    .name = expr.names[index],
+                    .type = static_expression_type(expr.children[index], registry, with_locals),
+                });
             }
 
-            collect_requirements(expr.children.back(),
-                                 registry,
-                                 rule_symbols,
-                                 current_namespace,
-                                 rule_patterns,
-                                 facts,
-                                 rule_dependencies,
-                                 errors,
-                                 source,
-                                 with_locals,
-                                 for_of_body);
+            collect_requirements(expr.children.back(), registry, rule_symbols, current_namespace, rule_patterns, facts,
+                                 rule_dependencies, errors, source, with_locals, for_of_body);
             return;
         }
 
         if (expr.kind == rule_engine::ExpressionKind::function_call) {
-            const auto key = join_names(expr.names);
+            const auto key = !expr.names.empty() ? join_names(expr.names) : expr.text;
+            if (integer_reader_spec(key).has_value()) {
+                for (auto &child : expr.children) {
+                    collect_requirements(child, registry, rule_symbols, current_namespace, rule_patterns, facts,
+                                         rule_dependencies, errors, source, local_types, for_of_body);
+                }
+                validate_integer_reader_arguments(key, expr, registry, errors, source, local_types);
+                expr.kind = rule_engine::ExpressionKind::integer_reader;
+                expr.text = key;
+                expr.names = {key};
+                expr.bound_key_prefix = std::string {process_image_bytes_key};
+                expr.bound_route = std::string {scan_pattern_route};
+                expr.bound_ttl = std::chrono::seconds {30};
+                expr.bound_timeout = std::chrono::seconds {5};
+                expr.bound_retry_policy = rule_engine::ProviderRetryPolicy::none;
+                expr.bound_retry_budget = 0u;
+                expr.bound_cancellation_diagnostic = "process image bytes request cancelled";
+                expr.bound_cheap_prefetch = false;
+                expr.bound_return_type = rule_engine::ValueType::integer;
+                expr.bound_cost_class = rule_engine::FactCostClass::pattern_scan;
+                add_fact(facts, rule_engine::RequiredFact {
+                                     .key = std::string {process_image_bytes_key},
+                                     .route = std::string {scan_pattern_route},
+                                     .ttl = std::chrono::seconds {30},
+                                     .timeout = std::chrono::seconds {5},
+                                     .retry_policy = rule_engine::ProviderRetryPolicy::none,
+                                     .retry_budget = 0u,
+                                     .cancellation_diagnostic = "process image bytes request cancelled",
+                                     .cheap_prefetch = false,
+                                     .type = rule_engine::ValueType::bytes,
+                                     .scan_plan = std::nullopt,
+                                     .cost_class = rule_engine::FactCostClass::pattern_scan,
+                                 });
+                return;
+            }
             const auto *function = registry.find_function(key);
             if (function == nullptr) {
                 errors.diagnostics.push_back(rule_engine::Diagnostic {
@@ -1071,8 +1104,8 @@ namespace {
                 errors.diagnostics.push_back(rule_engine::Diagnostic {
                     .source = diagnostic_source(expr.span, source),
                     .span = expr.span,
-                    .message = "function " + key + " expects " + std::to_string(function->parameters.size()) +
-                               " argument(s)",
+                    .message =
+                        "function " + key + " expects " + std::to_string(function->parameters.size()) + " argument(s)",
                 });
                 return;
             }
@@ -1082,23 +1115,18 @@ namespace {
             expr.bound_route = function->route;
             expr.bound_ttl = function->ttl;
             expr.bound_timeout = function->timeout;
+            expr.bound_retry_policy = function->retry_policy;
+            expr.bound_retry_budget = function->retry_budget;
+            expr.bound_cancellation_diagnostic = function->cancellation_diagnostic;
             expr.bound_cheap_prefetch = function->cheap_prefetch;
             expr.bound_return_type = function->return_type;
+            expr.bound_cost_class = function->cost_class;
 
             for (auto &child : expr.children) {
-                collect_requirements(child,
-                                     registry,
-                                     rule_symbols,
-                                     current_namespace,
-                                     rule_patterns,
-                                     facts,
-                                     rule_dependencies,
-                                     errors,
-                                     source,
-                                     local_names,
-                                     for_of_body);
+                collect_requirements(child, registry, rule_symbols, current_namespace, rule_patterns, facts,
+                                     rule_dependencies, errors, source, local_types, for_of_body);
             }
-            validate_function_arguments(key, expr, *function, registry, errors, source, local_names);
+            validate_function_arguments(key, expr, *function, registry, errors, source, local_types);
             if (function->cheap_prefetch) {
                 const auto arguments = static_function_arguments(expr);
                 if (arguments.has_value()) {
@@ -1107,10 +1135,14 @@ namespace {
                                         .route = function->route,
                                         .ttl = function->ttl,
                                         .timeout = function->timeout,
+                                        .retry_policy = function->retry_policy,
+                                        .retry_budget = function->retry_budget,
+                                        .cancellation_diagnostic = function->cancellation_diagnostic,
                                         .cheap_prefetch = true,
                                         .type = function->return_type,
                                         .scan_plan = std::nullopt,
-                                    });
+                                        .cost_class = function->cost_class,
+                                     });
                 }
             }
             return;
@@ -1125,10 +1157,14 @@ namespace {
                                     .route = field->route,
                                     .ttl = field->ttl,
                                     .timeout = field->timeout,
+                                    .retry_policy = field->retry_policy,
+                                    .retry_budget = field->retry_budget,
+                                    .cancellation_diagnostic = field->cancellation_diagnostic,
                                     .cheap_prefetch = field->cheap_prefetch,
                                     .type = field->type,
                                     .scan_plan = std::nullopt,
-                                });
+                                    .cost_class = field->cost_class,
+                                 });
                 return;
             }
 
@@ -1168,9 +1204,7 @@ namespace {
         if (expr.kind == rule_engine::ExpressionKind::of_expr && !expr.names.empty()) {
             std::vector<std::string> rule_pattern_names;
             rule_pattern_names.reserve(rule_patterns.size());
-            for (const auto &pattern : rule_patterns) {
-                rule_pattern_names.push_back(pattern.identifier);
-            }
+            for (const auto &pattern : rule_patterns) { rule_pattern_names.push_back(pattern.identifier); }
             expr.names = expand_pattern_names(expr.names, rule_pattern_names);
             for (const auto &name : expr.names) {
                 add_fact(facts,
@@ -1180,7 +1214,7 @@ namespace {
 
         if (expr.kind == rule_engine::ExpressionKind::identifier) {
             const auto name = !expr.names.empty() ? std::string_view {expr.names[0]} : std::string_view {expr.text};
-            if (contains_name(local_names, name)) {
+            if (contains_local_type(local_types, name)) {
                 return;
             }
             if (const auto rule_reference = resolve_rule_reference(rule_symbols, current_namespace, name);
@@ -1199,10 +1233,14 @@ namespace {
                                     .route = global->route,
                                     .ttl = global->ttl,
                                     .timeout = global->timeout,
+                                    .retry_policy = global->retry_policy,
+                                    .retry_budget = global->retry_budget,
+                                    .cancellation_diagnostic = global->cancellation_diagnostic,
                                     .cheap_prefetch = global->cheap_prefetch,
                                     .type = global->type,
                                     .scan_plan = std::nullopt,
-                                });
+                                    .cost_class = global->cost_class,
+                                 });
             } else {
                 errors.diagnostics.push_back(rule_engine::Diagnostic {
                     .source = diagnostic_source(expr.span, source),
@@ -1213,26 +1251,16 @@ namespace {
         }
 
         for (auto &child : expr.children) {
-            collect_requirements(
-                child,
-                registry,
-                rule_symbols,
-                current_namespace,
-                rule_patterns,
-                facts,
-                rule_dependencies,
-                errors,
-                source,
-                local_names,
-                for_of_body);
+            collect_requirements(child, registry, rule_symbols, current_namespace, rule_patterns, facts,
+                                 rule_dependencies, errors, source, local_types, for_of_body);
         }
     }
 
     [[nodiscard]] std::optional<std::size_t> rule_index_by_name(const rule_engine::VerifiedProgram &program,
                                                                 const std::string_view name) {
         const auto found = std::ranges::find_if(program.rules, [&](const auto &rule) {
-            const auto rule_key = rule.qualified_identifier.empty() ? std::string_view {rule.identifier}
-                                                                    : std::string_view {rule.qualified_identifier};
+            const auto rule_key = rule.qualified_identifier.empty() ? std::string_view {rule.identifier} :
+                                                                      std::string_view {rule.qualified_identifier};
             return rule_key == name;
         });
         if (found == program.rules.end()) {
@@ -1247,10 +1275,8 @@ namespace {
         visited,
     };
 
-    bool visit_rule_dependencies(const std::size_t index,
-                                 const rule_engine::VerifiedProgram &program,
-                                 std::vector<VisitState> &states,
-                                 rule_engine::ErrorSet &errors,
+    bool visit_rule_dependencies(const std::size_t index, const rule_engine::VerifiedProgram &program,
+                                 std::vector<VisitState> &states, rule_engine::ErrorSet &errors,
                                  const std::string_view source) {
         if (states[index] == VisitState::visiting) {
             errors.diagnostics.push_back(rule_engine::Diagnostic {
@@ -1331,9 +1357,7 @@ namespace {
     }
 
     void append_magic(std::vector<std::byte> &out, const std::string_view value) {
-        for (const auto byte : value) {
-            out.push_back(static_cast<std::byte>(static_cast<unsigned char>(byte)));
-        }
+        for (const auto byte : value) { out.push_back(static_cast<std::byte>(static_cast<unsigned char>(byte))); }
     }
 
     void append_u8(std::vector<std::byte> &out, const std::uint8_t value) {
@@ -1349,50 +1373,44 @@ namespace {
 
     void append_string(std::vector<std::byte> &out, const std::string_view value) {
         append_u32(out, static_cast<std::uint32_t>(value.size()));
-        for (const auto byte : value) {
-            out.push_back(static_cast<std::byte>(static_cast<unsigned char>(byte)));
+        for (const auto byte : value) { out.push_back(static_cast<std::byte>(static_cast<unsigned char>(byte))); }
+    }
+
+    [[nodiscard]] std::uint8_t retry_policy_code(const rule_engine::ProviderRetryPolicy retry_policy) noexcept {
+        switch (retry_policy) {
+            case rule_engine::ProviderRetryPolicy::none: return 0u;
+            case rule_engine::ProviderRetryPolicy::timed_out: return 1u;
+            default: return 0u;
         }
     }
 
     void merge_ruleset(rule_engine::ParsedRuleSet &target, rule_engine::ParsedRuleSet source) {
-        for (auto &source_name : source.sources) {
-            add_unique(target.sources, std::move(source_name));
-        }
-        for (auto &import_name : source.imports) {
-            add_unique(target.imports, std::move(import_name));
-        }
-        for (auto &include_name : source.includes) {
-            add_unique(target.includes, std::move(include_name));
-        }
-        for (auto &rule : source.rules) {
-            target.rules.push_back(std::move(rule));
-        }
+        for (auto &source_name : source.sources) { add_unique(target.sources, std::move(source_name)); }
+        for (auto &import_name : source.imports) { add_unique(target.imports, std::move(import_name)); }
+        for (auto &include_name : source.includes) { add_unique(target.includes, std::move(include_name)); }
+        for (auto &rule : source.rules) { target.rules.push_back(std::move(rule)); }
     }
 
     [[nodiscard]] std::expected<rule_engine::ParsedRuleSet, rule_engine::ErrorSet>
-    parse_source_with_id(const std::string_view source_name,
-                         const std::string_view source,
-                         const std::uint32_t source_id,
-                         const std::string_view namespace_name) {
-        OwnedBridgeParse owned {bridge::re_yara_bridge_parse(reinterpret_cast<const std::uint8_t *>(source.data()),
-                                                             source.size())};
+    parse_source_with_id(const std::string_view source_name, const std::string_view source,
+                         const std::uint32_t source_id, const std::string_view namespace_name) {
+        OwnedBridgeParse owned {
+            bridge::re_yara_bridge_parse(reinterpret_cast<const std::uint8_t *>(source.data()), source.size())};
         if (owned.result.rules == nullptr) {
-            return std::unexpected(rule_engine::single_error(std::string {source_name},
-                                                             "YARA bridge returned a null parse handle"));
+            return std::unexpected(
+                rule_engine::single_error(std::string {source_name}, "YARA bridge returned a null parse handle"));
         }
 
         if (bridge::re_yara_bridge_version(owned.result.rules) != 1u) {
-            return std::unexpected(rule_engine::single_error(std::string {source_name},
-                                                             "unsupported YARA bridge ABI version"));
+            return std::unexpected(
+                rule_engine::single_error(std::string {source_name}, "unsupported YARA bridge ABI version"));
         }
 
         rule_engine::ErrorSet errors;
         const auto diagnostic_count = bridge::re_yara_bridge_diagnostic_count(owned.result.rules);
         for (std::size_t index = 0; index < diagnostic_count; ++index) {
-            errors.diagnostics.push_back(
-                bridge_diagnostic(bridge::re_yara_bridge_diagnostic_at(owned.result.rules, index),
-                                  source_name,
-                                  source_id));
+            errors.diagnostics.push_back(bridge_diagnostic(
+                bridge::re_yara_bridge_diagnostic_at(owned.result.rules, index), source_name, source_id));
         }
         if (owned.result.status != bridge::ReParseStatus::Ok && errors.empty()) {
             errors.diagnostics.push_back(rule_engine::Diagnostic {
@@ -1418,11 +1436,8 @@ namespace {
         }
         const auto rule_count = bridge::re_yara_bridge_rule_count(owned.result.rules);
         for (std::size_t index = 0; index < rule_count; ++index) {
-            auto parsed_rule =
-                bridge_rule(owned.result.rules,
-                            bridge::re_yara_bridge_rule_at(owned.result.rules, index),
-                            source_name,
-                            source_id);
+            auto parsed_rule = bridge_rule(
+                owned.result.rules, bridge::re_yara_bridge_rule_at(owned.result.rules, index), source_name, source_id);
             parsed_rule.namespace_name = normalized_namespace;
             parsed_rule.qualified_identifier =
                 qualified_rule_identifier(parsed_rule.namespace_name, parsed_rule.identifier);
@@ -1509,8 +1524,8 @@ namespace {
             return static_cast<std::uint32_t>(merged.sources.size());
         }
 
-        [[nodiscard]] std::optional<std::filesystem::path> resolve_include(const std::string_view include_name,
-                                                                           const std::filesystem::path &parent_dir) const {
+        [[nodiscard]] std::optional<std::filesystem::path>
+        resolve_include(const std::string_view include_name, const std::filesystem::path &parent_dir) const {
             const std::filesystem::path include_path {include_name};
             if (include_path.is_absolute() && exists_file(include_path)) {
                 return include_path;
@@ -1536,15 +1551,14 @@ namespace {
         }
 
         void append_errors(const rule_engine::ErrorSet &source) {
-            for (const auto &diagnostic : source.diagnostics) {
-                errors.diagnostics.push_back(diagnostic);
-            }
+            for (const auto &diagnostic : source.diagnostics) { errors.diagnostics.push_back(diagnostic); }
         }
     };
 } // namespace
 
 namespace rule_engine {
-    std::expected<ParsedRuleSet, ErrorSet> parse_source(const std::string_view source_name, const std::string_view source) {
+    std::expected<ParsedRuleSet, ErrorSet> parse_source(const std::string_view source_name,
+                                                        const std::string_view source) {
         return parse_source_with_id(source_name, source, 1u, "default");
     }
 
@@ -1566,14 +1580,10 @@ namespace rule_engine {
             }
 
             const auto source_id = static_cast<std::uint32_t>(index + 1u);
-            auto parsed = parse_source_with_id(source_unit.source_name,
-                                               source_unit.source,
-                                               source_id,
+            auto parsed = parse_source_with_id(source_unit.source_name, source_unit.source, source_id,
                                                source_unit.namespace_name);
             if (!parsed) {
-                for (const auto &diagnostic : parsed.error().diagnostics) {
-                    errors.diagnostics.push_back(diagnostic);
-                }
+                for (const auto &diagnostic : parsed.error().diagnostics) { errors.diagnostics.push_back(diagnostic); }
                 continue;
             }
 
@@ -1607,9 +1617,9 @@ namespace rule_engine {
 
         std::vector<RuleSymbol> rule_symbols;
         for (const auto &rule : rules.rules) {
-            const auto qualified_identifier = rule.qualified_identifier.empty()
-                                                  ? qualified_rule_identifier(rule.namespace_name, rule.identifier)
-                                                  : rule.qualified_identifier;
+            const auto qualified_identifier = rule.qualified_identifier.empty() ?
+                                                  qualified_rule_identifier(rule.namespace_name, rule.identifier) :
+                                                  rule.qualified_identifier;
             if (contains_rule_symbol(rule_symbols, qualified_identifier)) {
                 errors.diagnostics.push_back(Diagnostic {
                     .source = diagnostic_source(rule.span, rules.source_name),
@@ -1634,22 +1644,15 @@ namespace rule_engine {
             VerifiedRule verified;
             verified.identifier = rule.identifier;
             verified.namespace_name = normalize_namespace_name(rule.namespace_name);
-            verified.qualified_identifier = rule.qualified_identifier.empty()
-                                                ? qualified_rule_identifier(verified.namespace_name, rule.identifier)
-                                                : rule.qualified_identifier;
+            verified.qualified_identifier = rule.qualified_identifier.empty() ?
+                                                qualified_rule_identifier(verified.namespace_name, rule.identifier) :
+                                                rule.qualified_identifier;
             verified.is_private = rule.is_private;
             verified.is_global = rule.is_global;
             verified.span = rule.span;
             verified.condition = rule.condition;
-            collect_requirements(verified.condition,
-                                 registry,
-                                 rule_symbols,
-                                 verified.namespace_name,
-                                 rule.patterns,
-                                 verified.facts,
-                                 verified.rule_dependencies,
-                                 errors,
-                                 rules.source_name);
+            collect_requirements(verified.condition, registry, rule_symbols, verified.namespace_name, rule.patterns,
+                                 verified.facts, verified.rule_dependencies, errors, rules.source_name);
             program.rules.push_back(std::move(verified));
         }
 
@@ -1686,18 +1689,21 @@ namespace rule_engine {
     std::vector<std::string> required_provider_routes(const VerifiedProgram &program) {
         std::vector<std::string> routes;
         for (const auto &rule : program.rules) {
-            for (const auto &fact : rule.facts) {
-                add_route(routes, fact.route);
-            }
+            for (const auto &fact : rule.facts) { add_route(routes, fact.route); }
             collect_expression_routes(rule.condition, routes);
         }
         std::ranges::sort(routes);
         return routes;
     }
 
+    constexpr std::uint32_t debug_ir_artifact_version {4u};
+    constexpr std::string_view debug_ir_schema {"rule-engine-debug-ir.v1"};
+    constexpr std::uint32_t schedule_artifact_version {4u};
+    constexpr std::string_view schedule_schema {"rule-engine-schedule.v1"};
+
     std::string VerifiedProgram::ir_dump() const {
         std::ostringstream out;
-        out << "rule_engine_ir version=2\n";
+        out << "rule_engine_ir schema=" << debug_ir_schema << " version=" << debug_ir_artifact_version << '\n';
         for (std::size_t index = 0; index < sources.size(); ++index) {
             out << "source id=" << (index + 1u) << " name=" << sources[index] << '\n';
         }
@@ -1711,11 +1717,10 @@ namespace rule_engine {
     std::vector<std::byte> VerifiedProgram::ir_artifact() const {
         std::vector<std::byte> out;
         append_magic(out, "REIR");
-        append_u32(out, 2u);
+        append_u32(out, debug_ir_artifact_version);
+        append_string(out, debug_ir_schema);
         append_u32(out, static_cast<std::uint32_t>(sources.size()));
-        for (const auto &source : sources) {
-            append_string(out, source);
-        }
+        for (const auto &source : sources) { append_string(out, source); }
         append_u32(out, static_cast<std::uint32_t>(rules.size()));
         for (const auto &rule : rules) {
             append_string(out, rule.identifier);
@@ -1731,6 +1736,9 @@ namespace rule_engine {
                 append_u32(out, static_cast<std::uint32_t>(fact.ttl.count()));
                 append_u32(out, static_cast<std::uint32_t>(fact.timeout.count()));
                 append_u8(out, fact.cheap_prefetch ? 1u : 0u);
+                append_u8(out, retry_policy_code(fact.retry_policy));
+                append_u8(out, fact.retry_budget);
+                append_string(out, fact.cancellation_diagnostic);
             }
         }
         return out;
@@ -1738,13 +1746,19 @@ namespace rule_engine {
 
     std::string VerifiedProgram::schedule_plan_dump() const {
         std::ostringstream out;
-        out << "schedule version=2\n";
+        out << "schedule schema=" << schedule_schema << " version=" << schedule_artifact_version << '\n';
         for (const auto &rule : rules) {
             for (const auto &fact : rule.facts) {
                 out << rule.qualified_identifier << " namespace=" << rule.namespace_name
                     << " source_id=" << rule.span.source_id << " -> " << fact.route << " :: " << fact.key
                     << " ttl=" << fact.ttl.count() << "s timeout=" << fact.timeout.count()
-                    << "s cheap=" << (fact.cheap_prefetch ? "true" : "false") << '\n';
+                    << "s cheap=" << (fact.cheap_prefetch ? "true" : "false")
+                    << " retry=" << rule_engine::provider_retry_policy_name(fact.retry_policy)
+                    << " retry_budget=" << static_cast<unsigned int>(fact.retry_budget);
+                if (!fact.cancellation_diagnostic.empty()) {
+                    out << " cancel=\"" << fact.cancellation_diagnostic << '"';
+                }
+                out << '\n';
             }
         }
         return out.str();
@@ -1753,11 +1767,10 @@ namespace rule_engine {
     std::vector<std::byte> VerifiedProgram::schedule_plan_artifact() const {
         std::vector<std::byte> out;
         append_magic(out, "RESC");
-        append_u32(out, 2u);
+        append_u32(out, schedule_artifact_version);
+        append_string(out, schedule_schema);
         std::uint32_t edge_count {};
-        for (const auto &rule : rules) {
-            edge_count += static_cast<std::uint32_t>(rule.facts.size());
-        }
+        for (const auto &rule : rules) { edge_count += static_cast<std::uint32_t>(rule.facts.size()); }
         append_u32(out, edge_count);
         for (const auto &rule : rules) {
             for (const auto &fact : rule.facts) {
@@ -1770,6 +1783,9 @@ namespace rule_engine {
                 append_u32(out, static_cast<std::uint32_t>(fact.ttl.count()));
                 append_u32(out, static_cast<std::uint32_t>(fact.timeout.count()));
                 append_u8(out, fact.cheap_prefetch ? 1u : 0u);
+                append_u8(out, retry_policy_code(fact.retry_policy));
+                append_u8(out, fact.retry_budget);
+                append_string(out, fact.cancellation_diagnostic);
             }
         }
         return out;

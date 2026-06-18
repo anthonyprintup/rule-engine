@@ -367,6 +367,60 @@ namespace {
         out.push_back('}');
     }
 
+    void append_instrumentation(
+        std::string &out, const rule_engine::client_protocol::ClientEvaluationInstrumentation &instrumentation) {
+        out.push_back('{');
+        append_key_u64(out, "peakPendingVmSubjects", instrumentation.peak_pending_vm_subjects);
+        out.push_back(',');
+        append_key_u64(out, "vmBackpressureEvents", instrumentation.vm_backpressure_events);
+        out.push_back(',');
+        append_key_u64(out, "peakPendingProviderRequests", instrumentation.peak_pending_provider_requests);
+        out.push_back(',');
+        append_key_u64(out, "providerBackpressureEvents", instrumentation.provider_backpressure_events);
+        out.push_back(',');
+        append_key_u64(out, "providerRounds", instrumentation.provider_rounds);
+        out.push_back(',');
+        append_key_u64(out, "providerRequests", instrumentation.provider_requests);
+        out.push_back(',');
+        append_key_u64(out, "providerFactKeysRequested", instrumentation.provider_fact_keys_requested);
+        out.push_back(',');
+        append_key_u64(out, "providerFactsReturned", instrumentation.provider_facts_returned);
+        out.push_back(',');
+        append_key_u64(out, "providerElapsedUs", instrumentation.provider_elapsed_us);
+        out.push_back(',');
+        append_key_u64(out, "candidateProviderRequests", instrumentation.candidate_provider_requests);
+        out.push_back(',');
+        append_key_u64(out, "candidateProviderFiltersRequested",
+                       instrumentation.candidate_provider_filters_requested);
+        out.push_back(',');
+        append_key_u64(out, "candidateProviderSubjectsReturned",
+                       instrumentation.candidate_provider_subjects_returned);
+        out.push_back(',');
+        append_key_u64(out, "candidateProviderBroadResults", instrumentation.candidate_provider_broad_results);
+        out.push_back(',');
+        append_key_u64(out, "candidateProviderFiltersNotAdvertised",
+                       instrumentation.candidate_provider_filters_not_advertised);
+        out.push_back(',');
+        append_key_u64(out, "candidateProviderElapsedUs", instrumentation.candidate_provider_elapsed_us);
+        out.push_back(',');
+        append_key_u64(out, "staticFactCacheLookups", instrumentation.static_fact_cache_lookups);
+        out.push_back(',');
+        append_key_u64(out, "staticFactCacheHits", instrumentation.static_fact_cache_hits);
+        out.push_back(',');
+        append_key_u64(out, "staticFactCacheMisses", instrumentation.static_fact_cache_misses);
+        out.push_back(',');
+        append_key_u64(out, "staticFactCacheReuses", instrumentation.static_fact_cache_reuses);
+        out.push_back(',');
+        append_key_u64(out, "staticFactCacheInvalidations", instrumentation.static_fact_cache_invalidations);
+        out.push_back(',');
+        append_key_u64(out, "staticFactCacheSubjectScoped", instrumentation.static_fact_cache_subject_scoped);
+        out.push_back(',');
+        append_key_u64(out,
+                       "staticFactCacheProviderFactKeysAvoided",
+                       instrumentation.static_fact_cache_provider_fact_keys_avoided);
+        out.push_back('}');
+    }
+
     void append_common_prefix(std::string &out,
                               const std::string_view host,
                               const std::uint16_t port,
@@ -391,12 +445,18 @@ namespace {
 namespace rule_engine::server_output {
     std::string evaluation_session_json(const std::string_view host,
                                         const std::uint16_t port,
-                                        const client_protocol::ClientMultiEvaluationSession &session) {
+                                        const client_protocol::ClientMultiEvaluationSession &session,
+                                        const client_protocol::ClientEvaluationInstrumentation *instrumentation) {
         std::string out;
         out.reserve(1024u);
         append_common_prefix(out, host, port, session.handshake, session.subjects.subjects.size());
         out.push_back(',');
         append_key_size(out, "evaluated", session.evaluations.size());
+        if (instrumentation != nullptr) {
+            out.push_back(',');
+            append_key(out, "instrumentation");
+            append_instrumentation(out, *instrumentation);
+        }
         out.push_back(',');
         append_key(out, "subjects");
         out.push_back('[');

@@ -18,9 +18,12 @@ diagnostics. A client never evaluates conditions, predicates, or whole rules.
   provider facts.
 - Evaluate pattern-set and boolean tuple `of` expressions, including numeric and
   percentage quantifiers plus `at`/`in` anchors for pattern sets.
+- Evaluate built-in integer readers such as `uint8`, `uint16`, and `uint32`
+  inside the VM from provider-supplied scan-space bytes.
 - Request process, PE image, and fixture pattern facts through provider routes.
 - Exchange localhost v1 client/server messages with length-prefixed frames.
-- Emit machine-readable artifacts, readable dumps, diagnostics, and opt-in traces.
+- Emit machine-readable artifacts, readable dumps, diagnostics, and opt-in traces
+  with explicit schema identifiers.
 
 See [GOAL.md](GOAL.md) for the project target and
 [docs/V1_IMPLEMENTATION_STATUS.md](docs/V1_IMPLEMENTATION_STATUS.md) for the
@@ -66,9 +69,48 @@ cheap, including deterministic module function facts whose arguments are
 statically known, then evaluates symbolically and requests expensive facts only
 when control flow reaches them. Pattern scan facts are treated as expensive so
 process/PE filters can short-circuit before a scan route is requested.
-Provider request timeouts are descriptor-owned: each field, function, and global
-fact carries a timeout into the lowered requirement, and route batches use the
-maximum timeout among the facts grouped into that request.
+Provider request timeouts and retry policy are descriptor-owned: each field,
+function, and global fact carries a timeout into the lowered requirement, and
+route batches use the maximum timeout among the facts grouped into that request.
+Descriptors may opt into retrying timed-out fact diagnostics for a bounded retry
+budget. If evaluation is cancelled before provider dispatch, the server
+synthesizes unavailable facts with the descriptor cancellation diagnostic instead
+of asking the client to decide anything about the rule.
+
+An offline optimizer POC can extract canonical descriptor-backed comparison
+predicates, simulate shared predicate DAG candidate sets, derive lazy provider
+expansion plans, model generic candidate-provider subject sets, and report
+exact-VM-only or unsafe-pruning shapes; it does not affect evaluation decisions.
+`build_optimizer_plan` packages those pieces into an opt-in server-owned
+artifact with predicate nodes, safe order, exact-VM fallback notes, provider
+requirements, and generic candidate-provider requests.
+`evaluate_with_optimizer_plan` consumes that artifact for an opt-in C++ sweep
+path that runs exact VM only for surviving rule/subject pairs and synthesizes
+no-match results for pruned pairs. The benchmark CLI can measure this path with
+`--simulate-optimizer-plan-prefilter`, including exact-VM work avoided, skip
+trace events, result mismatches, and incomplete subjects. When combined with
+`--simulate-candidate-provider`, the same plan-driven path consumes generic
+provider-scope subject sets before exact-VM final evaluation and falls back to
+server-side predicate evaluation when those results are unavailable.
+The v1 protocol also has generic candidate-provider request/response messages
+for route/filter/argument subject-set filters with status, diagnostics, and TTLs;
+these messages intentionally carry no rule identifiers. The localhost client
+session helpers can exchange those messages through an optional
+candidate-provider handler. The opt-in
+`evaluate_subjects_with_optimizer_plan` client path uses those advertised
+filters before exact VM and only requests provider facts for rule/subject pairs
+that survive the server-owned optimizer plan. If a filter is not advertised, the
+client path skips that frame and rebuilds the same candidates from ordinary fact
+batches. Its optional instrumentation records candidate-provider request
+messages, requested filters, returned subject ids, skipped unadvertised filters,
+available broad results that cover every evaluated subject, and elapsed time
+beside the ordinary provider-fact counters. Optimized client sessions also
+expose the evaluated subjects, fact snapshot, and
+candidate-provider results needed to replay the same server-owned optimized
+sweep without live providers through `replay_optimized_client_evaluation`.
+An opt-in prefiltered evaluation comparison can run exact VM only for shared-DAG
+candidate rule/subject pairs, synthesize pruned no-match results, and report
+parity against baseline evaluation before any runtime path is made default.
 
 Facts carry a subject id, key, typed `Value`, status, diagnostic text, and TTL.
 Available facts participate in expression evaluation. Unavailable or
@@ -107,8 +149,13 @@ The function fields are: name, return type, comma-separated argument types or
 `-`, provider route, key prefix, TTL seconds, cheap-prefetch boolean, and
 optional timeout seconds. The same file format also accepts
 `field <key> <type> <route> <ttl> <cheap> [timeout]` inside a module and
-`global <name> <type> <key> <route> <ttl> <cheap> [timeout]`. If omitted, the
-descriptor timeout defaults to 5 seconds.
+`global <name> <type> <key> <route> <ttl> <cheap> [timeout]`. Each descriptor
+line may then add `[retry-policy] [retry-budget] [cancel-diagnostic]`. The
+current retry policies are `none` and `timed_out`; cancellation diagnostics are
+single whitespace-delimited tokens, with `-` meaning the default diagnostic. If
+omitted, the descriptor timeout defaults to 5 seconds, retry policy defaults to
+`none`, retry budget defaults to 0, and the cancellation diagnostic defaults to a
+generic evaluator shutdown message.
 
 `rule_engine_client --custom-fact-fixture <file>` advertises configured custom
 routes and serves fixture facts for them:
@@ -132,8 +179,10 @@ build\debug\rule_engine_server.exe --module-config examples\custom_binding\demo.
 ```
 
 By default, `rule_engine_client` serves one localhost session and exits. Use
-`--max-sessions <n>` to serve a bounded number of sequential sessions, or
-`--serve` to keep the local provider service running until it is stopped.
+`--max-sessions <n>` to serve a bounded number of sessions, or `--serve` to keep
+the local provider service running until it is stopped. Sessions are handled
+serially unless `--session-workers <n>` is set, which admits up to `n`
+concurrent localhost sessions before applying listener backpressure.
 
 ## Pattern Scan Configs
 
@@ -179,6 +228,9 @@ When no explicit scan spaces are configured, the default Windows client adds a
 subject-scoped `process.image.bytes` scan space by reading each requested
 process subject's image file, so rules can match literals against process image
 bytes without duplicating those literals in client config.
+Rules that use built-in integer readers such as `uint32(0)` request the same
+`process.image.bytes` scan-space as a raw `bytes` fact; clients return bytes only,
+and the C++ VM performs the integer read and comparison.
 To scan mapped image sections instead of the whole image file, enable explicit
 section scan spaces in the pattern fixture file:
 
@@ -204,10 +256,10 @@ scan spaces with the Windows protection string as region permissions.
 ## Rule Corpus
 
 `examples/rule_corpus/` contains a small checked corpus for the current YARA
-subset. `supported_process_pe.yar` is expected to parse and verify with the
-default descriptors. The `unsupported_*.yar` files are expected to parse but
-fail semantic verification, documenting constructs that are intentionally
-outside the current implementation.
+subset. The `supported_*.yar` files are expected to parse and verify with the
+default descriptors. The `unsupported_*.yar` files are expected to parse but fail
+semantic verification, documenting constructs that are intentionally outside the
+current implementation.
 
 ## Repository Layout
 
@@ -217,8 +269,8 @@ outside the current implementation.
 - `rust/yara_bridge/` - Rust YARA-X parser bridge and generated C++ ABI inputs.
 - `tests/` - Catch2 tests and YARA fixtures.
 - `examples/` - tested custom-binding and rule-corpus examples.
-- `docs/` - implementation notes, bridge/transport guidance, and status
-  tracking.
+- `docs/` - implementation notes, optimizer architecture, bridge/transport
+  guidance, and status tracking.
 
 ## Requirements
 
@@ -254,16 +306,89 @@ The test suite covers parser bridge conversion, semantic validation, VM behavior
 scheduling, protocol framing/codecs, runtime orchestration, traces, and unattended
 abort behavior. Trace replay artifacts snapshot cached subject facts, including
 runtime-derived custom function facts, so replay does not need live providers.
+Debug IR artifacts use `rule-engine-debug-ir.v1`, schedule artifacts use
+`rule-engine-schedule.v1`, and evaluation trace artifacts use
+`rule-engine-evaluation-trace.v1`.
 
 ## CLI Tools
 
 - `rule_engine_check` parses and validates rules.
 - `rule_engine_server` evaluates rules against process subjects through the v1
   client protocol. Pass `--json` to emit structured JSON for both rule
-  evaluation and smoke fact round trips.
+  evaluation and smoke fact round trips. Rule-evaluation JSON includes runtime
+  provider/VM queue, candidate-provider, and static-cache instrumentation; use
+  `--vm-backpressure-subject-threshold <n>` and
+  `--provider-backpressure-request-threshold <n>` to record threshold-crossing
+  scheduler pressure events.
 - `rule_engine_client` serves localhost provider facts for v1 smoke paths. Pass
-  `--max-sessions <n>` for bounded multi-session service mode or `--serve` for
-  an unbounded local service.
+  `--max-sessions <n>` for bounded multi-session service mode, `--serve` for an
+  unbounded local service, and `--session-workers <n>` to cap concurrent session
+  workers.
+- `rule_engine_benchmark` runs synthetic baseline evaluator workloads and emits
+  JSON by default, including reproducibility metadata, enabled optimizer flags,
+  provider-round, provider-elapsed, fact, expression-evaluation, cache hit/miss,
+  cache lookup-probe counters, and opt-in optimizer predicate order observations
+  with cost class and observed selectivity. Pass `--format markdown` for a
+  readable report. Pass `--simulate-shared-predicate-dag` to keep baseline
+  exact-VM execution enabled while adding simulated shared-predicate prune, peak
+  candidate-set subject/byte, optimizer trace-event count,
+  nonselective-predicate, predicate-order, cost-class, and selectivity metrics.
+  Pass `--simulate-discovery-gates` to report pack-level discovery-gate counts,
+  evaluations, skips, and trace events; use `--scenario discovery_gate_empty_pack`
+  for an empty-pack gate workload.
+  Use `--scenario or_process_name --simulate-prefiltered-evaluation` for a
+  selective simple-OR workload that validates candidate-set union pruning and
+  baseline parity.
+  Use `--scenario broad_process_name` for a nonselective shared-predicate
+  workload where every subject survives the cheap process-name filter.
+  Use `--scenario empty_process_name_expensive_pe --simulate-lazy-provider-expansion`
+  to validate dropped branches and zero lazy expensive fact requests when no
+  subject survives a cheap filter.
+  Use `--scenario mixed_process_name_expensive_pe` for mixed cheap-first,
+  expensive-first, and exact-VM-only branches with an expensive PE-import leaf.
+  Use `--scenario production_scale_validation` for a scalable validation fixture
+  that combines selective shared predicates, broad nonselective filters,
+  expensive PE-import leaves, exact-VM-only `with` leaves, and benchmark metadata
+  for the acceptance target scale.
+  Pass `--simulate-lazy-provider-expansion` with a scenario such as
+  `shared_process_name_expensive_pe` to add simulated lazy provider
+  batch/request/avoidance metrics. Pass `--simulate-candidate-provider` to add
+  generic candidate-provider request, returned-subject, broad-result, and
+  fallback counters.
+  Use `--scenario candidate_provider_unavailable --simulate-candidate-provider`
+  to force server-side candidate reconstruction from per-subject facts when the
+  provider-scope filter is unavailable; optimizer trace records include the
+  generic filter key and provider diagnostic for that fallback.
+  Pass `--simulate-prefiltered-evaluation` to add exact-VM execution avoidance,
+  exact-VM skip trace-event, and baseline parity counters for the shared-DAG
+  candidate path. Pass `--simulate-optimizer-plan-prefilter` to benchmark the
+  opt-in `OptimizerPlan` sweep path directly, including plan-driven exact-VM
+  executions, avoided executions, skip trace events, result mismatches, and
+  incomplete subjects. Combine it with `--simulate-candidate-provider` and
+  `--simulate-lazy-provider-expansion` to measure generic provider-scope
+  candidate sets feeding the plan-driven exact-VM prefilter and avoided
+  expensive fact materialization. Use `--scenario global_gate_prefilter
+  --simulate-optimizer-plan-prefilter` to validate global-rule gating while
+  report counters stay scoped to reportable rules. Opt-in optimizer reports include a bounded
+  optimizer trace record section with event, predicate, source-span,
+  rule/subject, reason, and candidate-set fields for debugging. Pass
+  `--simulate-selectivity-feedback` with `selectivity_feedback_inventory` to
+  build a server-owned observed-selectivity profile from a warm-up shared-DAG
+  sweep and use it as a same-cost predicate-order tie-breaker. Pass
+  `--simulate-optimization-comparison`
+  with `production_scale_validation` to emit baseline-versus-optimized
+  comparison counters for exact-VM executions, expensive provider facts,
+  expression evaluations, parity, and broad candidate-state boundedness. Pass
+  `--simulate-watchdogs` to add trace-only watchdog budget counters for broad
+  predicate selectivity and oversized lazy provider route batches without
+  enforcing cooldowns. Pass `--simulate-watchdog-enforcement` to add explicit
+  budget diagnostic counters for the first opt-in policy outcomes: deferred
+  broad-predicate branches and timed-out oversized route batches. Pass
+  `--simulate-static-fact-cache` to add
+  content-addressed static image fact cache reuse/invalidation counters without
+  changing VM/provider behavior. Pass `--simulate-scheduler-controls` to add
+  stress-tier jitter, queue, backpressure, deadline, and idle-state counters for
+  10,000 simulated clients without changing runtime scheduling.
 
 ## Generated Files
 
