@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -278,6 +279,27 @@ TEST_CASE("Python operator ABI implements numeric bitwise and containment semant
     REQUIRE(rounded_float.has_value());
     CHECK(heap.compare_operation(CompareOperation::equal, *one, *one_float) == true);
     CHECK(heap.compare_operation(CompareOperation::greater, *large, *rounded_float) == true);
+
+    auto positive_zero = heap.allocate_float(0.0);
+    auto negative_zero = heap.allocate_float(-0.0);
+    auto positive_infinity = heap.allocate_float(std::numeric_limits<double>::infinity());
+    auto second_positive_infinity = heap.allocate_float(std::numeric_limits<double>::infinity());
+    auto negative_infinity = heap.allocate_float(-std::numeric_limits<double>::infinity());
+    auto not_a_number = heap.allocate_float(std::numeric_limits<double>::quiet_NaN());
+    auto second_not_a_number = heap.allocate_float(std::numeric_limits<double>::quiet_NaN());
+    REQUIRE(positive_zero.has_value());
+    REQUIRE(negative_zero.has_value());
+    REQUIRE(positive_infinity.has_value());
+    REQUIRE(second_positive_infinity.has_value());
+    REQUIRE(negative_infinity.has_value());
+    REQUIRE(not_a_number.has_value());
+    REQUIRE(second_not_a_number.has_value());
+    CHECK(heap.compare_operation(CompareOperation::equal, *positive_zero, *negative_zero) == true);
+    CHECK(heap.compare_operation(CompareOperation::equal, *positive_infinity, *second_positive_infinity) == true);
+    CHECK(heap.compare_operation(CompareOperation::equal, *positive_infinity, *negative_infinity) == false);
+    CHECK(heap.compare_operation(CompareOperation::equal, *not_a_number, *not_a_number) == false);
+    CHECK(heap.compare_operation(CompareOperation::equal, *not_a_number, *second_not_a_number) == false);
+    CHECK(heap.compare_operation(CompareOperation::not_equal, *not_a_number, *not_a_number) == true);
 
     auto needle = heap.allocate_unicode("żół");
     auto haystack = heap.allocate_unicode("Zażółć");

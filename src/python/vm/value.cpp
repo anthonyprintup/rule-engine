@@ -257,11 +257,14 @@ namespace rule_engine::python::vm {
             }
             std::vector<bool> result(width);
             for (std::size_t index = 0; index < width; ++index) {
-                switch (operation) {
-                    case BinaryOperation::bit_or: result[index] = left_bits[index] || right_bits[index]; break;
-                    case BinaryOperation::bit_xor: result[index] = left_bits[index] != right_bits[index]; break;
-                    case BinaryOperation::bit_and: result[index] = left_bits[index] && right_bits[index]; break;
-                    default: break;
+                if (operation == BinaryOperation::bit_or) {
+                    result[index] = left_bits[index] || right_bits[index];
+                } else if (operation == BinaryOperation::bit_xor) {
+                    result[index] = left_bits[index] != right_bits[index];
+                } else if (operation == BinaryOperation::bit_and) {
+                    result[index] = left_bits[index] && right_bits[index];
+                } else {
+                    std::unreachable();
                 }
             }
             const auto negative = result.back();
@@ -281,6 +284,10 @@ namespace rule_engine::python::vm {
                     error(VmErrorCode::arithmetic_error, "integer is too large to convert to a finite float"));
             }
             return result;
+        }
+
+        [[nodiscard]] bool python_float_equal(const double left, const double right) noexcept {
+            return !std::isnan(left) && !std::isnan(right) && !(left < right) && !(right < left);
         }
 
         [[nodiscard]] std::expected<int, VmError> compare_integer_float(const BigInteger &integer,
@@ -554,6 +561,9 @@ namespace rule_engine::python::vm {
                     bytes += record.schema.value.size() + record.fields.size() * sizeof(RecordFieldValue);
                     break;
                 }
+                case ValueKind::none:
+                case ValueKind::boolean:
+                case ValueKind::floating: break;
                 default: break;
             }
             return bytes;
@@ -624,9 +634,6 @@ namespace rule_engine::python::vm {
         [[nodiscard]] std::expected<bool, VmError>
         equal_recursive(const PyValue left, const PyValue right,
                         std::set<std::pair<std::uint64_t, std::uint64_t>> &active, const std::uint32_t depth) const {
-            if (left == right) {
-                return true;
-            }
             if (depth > 128U) {
                 return std::unexpected(error(VmErrorCode::value_error, "equality recursion limit exceeded"));
             }
@@ -637,6 +644,13 @@ namespace rule_engine::python::vm {
             }
             if (!right_object) {
                 return std::unexpected(right_object.error());
+            }
+            if (left == right) {
+                if ((*left_object)->kind == ValueKind::floating) {
+                    const auto floating = std::get<double>((*left_object)->payload);
+                    return python_float_equal(floating, floating);
+                }
+                return true;
             }
             const auto left_integer = integer_like(**left_object);
             const auto right_integer = integer_like(**right_object);
@@ -664,8 +678,11 @@ namespace rule_engine::python::vm {
             }
             switch ((*left_object)->kind) {
                 case ValueKind::none: return true;
-                case ValueKind::floating:
-                    return std::get<double>((*left_object)->payload) == std::get<double>((*right_object)->payload);
+                case ValueKind::floating: {
+                    const auto left_float = std::get<double>((*left_object)->payload);
+                    const auto right_float = std::get<double>((*right_object)->payload);
+                    return python_float_equal(left_float, right_float);
+                }
                 case ValueKind::unicode:
                     return std::get<UnicodeStorage>((*left_object)->payload).codepoints ==
                            std::get<UnicodeStorage>((*right_object)->payload).codepoints;
@@ -769,6 +786,7 @@ namespace rule_engine::python::vm {
                 }
                 case ValueKind::boolean:
                 case ValueKind::integer: break;
+                default: return std::unexpected(error(VmErrorCode::engine_fault, "VM value has an invalid kind"));
             }
             return false;
         }
@@ -839,6 +857,9 @@ namespace rule_engine::python::vm {
                 case ValueKind::record:
                     return std::unexpected(freeze_error(FreezeErrorCode::unsupported_type,
                                                         "container or record is not a canonical map key"));
+                default:
+                    return std::unexpected(
+                        freeze_error(FreezeErrorCode::unsupported_type, "VM value has an invalid kind"));
             }
             return result;
         }
@@ -935,6 +956,9 @@ namespace rule_engine::python::vm {
                 case ValueKind::list:
                 case ValueKind::map:
                 case ValueKind::record: break;
+                default:
+                    return std::unexpected(
+                        freeze_error(FreezeErrorCode::unsupported_type, "VM value has an invalid kind"));
             }
 
             const auto key = (static_cast<std::uint64_t>(value.slot) << 32U) | value.generation;
@@ -1359,8 +1383,8 @@ namespace rule_engine::python::vm {
             case ValueKind::list: return !std::get<Impl::ListStorage>((*object)->payload).values.empty();
             case ValueKind::map: return !std::get<Impl::MapStorage>((*object)->payload).entries.empty();
             case ValueKind::record: return true;
+            default: return std::unexpected(error(VmErrorCode::engine_fault, "VM value has an invalid kind"));
         }
-        return false;
     }
 
     std::expected<bool, VmError> ValueHeap::equal(const PyValue left, const PyValue right) const {
@@ -1511,7 +1535,13 @@ namespace rule_engine::python::vm {
                     case BinaryOperation::right_shift:
                         *work_charge = left_work * std::max<std::uint64_t>(1U, operand_count);
                         break;
-                    default: *work_charge = std::max(left_work, right_work); break;
+                    case BinaryOperation::add:
+                    case BinaryOperation::subtract:
+                    case BinaryOperation::true_divide:
+                    case BinaryOperation::bit_or:
+                    case BinaryOperation::bit_xor:
+                    case BinaryOperation::bit_and: *work_charge = std::max(left_work, right_work); break;
+                    default: return std::unexpected(error(VmErrorCode::engine_fault, "invalid binary operation"));
                 }
             }
             BigInteger result;
@@ -1592,6 +1622,7 @@ namespace rule_engine::python::vm {
                 case BinaryOperation::bit_or:
                 case BinaryOperation::bit_xor:
                 case BinaryOperation::bit_and: result = bitwise(*left_integer, *right_integer, operation); break;
+                default: return std::unexpected(error(VmErrorCode::engine_fault, "invalid binary operation"));
             }
             return allocate_integer(result.decimal());
         }
@@ -1650,6 +1681,7 @@ namespace rule_engine::python::vm {
                 case BinaryOperation::bit_xor:
                 case BinaryOperation::bit_and:
                     return std::unexpected(error(VmErrorCode::type_error, "bitwise operation requires integers"));
+                default: return std::unexpected(error(VmErrorCode::engine_fault, "invalid binary operation"));
             }
         }
         if (operation == BinaryOperation::add && (*left_object)->kind == ValueKind::unicode &&
@@ -1800,6 +1832,7 @@ namespace rule_engine::python::vm {
                 case ValueKind::floating:
                 case ValueKind::record:
                     return std::unexpected(error(VmErrorCode::type_error, "right operand is not a container"));
+                default: return std::unexpected(error(VmErrorCode::engine_fault, "VM value has an invalid kind"));
             }
             return operation == CompareOperation::contains ? found : !found;
         }
@@ -1818,6 +1851,7 @@ namespace rule_engine::python::vm {
             case CompareOperation::not_identity:
             case CompareOperation::contains:
             case CompareOperation::not_contains: break;
+            default: return std::unexpected(error(VmErrorCode::engine_fault, "invalid comparison operation"));
         }
         return false;
     }

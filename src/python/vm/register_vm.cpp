@@ -144,8 +144,8 @@ namespace rule_engine::python::vm {
                 case VmErrorCode::invalid_handle:
                 case VmErrorCode::stale_handle:
                 case VmErrorCode::engine_fault: return "PYVM9001";
+                default: return "PYVM9001";
             }
-            return "PYVM9001";
         }
 
         [[nodiscard]] std::uint64_t deadline_after(const std::chrono::milliseconds duration) {
@@ -2093,6 +2093,10 @@ namespace rule_engine::python::vm {
                         transaction_marks.pop_back();
                         ++frame.pc;
                         break;
+                    default:
+                        return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                             .message = "instruction opcode is invalid",
+                                             .span = instruction.span});
                 }
 
                 if (const auto heap_fault = check_forced_cleanup_heap(instruction.span); heap_fault.has_value()) {
