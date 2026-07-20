@@ -88,6 +88,44 @@ namespace rule_engine::python::vm {
         return {};
     }
 
+    std::expected<void, VmError> StructuredTasks::cancel_group(const TaskGroupId group) {
+        const auto found = std::ranges::find(groups_, group, &StructuredTaskGroup::id);
+        if (found == groups_.end() || !found->open) {
+            return std::unexpected(task_error("task group is unknown or already closed"));
+        }
+        std::vector<TaskGroupId> owned {group};
+        for (std::size_t index = 0; index < owned.size(); ++index) {
+            for (const auto &candidate : groups_) {
+                if (candidate.open && candidate.parent == owned[index]) {
+                    owned.push_back(candidate.id);
+                }
+            }
+        }
+        for (auto &task : tasks_) {
+            if (std::ranges::find(owned, task.owner) != owned.end() && live(task.state)) {
+                task.state = TaskState::canceled;
+            }
+        }
+        for (auto group_index = owned.size(); group_index != 0U; --group_index) {
+            const auto current = std::ranges::find(groups_, owned[group_index - 1U], &StructuredTaskGroup::id);
+            current->open = false;
+        }
+        return {};
+    }
+
+    std::expected<void, VmError> StructuredTasks::close_all() {
+        for (auto index = groups_.size(); index != 0U; --index) {
+            auto &group = groups_[index - 1U];
+            if (!group.open) {
+                continue;
+            }
+            if (auto closed = cancel_group(group.id); !closed) {
+                return closed;
+            }
+        }
+        return {};
+    }
+
     bool StructuredTasks::owns(const TaskGroupId group, const TaskId task) const noexcept {
         const auto found = std::ranges::find(tasks_, task, &StructuredTask::id);
         return found != tasks_.end() && found->owner == group;
@@ -96,6 +134,11 @@ namespace rule_engine::python::vm {
     bool StructuredTasks::has_live_tasks(const TaskGroupId group) const noexcept {
         return std::ranges::any_of(tasks_,
                                    [group](const auto &task) { return task.owner == group && live(task.state); });
+    }
+
+    bool StructuredTasks::group_open(const TaskGroupId group) const noexcept {
+        const auto found = std::ranges::find(groups_, group, &StructuredTaskGroup::id);
+        return found != groups_.end() && found->open;
     }
 
     std::span<const StructuredTask> StructuredTasks::tasks() const noexcept { return tasks_; }

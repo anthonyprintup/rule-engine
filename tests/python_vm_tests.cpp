@@ -6,6 +6,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -103,6 +104,32 @@ namespace {
         const auto *number = std::get_if<IntegerValue>(&value.value.node->data);
         REQUIRE(number != nullptr);
         return number->decimal;
+    }
+
+    [[nodiscard]] FrozenValue canonical_frozen(const FactValue &value) {
+        ValueHeap heap;
+        auto thawed = heap.thaw(value);
+        REQUIRE(thawed.has_value());
+        auto frozen = heap.freeze(*thawed);
+        REQUIRE(frozen.has_value());
+        return std::move(*frozen);
+    }
+
+    [[nodiscard]] bool frozen_boolean(const FrozenValue &value) {
+        REQUIRE(value.value.valid());
+        const auto *boolean = std::get_if<bool>(&value.value.node->data);
+        REQUIRE(boolean != nullptr);
+        return *boolean;
+    }
+
+    [[nodiscard]] VmStep run_internal(RegisterVmSession &session, VmStep current) {
+        for (std::size_t turns = 0U;
+             turns < 32U && current.state == VmStepState::yielded && !current.yielded_value.has_value() &&
+             current.fact_requests.empty() && current.capability_requests.empty() && current.state_requests.empty();
+             ++turns) {
+            current = session.step({});
+        }
+        return current;
     }
 
 } // namespace
@@ -205,6 +232,126 @@ TEST_CASE("heap and boundary limits are checked before mutation") {
     CHECK(frozen.error().code == FreezeErrorCode::budget_exhausted);
 }
 
+TEST_CASE("Python operator ABI implements numeric bitwise and containment semantics") {
+    STATIC_REQUIRE(static_cast<std::uint32_t>(UnaryOperation::invert) == 3U);
+    STATIC_REQUIRE(static_cast<std::uint32_t>(BinaryOperation::bit_and) == 11U);
+    STATIC_REQUIRE(static_cast<std::uint32_t>(CompareOperation::not_contains) == 9U);
+
+    ValueHeap heap;
+    auto negative_seven = heap.allocate_integer("-7");
+    auto three = heap.allocate_integer("3");
+    auto five = heap.allocate_integer("5");
+    auto six = heap.allocate_integer("6");
+    REQUIRE(negative_seven.has_value());
+    REQUIRE(three.has_value());
+    REQUIRE(five.has_value());
+    REQUIRE(six.has_value());
+
+    auto quotient = heap.binary(BinaryOperation::floor_divide, *negative_seven, *three);
+    auto remainder = heap.binary(BinaryOperation::modulo, *negative_seven, *three);
+    auto power = heap.binary(BinaryOperation::power, *three, *five);
+    auto shifted = heap.binary(BinaryOperation::left_shift, *three, *three);
+    auto inverted = heap.unary(UnaryOperation::invert, *five);
+    auto conjunction = heap.binary(BinaryOperation::bit_and, *negative_seven, *six);
+    REQUIRE(quotient.has_value());
+    REQUIRE(remainder.has_value());
+    REQUIRE(power.has_value());
+    REQUIRE(shifted.has_value());
+    REQUIRE(inverted.has_value());
+    REQUIRE(conjunction.has_value());
+    CHECK(heap.integer_decimal(*quotient) == "-3");
+    CHECK(heap.integer_decimal(*remainder) == "2");
+    CHECK(heap.integer_decimal(*power) == "243");
+    CHECK(heap.integer_decimal(*shifted) == "24");
+    CHECK(heap.integer_decimal(*inverted) == "-6");
+    auto conjunction_text = heap.integer_decimal(*conjunction);
+    REQUIRE(conjunction_text.has_value());
+    CHECK(*conjunction_text == "0");
+
+    auto one = heap.allocate_integer("1");
+    auto one_float = heap.allocate_float(1.0);
+    auto large = heap.allocate_integer("9007199254740993");
+    auto rounded_float = heap.allocate_float(9007199254740992.0);
+    REQUIRE(one.has_value());
+    REQUIRE(one_float.has_value());
+    REQUIRE(large.has_value());
+    REQUIRE(rounded_float.has_value());
+    CHECK(heap.compare_operation(CompareOperation::equal, *one, *one_float) == true);
+    CHECK(heap.compare_operation(CompareOperation::greater, *large, *rounded_float) == true);
+
+    auto needle = heap.allocate_unicode("żół");
+    auto haystack = heap.allocate_unicode("Zażółć");
+    REQUIRE(needle.has_value());
+    REQUIRE(haystack.has_value());
+    CHECK(heap.compare_operation(CompareOperation::contains, *needle, *haystack) == true);
+    const std::array list_values {*three, *five};
+    auto list = heap.allocate_list(list_values);
+    REQUIRE(list.has_value());
+    CHECK(heap.compare_operation(CompareOperation::contains, *five, *list) == true);
+    CHECK(heap.compare_operation(CompareOperation::identity, *five, *five) == true);
+    CHECK(heap.compare_operation(CompareOperation::not_identity, *five, *three) == true);
+}
+
+TEST_CASE("records and maps have canonical schema-checked boundaries") {
+    ValueHeap heap;
+    auto name = heap.allocate_unicode("alice");
+    auto enabled = heap.allocate_bool(true);
+    REQUIRE(name.has_value());
+    REQUIRE(enabled.has_value());
+    const std::array fields {
+        RecordFieldValue {.field_id = 2U, .value = *enabled},
+        RecordFieldValue {.field_id = 1U, .value = *name},
+    };
+    auto record = heap.allocate_record(SchemaId {"account.v1"}, fields);
+    REQUIRE(record.has_value());
+    auto frozen_record = heap.freeze(*record);
+    REQUIRE(frozen_record.has_value());
+    const auto *fact_record = std::get_if<FactRecord>(&frozen_record->value.node->data);
+    REQUIRE(fact_record != nullptr);
+    REQUIRE(fact_record->fields.size() == 2U);
+    CHECK(fact_record->fields[0].field_id == 1U);
+
+    SchemaCatalog schemas {
+        .descriptors = {SchemaDescriptor {
+            .id = SchemaId {"account.v1"},
+            .kind = SchemaKind::state,
+            .qualified_name = "Account",
+            .canonical_hash = "sha256:account",
+            .fields =
+                {
+                    SchemaField {
+                        .field_id = 1U, .name = "name", .type = SchemaId {"text"}, .optional = false, .label = {}},
+                    SchemaField {
+                        .field_id = 2U, .name = "enabled", .type = SchemaId {"bool"}, .optional = false, .label = {}},
+                }}},
+        .canonical_hash = "sha256:schemas",
+    };
+    REQUIRE(ValueHeap::validate_schema(frozen_record->value, SchemaId {"account.v1"}, &schemas).has_value());
+    auto tampered = *frozen_record;
+    tampered.canonical_digest = "fnv1a64:0000000000000000";
+    CHECK_FALSE(heap.validate_frozen(tampered, SchemaId {"account.v1"}, &schemas).has_value());
+
+    auto key_a = heap.allocate_unicode("a");
+    auto key_b = heap.allocate_unicode("b");
+    auto value_a = heap.allocate_integer("1");
+    auto value_b = heap.allocate_integer("2");
+    REQUIRE(key_a.has_value());
+    REQUIRE(key_b.has_value());
+    REQUIRE(value_a.has_value());
+    REQUIRE(value_b.has_value());
+    const std::array first_entries {std::pair {*key_b, *value_b}, std::pair {*key_a, *value_a}};
+    const std::array second_entries {std::pair {*key_a, *value_a}, std::pair {*key_b, *value_b}};
+    auto first = heap.allocate_map(first_entries);
+    auto second = heap.allocate_map(second_entries);
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    auto first_frozen = heap.freeze(*first);
+    auto second_frozen = heap.freeze(*second);
+    REQUIRE(first_frozen.has_value());
+    REQUIRE(second_frozen.has_value());
+    CHECK(first_frozen->canonical_digest == second_frozen->canonical_digest);
+}
+
 TEST_CASE("fact suspension resumes the exact PC without duplicate reads or intents") {
     auto pack = pack_with(
         {
@@ -276,7 +423,7 @@ TEST_CASE("capability suspension freezes arguments and correlates its response")
     response.capabilities.push_back(CapabilityResponse {
         .request_id = waiting.capability_requests.front().request_id,
         .status = FactTerminalStatus::value,
-        .value = FrozenValue {.value = make_fact(true), .label = {}, .canonical_digest = "bool:true"},
+        .value = canonical_frozen(make_fact(true)),
         .diagnostic = std::nullopt,
     });
     const auto complete = session->step(std::move(response));
@@ -309,6 +456,153 @@ TEST_CASE("invalid host responses fail closed without resuming the continuation"
     REQUIRE(faulted.result->fault->frames.size() == 1U);
     CHECK(faulted.result->fault->frames.front().code == "PYVM3001");
     CHECK(session->logical_read_count() == 1U);
+}
+
+TEST_CASE("state reads suspend once validate boundaries and preserve read-your-writes") {
+    auto pack = pack_with(
+        {
+            make_state_operand("tenant", "enabled", SchemaId {"bool"}),
+            make_fact(true),
+        },
+        {function("rule.main", 3U,
+                  {
+                      instruction(Opcode::read_state, 0U, 0U, 0U, 0U),
+                      instruction(Opcode::load_const, 1U, 0U, 0U, 1U),
+                      instruction(Opcode::write_state, 0U, 1U, 0U, 0U),
+                      instruction(Opcode::read_state, 2U, 0U, 0U, 0U),
+                      instruction(Opcode::return_value, 0U, 2U),
+                  })});
+    auto session = start(pack);
+    const auto waiting = session->step({});
+    REQUIRE(waiting.state == VmStepState::yielded);
+    REQUIRE(waiting.state_requests.size() == 1U);
+    CHECK(waiting.state_requests.front().namespace_name == "tenant");
+    CHECK(waiting.state_requests.front().key == "enabled");
+    CHECK(session->logical_read_count() == 1U);
+    CHECK(session->counters().state_keys == 1U);
+
+    const auto still_waiting = session->step({});
+    CHECK(still_waiting.state == VmStepState::yielded);
+    CHECK(still_waiting.state_requests.empty());
+    CHECK(session->logical_read_count() == 1U);
+
+    HostResponses response;
+    response.state.push_back(StateReadResponse {.request_id = waiting.state_requests.front().request_id,
+                                                .value = canonical_frozen(make_fact(false)),
+                                                .version = 7U,
+                                                .diagnostic = std::nullopt});
+    const auto complete = session->step(std::move(response));
+    REQUIRE(complete.state == VmStepState::complete);
+    REQUIRE(complete.result.has_value());
+    CHECK(complete.result->verdict == true);
+    REQUIRE(complete.result->state_mutations.size() == 1U);
+    CHECK(complete.result->state_mutations.front().expected_version == 7U);
+    REQUIRE(complete.result->state_mutations.front().value.has_value());
+    CHECK(frozen_boolean(*complete.result->state_mutations.front().value) == true);
+    CHECK(session->logical_read_count() == 1U);
+}
+
+TEST_CASE("state responses fail closed on non-canonical digests and schemas") {
+    auto make_pack = [] {
+        return pack_with({make_state_operand("tenant", "enabled", SchemaId {"bool"})},
+                         {function("rule.main", 1U,
+                                   {
+                                       instruction(Opcode::read_state, 0U, 0U, 0U, 0U),
+                                       instruction(Opcode::return_value, 0U, 0U),
+                                   })});
+    };
+
+    SECTION("digest") {
+        const auto pack = make_pack();
+        auto session = start(pack);
+        const auto waiting = session->step({});
+        auto value = canonical_frozen(make_fact(true));
+        value.canonical_digest = "fnv1a64:bad";
+        HostResponses response;
+        response.state.push_back(StateReadResponse {.request_id = waiting.state_requests.front().request_id,
+                                                    .value = std::move(value),
+                                                    .version = 1U,
+                                                    .diagnostic = std::nullopt});
+        const auto faulted = session->step(std::move(response));
+        CHECK(faulted.state == VmStepState::faulted);
+    }
+
+    SECTION("schema") {
+        const auto pack = make_pack();
+        auto session = start(pack);
+        const auto waiting = session->step({});
+        HostResponses response;
+        response.state.push_back(StateReadResponse {.request_id = waiting.state_requests.front().request_id,
+                                                    .value = canonical_frozen(text("not a bool")),
+                                                    .version = 1U,
+                                                    .diagnostic = std::nullopt});
+        const auto faulted = session->step(std::move(response));
+        CHECK(faulted.state == VmStepState::faulted);
+    }
+}
+
+TEST_CASE("transactions atomically commit or roll back effects and state overlays") {
+    auto transaction_pack = [](const Opcode exit_opcode, const bool prewrite) {
+        std::vector<Instruction> body;
+        if (prewrite) {
+            body.push_back(instruction(Opcode::load_const, 0U, 0U, 0U, 1U));
+            body.push_back(instruction(Opcode::write_state, 0U, 0U, 0U, 0U));
+        }
+        body.push_back(instruction(Opcode::begin_transaction));
+        body.push_back(instruction(Opcode::load_const, 1U, 0U, 0U, 2U));
+        body.push_back(instruction(Opcode::write_state, 0U, 1U, 0U, 0U));
+        body.push_back(instruction(Opcode::append_effect, 0U, 1U, 0U, 3U));
+        if (exit_opcode != Opcode::return_value) {
+            body.push_back(instruction(exit_opcode));
+        }
+        body.push_back(instruction(Opcode::read_state, 2U, 0U, 0U, 0U));
+        body.push_back(instruction(Opcode::compare, 3U, 2U, prewrite ? 0U : 1U,
+                                   static_cast<std::uint32_t>(CompareOperation::equal)));
+        body.push_back(instruction(Opcode::return_value, 0U, 3U));
+        return pack_with(
+            {
+                make_state_operand("tenant", "flag", SchemaId {"bool"}),
+                make_fact(false),
+                make_fact(true),
+                text("audit"),
+            },
+            {function("rule.main", 4U, std::move(body))});
+    };
+
+    SECTION("explicit rollback restores a mutation that existed before the transaction") {
+        const auto pack = transaction_pack(Opcode::rollback_transaction, true);
+        auto session = start(pack);
+        const auto complete = session->step({});
+        REQUIRE(complete.state == VmStepState::complete);
+        REQUIRE(complete.result.has_value());
+        CHECK(complete.result->verdict == true);
+        CHECK(complete.result->committed_effects.empty());
+        REQUIRE(complete.result->state_mutations.size() == 1U);
+        REQUIRE(complete.result->state_mutations.front().value.has_value());
+        CHECK(frozen_boolean(*complete.result->state_mutations.front().value) == false);
+        REQUIRE(complete.journal_delta.size() == 1U);
+        CHECK(complete.journal_delta.front().disposition == EffectDisposition::rolled_back);
+    }
+
+    SECTION("commit publishes both state and effect") {
+        const auto pack = transaction_pack(Opcode::commit_transaction, false);
+        auto session = start(pack);
+        const auto complete = session->step({});
+        REQUIRE(complete.result.has_value());
+        CHECK(complete.result->verdict == true);
+        REQUIRE(complete.result->committed_effects.size() == 1U);
+        REQUIRE(complete.result->state_mutations.size() == 1U);
+        CHECK(frozen_boolean(*complete.result->state_mutations.front().value) == true);
+    }
+
+    SECTION("an open transaction rolls back at return") {
+        const auto pack = transaction_pack(Opcode::return_value, false);
+        auto session = start(pack);
+        const auto complete = session->step({});
+        REQUIRE(complete.result.has_value());
+        CHECK(complete.result->committed_effects.empty());
+        CHECK(complete.result->state_mutations.empty());
+    }
 }
 
 TEST_CASE("typed fact terminals enter verifier-approved exception regions") {
@@ -371,6 +665,98 @@ TEST_CASE("static calls return through explicit frames and preserve arbitrary in
     REQUIRE(complete.result.has_value());
     CHECK(complete.result->verdict == true);
     CHECK(session->counters().peak_frames == 2U);
+}
+
+TEST_CASE("bound entrypoints admit the compiler subject parameter ABI") {
+    auto pack = pack_with({}, {function("rule.main", 1U, {instruction(Opcode::return_value, 0U, 0U)}, false, 1U)});
+    auto session = start(pack);
+    const auto complete = session->step({});
+    REQUIRE(complete.state == VmStepState::complete);
+    REQUIRE(complete.result.has_value());
+    CHECK(complete.result->outcome == EvaluationOutcome::no_match);
+}
+
+TEST_CASE("author exceptions cross call frames into caller handlers") {
+    auto main = function("rule.main", 2U,
+                         {
+                             instruction(Opcode::call, 0U, 0U, 0U, 1U, 0U),
+                             instruction(Opcode::return_value, 0U, 0U, 0U, 0U, 1U),
+                             instruction(Opcode::load_const, 1U, 0U, 0U, 1U, 2U),
+                             instruction(Opcode::return_value, 0U, 1U, 0U, 0U, 3U),
+                         });
+    main.exception_regions.push_back(ExceptionRegion {
+        .begin_instruction = 0U, .end_instruction = 1U, .handler_instruction = 2U, .cleanup_instruction = 2U});
+    auto pack =
+        pack_with({text("boom"), make_fact(true)}, {
+                                                       std::move(main),
+                                                       function("helper", 1U,
+                                                                {
+                                                                    instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                                                                    instruction(Opcode::raise_fault, 0U, 0U),
+                                                                }),
+                                                   });
+    auto session = start(pack);
+    const auto complete = session->step({});
+    REQUIRE(complete.state == VmStepState::complete);
+    REQUIRE(complete.result.has_value());
+    CHECK(complete.result->verdict == true);
+    CHECK(session->counters().peak_frames == 2U);
+}
+
+TEST_CASE("return unwind runs every nested cleanup exactly once") {
+    auto body = function("rule.main", 1U,
+                         {
+                             instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                             instruction(Opcode::return_value, 0U, 0U),
+                             instruction(Opcode::leave_try),
+                             instruction(Opcode::leave_try),
+                         });
+    body.exception_regions.push_back(ExceptionRegion {
+        .begin_instruction = 0U, .end_instruction = 2U, .handler_instruction = 3U, .cleanup_instruction = 3U});
+    body.exception_regions.push_back(ExceptionRegion {
+        .begin_instruction = 1U, .end_instruction = 2U, .handler_instruction = 2U, .cleanup_instruction = 2U});
+    auto pack = pack_with({make_fact(true)}, {std::move(body)});
+    auto session = start(pack);
+    const auto complete = session->step({});
+    REQUIRE(complete.state == VmStepState::complete);
+    CHECK(session->counters().instructions == 4U);
+}
+
+TEST_CASE("hard faults run cross-frame cleanup but remain unsuppressible") {
+    auto main = function("rule.main", 1U,
+                         {
+                             instruction(Opcode::call, 0U, 0U, 0U, 1U),
+                             instruction(Opcode::return_value, 0U, 0U),
+                             instruction(Opcode::leave_try),
+                             instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                             instruction(Opcode::return_value, 0U, 0U),
+                         });
+    main.exception_regions.push_back(ExceptionRegion {
+        .begin_instruction = 0U, .end_instruction = 1U, .handler_instruction = 3U, .cleanup_instruction = 2U});
+    auto pack = pack_with(
+        {
+            make_fact(true),
+            make_handler_metadata(ExecutableId {"rule.main"}, std::nullopt, ExecutableId {"rule.on_fault"},
+                                  std::nullopt),
+        },
+        {
+            std::move(main),
+            function("helper", 1U, {instruction(Opcode::jump, 0U, 0U, 0U, 0U)}),
+            function("rule.on_fault", 1U,
+                     {
+                         instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                         instruction(Opcode::return_value, 0U, 0U),
+                     }),
+        });
+    auto budget = balanced_v1;
+    budget.normal.instructions = 2U;
+    auto session = start(pack, invocation(budget));
+    auto result = run_internal(*session, session->step({}));
+    REQUIRE(result.state == VmStepState::faulted);
+    REQUIRE(result.result.has_value());
+    CHECK_FALSE(result.result->verdict.has_value());
+    CHECK(session->recovery_counters().forced_cleanup.instructions == 1U);
+    CHECK(session->recovery_counters().finalizer_or_fault.instructions == 0U);
 }
 
 TEST_CASE("deployment cancellation is unsuppressible while a fact is pending") {
@@ -480,6 +866,66 @@ TEST_CASE("generator yield preserves its frame and resumes at the successor inst
     CHECK(session->counters().loop_iterations_and_yields == 1U);
 }
 
+TEST_CASE("generator send throw and close resume only the suspended continuation") {
+    SECTION("send") {
+        auto pack = pack_with({integer("7")}, {function("rule.main", 2U,
+                                                        {
+                                                            instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                                                            instruction(Opcode::yield_value, 1U, 0U),
+                                                            instruction(Opcode::return_value, 0U, 1U),
+                                                        },
+                                                        true)});
+        auto session = start(pack);
+        const auto yielded = session->step({});
+        REQUIRE(yielded.yielded_value.has_value());
+        const auto complete = session->send_generator(*yielded.yielded_value);
+        REQUIRE(complete.state == VmStepState::complete);
+        CHECK(complete.result->verdict == true);
+    }
+
+    SECTION("throw") {
+        auto body = function("rule.main", 2U,
+                             {
+                                 instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                                 instruction(Opcode::yield_value, 1U, 0U),
+                                 instruction(Opcode::return_value, 0U, 1U),
+                                 instruction(Opcode::load_const, 1U, 0U, 0U, 1U),
+                                 instruction(Opcode::return_value, 0U, 1U),
+                             },
+                             true);
+        body.exception_regions.push_back(ExceptionRegion {
+            .begin_instruction = 1U, .end_instruction = 2U, .handler_instruction = 3U, .cleanup_instruction = 3U});
+        auto pack = pack_with({integer("7"), make_fact(true)}, {std::move(body)});
+        auto session = start(pack);
+        const auto yielded = session->step({});
+        REQUIRE(yielded.yielded_value.has_value());
+        const auto complete = session->throw_generator(*yielded.yielded_value);
+        REQUIRE(complete.state == VmStepState::complete);
+        CHECK(complete.result->verdict == true);
+    }
+
+    SECTION("close") {
+        auto body = function("rule.main", 2U,
+                             {
+                                 instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                                 instruction(Opcode::yield_value, 1U, 0U),
+                                 instruction(Opcode::return_value, 0U, 1U),
+                                 instruction(Opcode::leave_try),
+                                 instruction(Opcode::load_const, 1U, 0U, 0U, 1U),
+                                 instruction(Opcode::return_value, 0U, 1U),
+                             },
+                             true);
+        body.exception_regions.push_back(ExceptionRegion {
+            .begin_instruction = 1U, .end_instruction = 2U, .handler_instruction = 4U, .cleanup_instruction = 3U});
+        auto pack = pack_with({integer("7"), make_fact(true)}, {std::move(body)});
+        auto session = start(pack);
+        REQUIRE(session->step({}).state == VmStepState::yielded);
+        auto closed = run_internal(*session, session->close_generator());
+        REQUIRE(closed.state == VmStepState::canceled);
+        CHECK(session->recovery_counters().forced_cleanup.instructions == 1U);
+    }
+}
+
 TEST_CASE("structured task groups own children lexically and schedule ready tasks FIFO") {
     StructuredTasks tasks;
     const auto root = tasks.open_group();
@@ -498,6 +944,263 @@ TEST_CASE("structured task groups own children lexically and schedule ready task
     REQUIRE(tasks.close(nested, TaskGroupExitMode::cancel_pending).has_value());
     CHECK_FALSE(tasks.has_live_tasks(nested));
     REQUIRE(tasks.close(root, TaskGroupExitMode::wait_pending).has_value());
+}
+
+TEST_CASE("structured task cancellation is transitive and close_all leaves no open groups") {
+    StructuredTasks tasks;
+    const auto root = tasks.open_group();
+    const auto child = tasks.open_group(root);
+    const auto grandchild = tasks.open_group(child);
+    auto root_task = tasks.start(root);
+    auto child_task = tasks.start(child);
+    auto grandchild_task = tasks.start(grandchild);
+    REQUIRE(root_task.has_value());
+    REQUIRE(child_task.has_value());
+    REQUIRE(grandchild_task.has_value());
+    REQUIRE(tasks.cancel_group(child).has_value());
+    CHECK(tasks.group_open(root));
+    CHECK_FALSE(tasks.group_open(child));
+    CHECK_FALSE(tasks.group_open(grandchild));
+    CHECK(tasks.tasks()[0].state == TaskState::ready);
+    CHECK(tasks.tasks()[1].state == TaskState::canceled);
+    CHECK(tasks.tasks()[2].state == TaskState::canceled);
+    REQUIRE(tasks.close_all().has_value());
+    CHECK_FALSE(tasks.group_open(root));
+    CHECK(tasks.tasks()[0].state == TaskState::canceled);
+}
+
+TEST_CASE("fresh finalizer executors keep replace abort or escalate a candidate") {
+    const auto finalizer_pack = [](FactValue decision, const bool raises = false) {
+        std::vector<Instruction> finalizer {
+            instruction(Opcode::load_const, 0U, 0U, 0U, 1U),
+            instruction(raises ? Opcode::raise_fault : Opcode::return_value, 0U, 0U),
+        };
+        return pack_with(
+            {
+                make_fact(true),
+                std::move(decision),
+                make_handler_metadata(ExecutableId {"rule.main"}, ExecutableId {"rule.finalize"}, std::nullopt,
+                                      std::nullopt),
+            },
+            {
+                function("rule.main", 1U,
+                         {
+                             instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                             instruction(Opcode::return_value, 0U, 0U),
+                         }),
+                function("rule.finalize", 1U, std::move(finalizer)),
+            });
+    };
+
+    SECTION("keep") {
+        const auto pack = finalizer_pack(text("keep"));
+        auto session = start(pack);
+        const auto complete = run_internal(*session, session->step({}));
+        REQUIRE(complete.state == VmStepState::complete);
+        CHECK(complete.result->verdict == true);
+        CHECK(session->recovery_counters().finalizer_or_fault.instructions == 2U);
+    }
+
+    SECTION("replace") {
+        const auto pack = finalizer_pack(make_fact(false));
+        auto session = start(pack);
+        const auto complete = run_internal(*session, session->step({}));
+        REQUIRE(complete.state == VmStepState::complete);
+        CHECK(complete.result->outcome == EvaluationOutcome::no_match);
+        CHECK(complete.result->verdict == false);
+    }
+
+    SECTION("abort") {
+        const auto pack = finalizer_pack(text("abort: policy"));
+        auto session = start(pack);
+        const auto faulted = run_internal(*session, session->step({}));
+        REQUIRE(faulted.state == VmStepState::faulted);
+        REQUIRE(faulted.result->fault.has_value());
+        CHECK_FALSE(faulted.result->fault->double_fault);
+    }
+
+    SECTION("fault escalates without re-entering pack code") {
+        const auto pack = finalizer_pack(text("finalizer exploded"), true);
+        auto session = start(pack);
+        const auto quarantined = run_internal(*session, session->step({}));
+        REQUIRE(quarantined.state == VmStepState::quarantined);
+        REQUIRE(quarantined.result->fault.has_value());
+        CHECK(quarantined.result->fault->double_fault);
+        CHECK(quarantined.result->fault->triple_fault);
+        CHECK(session->recovery_counters().double_faults == 1U);
+        CHECK(session->recovery_counters().triple_faults == 1U);
+    }
+}
+
+TEST_CASE("on_fault and on_double_fault follow the bounded recovery ladder") {
+    const auto recovery_pack = [](FactValue fault_decision, std::optional<FactValue> double_decision,
+                                  const bool fault_handler_raises = false, const bool double_handler_raises = false) {
+        std::vector<FactValue> constants {text("primary exploded"), std::move(fault_decision)};
+        if (double_decision.has_value()) {
+            constants.push_back(std::move(*double_decision));
+        }
+        constants.push_back(make_handler_metadata(
+            ExecutableId {"rule.main"}, std::nullopt, ExecutableId {"rule.on_fault"},
+            double_decision.has_value() ? std::optional<ExecutableId> {ExecutableId {"rule.on_double"}} :
+                                          std::nullopt));
+        std::vector<BytecodeFunction> functions {
+            function("rule.main", 1U,
+                     {
+                         instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                         instruction(Opcode::raise_fault, 0U, 0U),
+                     }),
+            function("rule.on_fault", 1U,
+                     {
+                         instruction(Opcode::load_const, 0U, 0U, 0U, 1U),
+                         instruction(fault_handler_raises ? Opcode::raise_fault : Opcode::return_value, 0U, 0U),
+                     }),
+        };
+        if (double_decision.has_value()) {
+            functions.push_back(
+                function("rule.on_double", 1U,
+                         {
+                             instruction(Opcode::load_const, 0U, 0U, 0U, 2U),
+                             instruction(double_handler_raises ? Opcode::raise_fault : Opcode::return_value, 0U, 0U),
+                         }));
+        }
+        return pack_with(std::move(constants), std::move(functions));
+    };
+
+    SECTION("on_fault can complete") {
+        const auto pack = recovery_pack(make_fact(true), std::nullopt);
+        auto session = start(pack);
+        const auto complete = run_internal(*session, session->step({}));
+        REQUIRE(complete.state == VmStepState::complete);
+        CHECK(complete.result->verdict == true);
+        CHECK(session->recovery_counters().primary_faults == 1U);
+        CHECK(session->recovery_counters().finalizer_or_fault.instructions == 2U);
+    }
+
+    SECTION("on_fault can abort or quarantine") {
+        const auto abort_pack = recovery_pack(text("abort"), std::nullopt);
+        auto abort_session = start(abort_pack);
+        CHECK(run_internal(*abort_session, abort_session->step({})).state == VmStepState::faulted);
+
+        const auto quarantine_pack = recovery_pack(text("quarantine"), std::nullopt);
+        auto quarantine_session = start(quarantine_pack);
+        CHECK(run_internal(*quarantine_session, quarantine_session->step({})).state == VmStepState::quarantined);
+    }
+
+    SECTION("retry_once gets one fresh entry executor before escalation") {
+        const auto pack = recovery_pack(text("retry_once"), text("abort"));
+        auto session = start(pack);
+        const auto faulted = run_internal(*session, session->step({}));
+        REQUIRE(faulted.state == VmStepState::faulted);
+        CHECK(session->recovery_counters().double_faults == 1U);
+        CHECK(session->counters().instructions == 4U);
+    }
+
+    SECTION("double fault handler can abort") {
+        const auto pack = recovery_pack(text("secondary exploded"), text("abort"), true);
+        auto session = start(pack);
+        const auto faulted = run_internal(*session, session->step({}));
+        REQUIRE(faulted.state == VmStepState::faulted);
+        REQUIRE(faulted.result->fault.has_value());
+        CHECK(faulted.result->fault->double_fault);
+        CHECK_FALSE(faulted.result->fault->triple_fault);
+        CHECK(session->recovery_counters().double_faults == 1U);
+        CHECK(session->recovery_counters().double_fault.instructions == 2U);
+    }
+
+    SECTION("a fault in the double fault handler is terminal quarantine") {
+        const auto pack = recovery_pack(text("secondary exploded"), text("tertiary exploded"), true, true);
+        auto session = start(pack);
+        const auto quarantined = run_internal(*session, session->step({}));
+        REQUIRE(quarantined.state == VmStepState::quarantined);
+        REQUIRE(quarantined.result->fault.has_value());
+        CHECK(quarantined.result->fault->triple_fault);
+        CHECK(session->recovery_counters().triple_faults == 1U);
+    }
+}
+
+TEST_CASE("retry_once replays captured fact terminals without a duplicate provider read") {
+    auto pack = pack_with(
+        {
+            make_fact_operand(FactRoute {.provider = "process", .fact = "optional"}, SchemaId {"bool"}),
+            text("retry_once"),
+            text("abort"),
+            make_handler_metadata(ExecutableId {"rule.main"}, std::nullopt, ExecutableId {"rule.on_fault"},
+                                  ExecutableId {"rule.on_double"}),
+        },
+        {
+            function("rule.main", 1U,
+                     {
+                         instruction(Opcode::await_fact, 0U, 0U, 0U, 0U),
+                         instruction(Opcode::return_value, 0U, 0U),
+                     }),
+            function("rule.on_fault", 1U,
+                     {
+                         instruction(Opcode::load_const, 0U, 0U, 0U, 1U),
+                         instruction(Opcode::return_value, 0U, 0U),
+                     }),
+            function("rule.on_double", 1U,
+                     {
+                         instruction(Opcode::load_const, 0U, 0U, 0U, 2U),
+                         instruction(Opcode::return_value, 0U, 0U),
+                     }),
+        });
+    auto session = start(pack);
+    const auto waiting = session->step({});
+    REQUIRE(waiting.fact_requests.size() == 1U);
+    HostResponses denied;
+    denied.facts.push_back(FactResponse {.request_id = waiting.fact_requests.front().request_id,
+                                         .subject = waiting.fact_requests.front().subject,
+                                         .status = FactTerminalStatus::denied,
+                                         .value = std::nullopt,
+                                         .diagnostic = std::nullopt});
+    const auto faulted = run_internal(*session, session->step(std::move(denied)));
+    REQUIRE(faulted.state == VmStepState::faulted);
+    CHECK(faulted.fact_requests.empty());
+    CHECK(session->logical_read_count() == 1U);
+    CHECK(session->counters().logical_facts == 1U);
+}
+
+TEST_CASE("recovery tiers enforce their independent instruction and heap budgets") {
+    auto pack = pack_with(
+        {
+            make_fact(true),
+            text("keep"),
+            make_handler_metadata(ExecutableId {"rule.main"}, ExecutableId {"rule.finalize"}, std::nullopt,
+                                  std::nullopt),
+        },
+        {
+            function("rule.main", 1U,
+                     {
+                         instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                         instruction(Opcode::return_value, 0U, 0U),
+                     }),
+            function("rule.finalize", 1U,
+                     {
+                         instruction(Opcode::load_const, 0U, 0U, 0U, 1U),
+                         instruction(Opcode::return_value, 0U, 0U),
+                     }),
+        });
+
+    SECTION("instruction") {
+        auto budget = balanced_v1;
+        budget.finalizer_or_fault.instructions = 1U;
+        auto session = start(pack, invocation(budget));
+        const auto quarantined = run_internal(*session, session->step({}));
+        CHECK(quarantined.state == VmStepState::quarantined);
+        CHECK(session->recovery_counters().finalizer_or_fault.instructions == 1U);
+    }
+
+    SECTION("heap") {
+        auto budget = balanced_v1;
+        budget.finalizer_or_fault.heap_bytes = 0U;
+        auto session = start(pack, invocation(budget));
+        const auto quarantined = run_internal(*session, session->step({}));
+        CHECK(quarantined.state == VmStepState::quarantined);
+    }
+
+    CHECK(balanced_v1.finalizer_or_fault.instructions == 100'000U);
+    CHECK(balanced_v1.double_fault.instructions == 25'000U);
+    CHECK(balanced_v1.forced_cleanup.instructions == 25'000U);
 }
 
 TEST_CASE("identical executions produce deterministic requests intents and results") {

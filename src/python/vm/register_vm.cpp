@@ -1,11 +1,22 @@
 #include "rule_engine/python/vm/register_vm.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <limits>
 #include <set>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+
+#if defined(_WIN32)
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+#else
+#include <ctime>
+#endif
 
 namespace rule_engine::python::vm {
     namespace {
@@ -122,6 +133,7 @@ namespace rule_engine::python::vm {
                 case VmErrorCode::elapsed_budget_exhausted: return "PYVM4001";
                 case VmErrorCode::fact_budget_exhausted: return "PYVM4010";
                 case VmErrorCode::capability_budget_exhausted: return "PYVM4011";
+                case VmErrorCode::state_budget_exhausted: return "PYVM4013";
                 case VmErrorCode::effect_budget_exhausted: return "PYVM4012";
                 case VmErrorCode::invalid_bytecode: return "PYVM1001";
                 case VmErrorCode::invalid_host_response: return "PYVM3001";
@@ -146,6 +158,31 @@ namespace rule_engine::python::vm {
             return value <= last;
         }
 
+        [[nodiscard]] std::optional<std::chrono::nanoseconds> thread_cpu_now() noexcept {
+#if defined(_WIN32)
+            FILETIME created {};
+            FILETIME exited {};
+            FILETIME kernel {};
+            FILETIME user {};
+            if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user) == 0) {
+                return std::nullopt;
+            }
+            const auto ticks = [](const FILETIME &value) {
+                return (static_cast<std::uint64_t>(value.dwHighDateTime) << 32U) |
+                       static_cast<std::uint64_t>(value.dwLowDateTime);
+            };
+            return std::chrono::nanoseconds {(ticks(kernel) + ticks(user)) * 100U};
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
+            timespec value {};
+            if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) {
+                return std::nullopt;
+            }
+            return std::chrono::seconds {value.tv_sec} + std::chrono::nanoseconds {value.tv_nsec};
+#else
+            return std::nullopt;
+#endif
+        }
+
     } // namespace
 
     FactValue make_fact_operand(FactRoute route, SchemaId expected_schema) {
@@ -158,24 +195,69 @@ namespace rule_engine::python::vm {
             });
     }
 
-    FactValue make_capability_operand(CapabilityId capability, SchemaId request_schema) {
-        return operand_record(capability_operand_schema,
+    FactValue make_capability_operand(CapabilityId capability, SchemaId request_schema, SchemaId response_schema) {
+        std::vector fields {
+            FactRecordField {.field_id = 1U, .value = text_fact(std::move(capability.value))},
+            FactRecordField {.field_id = 2U, .value = text_fact(std::move(request_schema.value))},
+        };
+        if (!response_schema.empty()) {
+            fields.push_back(FactRecordField {.field_id = 3U, .value = text_fact(std::move(response_schema.value))});
+        }
+        return operand_record(capability_operand_schema, std::move(fields));
+    }
+
+    FactValue make_state_operand(std::string namespace_name, std::string key, SchemaId schema) {
+        return operand_record(state_operand_schema,
                               {
-                                  FactRecordField {.field_id = 1U, .value = text_fact(std::move(capability.value))},
-                                  FactRecordField {.field_id = 2U, .value = text_fact(std::move(request_schema.value))},
+                                  FactRecordField {.field_id = 1U, .value = text_fact(std::move(namespace_name))},
+                                  FactRecordField {.field_id = 2U, .value = text_fact(std::move(key))},
+                                  FactRecordField {.field_id = 3U, .value = text_fact(std::move(schema.value))},
                               });
     }
 
+    FactValue make_handler_metadata(ExecutableId entrypoint, std::optional<ExecutableId> finalizer,
+                                    std::optional<ExecutableId> on_fault, std::optional<ExecutableId> on_double_fault) {
+        std::vector fields {
+            FactRecordField {.field_id = 1U, .value = text_fact(std::move(entrypoint.value))},
+        };
+        if (finalizer.has_value()) {
+            fields.push_back(FactRecordField {.field_id = 2U, .value = text_fact(std::move(finalizer->value))});
+        }
+        if (on_fault.has_value()) {
+            fields.push_back(FactRecordField {.field_id = 3U, .value = text_fact(std::move(on_fault->value))});
+        }
+        if (on_double_fault.has_value()) {
+            fields.push_back(FactRecordField {.field_id = 4U, .value = text_fact(std::move(on_double_fault->value))});
+        }
+        return operand_record(handler_metadata_schema, std::move(fields));
+    }
+
     struct RegisterVmSession::Impl {
+        enum struct ExecutorPhase : std::uint8_t { normal, recovery_retry, finalizer, on_fault, double_fault };
+        enum struct UnwindKind : std::uint8_t { exception, return_value, hard_fault, generator_close };
+
+        struct UnwindRecord {
+            UnwindKind kind {UnwindKind::exception};
+            std::optional<PyValue> value;
+            std::optional<VmError> fault;
+            std::optional<std::uint32_t> handler_instruction;
+            std::uint32_t destination {};
+            std::uint32_t origin_instruction {};
+        };
+
         struct Frame {
             std::size_t function_index {};
             std::uint32_t pc {};
             std::vector<PyValue> registers;
             std::optional<std::uint32_t> return_register;
+            std::optional<std::uint32_t> caller_instruction;
             GeneratorState generator_state {GeneratorState::running};
+            std::optional<std::uint32_t> yield_destination;
+            std::optional<UnwindRecord> unwind;
+            std::unordered_set<std::uint32_t> completed_cleanups;
         };
 
-        enum struct PendingKind : std::uint8_t { fact, capability };
+        enum struct PendingKind : std::uint8_t { fact, capability, state };
 
         struct PendingRequest {
             PendingKind kind {PendingKind::fact};
@@ -186,23 +268,78 @@ namespace rule_engine::python::vm {
             SourceSpan span;
             std::optional<FactRequest> fact;
             std::optional<CapabilityRequest> capability;
+            std::optional<StateReadRequest> state;
+            std::optional<SchemaId> response_schema;
+            std::string cache_key;
             bool emitted {};
+        };
+
+        struct CachedFactResponse {
+            FactTerminalStatus status {FactTerminalStatus::failed};
+            std::optional<FactValue> value;
+        };
+
+        struct CachedCapabilityResponse {
+            FactTerminalStatus status {FactTerminalStatus::failed};
+            std::optional<FrozenValue> value;
+        };
+
+        struct StateEntry {
+            std::optional<FrozenValue> value;
+            std::uint64_t version {};
+            std::optional<std::string> error;
+        };
+
+        struct TransactionMark {
+            std::size_t journal_size {};
+            std::vector<StateMutation> state_mutations;
+            std::unordered_map<std::string, StateEntry> state_overlay;
+        };
+
+        struct HandlerConfiguration {
+            std::optional<std::size_t> finalizer;
+            std::optional<std::size_t> on_fault;
+            std::optional<std::size_t> on_double_fault;
         };
 
         CompiledPack pack;
         VmInvocation invocation;
+        std::size_t entry_index {};
         ValueHeap heap;
         std::vector<PyValue> constants;
         std::vector<Frame> frames;
         std::optional<PendingRequest> pending;
         std::vector<std::string> logical_reads;
+        std::unordered_map<std::string, CachedFactResponse> fact_responses;
+        std::unordered_map<std::string, CachedCapabilityResponse> capability_responses;
         std::vector<EffectIntent> journal;
-        std::vector<std::size_t> transaction_marks;
+        std::vector<EffectIntent> journal_updates;
+        std::vector<TransactionMark> transaction_marks;
+        std::unordered_map<std::string, StateEntry> state_values;
+        std::unordered_map<std::string, StateEntry> state_overlay;
+        std::vector<StateMutation> state_mutations;
+        std::unordered_set<std::string> charged_state_keys;
         std::size_t emitted_journal {};
         VmCounters counters;
+        RecoveryCounters recovery;
+        VmCounters tier_counters;
+        ExecutorPhase phase {ExecutorPhase::normal};
+        HandlerConfiguration handlers;
+        std::optional<bool> candidate_verdict;
+        std::vector<EffectIntent> candidate_journal;
+        std::vector<StateMutation> candidate_state;
+        std::vector<FaultFrame> fault_frames;
+        bool retry_used {};
+        bool forced_cleanup_active {};
+        std::size_t forced_cleanup_heap_start {};
         std::uint32_t active_service_calls {};
         std::chrono::steady_clock::time_point started {std::chrono::steady_clock::now()};
+        std::chrono::steady_clock::time_point phase_started {started};
         std::chrono::steady_clock::time_point active_step_started {};
+        std::optional<std::chrono::nanoseconds> active_cpu_step_started;
+        ExecutorPhase active_measurement_phase {ExecutorPhase::normal};
+        bool active_measurement_forced {};
+        bool tier_counters_finalized {};
         bool active_step {};
         std::uint64_t request_sequence {};
         std::uint64_t effect_sequence {};
@@ -231,30 +368,122 @@ namespace rule_engine::python::vm {
             return result;
         }
 
-        [[nodiscard]] std::chrono::nanoseconds current_active_time() const {
-            if (!active_step) {
-                return counters.active_time;
+        [[nodiscard]] VmCounters &current_counters() noexcept {
+            if (forced_cleanup_active) {
+                return recovery.forced_cleanup;
             }
-            return counters.active_time + (std::chrono::steady_clock::now() - active_step_started);
+            return phase == ExecutorPhase::normal || phase == ExecutorPhase::recovery_retry ? counters : tier_counters;
+        }
+
+        [[nodiscard]] const VmCounters &current_counters() const noexcept {
+            if (forced_cleanup_active) {
+                return recovery.forced_cleanup;
+            }
+            return phase == ExecutorPhase::normal || phase == ExecutorPhase::recovery_retry ? counters : tier_counters;
+        }
+
+        void begin_active_measurement() {
+            active_step_started = std::chrono::steady_clock::now();
+            active_cpu_step_started = thread_cpu_now();
+            active_measurement_phase = phase;
+            active_measurement_forced = forced_cleanup_active;
+            active_step = true;
+        }
+
+        void settle_active_measurement() {
+            if (!active_step) {
+                return;
+            }
+            auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                                active_step_started);
+            if (active_cpu_step_started.has_value()) {
+                if (const auto current = thread_cpu_now();
+                    current.has_value() && *current >= *active_cpu_step_started) {
+                    elapsed = *current - *active_cpu_step_started;
+                }
+            }
+            if (active_measurement_forced) {
+                recovery.forced_cleanup.active_time += elapsed;
+            } else if (active_measurement_phase == ExecutorPhase::normal ||
+                       active_measurement_phase == ExecutorPhase::recovery_retry) {
+                counters.active_time += elapsed;
+            } else if (tier_counters_finalized) {
+                auto &destination = active_measurement_phase == ExecutorPhase::double_fault ?
+                                        recovery.double_fault :
+                                        recovery.finalizer_or_fault;
+                destination.active_time += elapsed;
+            } else {
+                tier_counters.active_time += elapsed;
+            }
+            active_step_started = std::chrono::steady_clock::now();
+            active_cpu_step_started = thread_cpu_now();
+        }
+
+        void rebind_active_measurement() {
+            settle_active_measurement();
+            active_measurement_phase = phase;
+            active_measurement_forced = forced_cleanup_active;
+        }
+
+        void end_active_measurement() {
+            settle_active_measurement();
+            active_step = false;
+            active_cpu_step_started.reset();
+        }
+
+        [[nodiscard]] const RecoveryBudget *recovery_budget() const noexcept {
+            if (forced_cleanup_active) {
+                return &invocation.budget.forced_cleanup;
+            }
+            if (phase == ExecutorPhase::finalizer || phase == ExecutorPhase::on_fault) {
+                return &invocation.budget.finalizer_or_fault;
+            }
+            if (phase == ExecutorPhase::double_fault) {
+                return &invocation.budget.double_fault;
+            }
+            return nullptr;
+        }
+
+        [[nodiscard]] std::chrono::nanoseconds current_active_time() const {
+            const auto &phase_counter = current_counters();
+            if (!active_step) {
+                return phase_counter.active_time;
+            }
+            if (active_cpu_step_started.has_value()) {
+                if (const auto current = thread_cpu_now();
+                    current.has_value() && *current >= *active_cpu_step_started) {
+                    return phase_counter.active_time + (*current - *active_cpu_step_started);
+                }
+            }
+            return phase_counter.active_time + (std::chrono::steady_clock::now() - active_step_started);
         }
 
         [[nodiscard]] std::chrono::milliseconds remaining_elapsed() const {
+            const auto deadline =
+                recovery_budget() == nullptr ? invocation.budget.normal.elapsed : recovery_budget()->elapsed;
+            const auto basis = recovery_budget() == nullptr ? started : phase_started;
             const auto elapsed =
-                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
-            if (elapsed >= invocation.budget.normal.elapsed) {
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - basis);
+            if (elapsed >= deadline) {
                 return std::chrono::milliseconds::zero();
             }
-            return invocation.budget.normal.elapsed - elapsed;
+            return deadline - elapsed;
         }
 
         [[nodiscard]] std::optional<VmError> check_time() const {
-            const auto elapsed = std::chrono::steady_clock::now() - started;
-            if (elapsed >= invocation.budget.normal.elapsed) {
+            const auto *recovery_limit = recovery_budget();
+            const auto elapsed_limit =
+                recovery_limit == nullptr ? invocation.budget.normal.elapsed : recovery_limit->elapsed;
+            const auto active_limit =
+                recovery_limit == nullptr ? invocation.budget.normal.active_cpu : recovery_limit->active_cpu;
+            const auto basis = recovery_limit == nullptr ? started : phase_started;
+            const auto elapsed = std::chrono::steady_clock::now() - basis;
+            if (elapsed >= elapsed_limit) {
                 return VmError {.code = VmErrorCode::elapsed_budget_exhausted,
                                 .message = "balanced.v1 elapsed deadline exhausted",
                                 .span = std::nullopt};
             }
-            if (current_active_time() >= invocation.budget.normal.active_cpu) {
+            if (active_limit != std::chrono::milliseconds::zero() && current_active_time() >= active_limit) {
                 return VmError {.code = VmErrorCode::elapsed_budget_exhausted,
                                 .message = "balanced.v1 active VM time exhausted",
                                 .span = std::nullopt};
@@ -263,23 +492,28 @@ namespace rule_engine::python::vm {
         }
 
         [[nodiscard]] std::optional<VmError> charge_instructions(const std::uint64_t amount, const SourceSpan &span) {
-            if (amount > invocation.budget.normal.instructions ||
-                counters.instructions > invocation.budget.normal.instructions - amount) {
+            const auto *recovery_limit = recovery_budget();
+            const auto limit =
+                recovery_limit == nullptr ? invocation.budget.normal.instructions : recovery_limit->instructions;
+            auto &phase_counter = current_counters();
+            if (amount > limit || phase_counter.instructions > limit - amount) {
                 return VmError {.code = VmErrorCode::instruction_budget_exhausted,
                                 .message = "balanced.v1 semantic instruction budget exhausted",
                                 .span = span};
             }
-            counters.instructions += amount;
+            phase_counter.instructions += amount;
             return std::nullopt;
         }
 
         [[nodiscard]] std::optional<VmError> charge_loop(const SourceSpan &span) {
-            if (counters.loop_iterations_and_yields == invocation.budget.normal.loop_iterations_and_yields) {
+            auto &phase_counter = current_counters();
+            if (recovery_budget() == nullptr &&
+                phase_counter.loop_iterations_and_yields == invocation.budget.normal.loop_iterations_and_yields) {
                 return VmError {.code = VmErrorCode::loop_budget_exhausted,
                                 .message = "balanced.v1 loop iteration/yield budget exhausted",
                                 .span = span};
             }
-            ++counters.loop_iterations_and_yields;
+            ++phase_counter.loop_iterations_and_yields;
             return std::nullopt;
         }
 
@@ -302,6 +536,119 @@ namespace rule_engine::python::vm {
             return IntentId {"vm:" + invocation.invocation.value + ":effect:" + std::to_string(effect_sequence)};
         }
 
+        void rollback_journal_from(const std::size_t first) {
+            for (std::size_t index = first; index < journal.size(); ++index) {
+                if (journal[index].disposition != EffectDisposition::pending) {
+                    continue;
+                }
+                journal[index].disposition = EffectDisposition::rolled_back;
+                if (index < emitted_journal) {
+                    journal_updates.push_back(journal[index]);
+                }
+            }
+        }
+
+        static void add_counters(VmCounters &target, const VmCounters &source) {
+            target.instructions += source.instructions;
+            target.peak_frames = std::max(target.peak_frames, source.peak_frames);
+            target.loop_iterations_and_yields += source.loop_iterations_and_yields;
+            target.logical_facts += source.logical_facts;
+            target.provider_rounds += source.provider_rounds;
+            target.fact_bytes += source.fact_bytes;
+            target.service_calls += source.service_calls;
+            target.peak_active_service_calls =
+                std::max(target.peak_active_service_calls, source.peak_active_service_calls);
+            target.service_response_bytes += source.service_response_bytes;
+            target.state_keys += source.state_keys;
+            target.state_bytes += source.state_bytes;
+            target.effect_intents += source.effect_intents;
+            target.effect_bytes += source.effect_bytes;
+            target.active_time += source.active_time;
+        }
+
+        void finish_tier_counters() {
+            settle_active_measurement();
+            if (phase == ExecutorPhase::finalizer || phase == ExecutorPhase::on_fault) {
+                add_counters(recovery.finalizer_or_fault, tier_counters);
+                tier_counters_finalized = true;
+            } else if (phase == ExecutorPhase::double_fault) {
+                add_counters(recovery.double_fault, tier_counters);
+                tier_counters_finalized = true;
+            }
+            tier_counters = {};
+        }
+
+        [[nodiscard]] std::optional<VmError> materialize_constants() {
+            constants.clear();
+            constants.reserve(pack.constants.size());
+            for (const auto &constant : pack.constants) {
+                auto thawed = heap.thaw(constant);
+                if (!thawed) {
+                    return VmError {.code = thawed.error().code,
+                                    .message = "constant cannot be materialized: " + thawed.error().message,
+                                    .span = thawed.error().span};
+                }
+                constants.push_back(*thawed);
+            }
+            return std::nullopt;
+        }
+
+        [[nodiscard]] std::optional<VmError>
+        start_executor(const std::size_t function_index, const ExecutorPhase next_phase, const std::size_t heap_limit) {
+            finish_tier_counters();
+            phase = next_phase;
+            tier_counters_finalized = false;
+            phase_started = std::chrono::steady_clock::now();
+            rebind_active_measurement();
+            heap = ValueHeap {heap_limit};
+            frames.clear();
+            pending.reset();
+            journal.clear();
+            transaction_marks.clear();
+            state_overlay.clear();
+            state_mutations.clear();
+            emitted_journal = 0U;
+            active_service_calls = 0U;
+            tasks = StructuredTasks {};
+            root_group = 0U;
+            root_task = 0U;
+            if (const auto fault = materialize_constants(); fault.has_value()) {
+                return fault;
+            }
+            const auto entry_parameters = function_index == entry_index ? 1U : 0U;
+            if (function_index >= pack.functions.size() ||
+                pack.functions[function_index].parameter_count > entry_parameters) {
+                return VmError {.code = VmErrorCode::invalid_bytecode,
+                                .message = "executor entrypoint has an unsupported parameter ABI",
+                                .span = std::nullopt};
+            }
+            frames.push_back(Frame {.function_index = function_index,
+                                    .pc = 0U,
+                                    .registers = std::vector<PyValue>(pack.functions[function_index].register_count),
+                                    .return_register = std::nullopt,
+                                    .caller_instruction = std::nullopt,
+                                    .generator_state = GeneratorState::running,
+                                    .yield_destination = std::nullopt,
+                                    .unwind = std::nullopt,
+                                    .completed_cleanups = {}});
+            if (pack.functions[function_index].parameter_count == 1U) {
+                auto subject_value = heap.allocate_none();
+                if (!subject_value) {
+                    return subject_value.error();
+                }
+                frames.back().registers[0] = *subject_value;
+            }
+            current_counters().peak_frames = 1U;
+            root_group = tasks.open_group();
+            auto task = tasks.start(root_group);
+            if (!task) {
+                return task.error();
+            }
+            root_task = *task;
+            static_cast<void>(tasks.set_state(*task, TaskState::running));
+            return std::nullopt;
+        }
+
         [[nodiscard]] VmStep terminal(VmStepState state, EvaluationResult result) {
             terminal_state = state;
             terminal_result = std::move(result);
@@ -314,13 +661,8 @@ namespace rule_engine::python::vm {
             return make_step(state, terminal_result);
         }
 
-        [[nodiscard]] VmStep fail(VmError fault, const VmStepState state = VmStepState::faulted) {
-            FaultFrame frame {
-                .code = error_code(fault.code),
-                .message = std::move(fault.message),
-                .executable = frames.empty() ? ExecutableId {} : function(frames.back()).id,
-                .span = fault.span.value_or(SourceSpan {}),
-            };
+        [[nodiscard]] VmStep terminal_fault(const VmStepState state, const bool double_fault, const bool triple_fault) {
+            finish_tier_counters();
             EvaluationResult result {
                 .outcome = state == VmStepState::quarantined ? EvaluationOutcome::quarantined :
                            state == VmStepState::canceled    ? EvaluationOutcome::canceled :
@@ -328,30 +670,252 @@ namespace rule_engine::python::vm {
                 .verdict = std::nullopt,
                 .committed_effects = {},
                 .state_mutations = {},
-                .fault = FaultChain {.frames = {std::move(frame)}, .double_fault = false, .triple_fault = false},
+                .fault =
+                    FaultChain {.frames = fault_frames, .double_fault = double_fault, .triple_fault = triple_fault},
             };
             return terminal(state, std::move(result));
         }
 
-        [[nodiscard]] VmStep complete(const PyValue value) {
-            auto verdict = heap.truthy(value);
-            if (!verdict) {
-                return fail(verdict.error());
+        [[nodiscard]] static bool integrity_fault(const VmErrorCode code) noexcept {
+            return code == VmErrorCode::invalid_handle || code == VmErrorCode::stale_handle ||
+                   code == VmErrorCode::invalid_bytecode || code == VmErrorCode::engine_fault;
+        }
+
+        [[nodiscard]] static bool hard_control_fault(const VmErrorCode code) noexcept {
+            return code == VmErrorCode::heap_budget_exhausted || code == VmErrorCode::instruction_budget_exhausted ||
+                   code == VmErrorCode::frame_budget_exhausted || code == VmErrorCode::loop_budget_exhausted ||
+                   code == VmErrorCode::elapsed_budget_exhausted || code == VmErrorCode::fact_budget_exhausted ||
+                   code == VmErrorCode::capability_budget_exhausted || code == VmErrorCode::state_budget_exhausted ||
+                   code == VmErrorCode::effect_budget_exhausted || code == VmErrorCode::canceled;
+        }
+
+        [[nodiscard]] static bool author_exception(const VmErrorCode code) noexcept {
+            return code == VmErrorCode::type_error || code == VmErrorCode::value_error ||
+                   code == VmErrorCode::arithmetic_error;
+        }
+
+        void record_fault(VmError fault) {
+            fault_frames.push_back(FaultFrame {
+                .code = error_code(fault.code),
+                .message = std::move(fault.message),
+                .executable = frames.empty() ? ExecutableId {} : function(frames.back()).id,
+                .span = fault.span.value_or(SourceSpan {}),
+            });
+        }
+
+        [[nodiscard]] VmStep begin_double_fault(VmError fault) {
+            record_fault(std::move(fault));
+            ++recovery.double_faults;
+            rollback_journal_from(0U);
+            candidate_journal.clear();
+            candidate_state.clear();
+            if (!handlers.on_double_fault.has_value()) {
+                ++recovery.triple_faults;
+                finish_tier_counters();
+                return terminal_fault(VmStepState::quarantined, true, true);
             }
-            auto committed = journal;
-            for (auto &intent : committed) {
-                if (intent.disposition == EffectDisposition::pending) {
-                    intent.disposition = EffectDisposition::committed;
+            if (const auto start = start_executor(*handlers.on_double_fault, ExecutorPhase::double_fault,
+                                                  invocation.budget.double_fault.heap_bytes);
+                start.has_value()) {
+                record_fault(*start);
+                ++recovery.triple_faults;
+                return terminal_fault(VmStepState::quarantined, true, true);
+            }
+            return make_step(VmStepState::yielded);
+        }
+
+        [[nodiscard]] VmStep fail(VmError fault, const VmStepState requested_state = VmStepState::faulted) {
+            const auto code = fault.code;
+            if (integrity_fault(code)) {
+                record_fault(std::move(fault));
+                return terminal_fault(VmStepState::quarantined, phase != ExecutorPhase::normal, false);
+            }
+            if (code == VmErrorCode::invalid_host_response) {
+                record_fault(std::move(fault));
+                return terminal_fault(VmStepState::faulted, phase != ExecutorPhase::normal, false);
+            }
+            if (forced_cleanup_active) {
+                set_forced_cleanup(false);
+                return begin_double_fault(std::move(fault));
+            }
+            if (author_exception(code) && !frames.empty()) {
+                auto exception = heap.allocate_unicode(fault.message);
+                if (exception && frames.back().pc < function(frames.back()).instructions.size()) {
+                    const auto &current = function(frames.back()).instructions[frames.back().pc];
+                    if (handle_author_fault(current, *exception)) {
+                        return make_step(VmStepState::yielded);
+                    }
                 }
             }
+            if (phase == ExecutorPhase::double_fault) {
+                record_fault(std::move(fault));
+                ++recovery.triple_faults;
+                finish_tier_counters();
+                return terminal_fault(VmStepState::quarantined, true, true);
+            }
+            if (phase == ExecutorPhase::finalizer || phase == ExecutorPhase::on_fault ||
+                phase == ExecutorPhase::recovery_retry) {
+                return begin_double_fault(std::move(fault));
+            }
+
+            if (hard_control_fault(code) && begin_forced_cleanup(fault)) {
+                return make_step(VmStepState::yielded);
+            }
+
+            record_fault(std::move(fault));
+            ++recovery.primary_faults;
+            rollback_journal_from(0U);
+            state_mutations.clear();
+            state_overlay.clear();
+            if (requested_state == VmStepState::canceled) {
+                return terminal_fault(VmStepState::canceled, false, false);
+            }
+            if (hard_control_fault(code)) {
+                return terminal_fault(requested_state, false, false);
+            }
+            if (!handlers.on_fault.has_value()) {
+                return terminal_fault(requested_state, false, false);
+            }
+            if (const auto start = start_executor(*handlers.on_fault, ExecutorPhase::on_fault,
+                                                  invocation.budget.finalizer_or_fault.heap_bytes);
+                start.has_value()) {
+                return begin_double_fault(*start);
+            }
+            return make_step(VmStepState::yielded);
+        }
+
+        [[nodiscard]] std::optional<std::string> unicode_decision(const PyValue value) const {
+            auto kind = heap.kind(value);
+            if (!kind || *kind != ValueKind::unicode) {
+                return std::nullopt;
+            }
+            auto text = heap.unicode_utf8(value);
+            return text ? std::optional<std::string> {*text} : std::nullopt;
+        }
+
+        [[nodiscard]] VmStep finalize_candidate() {
+            std::vector<EffectIntent> committed;
+            committed.reserve(candidate_journal.size());
+            for (auto intent : candidate_journal) {
+                if (intent.disposition != EffectDisposition::pending &&
+                    intent.disposition != EffectDisposition::committed) {
+                    continue;
+                }
+                intent.disposition = EffectDisposition::committed;
+                committed.push_back(std::move(intent));
+            }
+            const auto verdict = candidate_verdict.value_or(false);
             EvaluationResult result {
-                .outcome = *verdict ? EvaluationOutcome::match : EvaluationOutcome::no_match,
-                .verdict = *verdict,
+                .outcome = verdict ? EvaluationOutcome::match : EvaluationOutcome::no_match,
+                .verdict = verdict,
                 .committed_effects = std::move(committed),
-                .state_mutations = {},
+                .state_mutations = candidate_state,
                 .fault = std::nullopt,
             };
+            finish_tier_counters();
             return terminal(VmStepState::complete, std::move(result));
+        }
+
+        [[nodiscard]] VmStep complete(const PyValue value) {
+            if (phase == ExecutorPhase::double_fault) {
+                const auto decision = unicode_decision(value);
+                if (!decision.has_value() ||
+                    (!decision->starts_with("abort") && !decision->starts_with("quarantine"))) {
+                    return fail(VmError {.code = VmErrorCode::value_error,
+                                         .message = "on_double_fault must return abort or quarantine",
+                                         .span = std::nullopt});
+                }
+                finish_tier_counters();
+                return terminal_fault(
+                    decision->starts_with("quarantine") ? VmStepState::quarantined : VmStepState::faulted, true, false);
+            }
+
+            if (phase == ExecutorPhase::finalizer) {
+                auto kind = heap.kind(value);
+                if (!kind) {
+                    return begin_double_fault(kind.error());
+                }
+                const auto decision = unicode_decision(value);
+                if (*kind == ValueKind::boolean) {
+                    auto replacement = heap.truthy(value);
+                    candidate_verdict = replacement.value_or(false);
+                } else if (*kind != ValueKind::none && (!decision.has_value() || !decision->starts_with("keep"))) {
+                    if (decision.has_value() && decision->starts_with("abort")) {
+                        record_fault(
+                            VmError {.code = VmErrorCode::value_error, .message = *decision, .span = std::nullopt});
+                        return terminal_fault(VmStepState::faulted, false, false);
+                    }
+                    return begin_double_fault(VmError {.code = VmErrorCode::value_error,
+                                                       .message = "finalizer must return keep, replace(bool), or abort",
+                                                       .span = std::nullopt});
+                }
+                candidate_journal.insert(candidate_journal.end(), journal.begin(), journal.end());
+                return finalize_candidate();
+            }
+
+            if (phase == ExecutorPhase::on_fault) {
+                auto kind = heap.kind(value);
+                if (!kind) {
+                    return begin_double_fault(kind.error());
+                }
+                const auto decision = unicode_decision(value);
+                if (*kind == ValueKind::boolean) {
+                    auto replacement = heap.truthy(value);
+                    candidate_verdict = replacement.value_or(false);
+                    candidate_journal = journal;
+                    candidate_state.clear();
+                } else if (decision.has_value() && decision->starts_with("retry_once")) {
+                    if (retry_used) {
+                        return begin_double_fault(VmError {.code = VmErrorCode::value_error,
+                                                           .message = "fault recovery retry was already consumed",
+                                                           .span = std::nullopt});
+                    }
+                    retry_used = true;
+                    if (const auto start = start_executor(entry_index, ExecutorPhase::recovery_retry,
+                                                          invocation.budget.normal.heap_bytes);
+                        start.has_value()) {
+                        return begin_double_fault(*start);
+                    }
+                    return make_step(VmStepState::yielded);
+                } else if (decision.has_value() &&
+                           (decision->starts_with("abort") || decision->starts_with("quarantine"))) {
+                    finish_tier_counters();
+                    return terminal_fault(decision->starts_with("quarantine") ? VmStepState::quarantined :
+                                                                                VmStepState::faulted,
+                                          false, false);
+                } else {
+                    return begin_double_fault(VmError {.code = VmErrorCode::value_error,
+                                                       .message = "on_fault returned an invalid recovery decision",
+                                                       .span = std::nullopt});
+                }
+            } else {
+                auto verdict = heap.truthy(value);
+                if (!verdict) {
+                    return fail(verdict.error());
+                }
+                candidate_verdict = *verdict;
+                candidate_journal = journal;
+                candidate_state = state_mutations;
+            }
+
+            if (!transaction_marks.empty()) {
+                const auto &root_mark = transaction_marks.front();
+                rollback_journal_from(root_mark.journal_size);
+                state_mutations = root_mark.state_mutations;
+                state_overlay = root_mark.state_overlay;
+                transaction_marks.clear();
+                candidate_journal = journal;
+                candidate_state = state_mutations;
+            }
+            if (handlers.finalizer.has_value()) {
+                if (const auto start = start_executor(*handlers.finalizer, ExecutorPhase::finalizer,
+                                                      invocation.budget.finalizer_or_fault.heap_bytes);
+                    start.has_value()) {
+                    return begin_double_fault(*start);
+                }
+                return make_step(VmStepState::yielded);
+            }
+            return finalize_candidate();
         }
 
         [[nodiscard]] VmStep make_step(const VmStepState state,
@@ -374,6 +938,8 @@ namespace rule_engine::python::vm {
                     step.fact_requests.push_back(*pending->fact);
                 } else if (pending->capability.has_value()) {
                     step.capability_requests.push_back(*pending->capability);
+                } else if (pending->state.has_value()) {
+                    step.state_requests.push_back(*pending->state);
                 }
                 pending->emitted = true;
             }
@@ -382,6 +948,10 @@ namespace rule_engine::python::vm {
                                           journal.begin() + static_cast<std::ptrdiff_t>(emitted_journal),
                                           journal.end());
                 emitted_journal = journal.size();
+            }
+            if (!journal_updates.empty()) {
+                step.journal_delta.insert(step.journal_delta.end(), journal_updates.begin(), journal_updates.end());
+                journal_updates.clear();
             }
             step.yielded_value = yielded;
             step.result = result;
@@ -406,7 +976,7 @@ namespace rule_engine::python::vm {
             if (total == 0U) {
                 return std::nullopt;
             }
-            if (total != 1U || !responses.scans.empty() || !responses.state.empty() || !responses.history.empty()) {
+            if (total != 1U || !responses.scans.empty() || !responses.history.empty()) {
                 return VmError {.code = VmErrorCode::invalid_host_response,
                                 .message = "host response batch does not match the outstanding VM request",
                                 .span = pending->span};
@@ -421,14 +991,26 @@ namespace rule_engine::python::vm {
                                 .message = "fact response cannot satisfy an outstanding capability request",
                                 .span = pending->span};
             }
+            if (pending->kind == PendingKind::state && responses.state.size() != 1U) {
+                return VmError {.code = VmErrorCode::invalid_host_response,
+                                .message = "non-state response cannot satisfy an outstanding state request",
+                                .span = pending->span};
+            }
             return std::nullopt;
         }
 
-        [[nodiscard]] std::optional<VmError> raise_pending_terminal(std::string message) {
+        [[nodiscard]] std::optional<VmError> raise_author_terminal(const Instruction &faulting, std::string message) {
             auto exception = heap.allocate_unicode(message);
             if (!exception) {
                 return exception.error();
             }
+            if (!handle_author_fault(faulting, *exception)) {
+                return VmError {.code = VmErrorCode::value_error, .message = std::move(message), .span = faulting.span};
+            }
+            return std::nullopt;
+        }
+
+        [[nodiscard]] std::optional<VmError> raise_pending_terminal(std::string message) {
             const Instruction faulting {
                 .opcode = Opcode::raise_fault,
                 .destination = pending->destination,
@@ -437,8 +1019,8 @@ namespace rule_engine::python::vm {
                 .immediate = 0U,
                 .span = pending->span,
             };
-            if (!handle_author_fault(faulting, *exception)) {
-                return VmError {.code = VmErrorCode::value_error, .message = std::move(message), .span = pending->span};
+            if (const auto fault = raise_author_terminal(faulting, std::move(message)); fault.has_value()) {
+                return fault;
             }
             pending.reset();
             return std::nullopt;
@@ -457,8 +1039,14 @@ namespace rule_engine::python::vm {
             if (pending->kind == PendingKind::capability && responses.capabilities.empty()) {
                 return std::nullopt;
             }
+            if (pending->kind == PendingKind::state && responses.state.empty()) {
+                return std::nullopt;
+            }
 
-            FactValue response_value;
+            std::expected<PyValue, VmError> thawed =
+                std::unexpected(VmError {.code = VmErrorCode::engine_fault,
+                                         .message = "host response did not produce a VM value",
+                                         .span = pending->span});
             if (pending->kind == PendingKind::fact) {
                 const auto &response = responses.facts.front();
                 if (response.request_id != pending->id ||
@@ -467,12 +1055,26 @@ namespace rule_engine::python::vm {
                                     .message = "fact response identity does not match its request",
                                     .span = pending->span};
                 }
-                if (response.status != FactTerminalStatus::value || !response.value.has_value()) {
+                if ((response.status == FactTerminalStatus::value) != response.value.has_value()) {
+                    return VmError {.code = VmErrorCode::invalid_host_response,
+                                    .message = "fact response value does not match its terminal status",
+                                    .span = pending->span};
+                }
+                if (response.status != FactTerminalStatus::value) {
+                    fact_responses.insert_or_assign(
+                        pending->cache_key, CachedFactResponse {.status = response.status, .value = std::nullopt});
                     return raise_pending_terminal("fact provider returned terminal status " +
                                                   std::to_string(static_cast<unsigned>(response.status)));
                 }
-                response_value = *response.value;
-                const auto bytes = fact_size(response_value);
+                if (auto schema = ValueHeap::validate_schema(*response.value, *pending->response_schema, &pack.schemas);
+                    !schema) {
+                    return VmError {.code = VmErrorCode::invalid_host_response,
+                                    .message = "fact response failed schema validation: " + schema.error().message,
+                                    .span = pending->span};
+                }
+                fact_responses.insert_or_assign(
+                    pending->cache_key, CachedFactResponse {.status = response.status, .value = *response.value});
+                const auto bytes = fact_size(*response.value);
                 if (bytes == std::numeric_limits<std::size_t>::max() || bytes > invocation.budget.normal.fact_bytes ||
                     counters.fact_bytes > invocation.budget.normal.fact_bytes - bytes) {
                     return VmError {.code = VmErrorCode::fact_budget_exhausted,
@@ -480,47 +1082,107 @@ namespace rule_engine::python::vm {
                                     .span = pending->span};
                 }
                 counters.fact_bytes += bytes;
-            } else {
+                thawed = heap.thaw(*response.value);
+            } else if (pending->kind == PendingKind::capability) {
                 const auto &response = responses.capabilities.front();
                 if (response.request_id != pending->id) {
                     return VmError {.code = VmErrorCode::invalid_host_response,
                                     .message = "capability response identity does not match its request",
                                     .span = pending->span};
                 }
-                if (response.status != FactTerminalStatus::value || !response.value.has_value()) {
+                if ((response.status == FactTerminalStatus::value) != response.value.has_value()) {
+                    return VmError {.code = VmErrorCode::invalid_host_response,
+                                    .message = "capability response value does not match its terminal status",
+                                    .span = pending->span};
+                }
+                if (response.status != FactTerminalStatus::value) {
                     if (active_service_calls == 0U) {
                         return VmError {.code = VmErrorCode::engine_fault,
                                         .message = "capability terminal underflowed active-call accounting",
                                         .span = pending->span};
                     }
                     --active_service_calls;
+                    capability_responses.insert_or_assign(
+                        pending->cache_key,
+                        CachedCapabilityResponse {.status = response.status, .value = std::nullopt});
                     return raise_pending_terminal("capability returned a non-value terminal status");
                 }
-                response_value = response.value->value;
-                const auto bytes = fact_size(response_value);
+                const auto bytes = fact_size(response.value->value);
                 if (bytes == std::numeric_limits<std::size_t>::max() ||
                     bytes > invocation.budget.normal.service_response_bytes ||
-                    counters.service_response_bytes > invocation.budget.normal.service_response_bytes - bytes) {
+                    current_counters().service_response_bytes >
+                        invocation.budget.normal.service_response_bytes - bytes) {
                     return VmError {.code = VmErrorCode::capability_budget_exhausted,
                                     .message = "balanced.v1 service response budget exhausted",
                                     .span = pending->span};
                 }
-                counters.service_response_bytes += bytes;
+                current_counters().service_response_bytes += bytes;
                 if (active_service_calls == 0U) {
                     return VmError {.code = VmErrorCode::engine_fault,
                                     .message = "capability response underflowed active-call accounting",
                                     .span = pending->span};
                 }
                 --active_service_calls;
+                auto validated = heap.validate_frozen(
+                    response.value.value(), pending->response_schema, &pack.schemas,
+                    FreezeLimits {.maximum_bytes = invocation.budget.normal.service_response_bytes});
+                if (!validated) {
+                    return VmError {.code = VmErrorCode::invalid_host_response,
+                                    .message = "capability response failed canonical boundary validation: " +
+                                               validated.error().message,
+                                    .span = pending->span};
+                }
+                capability_responses.insert_or_assign(
+                    pending->cache_key, CachedCapabilityResponse {.status = response.status, .value = *response.value});
+                thawed = *validated;
+            } else {
+                const auto &response = responses.state.front();
+                if (response.request_id != pending->id) {
+                    return VmError {.code = VmErrorCode::invalid_host_response,
+                                    .message = "state response identity does not match its request",
+                                    .span = pending->span};
+                }
+                const auto key = pending->state->namespace_name + "\x1f" + pending->state->key + "\x1f" +
+                                 pending->state->schema.value;
+                if (response.diagnostic.has_value()) {
+                    state_values.insert_or_assign(
+                        key, StateEntry {.value = std::nullopt,
+                                         .version = response.version,
+                                         .error = "state read failed: " + response.diagnostic->message});
+                    return raise_pending_terminal("state read failed: " + response.diagnostic->message);
+                }
+                if (response.value.has_value()) {
+                    const auto bytes = fact_size(response.value->value);
+                    if (bytes == std::numeric_limits<std::size_t>::max() ||
+                        bytes > invocation.budget.normal.state_bytes ||
+                        counters.state_bytes > invocation.budget.normal.state_bytes - bytes) {
+                        return VmError {.code = VmErrorCode::state_budget_exhausted,
+                                        .message = "balanced.v1 state data budget exhausted",
+                                        .span = pending->span};
+                    }
+                    auto validated =
+                        heap.validate_frozen(*response.value, pending->response_schema, &pack.schemas,
+                                             FreezeLimits {.maximum_bytes = invocation.budget.normal.state_bytes});
+                    if (!validated) {
+                        return VmError {.code = VmErrorCode::invalid_host_response,
+                                        .message = "state response failed canonical boundary validation: " +
+                                                   validated.error().message,
+                                        .span = pending->span};
+                    }
+                    counters.state_bytes += bytes;
+                    thawed = *validated;
+                } else {
+                    thawed = heap.allocate_none();
+                }
+                state_values.insert_or_assign(
+                    key, StateEntry {.value = response.value, .version = response.version, .error = std::nullopt});
             }
 
-            auto thawed = heap.thaw(response_value);
             if (!thawed && thawed.error().code == VmErrorCode::heap_budget_exhausted) {
                 const auto gc = heap.collect(roots());
                 if (!gc) {
                     return gc.error();
                 }
-                thawed = heap.thaw(response_value);
             }
             if (!thawed) {
                 return thawed.error();
@@ -553,6 +1215,28 @@ namespace rule_engine::python::vm {
                                 .message = "await_fact constant is not a valid fact operand",
                                 .span = instruction.span};
             }
+            const auto cache_key =
+                canonical_subject_key(invocation.subject) + "\x1f" + *provider + "\x1f" + *fact + "\x1f" + *schema;
+            if (const auto cached = fact_responses.find(cache_key); cached != fact_responses.end()) {
+                if (cached->second.status != FactTerminalStatus::value || !cached->second.value.has_value()) {
+                    return raise_author_terminal(instruction,
+                                                 "fact provider returned terminal status " +
+                                                     std::to_string(static_cast<unsigned>(cached->second.status)));
+                }
+                if (auto valid = ValueHeap::validate_schema(*cached->second.value, SchemaId {*schema}, &pack.schemas);
+                    !valid) {
+                    return VmError {.code = VmErrorCode::engine_fault,
+                                    .message = "cached fact response no longer satisfies its schema",
+                                    .span = instruction.span};
+                }
+                auto value = heap.thaw(*cached->second.value);
+                if (!value) {
+                    return value.error();
+                }
+                frame.registers[instruction.destination] = *value;
+                ++frame.pc;
+                return std::nullopt;
+            }
             if (counters.logical_facts == invocation.budget.normal.logical_facts ||
                 counters.provider_rounds == invocation.budget.normal.provider_rounds) {
                 return VmError {.code = VmErrorCode::fact_budget_exhausted,
@@ -579,6 +1263,9 @@ namespace rule_engine::python::vm {
                 .span = instruction.span,
                 .fact = std::move(request),
                 .capability = std::nullopt,
+                .state = std::nullopt,
+                .response_schema = SchemaId {*schema},
+                .cache_key = cache_key,
                 .emitted = false,
             };
             return std::nullopt;
@@ -593,15 +1280,11 @@ namespace rule_engine::python::vm {
             const auto capability =
                 record_text_field(pack.constants[instruction.immediate], capability_operand_schema, 1U);
             const auto schema = record_text_field(pack.constants[instruction.immediate], capability_operand_schema, 2U);
+            const auto response_schema =
+                record_text_field(pack.constants[instruction.immediate], capability_operand_schema, 3U);
             if (!capability.has_value() || !schema.has_value() || capability->empty() || schema->empty()) {
                 return VmError {.code = VmErrorCode::invalid_bytecode,
                                 .message = "await_capability constant is not a valid capability operand",
-                                .span = instruction.span};
-            }
-            if (counters.service_calls == invocation.budget.normal.service_calls ||
-                active_service_calls == invocation.budget.normal.active_service_calls) {
-                return VmError {.code = VmErrorCode::capability_budget_exhausted,
-                                .message = "balanced.v1 service call budget exhausted",
                                 .span = instruction.span};
             }
             auto arguments =
@@ -613,9 +1296,39 @@ namespace rule_engine::python::vm {
                                     "capability arguments failed boundary freezing: " + arguments.error().message,
                                 .span = instruction.span};
             }
-            ++counters.service_calls;
+            const auto cache_key = *capability + "\x1f" + *schema + "\x1f" + response_schema.value_or(std::string {}) +
+                                   "\x1f" + arguments->canonical_digest;
+            if (const auto cached = capability_responses.find(cache_key); cached != capability_responses.end()) {
+                if (cached->second.status != FactTerminalStatus::value || !cached->second.value.has_value()) {
+                    return raise_author_terminal(instruction, "capability returned a non-value terminal status");
+                }
+                auto validated = heap.validate_frozen(
+                    *cached->second.value,
+                    response_schema.has_value() ? std::optional<SchemaId> {SchemaId {*response_schema}} : std::nullopt,
+                    &pack.schemas, FreezeLimits {.maximum_bytes = invocation.budget.normal.service_response_bytes});
+                if (!validated) {
+                    return VmError {.code = VmErrorCode::engine_fault,
+                                    .message = "cached capability response is no longer canonical",
+                                    .span = instruction.span};
+                }
+                frame.registers[instruction.destination] = *validated;
+                ++frame.pc;
+                return std::nullopt;
+            }
+            const auto *recovery_limit = recovery_budget();
+            const auto service_limit =
+                recovery_limit == nullptr ? invocation.budget.normal.service_calls : recovery_limit->service_calls;
+            auto &phase_counter = current_counters();
+            if (phase_counter.service_calls == service_limit ||
+                active_service_calls == invocation.budget.normal.active_service_calls) {
+                return VmError {.code = VmErrorCode::capability_budget_exhausted,
+                                .message = "balanced.v1 service call budget exhausted",
+                                .span = instruction.span};
+            }
+            ++phase_counter.service_calls;
             ++active_service_calls;
-            counters.peak_active_service_calls = std::max(counters.peak_active_service_calls, active_service_calls);
+            phase_counter.peak_active_service_calls =
+                std::max(phase_counter.peak_active_service_calls, active_service_calls);
             const auto id = next_request_id();
             CapabilityRequest request {
                 .request_id = id,
@@ -634,8 +1347,162 @@ namespace rule_engine::python::vm {
                 .span = instruction.span,
                 .fact = std::nullopt,
                 .capability = std::move(request),
+                .state = std::nullopt,
+                .response_schema =
+                    response_schema.has_value() ? std::optional<SchemaId> {SchemaId {*response_schema}} : std::nullopt,
+                .cache_key = cache_key,
                 .emitted = false,
             };
+            return std::nullopt;
+        }
+
+        [[nodiscard]] std::optional<VmError> charge_state_key(const std::string &key, const SourceSpan &span) {
+            if (charged_state_keys.contains(key)) {
+                return std::nullopt;
+            }
+            if (counters.state_keys == invocation.budget.normal.state_keys) {
+                return VmError {.code = VmErrorCode::state_budget_exhausted,
+                                .message = "balanced.v1 state key budget exhausted",
+                                .span = span};
+            }
+            charged_state_keys.insert(key);
+            ++counters.state_keys;
+            return std::nullopt;
+        }
+
+        [[nodiscard]] std::optional<VmError> begin_state_read(const Instruction &instruction, Frame &frame) {
+            if (instruction.immediate >= pack.constants.size()) {
+                return VmError {.code = VmErrorCode::invalid_bytecode,
+                                .message = "read_state constant index is out of range",
+                                .span = instruction.span};
+            }
+            const auto namespace_name =
+                record_text_field(pack.constants[instruction.immediate], state_operand_schema, 1U);
+            const auto name = record_text_field(pack.constants[instruction.immediate], state_operand_schema, 2U);
+            const auto schema = record_text_field(pack.constants[instruction.immediate], state_operand_schema, 3U);
+            if (!namespace_name.has_value() || !name.has_value() || !schema.has_value() || namespace_name->empty() ||
+                name->empty() || schema->empty()) {
+                return VmError {.code = VmErrorCode::invalid_bytecode,
+                                .message = "read_state constant is not a valid state operand",
+                                .span = instruction.span};
+            }
+            const auto key = *namespace_name + "\x1f" + *name + "\x1f" + *schema;
+            if (const auto fault = charge_state_key(key, instruction.span); fault.has_value()) {
+                return fault;
+            }
+            const auto cached_overlay = state_overlay.find(key);
+            const auto cached_read = state_values.find(key);
+            const auto *cached = cached_overlay != state_overlay.end() ? &cached_overlay->second :
+                                 cached_read != state_values.end()     ? &cached_read->second :
+                                                                         nullptr;
+            if (cached != nullptr) {
+                if (cached->error.has_value()) {
+                    return raise_author_terminal(instruction, *cached->error);
+                }
+                auto value = cached->value.has_value() ? heap.thaw(cached->value->value) : heap.allocate_none();
+                if (!value) {
+                    return value.error();
+                }
+                frame.registers[instruction.destination] = *value;
+                ++frame.pc;
+                return std::nullopt;
+            }
+
+            const auto id = next_request_id();
+            StateReadRequest request {
+                .request_id = id,
+                .owner = function(frame).id,
+                .namespace_name = *namespace_name,
+                .key = *name,
+                .schema = SchemaId {*schema},
+            };
+            logical_reads.push_back(id.value + ":state:" + key);
+            pending = PendingRequest {
+                .kind = PendingKind::state,
+                .id = id,
+                .frame_index = frames.size() - 1U,
+                .destination = instruction.destination,
+                .successor_pc = frame.pc + 1U,
+                .span = instruction.span,
+                .fact = std::nullopt,
+                .capability = std::nullopt,
+                .state = std::move(request),
+                .response_schema = SchemaId {*schema},
+                .cache_key = key,
+                .emitted = false,
+            };
+            return std::nullopt;
+        }
+
+        [[nodiscard]] std::optional<VmError> write_state(const Instruction &instruction, Frame &frame) {
+            if (forced_cleanup_active || (phase != ExecutorPhase::normal && phase != ExecutorPhase::recovery_retry)) {
+                return VmError {.code = VmErrorCode::state_budget_exhausted,
+                                .message = "state mutation is forbidden in recovery executors",
+                                .span = instruction.span};
+            }
+            if (instruction.immediate >= pack.constants.size() || !register_valid(frame, instruction.operand_a)) {
+                return VmError {.code = VmErrorCode::invalid_bytecode,
+                                .message = "write_state operand is invalid",
+                                .span = instruction.span};
+            }
+            const auto namespace_name =
+                record_text_field(pack.constants[instruction.immediate], state_operand_schema, 1U);
+            const auto name = record_text_field(pack.constants[instruction.immediate], state_operand_schema, 2U);
+            const auto schema = record_text_field(pack.constants[instruction.immediate], state_operand_schema, 3U);
+            if (!namespace_name.has_value() || !name.has_value() || !schema.has_value() || namespace_name->empty() ||
+                name->empty() || schema->empty()) {
+                return VmError {.code = VmErrorCode::invalid_bytecode,
+                                .message = "write_state constant is not a valid state operand",
+                                .span = instruction.span};
+            }
+            const auto key = *namespace_name + "\x1f" + *name + "\x1f" + *schema;
+            if (const auto fault = charge_state_key(key, instruction.span); fault.has_value()) {
+                return fault;
+            }
+            const auto remaining = invocation.budget.normal.state_bytes - counters.state_bytes;
+            auto frozen =
+                heap.freeze(frame.registers[instruction.operand_a], {}, FreezeLimits {.maximum_bytes = remaining});
+            if (!frozen) {
+                return VmError {.code = VmErrorCode::state_budget_exhausted,
+                                .message = "state value failed boundary freezing: " + frozen.error().message,
+                                .span = instruction.span};
+            }
+            if (auto valid = ValueHeap::validate_schema(frozen->value, SchemaId {*schema}, &pack.schemas); !valid) {
+                return VmError {.code = VmErrorCode::state_budget_exhausted,
+                                .message = "state value failed schema validation: " + valid.error().message,
+                                .span = instruction.span};
+            }
+            const auto bytes = fact_size(frozen->value);
+            if (bytes == std::numeric_limits<std::size_t>::max() || bytes > remaining) {
+                return VmError {.code = VmErrorCode::state_budget_exhausted,
+                                .message = "balanced.v1 state data budget exhausted",
+                                .span = instruction.span};
+            }
+            counters.state_bytes += bytes;
+            const auto prior = state_values.find(key);
+            const auto overlay = state_overlay.find(key);
+            const auto version = overlay != state_overlay.end() ? overlay->second.version :
+                                 prior != state_values.end()    ? prior->second.version :
+                                                                  0U;
+            StateMutation mutation {
+                .owner = function(frame).id,
+                .namespace_name = *namespace_name,
+                .key = *name,
+                .expected_version = version,
+                .value = *frozen,
+            };
+            const auto existing = std::ranges::find_if(state_mutations, [&](const auto &candidate) {
+                return candidate.owner == mutation.owner && candidate.namespace_name == mutation.namespace_name &&
+                       candidate.key == mutation.key;
+            });
+            if (existing == state_mutations.end()) {
+                state_mutations.push_back(std::move(mutation));
+            } else {
+                *existing = std::move(mutation);
+            }
+            state_overlay.insert_or_assign(key,
+                                           StateEntry {.value = *frozen, .version = version, .error = std::nullopt});
+            ++frame.pc;
             return std::nullopt;
         }
 
@@ -651,12 +1518,16 @@ namespace rule_engine::python::vm {
                                 .message = "append_effect kind constant must be non-empty Unicode",
                                 .span = instruction.span};
             }
-            if (counters.effect_intents == invocation.budget.normal.effect_intents) {
+            const auto *recovery_limit = recovery_budget();
+            const auto intent_limit =
+                recovery_limit == nullptr ? invocation.budget.normal.effect_intents : recovery_limit->effect_intents;
+            auto &phase_counter = current_counters();
+            if (phase_counter.effect_intents == intent_limit) {
                 return VmError {.code = VmErrorCode::effect_budget_exhausted,
                                 .message = "balanced.v1 effect intent budget exhausted",
                                 .span = instruction.span};
             }
-            const auto remaining = invocation.budget.normal.effect_bytes - counters.effect_bytes;
+            const auto remaining = invocation.budget.normal.effect_bytes - phase_counter.effect_bytes;
             auto payload =
                 heap.freeze(frame.registers[instruction.operand_a], {}, FreezeLimits {.maximum_bytes = remaining});
             if (!payload) {
@@ -670,8 +1541,8 @@ namespace rule_engine::python::vm {
                                 .message = "balanced.v1 effect payload budget exhausted",
                                 .span = instruction.span};
             }
-            ++counters.effect_intents;
-            counters.effect_bytes += bytes;
+            ++phase_counter.effect_intents;
+            phase_counter.effect_bytes += bytes;
             const auto id = next_intent_id();
             journal.push_back(EffectIntent {
                 .id = id,
@@ -702,27 +1573,131 @@ namespace rule_engine::python::vm {
             }
             const auto left_digits = static_cast<std::uint64_t>(left->size() - (left->starts_with('-') ? 1U : 0U));
             const auto right_digits = static_cast<std::uint64_t>(right->size() - (right->starts_with('-') ? 1U : 0U));
-            if (instruction.immediate == static_cast<std::uint32_t>(BinaryOperation::multiply)) {
+            const auto operation = static_cast<BinaryOperation>(instruction.immediate);
+            if (operation == BinaryOperation::multiply || operation == BinaryOperation::floor_divide ||
+                operation == BinaryOperation::modulo) {
                 if (right_digits != 0U && left_digits > std::numeric_limits<std::uint64_t>::max() / right_digits) {
                     return std::nullopt;
                 }
                 return std::max<std::uint64_t>(1U, left_digits * right_digits);
             }
+            if (operation == BinaryOperation::power || operation == BinaryOperation::left_shift ||
+                operation == BinaryOperation::right_shift) {
+                if (right->starts_with('-')) {
+                    return operation == BinaryOperation::power ? std::optional<std::uint64_t> {left_digits} :
+                                                                 std::nullopt;
+                }
+                std::uint64_t count {};
+                const auto [end, error] = std::from_chars(right->data(), right->data() + right->size(), count);
+                if (error != std::errc {} || end != right->data() + right->size() || count > 1'000'000U ||
+                    (count != 0U && left_digits > std::numeric_limits<std::uint64_t>::max() / count)) {
+                    return std::nullopt;
+                }
+                return std::max<std::uint64_t>(1U, left_digits * std::max<std::uint64_t>(1U, count));
+            }
             return std::max<std::uint64_t>(1U, std::max(left_digits, right_digits));
         }
 
         [[nodiscard]] bool handle_author_fault(const Instruction &instruction, const PyValue value) {
-            auto &frame = frames.back();
-            const auto &regions = function(frame).exception_regions;
-            for (auto region = regions.rbegin(); region != regions.rend(); ++region) {
-                if (frame.pc < region->begin_instruction || frame.pc >= region->end_instruction) {
-                    continue;
+            auto fault_instruction = frames.back().pc;
+            auto destination = instruction.destination;
+            while (!frames.empty()) {
+                auto &frame = frames.back();
+                const auto &regions = function(frame).exception_regions;
+                for (auto region = regions.rbegin(); region != regions.rend(); ++region) {
+                    if (fault_instruction < region->begin_instruction || fault_instruction >= region->end_instruction) {
+                        continue;
+                    }
+                    if (region->cleanup_instruction != region->handler_instruction &&
+                        !frame.completed_cleanups.contains(region->cleanup_instruction)) {
+                        frame.completed_cleanups.insert(region->cleanup_instruction);
+                        frame.unwind = UnwindRecord {.kind = UnwindKind::exception,
+                                                     .value = value,
+                                                     .fault = std::nullopt,
+                                                     .handler_instruction = region->handler_instruction,
+                                                     .destination = destination,
+                                                     .origin_instruction = fault_instruction};
+                        frame.pc = region->cleanup_instruction;
+                        return true;
+                    }
+                    if (destination >= frame.registers.size()) {
+                        return false;
+                    }
+                    frame.registers[destination] = value;
+                    frame.pc = region->handler_instruction;
+                    return true;
                 }
-                frame.registers[instruction.destination] = value;
-                frame.pc = region->handler_instruction;
-                return true;
+                if (frames.size() == 1U) {
+                    return false;
+                }
+                const auto child = std::move(frames.back());
+                frames.pop_back();
+                fault_instruction = child.caller_instruction.value_or(frames.back().pc);
+                destination = child.return_register.value_or(0U);
             }
             return false;
+        }
+
+        void set_forced_cleanup(const bool active) {
+            settle_active_measurement();
+            forced_cleanup_active = active;
+            if (active) {
+                forced_cleanup_heap_start = heap.stats().logical_allocated_bytes;
+            }
+            active_measurement_phase = phase;
+            active_measurement_forced = active;
+        }
+
+        [[nodiscard]] bool continue_forced_cleanup(const VmError &fault, std::uint32_t origin_instruction) {
+            while (!frames.empty()) {
+                auto &frame = frames.back();
+                const auto &regions = function(frame).exception_regions;
+                for (auto region = regions.rbegin(); region != regions.rend(); ++region) {
+                    if (origin_instruction < region->begin_instruction ||
+                        origin_instruction >= region->end_instruction ||
+                        frame.completed_cleanups.contains(region->cleanup_instruction)) {
+                        continue;
+                    }
+                    frame.completed_cleanups.insert(region->cleanup_instruction);
+                    frame.unwind = UnwindRecord {.kind = UnwindKind::hard_fault,
+                                                 .value = std::nullopt,
+                                                 .fault = fault,
+                                                 .handler_instruction = std::nullopt,
+                                                 .destination = 0U,
+                                                 .origin_instruction = origin_instruction};
+                    frame.pc = region->cleanup_instruction;
+                    if (!forced_cleanup_active) {
+                        set_forced_cleanup(true);
+                        phase_started = std::chrono::steady_clock::now();
+                    }
+                    return true;
+                }
+                if (frames.size() == 1U) {
+                    return false;
+                }
+                const auto child = std::move(frames.back());
+                frames.pop_back();
+                origin_instruction = child.caller_instruction.value_or(frames.back().pc);
+            }
+            return false;
+        }
+
+        [[nodiscard]] bool begin_forced_cleanup(const VmError &fault) {
+            return !frames.empty() && continue_forced_cleanup(fault, frames.back().pc);
+        }
+
+        [[nodiscard]] std::optional<VmError> check_forced_cleanup_heap(const SourceSpan &span) const {
+            if (!forced_cleanup_active) {
+                return std::nullopt;
+            }
+            const auto allocated = heap.stats().logical_allocated_bytes;
+            const auto limit = invocation.budget.forced_cleanup.heap_bytes;
+            if (allocated >= forced_cleanup_heap_start && allocated - forced_cleanup_heap_start <= limit) {
+                return std::nullopt;
+            }
+            return VmError {.code = VmErrorCode::heap_budget_exhausted,
+                            .message = "balanced.v1 forced-cleanup heap budget exhausted",
+                            .span = span};
         }
 
         [[nodiscard]] VmStep execute() {
@@ -767,7 +1742,7 @@ namespace rule_engine::python::vm {
                     case Opcode::unary_op: {
                         if (!register_valid(frame, instruction.operand_a) ||
                             !operation_in_range(instruction.immediate,
-                                                static_cast<std::uint32_t>(UnaryOperation::negative))) {
+                                                static_cast<std::uint32_t>(UnaryOperation::invert))) {
                             return fail(VmError {.code = VmErrorCode::invalid_bytecode,
                                                  .message = "unary operation encoding is invalid",
                                                  .span = instruction.span});
@@ -785,7 +1760,7 @@ namespace rule_engine::python::vm {
                         if (!register_valid(frame, instruction.operand_a) ||
                             !register_valid(frame, instruction.operand_b) ||
                             !operation_in_range(instruction.immediate,
-                                                static_cast<std::uint32_t>(BinaryOperation::multiply))) {
+                                                static_cast<std::uint32_t>(BinaryOperation::bit_and))) {
                             return fail(VmError {.code = VmErrorCode::invalid_bytecode,
                                                  .message = "binary operation encoding is invalid",
                                                  .span = instruction.span});
@@ -817,7 +1792,7 @@ namespace rule_engine::python::vm {
                         if (!register_valid(frame, instruction.operand_a) ||
                             !register_valid(frame, instruction.operand_b) ||
                             !operation_in_range(instruction.immediate,
-                                                static_cast<std::uint32_t>(CompareOperation::greater_equal))) {
+                                                static_cast<std::uint32_t>(CompareOperation::not_contains))) {
                             return fail(VmError {.code = VmErrorCode::invalid_bytecode,
                                                  .message = "compare operation encoding is invalid",
                                                  .span = instruction.span});
@@ -888,23 +1863,51 @@ namespace rule_engine::python::vm {
                             }
                             registers[index] = frame.registers[source];
                         }
+                        const auto caller_instruction = frame.pc;
                         ++frame.pc;
                         frames.push_back(Frame {.function_index = instruction.immediate,
                                                 .pc = 0U,
                                                 .registers = std::move(registers),
                                                 .return_register = instruction.destination,
-                                                .generator_state = GeneratorState::running});
-                        counters.peak_frames =
-                            std::max(counters.peak_frames, static_cast<std::uint32_t>(frames.size()));
+                                                .caller_instruction = caller_instruction,
+                                                .generator_state = GeneratorState::running,
+                                                .yield_destination = std::nullopt,
+                                                .unwind = std::nullopt,
+                                                .completed_cleanups = {}});
+                        current_counters().peak_frames =
+                            std::max(current_counters().peak_frames, static_cast<std::uint32_t>(frames.size()));
                         break;
                     }
                     case Opcode::return_value: {
+                        if (forced_cleanup_active && frame.unwind.has_value() &&
+                            frame.unwind->kind == UnwindKind::hard_fault) {
+                            return fail(VmError {.code = VmErrorCode::heap_budget_exhausted,
+                                                 .message = "hard cleanup cannot replace its controlling fault",
+                                                 .span = instruction.span});
+                        }
                         if (!register_valid(frame, instruction.operand_a)) {
                             return fail(VmError {.code = VmErrorCode::invalid_bytecode,
                                                  .message = "return reads an uninitialized register",
                                                  .span = instruction.span});
                         }
                         const auto value = frame.registers[instruction.operand_a];
+                        const auto cleanup = std::ranges::find_if(
+                            function(frame).exception_regions.rbegin(), function(frame).exception_regions.rend(),
+                            [&](const auto &region) {
+                                return frame.pc >= region.begin_instruction && frame.pc < region.end_instruction &&
+                                       !frame.completed_cleanups.contains(region.cleanup_instruction);
+                            });
+                        if (cleanup != function(frame).exception_regions.rend()) {
+                            frame.completed_cleanups.insert(cleanup->cleanup_instruction);
+                            frame.unwind = UnwindRecord {.kind = UnwindKind::return_value,
+                                                         .value = value,
+                                                         .fault = std::nullopt,
+                                                         .handler_instruction = std::nullopt,
+                                                         .destination = 0U,
+                                                         .origin_instruction = frame.pc};
+                            frame.pc = cleanup->cleanup_instruction;
+                            break;
+                        }
                         const auto destination = frame.return_register;
                         frames.pop_back();
                         if (frames.empty()) {
@@ -914,6 +1917,11 @@ namespace rule_engine::python::vm {
                         break;
                     }
                     case Opcode::raise_fault:
+                        if (forced_cleanup_active) {
+                            return fail(VmError {.code = VmErrorCode::value_error,
+                                                 .message = "hard cleanup raised a secondary fault",
+                                                 .span = instruction.span});
+                        }
                         if (!register_valid(frame, instruction.operand_a)) {
                             return fail(VmError {.code = VmErrorCode::invalid_bytecode,
                                                  .message = "raise reads an uninitialized register",
@@ -926,9 +1934,75 @@ namespace rule_engine::python::vm {
                                                  .span = instruction.span});
                         }
                         break;
-                    case Opcode::enter_try:
-                    case Opcode::leave_try: ++frame.pc; break;
+                    case Opcode::enter_try: ++frame.pc; break;
+                    case Opcode::leave_try:
+                        if (!frame.unwind.has_value()) {
+                            ++frame.pc;
+                            break;
+                        } else {
+                            auto unwind = std::move(*frame.unwind);
+                            frame.unwind.reset();
+                            if (unwind.kind == UnwindKind::exception) {
+                                if (!unwind.handler_instruction.has_value() || !unwind.value.has_value() ||
+                                    unwind.destination >= frame.registers.size()) {
+                                    return fail(VmError {.code = VmErrorCode::engine_fault,
+                                                         .message = "exception cleanup continuation is malformed",
+                                                         .span = instruction.span});
+                                }
+                                frame.registers[unwind.destination] = *unwind.value;
+                                frame.pc = *unwind.handler_instruction;
+                                break;
+                            }
+                            if (unwind.kind == UnwindKind::hard_fault) {
+                                if (!unwind.fault.has_value()) {
+                                    return fail(VmError {.code = VmErrorCode::engine_fault,
+                                                         .message = "hard cleanup continuation is malformed",
+                                                         .span = instruction.span});
+                                }
+                                if (continue_forced_cleanup(*unwind.fault, unwind.origin_instruction)) {
+                                    break;
+                                }
+                                set_forced_cleanup(false);
+                                const auto requested_state = unwind.fault->code == VmErrorCode::canceled ?
+                                                                 VmStepState::canceled :
+                                                                 VmStepState::faulted;
+                                return fail(std::move(*unwind.fault), requested_state);
+                            }
+                            if (unwind.kind == UnwindKind::generator_close) {
+                                frame.generator_state = GeneratorState::closed;
+                                return fail(VmError {.code = VmErrorCode::canceled,
+                                                     .message = "generator was closed",
+                                                     .span = instruction.span},
+                                            VmStepState::canceled);
+                            }
+                            const auto cleanup = std::ranges::find_if(
+                                function(frame).exception_regions.rbegin(), function(frame).exception_regions.rend(),
+                                [&](const auto &region) {
+                                    return unwind.origin_instruction >= region.begin_instruction &&
+                                           unwind.origin_instruction < region.end_instruction &&
+                                           !frame.completed_cleanups.contains(region.cleanup_instruction);
+                                });
+                            if (cleanup != function(frame).exception_regions.rend()) {
+                                frame.completed_cleanups.insert(cleanup->cleanup_instruction);
+                                frame.unwind = std::move(unwind);
+                                frame.pc = cleanup->cleanup_instruction;
+                                break;
+                            }
+                            const auto destination = frame.return_register;
+                            const auto value = *unwind.value;
+                            frames.pop_back();
+                            if (frames.empty()) {
+                                return complete(value);
+                            }
+                            frames.back().registers[*destination] = value;
+                            break;
+                        }
                     case Opcode::yield_value:
+                        if (forced_cleanup_active) {
+                            return fail(VmError {.code = VmErrorCode::loop_budget_exhausted,
+                                                 .message = "hard cleanup cannot suspend",
+                                                 .span = instruction.span});
+                        }
                         if (!code.generator && !code.async) {
                             return fail(VmError {.code = VmErrorCode::invalid_bytecode,
                                                  .message = "yield opcode appears in a non-generator function",
@@ -944,24 +2018,58 @@ namespace rule_engine::python::vm {
                         }
                         ++frame.pc;
                         frame.generator_state = GeneratorState::suspended;
+                        frame.yield_destination = instruction.destination;
                         return make_step(VmStepState::yielded, std::nullopt, frame.registers[instruction.operand_a]);
                     case Opcode::await_fact:
+                        if (forced_cleanup_active) {
+                            return fail(VmError {.code = VmErrorCode::fact_budget_exhausted,
+                                                 .message = "hard cleanup cannot request facts",
+                                                 .span = instruction.span});
+                        }
                         if (const auto fault = begin_fact(instruction, frame); fault.has_value()) {
                             return fail(*fault);
                         }
-                        return make_step(VmStepState::waiting_for_facts);
+                        if (pending.has_value()) {
+                            return make_step(VmStepState::waiting_for_facts);
+                        }
+                        break;
                     case Opcode::await_capability:
                         if (const auto fault = begin_capability(instruction, frame); fault.has_value()) {
                             return fail(*fault);
                         }
-                        return make_step(VmStepState::waiting_for_capabilities);
+                        if (pending.has_value()) {
+                            return make_step(VmStepState::waiting_for_capabilities);
+                        }
+                        break;
+                    case Opcode::read_state:
+                        if (forced_cleanup_active) {
+                            return fail(VmError {.code = VmErrorCode::state_budget_exhausted,
+                                                 .message = "hard cleanup cannot read state",
+                                                 .span = instruction.span});
+                        }
+                        if (const auto fault = begin_state_read(instruction, frame); fault.has_value()) {
+                            return fail(*fault);
+                        }
+                        if (pending.has_value()) {
+                            return make_step(VmStepState::yielded);
+                        }
+                        break;
+                    case Opcode::write_state:
+                        if (const auto fault = write_state(instruction, frame); fault.has_value()) {
+                            return fail(*fault);
+                        }
+                        break;
                     case Opcode::append_effect:
                         if (const auto fault = append_effect(instruction, frame); fault.has_value()) {
                             return fail(*fault);
                         }
                         break;
                     case Opcode::begin_transaction:
-                        transaction_marks.push_back(journal.size());
+                        transaction_marks.push_back(TransactionMark {
+                            .journal_size = journal.size(),
+                            .state_mutations = state_mutations,
+                            .state_overlay = state_overlay,
+                        });
                         ++frame.pc;
                         break;
                     case Opcode::commit_transaction:
@@ -979,21 +2087,20 @@ namespace rule_engine::python::vm {
                                                  .message = "rollback_transaction has no open transaction",
                                                  .span = instruction.span});
                         }
-                        for (std::size_t index = transaction_marks.back(); index < journal.size(); ++index) {
-                            journal[index].disposition = EffectDisposition::rolled_back;
-                        }
+                        rollback_journal_from(transaction_marks.back().journal_size);
+                        state_mutations = std::move(transaction_marks.back().state_mutations);
+                        state_overlay = std::move(transaction_marks.back().state_overlay);
                         transaction_marks.pop_back();
                         ++frame.pc;
                         break;
-                    case Opcode::read_state:
-                    case Opcode::write_state:
-                        return fail(VmError {.code = VmErrorCode::invalid_bytecode,
-                                             .message = "state opcode requires the state-runtime integration lane",
-                                             .span = instruction.span});
+                }
+
+                if (const auto heap_fault = check_forced_cleanup_heap(instruction.span); heap_fault.has_value()) {
+                    return fail(*heap_fault);
                 }
 
                 if (quantum == cooperative_quantum) {
-                    if ((counters.instructions % cooperative_quantum) == 0U) {
+                    if ((current_counters().instructions % cooperative_quantum) == 0U) {
                         const auto collected = heap.collect(roots());
                         if (!collected) {
                             return fail(collected.error());
@@ -1024,13 +2131,91 @@ namespace rule_engine::python::vm {
                 return fail(*response_fault);
             }
             if (pending.has_value()) {
-                return make_step(pending->kind == PendingKind::fact ? VmStepState::waiting_for_facts :
-                                                                      VmStepState::waiting_for_capabilities);
+                const auto state = pending->kind == PendingKind::fact       ? VmStepState::waiting_for_facts :
+                                   pending->kind == PendingKind::capability ? VmStepState::waiting_for_capabilities :
+                                                                              VmStepState::yielded;
+                return make_step(state);
             }
             if (!frames.empty() && frames.back().generator_state == GeneratorState::suspended) {
-                frames.back().generator_state = GeneratorState::running;
+                return resume_generator(std::nullopt);
             }
             return execute();
+        }
+
+        [[nodiscard]] VmStep resume_generator(const std::optional<PyValue> value) {
+            if (terminal_state.has_value()) {
+                return make_step(*terminal_state, terminal_result);
+            }
+            if (pending.has_value() || frames.empty() || frames.back().generator_state != GeneratorState::suspended ||
+                !frames.back().yield_destination.has_value()) {
+                return fail(VmError {.code = VmErrorCode::value_error,
+                                     .message = "generator is not suspended at a yield point",
+                                     .span = std::nullopt});
+            }
+            auto sent = value.has_value() ? std::expected<PyValue, VmError> {*value} : heap.allocate_none();
+            if (!sent || !heap.valid(*sent)) {
+                return fail(!sent ? sent.error() :
+                                    VmError {.code = VmErrorCode::invalid_handle,
+                                             .message = "generator send value does not belong to this VM session",
+                                             .span = std::nullopt});
+            }
+            auto &frame = frames.back();
+            if (*frame.yield_destination >= frame.registers.size()) {
+                return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                     .message = "generator yield destination is out of range",
+                                     .span = std::nullopt});
+            }
+            frame.registers[*frame.yield_destination] = *sent;
+            frame.yield_destination.reset();
+            frame.generator_state = GeneratorState::running;
+            return execute();
+        }
+
+        [[nodiscard]] VmStep throw_generator(const PyValue exception) {
+            if (terminal_state.has_value()) {
+                return make_step(*terminal_state, terminal_result);
+            }
+            if (!heap.valid(exception) || frames.empty() ||
+                frames.back().generator_state != GeneratorState::suspended) {
+                return fail(VmError {.code = VmErrorCode::value_error,
+                                     .message = "generator throw requires a suspended generator and local value",
+                                     .span = std::nullopt});
+            }
+            auto &frame = frames.back();
+            frame.generator_state = GeneratorState::running;
+            frame.yield_destination.reset();
+            if (frame.pc != 0U) {
+                --frame.pc;
+            }
+            const auto instruction = function(frame).instructions[frame.pc];
+            if (handle_author_fault(instruction, exception)) {
+                return execute();
+            }
+            return fail(VmError {.code = VmErrorCode::value_error,
+                                 .message = "exception thrown into generator was not handled",
+                                 .span = instruction.span});
+        }
+
+        [[nodiscard]] VmStep close_generator() {
+            if (terminal_state.has_value()) {
+                return make_step(*terminal_state, terminal_result);
+            }
+            if (frames.empty() || frames.back().generator_state != GeneratorState::suspended) {
+                return fail(VmError {.code = VmErrorCode::value_error,
+                                     .message = "generator close requires a suspended generator",
+                                     .span = std::nullopt});
+            }
+            auto &frame = frames.back();
+            frame.generator_state = GeneratorState::closed;
+            frame.yield_destination.reset();
+            if (frame.pc != 0U) {
+                --frame.pc;
+            }
+            static_cast<void>(tasks.close_all());
+            return fail(VmError {.code = VmErrorCode::canceled,
+                                 .message = "generator was closed",
+                                 .span = function(frame).instructions[frame.pc].span},
+                        VmStepState::canceled);
         }
     };
 
@@ -1039,21 +2224,44 @@ namespace rule_engine::python::vm {
     RegisterVmSession::~RegisterVmSession() { delete impl_; }
 
     VmStep RegisterVmSession::step(HostResponses responses) {
-        impl_->active_step_started = std::chrono::steady_clock::now();
-        impl_->active_step = true;
+        impl_->begin_active_measurement();
         auto result = impl_->step(std::move(responses));
-        impl_->counters.active_time += std::chrono::steady_clock::now() - impl_->active_step_started;
-        impl_->active_step = false;
+        impl_->end_active_measurement();
+        return result;
+    }
+
+    VmStep RegisterVmSession::send_generator(const std::optional<PyValue> value) {
+        impl_->begin_active_measurement();
+        auto result = impl_->resume_generator(value);
+        impl_->end_active_measurement();
+        return result;
+    }
+
+    VmStep RegisterVmSession::throw_generator(const PyValue exception) {
+        impl_->begin_active_measurement();
+        auto result = impl_->throw_generator(exception);
+        impl_->end_active_measurement();
+        return result;
+    }
+
+    VmStep RegisterVmSession::close_generator() {
+        impl_->begin_active_measurement();
+        auto result = impl_->close_generator();
+        impl_->end_active_measurement();
         return result;
     }
 
     VmCounters RegisterVmSession::counters() const noexcept { return impl_->counters; }
+
+    RecoveryCounters RegisterVmSession::recovery_counters() const noexcept { return impl_->recovery; }
 
     HeapStats RegisterVmSession::heap_stats() const noexcept { return impl_->heap.stats(); }
 
     std::size_t RegisterVmSession::logical_read_count() const noexcept { return impl_->logical_reads.size(); }
 
     std::size_t RegisterVmSession::journal_size() const noexcept { return impl_->journal.size(); }
+
+    std::size_t RegisterVmSession::state_mutation_count() const noexcept { return impl_->state_mutations.size(); }
 
     std::expected<FrozenValue, FreezeError> RegisterVmSession::freeze_value(const PyValue value) const {
         return impl_->heap.freeze(value);
@@ -1080,8 +2288,8 @@ namespace rule_engine::python::vm {
                 diagnostics.push_back(diagnostic("PYVM0003", "binding references an unknown bytecode function"));
             } else {
                 entry_index = static_cast<std::size_t>(std::distance(pack.functions.begin(), function));
-                if (function->parameter_count != 0U) {
-                    diagnostics.push_back(diagnostic("PYVM0004", "bound entrypoint requires positional parameters"));
+                if (function->parameter_count > 1U) {
+                    diagnostics.push_back(diagnostic("PYVM0004", "bound entrypoint exceeds the subject-parameter ABI"));
                 }
             }
         }
@@ -1092,40 +2300,55 @@ namespace rule_engine::python::vm {
             return std::unexpected(std::move(diagnostics));
         }
 
-        auto implementation = std::unique_ptr<Impl> {new Impl {pack, invocation}};
-        implementation->constants.reserve(pack.constants.size());
-        for (const auto &constant : pack.constants) {
-            const auto *record = constant.valid() ? std::get_if<FactRecord>(&constant.node->data) : nullptr;
-            const auto metadata = record != nullptr && (record->schema.value == fact_operand_schema ||
-                                                        record->schema.value == capability_operand_schema);
-            auto thawed = metadata ? implementation->heap.allocate_none() : implementation->heap.thaw(constant);
-            if (!thawed) {
-                diagnostics.push_back(
-                    diagnostic("PYVM0006", "constant cannot be materialized: " + thawed.error().message));
-                return std::unexpected(std::move(diagnostics));
-            }
-            implementation->constants.push_back(*thawed);
-        }
         if (invocation.budget.normal.frames == 0U) {
             diagnostics.push_back(diagnostic("PYVM0007", "frame budget cannot admit the entrypoint"));
             return std::unexpected(std::move(diagnostics));
         }
-        implementation->frames.push_back(Impl::Frame {
-            .function_index = entry_index,
-            .pc = 0U,
-            .registers = std::vector<PyValue>(pack.functions[entry_index].register_count),
-            .return_register = std::nullopt,
-            .generator_state = GeneratorState::running,
-        });
-        implementation->counters.peak_frames = 1U;
-        implementation->root_group = implementation->tasks.open_group();
-        auto task = implementation->tasks.start(implementation->root_group);
-        if (!task) {
-            diagnostics.push_back(diagnostic("PYVM0008", task.error().message));
+
+        auto implementation = std::unique_ptr<Impl> {new Impl {pack, invocation}};
+        implementation->entry_index = entry_index;
+        const auto find_function = [&](const std::string &id) -> std::optional<std::size_t> {
+            const auto found = std::ranges::find(pack.functions, ExecutableId {id}, &BytecodeFunction::id);
+            if (found == pack.functions.end()) {
+                return std::nullopt;
+            }
+            return static_cast<std::size_t>(std::distance(pack.functions.begin(), found));
+        };
+        for (const auto &constant : pack.constants) {
+            const auto *record = constant.valid() ? std::get_if<FactRecord>(&constant.node->data) : nullptr;
+            if (record == nullptr || record->schema.value != handler_metadata_schema) {
+                continue;
+            }
+            const auto metadata_entry = record_text_field(constant, handler_metadata_schema, 1U);
+            if (!metadata_entry.has_value() || binding == pack.bindings.end() ||
+                *metadata_entry != binding->executable.value) {
+                continue;
+            }
+            const auto bind_handler = [&](const std::uint32_t field, std::optional<std::size_t> &destination) {
+                const auto id = record_text_field(constant, handler_metadata_schema, field);
+                if (!id.has_value()) {
+                    return;
+                }
+                const auto index = find_function(*id);
+                if (!index.has_value() || pack.functions[*index].parameter_count != 0U) {
+                    diagnostics.push_back(diagnostic("PYVM0009", "handler metadata references an invalid function"));
+                    return;
+                }
+                destination = *index;
+            };
+            bind_handler(2U, implementation->handlers.finalizer);
+            bind_handler(3U, implementation->handlers.on_fault);
+            bind_handler(4U, implementation->handlers.on_double_fault);
+        }
+        if (!diagnostics.empty()) {
             return std::unexpected(std::move(diagnostics));
         }
-        implementation->root_task = *task;
-        static_cast<void>(implementation->tasks.set_state(*task, TaskState::running));
+        if (const auto started = implementation->start_executor(entry_index, Impl::ExecutorPhase::normal,
+                                                                invocation.budget.normal.heap_bytes);
+            started.has_value()) {
+            diagnostics.push_back(diagnostic("PYVM0006", started->message));
+            return std::unexpected(std::move(diagnostics));
+        }
         return std::unique_ptr<RegisterVmSession> {new RegisterVmSession {implementation.release()}};
     }
 

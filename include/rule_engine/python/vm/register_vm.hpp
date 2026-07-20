@@ -16,6 +16,8 @@ namespace rule_engine::python::vm {
 
     inline constexpr std::string_view fact_operand_schema = "rule-engine.vm.fact-operand.v1";
     inline constexpr std::string_view capability_operand_schema = "rule-engine.vm.capability-operand.v1";
+    inline constexpr std::string_view state_operand_schema = "rule-engine.vm.state-operand.v1";
+    inline constexpr std::string_view handler_metadata_schema = "rule-engine.vm.handler-metadata.v1";
 
     // Instruction operand encoding used by the C++ compiler and the exact VM.
     // - load_const: immediate is the constant index.
@@ -25,9 +27,16 @@ namespace rule_engine::python::vm {
     // - return/yield/raise: operand_a is the value register.
     // - await_fact: immediate names a fact operand constant; the invocation subject is used.
     // - await_capability: immediate names a capability operand constant and operand_a is the argument register.
+    // - read_state: immediate names a state operand constant.
+    // - write_state: immediate names a state operand constant and operand_a is the value register.
     // - append_effect: immediate names a Unicode effect-kind constant and operand_a is the payload register.
     [[nodiscard]] FactValue make_fact_operand(FactRoute route, SchemaId expected_schema);
-    [[nodiscard]] FactValue make_capability_operand(CapabilityId capability, SchemaId request_schema);
+    [[nodiscard]] FactValue make_capability_operand(CapabilityId capability, SchemaId request_schema,
+                                                    SchemaId response_schema = {});
+    [[nodiscard]] FactValue make_state_operand(std::string namespace_name, std::string key, SchemaId schema);
+    [[nodiscard]] FactValue make_handler_metadata(ExecutableId entrypoint, std::optional<ExecutableId> finalizer,
+                                                  std::optional<ExecutableId> on_fault,
+                                                  std::optional<ExecutableId> on_double_fault);
 
     struct VmCounters {
         std::uint64_t instructions {};
@@ -39,9 +48,20 @@ namespace rule_engine::python::vm {
         std::uint32_t service_calls {};
         std::uint32_t peak_active_service_calls {};
         std::size_t service_response_bytes {};
+        std::uint32_t state_keys {};
+        std::size_t state_bytes {};
         std::uint32_t effect_intents {};
         std::size_t effect_bytes {};
         std::chrono::nanoseconds active_time {};
+    };
+
+    struct RecoveryCounters {
+        VmCounters finalizer_or_fault;
+        VmCounters double_fault;
+        VmCounters forced_cleanup;
+        std::uint32_t primary_faults {};
+        std::uint32_t double_faults {};
+        std::uint32_t triple_faults {};
     };
 
     enum struct GeneratorState : std::uint8_t { created, running, suspended, closed, faulted };
@@ -71,8 +91,11 @@ namespace rule_engine::python::vm {
         [[nodiscard]] std::expected<void, VmError> set_state(TaskId task, TaskState state);
         [[nodiscard]] std::optional<TaskId> next_ready() const noexcept;
         [[nodiscard]] std::expected<void, VmError> close(TaskGroupId group, TaskGroupExitMode mode);
+        [[nodiscard]] std::expected<void, VmError> cancel_group(TaskGroupId group);
+        [[nodiscard]] std::expected<void, VmError> close_all();
         [[nodiscard]] bool owns(TaskGroupId group, TaskId task) const noexcept;
         [[nodiscard]] bool has_live_tasks(TaskGroupId group) const noexcept;
+        [[nodiscard]] bool group_open(TaskGroupId group) const noexcept;
         [[nodiscard]] std::span<const StructuredTask> tasks() const noexcept;
 
     private:
@@ -88,10 +111,15 @@ namespace rule_engine::python::vm {
         ~RegisterVmSession() override;
 
         [[nodiscard]] VmStep step(HostResponses responses) override;
+        [[nodiscard]] VmStep send_generator(std::optional<PyValue> value = std::nullopt);
+        [[nodiscard]] VmStep throw_generator(PyValue exception);
+        [[nodiscard]] VmStep close_generator();
         [[nodiscard]] VmCounters counters() const noexcept;
+        [[nodiscard]] RecoveryCounters recovery_counters() const noexcept;
         [[nodiscard]] HeapStats heap_stats() const noexcept;
         [[nodiscard]] std::size_t logical_read_count() const noexcept;
         [[nodiscard]] std::size_t journal_size() const noexcept;
+        [[nodiscard]] std::size_t state_mutation_count() const noexcept;
         [[nodiscard]] std::expected<FrozenValue, FreezeError> freeze_value(PyValue value) const;
 
         [[nodiscard]] static std::expected<std::unique_ptr<RegisterVmSession>, DiagnosticSet>

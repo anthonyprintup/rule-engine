@@ -28,6 +28,7 @@ namespace rule_engine::python::vm {
         elapsed_budget_exhausted,
         fact_budget_exhausted,
         capability_budget_exhausted,
+        state_budget_exhausted,
         effect_budget_exhausted,
         invalid_bytecode,
         invalid_host_response,
@@ -67,11 +68,43 @@ namespace rule_engine::python::vm {
         bytes,
         list,
         map,
+        record,
     };
 
-    enum struct UnaryOperation : std::uint32_t { logical_not, positive, negative };
-    enum struct BinaryOperation : std::uint32_t { add, subtract, multiply };
-    enum struct CompareOperation : std::uint32_t { equal, not_equal, less, less_equal, greater, greater_equal };
+    // These ordinals are part of the compiler/VM ABI. Keep them synchronized with
+    // the Python AST operator lowering in the compiler lane.
+    enum struct UnaryOperation : std::uint32_t { logical_not, positive, negative, invert };
+    enum struct BinaryOperation : std::uint32_t {
+        add,
+        subtract,
+        multiply,
+        true_divide,
+        floor_divide,
+        modulo,
+        power,
+        left_shift,
+        right_shift,
+        bit_or,
+        bit_xor,
+        bit_and,
+    };
+    enum struct CompareOperation : std::uint32_t {
+        equal,
+        not_equal,
+        less,
+        less_equal,
+        greater,
+        greater_equal,
+        identity,
+        not_identity,
+        contains,
+        not_contains,
+    };
+
+    struct RecordFieldValue {
+        std::uint32_t field_id {};
+        PyValue value;
+    };
 
     struct FreezeLimits {
         std::size_t maximum_bytes {balanced_v1.normal.effect_bytes};
@@ -105,6 +138,8 @@ namespace rule_engine::python::vm {
         [[nodiscard]] std::expected<PyValue, VmError> allocate_list(std::span<const PyValue> values = {});
         [[nodiscard]] std::expected<PyValue, VmError>
         allocate_map(std::span<const std::pair<PyValue, PyValue>> entries = {});
+        [[nodiscard]] std::expected<PyValue, VmError> allocate_record(SchemaId schema,
+                                                                      std::span<const RecordFieldValue> fields = {});
 
         [[nodiscard]] std::expected<void, VmError> list_append(PyValue list, PyValue value);
         [[nodiscard]] std::expected<void, VmError> map_insert(PyValue map, PyValue key, PyValue value);
@@ -122,10 +157,19 @@ namespace rule_engine::python::vm {
         [[nodiscard]] std::expected<std::string, VmError> integer_decimal(PyValue value) const;
         [[nodiscard]] std::expected<std::string, VmError> unicode_utf8(PyValue value) const;
         [[nodiscard]] std::expected<std::vector<PyValue>, VmError> list_items(PyValue value) const;
+        [[nodiscard]] std::expected<SchemaId, VmError> record_schema(PyValue value) const;
+        [[nodiscard]] std::expected<std::vector<RecordFieldValue>, VmError> record_fields(PyValue value) const;
 
         [[nodiscard]] std::expected<FrozenValue, FreezeError> freeze(PyValue value, DataLabel label = {},
                                                                      FreezeLimits limits = {}) const;
         [[nodiscard]] std::expected<PyValue, VmError> thaw(const FactValue &value);
+        [[nodiscard]] std::expected<PyValue, FreezeError>
+        validate_frozen(const FrozenValue &value, std::optional<SchemaId> expected_schema = std::nullopt,
+                        const SchemaCatalog *schemas = nullptr, FreezeLimits limits = {});
+
+        [[nodiscard]] static std::expected<void, FreezeError> validate_schema(const FactValue &value,
+                                                                              const SchemaId &expected_schema,
+                                                                              const SchemaCatalog *schemas = nullptr);
 
         [[nodiscard]] std::expected<std::size_t, VmError> collect(std::span<const PyValue> roots);
         [[nodiscard]] bool valid(PyValue value) const noexcept;

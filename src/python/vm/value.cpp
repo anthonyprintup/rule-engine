@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <bit>
+#include <cerrno>
 #include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -105,6 +107,222 @@ namespace rule_engine::python::vm {
                 result.push_back(static_cast<char>('0' + digit));
             }
             return result.empty() ? std::string {"0"} : result;
+        }
+
+        [[nodiscard]] std::string normalize_magnitude(std::string value) {
+            const auto non_zero = value.find_first_not_of('0');
+            if (non_zero == std::string::npos) {
+                return "0";
+            }
+            value.erase(0U, non_zero);
+            return value;
+        }
+
+        struct MagnitudeDivision {
+            std::string quotient;
+            std::string remainder;
+        };
+
+        [[nodiscard]] std::expected<MagnitudeDivision, VmError> divide_magnitude(const std::string_view dividend,
+                                                                                 const std::string_view divisor) {
+            if (divisor == "0") {
+                return std::unexpected(error(VmErrorCode::arithmetic_error, "integer division or modulo by zero"));
+            }
+            if (compare_magnitude(dividend, divisor) < 0) {
+                return MagnitudeDivision {.quotient = "0", .remainder = std::string {dividend}};
+            }
+            std::string quotient;
+            quotient.reserve(dividend.size());
+            std::string remainder {"0"};
+            for (const auto digit : dividend) {
+                if (remainder == "0") {
+                    remainder.assign(1U, digit);
+                } else {
+                    remainder.push_back(digit);
+                }
+                remainder = normalize_magnitude(std::move(remainder));
+                unsigned quotient_digit {};
+                while (compare_magnitude(remainder, divisor) >= 0) {
+                    remainder = subtract_magnitude(remainder, divisor);
+                    ++quotient_digit;
+                }
+                quotient.push_back(static_cast<char>('0' + quotient_digit));
+            }
+            return MagnitudeDivision {.quotient = normalize_magnitude(std::move(quotient)),
+                                      .remainder = normalize_magnitude(std::move(remainder))};
+        }
+
+        struct IntegerDivision {
+            BigInteger quotient;
+            BigInteger remainder;
+        };
+
+        [[nodiscard]] std::expected<IntegerDivision, VmError> floor_divide(const BigInteger &left,
+                                                                           const BigInteger &right) {
+            auto divided = divide_magnitude(left.magnitude, right.magnitude);
+            if (!divided) {
+                return std::unexpected(divided.error());
+            }
+            const auto different_sign = left.negative != right.negative;
+            if (different_sign && divided->remainder != "0") {
+                divided->quotient = add_magnitude(divided->quotient, "1");
+                divided->remainder = subtract_magnitude(right.magnitude, divided->remainder);
+            }
+            return IntegerDivision {
+                .quotient = BigInteger {.negative = different_sign && divided->quotient != "0",
+                                        .magnitude = std::move(divided->quotient)},
+                .remainder = BigInteger {.negative = right.negative && divided->remainder != "0",
+                                         .magnitude = std::move(divided->remainder)},
+            };
+        }
+
+        [[nodiscard]] std::expected<std::uint64_t, VmError>
+        bounded_unsigned(const BigInteger &value, const std::uint64_t maximum, const std::string_view operation) {
+            if (value.negative) {
+                return std::unexpected(
+                    error(VmErrorCode::value_error, std::string {operation} + " count cannot be negative"));
+            }
+            std::uint64_t result {};
+            for (const auto digit : value.magnitude) {
+                const auto next = static_cast<std::uint64_t>(digit - '0');
+                if (result > (maximum - next) / 10U) {
+                    return std::unexpected(error(VmErrorCode::instruction_budget_exhausted,
+                                                 std::string {operation} + " count exceeds the bounded VM limit"));
+                }
+                result = result * 10U + next;
+            }
+            return result;
+        }
+
+        [[nodiscard]] std::pair<std::string, unsigned> divide_magnitude_by_two(const std::string_view magnitude) {
+            std::string quotient;
+            quotient.reserve(magnitude.size());
+            unsigned remainder {};
+            for (const auto digit : magnitude) {
+                const auto current = remainder * 10U + static_cast<unsigned>(digit - '0');
+                if (!quotient.empty() || current / 2U != 0U) {
+                    quotient.push_back(static_cast<char>('0' + current / 2U));
+                }
+                remainder = current % 2U;
+            }
+            return {quotient.empty() ? std::string {"0"} : std::move(quotient), remainder};
+        }
+
+        [[nodiscard]] std::vector<bool> magnitude_bits(std::string magnitude) {
+            std::vector<bool> bits;
+            while (magnitude != "0") {
+                auto [quotient, remainder] = divide_magnitude_by_two(magnitude);
+                bits.push_back(remainder != 0U);
+                magnitude = std::move(quotient);
+            }
+            if (bits.empty()) {
+                bits.push_back(false);
+            }
+            return bits;
+        }
+
+        [[nodiscard]] std::string bits_magnitude(const std::vector<bool> &bits) {
+            std::string magnitude {"0"};
+            for (auto index = bits.size(); index != 0U; --index) {
+                magnitude = multiply_magnitude(magnitude, "2");
+                if (bits[index - 1U]) {
+                    magnitude = add_magnitude(magnitude, "1");
+                }
+            }
+            return magnitude;
+        }
+
+        void twos_complement(std::vector<bool> &bits) {
+            for (std::size_t index = 0; index < bits.size(); ++index) { bits[index] = !bits[index]; }
+            bool carry = true;
+            for (std::size_t index = 0; index < bits.size() && carry; ++index) {
+                const bool old = bits[index];
+                bits[index] = !old;
+                carry = old;
+            }
+        }
+
+        [[nodiscard]] BigInteger bitwise(const BigInteger &left, const BigInteger &right,
+                                         const BinaryOperation operation) {
+            auto left_bits = magnitude_bits(left.magnitude);
+            auto right_bits = magnitude_bits(right.magnitude);
+            const auto width = std::max(left_bits.size(), right_bits.size()) + 1U;
+            left_bits.resize(width, false);
+            right_bits.resize(width, false);
+            if (left.negative) {
+                twos_complement(left_bits);
+            }
+            if (right.negative) {
+                twos_complement(right_bits);
+            }
+            std::vector<bool> result(width);
+            for (std::size_t index = 0; index < width; ++index) {
+                switch (operation) {
+                    case BinaryOperation::bit_or: result[index] = left_bits[index] || right_bits[index]; break;
+                    case BinaryOperation::bit_xor: result[index] = left_bits[index] != right_bits[index]; break;
+                    case BinaryOperation::bit_and: result[index] = left_bits[index] && right_bits[index]; break;
+                    default: break;
+                }
+            }
+            const auto negative = result.back();
+            if (negative) {
+                twos_complement(result);
+            }
+            return BigInteger {.negative = negative, .magnitude = bits_magnitude(result)};
+        }
+
+        [[nodiscard]] std::expected<double, VmError> as_double(const BigInteger &integer) {
+            const auto decimal = integer.decimal();
+            errno = 0;
+            char *end {};
+            const auto result = std::strtod(decimal.c_str(), &end);
+            if (end != decimal.data() + decimal.size() || errno == ERANGE || !std::isfinite(result)) {
+                return std::unexpected(
+                    error(VmErrorCode::arithmetic_error, "integer is too large to convert to a finite float"));
+            }
+            return result;
+        }
+
+        [[nodiscard]] std::expected<int, VmError> compare_integer_float(const BigInteger &integer,
+                                                                        const double floating) {
+            if (std::isnan(floating)) {
+                return std::unexpected(error(VmErrorCode::value_error, "NaN values are unordered"));
+            }
+            if (std::isinf(floating)) {
+                return std::signbit(floating) ? 1 : -1;
+            }
+
+            const auto bits = std::bit_cast<std::uint64_t>(floating);
+            const auto negative = (bits >> 63U) != 0U;
+            const auto exponent_bits = static_cast<unsigned>((bits >> 52U) & 0x7FFU);
+            constexpr std::uint64_t fraction_mask {(std::uint64_t {1U} << 52U) - 1U};
+            const auto fraction = bits & fraction_mask;
+            const auto significand = exponent_bits == 0U ? fraction : fraction | (std::uint64_t {1U} << 52U);
+            const auto exponent = exponent_bits == 0U ? -1074 : static_cast<int>(exponent_bits) - 1023 - 52;
+
+            BigInteger whole;
+            bool fractional {};
+            if (exponent >= 0) {
+                whole = *BigInteger::parse(std::to_string(significand));
+                for (auto shift = 0; shift < exponent; ++shift) {
+                    whole = multiply(whole, BigInteger {.negative = false, .magnitude = "2"});
+                }
+            } else {
+                const auto shift = static_cast<unsigned>(-exponent);
+                const auto whole_magnitude = shift >= 64U ? 0U : significand >> shift;
+                if (shift >= 64U) {
+                    fractional = significand != 0U;
+                } else if (shift != 0U) {
+                    fractional = (significand & ((std::uint64_t {1U} << shift) - 1U)) != 0U;
+                }
+                whole = *BigInteger::parse(std::to_string(whole_magnitude));
+            }
+            whole.negative = negative && !whole.is_zero();
+            const auto order = compare(integer, whole);
+            if (order != 0 || !fractional) {
+                return order;
+            }
+            return negative ? 1 : -1;
         }
 
         [[nodiscard]] std::expected<std::u32string, VmError> decode_utf8(const std::string_view input) {
@@ -293,8 +511,12 @@ namespace rule_engine::python::vm {
         struct MapStorage {
             std::vector<std::pair<PyValue, PyValue>> entries;
         };
+        struct RecordStorage {
+            SchemaId schema;
+            std::vector<RecordFieldValue> fields;
+        };
         using Payload = std::variant<std::monostate, bool, BigInteger, double, UnicodeStorage, BytesStorage,
-                                     ListStorage, MapStorage>;
+                                     ListStorage, MapStorage, RecordStorage>;
 
         struct Object {
             ValueKind kind {ValueKind::none};
@@ -327,6 +549,11 @@ namespace rule_engine::python::vm {
                 case ValueKind::map:
                     bytes += std::get<MapStorage>(object.payload).entries.size() * sizeof(std::pair<PyValue, PyValue>);
                     break;
+                case ValueKind::record: {
+                    const auto &record = std::get<RecordStorage>(object.payload);
+                    bytes += record.schema.value.size() + record.fields.size() * sizeof(RecordFieldValue);
+                    break;
+                }
                 default: break;
             }
             return bytes;
@@ -416,6 +643,22 @@ namespace rule_engine::python::vm {
             if (left_integer.has_value() && right_integer.has_value()) {
                 return compare(*left_integer, *right_integer) == 0;
             }
+            if (left_integer.has_value() && (*right_object)->kind == ValueKind::floating) {
+                const auto floating = std::get<double>((*right_object)->payload);
+                if (std::isnan(floating)) {
+                    return false;
+                }
+                auto order = compare_integer_float(*left_integer, floating);
+                return order && *order == 0;
+            }
+            if (right_integer.has_value() && (*left_object)->kind == ValueKind::floating) {
+                const auto floating = std::get<double>((*left_object)->payload);
+                if (std::isnan(floating)) {
+                    return false;
+                }
+                auto order = compare_integer_float(*right_integer, floating);
+                return order && *order == 0;
+            }
             if ((*left_object)->kind != (*right_object)->kind) {
                 return false;
             }
@@ -494,6 +737,36 @@ namespace rule_engine::python::vm {
                     active.erase(pair);
                     return true;
                 }
+                case ValueKind::record: {
+                    const auto pair = std::pair {
+                        (static_cast<std::uint64_t>(left.slot) << 32U) | left.generation,
+                        (static_cast<std::uint64_t>(right.slot) << 32U) | right.generation,
+                    };
+                    if (!active.insert(pair).second) {
+                        return true;
+                    }
+                    const auto &left_record = std::get<RecordStorage>((*left_object)->payload);
+                    const auto &right_record = std::get<RecordStorage>((*right_object)->payload);
+                    if (left_record.schema != right_record.schema ||
+                        left_record.fields.size() != right_record.fields.size()) {
+                        active.erase(pair);
+                        return false;
+                    }
+                    for (std::size_t index = 0; index < left_record.fields.size(); ++index) {
+                        if (left_record.fields[index].field_id != right_record.fields[index].field_id) {
+                            active.erase(pair);
+                            return false;
+                        }
+                        auto field_equal = equal_recursive(left_record.fields[index].value,
+                                                           right_record.fields[index].value, active, depth + 1U);
+                        if (!field_equal || !*field_equal) {
+                            active.erase(pair);
+                            return field_equal;
+                        }
+                    }
+                    active.erase(pair);
+                    return true;
+                }
                 case ValueKind::boolean:
                 case ValueKind::integer: break;
             }
@@ -518,6 +791,56 @@ namespace rule_engine::python::vm {
             }
             state.bytes += amount;
             return true;
+        }
+
+        [[nodiscard]] std::expected<std::string, FreezeError> canonical_map_key(const PyValue value) const {
+            const auto object_value = object(value);
+            if (!object_value) {
+                return std::unexpected(freeze_error(FreezeErrorCode::invalid_handle, object_value.error().message));
+            }
+            std::string result;
+            const auto &current = **object_value;
+            switch (current.kind) {
+                case ValueKind::none: append_token(result, "none"); break;
+                case ValueKind::boolean:
+                    append_token(result, std::get<bool>(current.payload) ? "true" : "false");
+                    break;
+                case ValueKind::integer:
+                    append_token(result, "int");
+                    append_token(result, std::get<BigInteger>(current.payload).decimal());
+                    break;
+                case ValueKind::floating: {
+                    auto floating = std::get<double>(current.payload);
+                    if (std::isnan(floating)) {
+                        floating = std::numeric_limits<double>::quiet_NaN();
+                    }
+                    append_token(result, "float");
+                    append_token(result, std::to_string(std::bit_cast<std::uint64_t>(floating)));
+                    break;
+                }
+                case ValueKind::unicode: {
+                    auto encoded = encode_utf8(std::get<UnicodeStorage>(current.payload).codepoints);
+                    if (!encoded) {
+                        return std::unexpected(
+                            freeze_error(FreezeErrorCode::unsupported_type, std::move(encoded.error().message)));
+                    }
+                    append_token(result, "unicode");
+                    append_token(result, *encoded);
+                    break;
+                }
+                case ValueKind::bytes: {
+                    append_token(result, "bytes");
+                    const auto &bytes = std::get<BytesStorage>(current.payload).bytes;
+                    result.append(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+                    break;
+                }
+                case ValueKind::list:
+                case ValueKind::map:
+                case ValueKind::record:
+                    return std::unexpected(freeze_error(FreezeErrorCode::unsupported_type,
+                                                        "container or record is not a canonical map key"));
+            }
+            return result;
         }
 
         [[nodiscard]] std::expected<FactValue, FreezeError> freeze_value(const PyValue value, FreezeState &state,
@@ -610,7 +933,8 @@ namespace rule_engine::python::vm {
                     return make_fact(BytesValue {.bytes = bytes});
                 }
                 case ValueKind::list:
-                case ValueKind::map: break;
+                case ValueKind::map:
+                case ValueKind::record: break;
             }
 
             const auto key = (static_cast<std::uint64_t>(value.slot) << 32U) | value.generation;
@@ -635,11 +959,46 @@ namespace rule_engine::python::vm {
                 return make_fact(std::move(list));
             }
 
+            if (current.kind == ValueKind::record) {
+                const auto &record = std::get<RecordStorage>(current.payload);
+                append_token(state.canonical, "record");
+                append_token(state.canonical, record.schema.value);
+                FactRecord frozen_record {.schema = record.schema, .fields = {}};
+                frozen_record.fields.reserve(record.fields.size());
+                for (const auto &field : record.fields) {
+                    append_token(state.canonical, std::to_string(field.field_id));
+                    auto frozen = freeze_value(field.value, state, depth + 1U);
+                    if (!frozen) {
+                        state.path.erase(key);
+                        return std::unexpected(std::move(frozen.error()));
+                    }
+                    frozen_record.fields.push_back(
+                        FactRecordField {.field_id = field.field_id, .value = std::move(*frozen)});
+                }
+                state.path.erase(key);
+                return make_fact(std::move(frozen_record));
+            }
+
             append_token(state.canonical, "map");
             FactMap map;
             const auto &entries = std::get<MapStorage>(current.payload).entries;
             map.entries.reserve(entries.size());
-            for (const auto &[entry_key, entry_value] : entries) {
+            std::vector<std::pair<std::string, std::size_t>> order;
+            order.reserve(entries.size());
+            for (std::size_t index = 0; index < entries.size(); ++index) {
+                auto encoded_key = canonical_map_key(entries[index].first);
+                if (!encoded_key) {
+                    state.path.erase(key);
+                    return std::unexpected(std::move(encoded_key.error()));
+                }
+                order.emplace_back(std::move(*encoded_key), index);
+            }
+            std::ranges::sort(order, [](const auto &left, const auto &right) {
+                return left.first < right.first || (left.first == right.first && left.second < right.second);
+            });
+            for (const auto &[canonical_key, index] : order) {
+                static_cast<void>(canonical_key);
+                const auto &[entry_key, entry_value] = entries[index];
                 auto frozen_key = freeze_value(entry_key, state, depth + 1U);
                 if (!frozen_key) {
                     state.path.erase(key);
@@ -727,6 +1086,36 @@ namespace rule_engine::python::vm {
                 if (entries.size() == map->entries.size()) {
                     result = allocate(
                         Object {.kind = ValueKind::map, .payload = MapStorage {.entries = std::move(entries)}});
+                }
+            } else if (const auto *record = std::get_if<FactRecord>(&data); record != nullptr) {
+                if (record->schema.empty()) {
+                    result = std::unexpected(error(VmErrorCode::value_error, "record schema is empty"));
+                } else {
+                    std::vector<RecordFieldValue> fields;
+                    fields.reserve(record->fields.size());
+                    for (const auto &field : record->fields) {
+                        auto thawed = thaw_value(field.value, path, depth + 1U);
+                        if (!thawed) {
+                            result = std::unexpected(thawed.error());
+                            break;
+                        }
+                        fields.push_back(RecordFieldValue {.field_id = field.field_id, .value = *thawed});
+                    }
+                    if (fields.size() == record->fields.size()) {
+                        std::ranges::sort(fields, {}, &RecordFieldValue::field_id);
+                        const auto duplicate =
+                            std::ranges::adjacent_find(fields, [](const auto &left, const auto &right) {
+                                return left.field_id == right.field_id;
+                            });
+                        if (duplicate != fields.end()) {
+                            result =
+                                std::unexpected(error(VmErrorCode::value_error, "record contains duplicate field IDs"));
+                        } else {
+                            result = allocate(Object {
+                                .kind = ValueKind::record,
+                                .payload = RecordStorage {.schema = record->schema, .fields = std::move(fields)}});
+                        }
+                    }
                 }
             }
             path.erase(value.node.get());
@@ -846,7 +1235,8 @@ namespace rule_engine::python::vm {
                 return std::unexpected(error(VmErrorCode::invalid_handle, "map contains an invalid VM handle"));
             }
             const auto key_kind = kind(key);
-            if (!key_kind || *key_kind == ValueKind::list || *key_kind == ValueKind::map) {
+            if (!key_kind || *key_kind == ValueKind::list || *key_kind == ValueKind::map ||
+                *key_kind == ValueKind::record) {
                 return std::unexpected(error(VmErrorCode::type_error, "unhashable map key"));
             }
         }
@@ -854,6 +1244,37 @@ namespace rule_engine::python::vm {
             .kind = ValueKind::map,
             .payload =
                 Impl::MapStorage {.entries = std::vector<std::pair<PyValue, PyValue>> {entries.begin(), entries.end()}},
+        });
+    }
+
+    std::expected<PyValue, VmError> ValueHeap::allocate_record(SchemaId schema,
+                                                               const std::span<const RecordFieldValue> fields) {
+        if (schema.empty()) {
+            return std::unexpected(error(VmErrorCode::value_error, "record schema is empty"));
+        }
+        const auto remaining = impl_->maximum_live_bytes - impl_->stats.live_bytes;
+        if (remaining < sizeof(Impl::Object) || schema.value.size() > remaining - sizeof(Impl::Object)) {
+            return std::unexpected(
+                error(VmErrorCode::heap_budget_exhausted, "record allocation would exceed the live VM heap budget"));
+        }
+        const auto field_capacity = (remaining - sizeof(Impl::Object) - schema.value.size()) / sizeof(RecordFieldValue);
+        if (fields.size() > field_capacity) {
+            return std::unexpected(
+                error(VmErrorCode::heap_budget_exhausted, "record allocation would exceed the live VM heap budget"));
+        }
+        std::vector<RecordFieldValue> sorted {fields.begin(), fields.end()};
+        if (!std::ranges::all_of(sorted, [this](const auto &field) { return valid(field.value); })) {
+            return std::unexpected(error(VmErrorCode::invalid_handle, "record contains an invalid VM handle"));
+        }
+        std::ranges::sort(sorted, {}, &RecordFieldValue::field_id);
+        if (std::ranges::adjacent_find(sorted, [](const auto &left, const auto &right) {
+                return left.field_id == right.field_id;
+            }) != sorted.end()) {
+            return std::unexpected(error(VmErrorCode::value_error, "record contains duplicate field IDs"));
+        }
+        return impl_->allocate(Impl::Object {
+            .kind = ValueKind::record,
+            .payload = Impl::RecordStorage {.schema = std::move(schema), .fields = std::move(sorted)},
         });
     }
 
@@ -887,7 +1308,8 @@ namespace rule_engine::python::vm {
             return std::unexpected(error(VmErrorCode::type_error, "map insert target is not a map"));
         }
         const auto key_kind = kind(key);
-        if (!key_kind || *key_kind == ValueKind::list || *key_kind == ValueKind::map) {
+        if (!key_kind || *key_kind == ValueKind::list || *key_kind == ValueKind::map ||
+            *key_kind == ValueKind::record) {
             return std::unexpected(error(VmErrorCode::type_error, "unhashable map key"));
         }
         auto &entries = std::get<Impl::MapStorage>(slot->object->payload).entries;
@@ -936,6 +1358,7 @@ namespace rule_engine::python::vm {
             case ValueKind::bytes: return !std::get<Impl::BytesStorage>((*object)->payload).bytes.empty();
             case ValueKind::list: return !std::get<Impl::ListStorage>((*object)->payload).values.empty();
             case ValueKind::map: return !std::get<Impl::MapStorage>((*object)->payload).entries.empty();
+            case ValueKind::record: return true;
         }
         return false;
     }
@@ -958,6 +1381,16 @@ namespace rule_engine::python::vm {
         const auto right_integer = impl_->integer_like(**right_object);
         if (left_integer.has_value() && right_integer.has_value()) {
             return compare(*left_integer, *right_integer);
+        }
+        if (left_integer.has_value() && (*right_object)->kind == ValueKind::floating) {
+            return compare_integer_float(*left_integer, std::get<double>((*right_object)->payload));
+        }
+        if (right_integer.has_value() && (*left_object)->kind == ValueKind::floating) {
+            auto order = compare_integer_float(*right_integer, std::get<double>((*left_object)->payload));
+            if (!order) {
+                return std::unexpected(order.error());
+            }
+            return -*order;
         }
         if ((*left_object)->kind == ValueKind::floating && (*right_object)->kind == ValueKind::floating) {
             const auto lhs = std::get<double>((*left_object)->payload);
@@ -996,10 +1429,15 @@ namespace rule_engine::python::vm {
         if (integer.has_value()) {
             if (operation == UnaryOperation::negative && !integer->is_zero()) {
                 integer->negative = !integer->negative;
+            } else if (operation == UnaryOperation::invert) {
+                *integer = subtract(BigInteger {.negative = true, .magnitude = "1"}, *integer);
             }
             return allocate_integer(integer->decimal());
         }
         if ((*object)->kind == ValueKind::floating) {
+            if (operation == UnaryOperation::invert) {
+                return std::unexpected(error(VmErrorCode::type_error, "bitwise inversion requires an integer"));
+            }
             const auto floating = std::get<double>((*object)->payload);
             return allocate_float(operation == UnaryOperation::negative ? -floating : floating);
         }
@@ -1021,37 +1459,197 @@ namespace rule_engine::python::vm {
         if (left_integer.has_value() && right_integer.has_value()) {
             const auto left_digits = left_integer->digits();
             const auto right_digits = right_integer->digits();
-            const auto maximum_result_digits = operation == BinaryOperation::multiply ?
-                                                   left_digits + right_digits :
-                                                   std::max(left_digits, right_digits) + 1U;
-            const auto scratch_multiplier = operation == BinaryOperation::multiply ? sizeof(unsigned) : 1U;
+            std::uint64_t operand_count {};
+            if (operation == BinaryOperation::power && right_integer->negative) {
+                operand_count = 0U;
+            } else if (operation == BinaryOperation::power || operation == BinaryOperation::left_shift ||
+                       operation == BinaryOperation::right_shift) {
+                auto count = bounded_unsigned(*right_integer, 1'000'000U,
+                                              operation == BinaryOperation::power ? "exponent" : "shift");
+                if (!count) {
+                    return std::unexpected(count.error());
+                }
+                operand_count = *count;
+            }
+
+            auto maximum_result_digits = std::max(left_digits, right_digits) + 1U;
+            if (operation == BinaryOperation::multiply) {
+                maximum_result_digits = left_digits + right_digits;
+            } else if (operation == BinaryOperation::power && !right_integer->negative) {
+                if (operand_count != 0U &&
+                    left_digits > (std::numeric_limits<std::size_t>::max() - 1U) / operand_count) {
+                    return std::unexpected(
+                        error(VmErrorCode::heap_budget_exhausted, "power result exceeds VM size accounting"));
+                }
+                maximum_result_digits = left_digits * static_cast<std::size_t>(operand_count) + 1U;
+            } else if (operation == BinaryOperation::left_shift) {
+                maximum_result_digits = left_digits + static_cast<std::size_t>(operand_count / 3U) + 2U;
+            }
+            const auto scratch_multiplier =
+                operation == BinaryOperation::multiply || operation == BinaryOperation::power ||
+                        operation == BinaryOperation::bit_or || operation == BinaryOperation::bit_xor ||
+                        operation == BinaryOperation::bit_and ?
+                    sizeof(unsigned) :
+                    1U;
             const auto remaining = impl_->maximum_live_bytes - impl_->stats.live_bytes;
+            const auto produces_float = operation == BinaryOperation::true_divide ||
+                                        (operation == BinaryOperation::power && right_integer->negative);
             if (remaining < sizeof(Impl::Object) ||
-                maximum_result_digits > (remaining - sizeof(Impl::Object)) / scratch_multiplier) {
+                (!produces_float && maximum_result_digits > (remaining - sizeof(Impl::Object)) / scratch_multiplier)) {
                 return std::unexpected(error(VmErrorCode::heap_budget_exhausted,
                                              "integer operation would exceed the live VM heap budget"));
             }
             if (work_charge != nullptr) {
                 const auto left_work = static_cast<std::uint64_t>(left_digits);
                 const auto right_work = static_cast<std::uint64_t>(right_digits);
-                *work_charge =
-                    operation == BinaryOperation::multiply ? left_work * right_work : std::max(left_work, right_work);
+                switch (operation) {
+                    case BinaryOperation::multiply:
+                    case BinaryOperation::floor_divide:
+                    case BinaryOperation::modulo: *work_charge = left_work * right_work; break;
+                    case BinaryOperation::power:
+                    case BinaryOperation::left_shift:
+                    case BinaryOperation::right_shift:
+                        *work_charge = left_work * std::max<std::uint64_t>(1U, operand_count);
+                        break;
+                    default: *work_charge = std::max(left_work, right_work); break;
+                }
             }
             BigInteger result;
             switch (operation) {
                 case BinaryOperation::add: result = add(*left_integer, *right_integer); break;
                 case BinaryOperation::subtract: result = subtract(*left_integer, *right_integer); break;
                 case BinaryOperation::multiply: result = multiply(*left_integer, *right_integer); break;
+                case BinaryOperation::true_divide: {
+                    if (right_integer->is_zero()) {
+                        return std::unexpected(error(VmErrorCode::arithmetic_error, "division by zero"));
+                    }
+                    auto lhs = as_double(*left_integer);
+                    auto rhs = as_double(*right_integer);
+                    if (!lhs) {
+                        return std::unexpected(lhs.error());
+                    }
+                    if (!rhs) {
+                        return std::unexpected(rhs.error());
+                    }
+                    return allocate_float(*lhs / *rhs);
+                }
+                case BinaryOperation::floor_divide:
+                case BinaryOperation::modulo: {
+                    auto divided = floor_divide(*left_integer, *right_integer);
+                    if (!divided) {
+                        return std::unexpected(divided.error());
+                    }
+                    result = operation == BinaryOperation::floor_divide ? std::move(divided->quotient) :
+                                                                          std::move(divided->remainder);
+                    break;
+                }
+                case BinaryOperation::power: {
+                    if (right_integer->negative) {
+                        auto lhs = as_double(*left_integer);
+                        auto rhs = as_double(*right_integer);
+                        if (!lhs) {
+                            return std::unexpected(lhs.error());
+                        }
+                        if (!rhs) {
+                            return std::unexpected(rhs.error());
+                        }
+                        if (*lhs == 0.0) {
+                            return std::unexpected(
+                                error(VmErrorCode::arithmetic_error, "zero cannot be raised to a negative power"));
+                        }
+                        return allocate_float(std::pow(*lhs, *rhs));
+                    }
+                    auto exponent = operand_count;
+                    result = BigInteger {.negative = false, .magnitude = "1"};
+                    auto factor = *left_integer;
+                    while (exponent != 0U) {
+                        if ((exponent & 1U) != 0U) {
+                            result = multiply(result, factor);
+                        }
+                        exponent >>= 1U;
+                        if (exponent != 0U) {
+                            factor = multiply(factor, factor);
+                        }
+                    }
+                    break;
+                }
+                case BinaryOperation::left_shift:
+                    result = *left_integer;
+                    for (std::uint64_t count = 0U; count < operand_count; ++count) {
+                        result = multiply(result, BigInteger {.negative = false, .magnitude = "2"});
+                    }
+                    break;
+                case BinaryOperation::right_shift:
+                    result = *left_integer;
+                    for (std::uint64_t count = 0U; count < operand_count; ++count) {
+                        auto divided = floor_divide(result, BigInteger {.negative = false, .magnitude = "2"});
+                        if (!divided) {
+                            return std::unexpected(divided.error());
+                        }
+                        result = std::move(divided->quotient);
+                    }
+                    break;
+                case BinaryOperation::bit_or:
+                case BinaryOperation::bit_xor:
+                case BinaryOperation::bit_and: result = bitwise(*left_integer, *right_integer, operation); break;
             }
             return allocate_integer(result.decimal());
         }
-        if ((*left_object)->kind == ValueKind::floating && (*right_object)->kind == ValueKind::floating) {
-            const auto lhs = std::get<double>((*left_object)->payload);
-            const auto rhs = std::get<double>((*right_object)->payload);
+
+        const auto numeric_value = [](const Impl::Object &object) -> std::expected<double, VmError> {
+            if (object.kind == ValueKind::floating) {
+                return std::get<double>(object.payload);
+            }
+            if (object.kind == ValueKind::integer) {
+                return as_double(std::get<BigInteger>(object.payload));
+            }
+            if (object.kind == ValueKind::boolean) {
+                return std::get<bool>(object.payload) ? 1.0 : 0.0;
+            }
+            return std::unexpected(error(VmErrorCode::type_error, "value is not numeric"));
+        };
+        if ((*left_object)->kind == ValueKind::floating || (*right_object)->kind == ValueKind::floating) {
+            auto lhs_value = numeric_value(**left_object);
+            auto rhs_value = numeric_value(**right_object);
+            if (!lhs_value) {
+                return std::unexpected(lhs_value.error());
+            }
+            if (!rhs_value) {
+                return std::unexpected(rhs_value.error());
+            }
+            const auto lhs = *lhs_value;
+            const auto rhs = *rhs_value;
             switch (operation) {
                 case BinaryOperation::add: return allocate_float(lhs + rhs);
                 case BinaryOperation::subtract: return allocate_float(lhs - rhs);
                 case BinaryOperation::multiply: return allocate_float(lhs * rhs);
+                case BinaryOperation::true_divide:
+                    if (rhs == 0.0) {
+                        return std::unexpected(error(VmErrorCode::arithmetic_error, "division by zero"));
+                    }
+                    return allocate_float(lhs / rhs);
+                case BinaryOperation::floor_divide:
+                    if (rhs == 0.0) {
+                        return std::unexpected(error(VmErrorCode::arithmetic_error, "division by zero"));
+                    }
+                    return allocate_float(std::floor(lhs / rhs));
+                case BinaryOperation::modulo: {
+                    if (rhs == 0.0) {
+                        return std::unexpected(error(VmErrorCode::arithmetic_error, "modulo by zero"));
+                    }
+                    auto remainder = std::fmod(lhs, rhs);
+                    if (remainder != 0.0 && std::signbit(remainder) != std::signbit(rhs)) {
+                        remainder += rhs;
+                    }
+                    return allocate_float(remainder);
+                }
+                case BinaryOperation::power: return allocate_float(std::pow(lhs, rhs));
+                case BinaryOperation::left_shift:
+                case BinaryOperation::right_shift:
+                case BinaryOperation::bit_or:
+                case BinaryOperation::bit_xor:
+                case BinaryOperation::bit_and:
+                    return std::unexpected(error(VmErrorCode::type_error, "bitwise operation requires integers"));
             }
         }
         if (operation == BinaryOperation::add && (*left_object)->kind == ValueKind::unicode &&
@@ -1075,17 +1673,135 @@ namespace rule_engine::python::vm {
             }
             return allocate_unicode_codepoints(std::move(result));
         }
+        if (operation == BinaryOperation::add && (*left_object)->kind == ValueKind::bytes &&
+            (*right_object)->kind == ValueKind::bytes) {
+            const auto &prefix = std::get<Impl::BytesStorage>((*left_object)->payload).bytes;
+            const auto &suffix = std::get<Impl::BytesStorage>((*right_object)->payload).bytes;
+            const auto remaining = impl_->maximum_live_bytes - impl_->stats.live_bytes;
+            if (remaining < sizeof(Impl::Object) || prefix.size() > remaining - sizeof(Impl::Object) ||
+                suffix.size() > remaining - sizeof(Impl::Object) - prefix.size()) {
+                return std::unexpected(
+                    error(VmErrorCode::heap_budget_exhausted, "bytes operation would exceed the live VM heap budget"));
+            }
+            std::vector<std::byte> result = prefix;
+            result.insert(result.end(), suffix.begin(), suffix.end());
+            if (work_charge != nullptr) {
+                *work_charge = static_cast<std::uint64_t>(result.size());
+            }
+            return allocate_bytes(result);
+        }
+        if (operation == BinaryOperation::add && (*left_object)->kind == ValueKind::list &&
+            (*right_object)->kind == ValueKind::list) {
+            const auto &prefix = std::get<Impl::ListStorage>((*left_object)->payload).values;
+            const auto &suffix = std::get<Impl::ListStorage>((*right_object)->payload).values;
+            const auto remaining = impl_->maximum_live_bytes - impl_->stats.live_bytes;
+            if (remaining < sizeof(Impl::Object)) {
+                return std::unexpected(
+                    error(VmErrorCode::heap_budget_exhausted, "list operation would exceed the live VM heap budget"));
+            }
+            const auto capacity = (remaining - sizeof(Impl::Object)) / sizeof(PyValue);
+            if (prefix.size() > capacity || suffix.size() > capacity - prefix.size()) {
+                return std::unexpected(
+                    error(VmErrorCode::heap_budget_exhausted, "list operation would exceed the live VM heap budget"));
+            }
+            std::vector<PyValue> result = prefix;
+            result.insert(result.end(), suffix.begin(), suffix.end());
+            if (work_charge != nullptr) {
+                *work_charge = static_cast<std::uint64_t>(result.size());
+            }
+            return allocate_list(result);
+        }
         return std::unexpected(error(VmErrorCode::type_error, "binary operands have incompatible types"));
     }
 
     std::expected<bool, VmError> ValueHeap::compare_operation(const CompareOperation operation, const PyValue left,
                                                               const PyValue right) const {
+        if (operation == CompareOperation::identity || operation == CompareOperation::not_identity) {
+            const auto identical = left == right;
+            return operation == CompareOperation::identity ? identical : !identical;
+        }
         if (operation == CompareOperation::equal || operation == CompareOperation::not_equal) {
             auto same = equal(left, right);
             if (!same) {
                 return std::unexpected(same.error());
             }
             return operation == CompareOperation::equal ? *same : !*same;
+        }
+        if (operation == CompareOperation::contains || operation == CompareOperation::not_contains) {
+            auto container = impl_->object(right);
+            if (!container) {
+                return std::unexpected(container.error());
+            }
+            bool found {};
+            switch ((*container)->kind) {
+                case ValueKind::list:
+                    for (const auto item : std::get<Impl::ListStorage>((*container)->payload).values) {
+                        auto same = equal(left, item);
+                        if (!same) {
+                            return std::unexpected(same.error());
+                        }
+                        if (*same) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    break;
+                case ValueKind::map:
+                    for (const auto &[key, value] : std::get<Impl::MapStorage>((*container)->payload).entries) {
+                        static_cast<void>(value);
+                        auto same = equal(left, key);
+                        if (!same) {
+                            return std::unexpected(same.error());
+                        }
+                        if (*same) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    break;
+                case ValueKind::unicode: {
+                    auto needle = impl_->object(left);
+                    if (!needle) {
+                        return std::unexpected(needle.error());
+                    }
+                    if ((*needle)->kind != ValueKind::unicode) {
+                        return std::unexpected(
+                            error(VmErrorCode::type_error, "Unicode containment requires a Unicode needle"));
+                    }
+                    const auto &needle_points = std::get<Impl::UnicodeStorage>((*needle)->payload).codepoints;
+                    const auto &haystack = std::get<Impl::UnicodeStorage>((*container)->payload).codepoints;
+                    found = std::ranges::search(haystack, needle_points).begin() != haystack.end();
+                    break;
+                }
+                case ValueKind::bytes: {
+                    auto needle = impl_->object(left);
+                    if (!needle) {
+                        return std::unexpected(needle.error());
+                    }
+                    const auto &haystack = std::get<Impl::BytesStorage>((*container)->payload).bytes;
+                    if (const auto integer = impl_->integer_like(**needle); integer.has_value()) {
+                        auto byte = bounded_unsigned(*integer, 255U, "byte membership");
+                        if (!byte) {
+                            return std::unexpected(byte.error());
+                        }
+                        found = std::ranges::find(haystack, static_cast<std::byte>(*byte)) != haystack.end();
+                    } else if ((*needle)->kind == ValueKind::bytes) {
+                        const auto &needle_bytes = std::get<Impl::BytesStorage>((*needle)->payload).bytes;
+                        found = std::ranges::search(haystack, needle_bytes).begin() != haystack.end();
+                    } else {
+                        return std::unexpected(
+                            error(VmErrorCode::type_error, "bytes containment requires an integer or bytes needle"));
+                    }
+                    break;
+                }
+                case ValueKind::none:
+                case ValueKind::boolean:
+                case ValueKind::integer:
+                case ValueKind::floating:
+                case ValueKind::record:
+                    return std::unexpected(error(VmErrorCode::type_error, "right operand is not a container"));
+            }
+            return operation == CompareOperation::contains ? found : !found;
         }
         auto order = compare_values(left, right);
         if (!order) {
@@ -1097,7 +1813,11 @@ namespace rule_engine::python::vm {
             case CompareOperation::greater: return *order > 0;
             case CompareOperation::greater_equal: return *order >= 0;
             case CompareOperation::equal:
-            case CompareOperation::not_equal: break;
+            case CompareOperation::not_equal:
+            case CompareOperation::identity:
+            case CompareOperation::not_identity:
+            case CompareOperation::contains:
+            case CompareOperation::not_contains: break;
         }
         return false;
     }
@@ -1135,6 +1855,28 @@ namespace rule_engine::python::vm {
         return std::get<Impl::ListStorage>((*object)->payload).values;
     }
 
+    std::expected<SchemaId, VmError> ValueHeap::record_schema(const PyValue value) const {
+        auto object = impl_->object(value);
+        if (!object) {
+            return std::unexpected(object.error());
+        }
+        if ((*object)->kind != ValueKind::record) {
+            return std::unexpected(error(VmErrorCode::type_error, "VM value is not a record"));
+        }
+        return std::get<Impl::RecordStorage>((*object)->payload).schema;
+    }
+
+    std::expected<std::vector<RecordFieldValue>, VmError> ValueHeap::record_fields(const PyValue value) const {
+        auto object = impl_->object(value);
+        if (!object) {
+            return std::unexpected(object.error());
+        }
+        if ((*object)->kind != ValueKind::record) {
+            return std::unexpected(error(VmErrorCode::type_error, "VM value is not a record"));
+        }
+        return std::get<Impl::RecordStorage>((*object)->payload).fields;
+    }
+
     std::expected<FrozenValue, FreezeError> ValueHeap::freeze(const PyValue value, DataLabel label,
                                                               const FreezeLimits limits) const {
         Impl::FreezeState state {
@@ -1158,6 +1900,119 @@ namespace rule_engine::python::vm {
     std::expected<PyValue, VmError> ValueHeap::thaw(const FactValue &value) {
         std::unordered_set<const FactNode *> path;
         return impl_->thaw_value(value, path, 0U);
+    }
+
+    std::expected<void, FreezeError> ValueHeap::validate_schema(const FactValue &value, const SchemaId &expected_schema,
+                                                                const SchemaCatalog *const schemas) {
+        const auto mismatch = [](std::string message) {
+            return std::unexpected(FreezeError {
+                .code = FreezeErrorCode::schema_mismatch, .message = std::move(message), .span = std::nullopt});
+        };
+        if (!value.valid() || expected_schema.empty()) {
+            return mismatch("boundary value or expected schema is empty");
+        }
+        const auto &data = value.node->data;
+        const auto &id = expected_schema.value;
+        const auto primitive_matches = [&]() {
+            if (id == "any") {
+                return true;
+            }
+            if (id == "none" || id == "null") {
+                return std::holds_alternative<std::monostate>(data);
+            }
+            if (id == "bool" || id == "boolean") {
+                return std::holds_alternative<bool>(data);
+            }
+            if (id == "int" || id == "integer") {
+                return std::holds_alternative<IntegerValue>(data);
+            }
+            if (id == "float") {
+                return std::holds_alternative<double>(data);
+            }
+            if (id == "str" || id == "string" || id == "text" || id == "unicode") {
+                return std::holds_alternative<UnicodeValue>(data);
+            }
+            if (id == "bytes") {
+                return std::holds_alternative<BytesValue>(data);
+            }
+            if (id == "list") {
+                return std::holds_alternative<FactList>(data);
+            }
+            if (id == "map") {
+                return std::holds_alternative<FactMap>(data);
+            }
+            return false;
+        };
+        if (primitive_matches()) {
+            return {};
+        }
+
+        if (const auto *enumeration = std::get_if<EnumValue>(&data); enumeration != nullptr) {
+            return enumeration->schema == expected_schema ? std::expected<void, FreezeError> {} :
+                                                            mismatch("enum schema does not match boundary schema");
+        }
+        const auto *record = std::get_if<FactRecord>(&data);
+        if (record == nullptr || record->schema != expected_schema) {
+            return mismatch("record schema does not match boundary schema");
+        }
+        if (schemas == nullptr) {
+            return {};
+        }
+        const auto descriptor = std::ranges::find(schemas->descriptors, expected_schema, &SchemaDescriptor::id);
+        if (descriptor == schemas->descriptors.end()) {
+            return mismatch("expected schema is absent from the active catalog");
+        }
+        for (const auto &schema_field : descriptor->fields) {
+            const auto field = std::ranges::find(record->fields, schema_field.field_id, &FactRecordField::field_id);
+            if (field == record->fields.end()) {
+                if (!schema_field.optional) {
+                    return mismatch("record is missing required schema field " + std::to_string(schema_field.field_id));
+                }
+                continue;
+            }
+            if (auto valid = validate_schema(field->value, schema_field.type, schemas); !valid) {
+                return valid;
+            }
+        }
+        for (const auto &field : record->fields) {
+            if (std::ranges::find(descriptor->fields, field.field_id, &SchemaField::field_id) ==
+                descriptor->fields.end()) {
+                return mismatch("record contains unknown schema field " + std::to_string(field.field_id));
+            }
+        }
+        return {};
+    }
+
+    std::expected<PyValue, FreezeError> ValueHeap::validate_frozen(const FrozenValue &value,
+                                                                   const std::optional<SchemaId> expected_schema,
+                                                                   const SchemaCatalog *const schemas,
+                                                                   const FreezeLimits limits) {
+        if (!value.value.valid() || value.canonical_digest.empty()) {
+            return std::unexpected(FreezeError {.code = FreezeErrorCode::invalid_handle,
+                                                .message = "frozen boundary value is incomplete",
+                                                .span = std::nullopt});
+        }
+        if (expected_schema.has_value()) {
+            if (auto valid = validate_schema(value.value, *expected_schema, schemas); !valid) {
+                return std::unexpected(std::move(valid.error()));
+            }
+        }
+        auto thawed = thaw(value.value);
+        if (!thawed) {
+            return std::unexpected(FreezeError {.code = FreezeErrorCode::unsupported_type,
+                                                .message = std::move(thawed.error().message),
+                                                .span = thawed.error().span});
+        }
+        auto canonical = freeze(*thawed, value.label, limits);
+        if (!canonical) {
+            return std::unexpected(std::move(canonical.error()));
+        }
+        if (canonical->canonical_digest != value.canonical_digest) {
+            return std::unexpected(FreezeError {.code = FreezeErrorCode::schema_mismatch,
+                                                .message = "frozen boundary digest is not canonical",
+                                                .span = std::nullopt});
+        }
+        return *thawed;
     }
 
     std::expected<std::size_t, VmError> ValueHeap::collect(const std::span<const PyValue> roots) {
@@ -1184,6 +2039,10 @@ namespace rule_engine::python::vm {
                 for (const auto &[key, item] : std::get<Impl::MapStorage>(slot->object->payload).entries) {
                     worklist.push_back(key);
                     worklist.push_back(item);
+                }
+            } else if (slot->object->kind == ValueKind::record) {
+                for (const auto &field : std::get<Impl::RecordStorage>(slot->object->payload).fields) {
+                    worklist.push_back(field.value);
                 }
             }
         }
