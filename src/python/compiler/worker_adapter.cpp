@@ -91,7 +91,7 @@ namespace rule_engine::python::compiler {
                 .runtime = client_.runtime.descriptor,
                 .payload = {.schema = std::string {packaging::static_source_schema_v1},
                             .source = source.id,
-                            .source_digest = pack.closure_digest,
+                            .source_digest = source.digest,
                             .bytes = source_bytes(source.utf8)},
                 .hash_seed = 0U,
                 .generator_execution_authorized = false,
