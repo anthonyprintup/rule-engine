@@ -256,7 +256,7 @@ namespace rule_engine::python::optimizer {
                                                 const ShadowParityLimits limits) {
         ShadowParityReport report;
 
-        if (exact.outcome != optimized.outcome) {
+        if (exact.evaluation.outcome != optimized.evaluation.outcome) {
             add_mismatch(report, limits,
                          RedactedShadowMismatch {
                              .dimension = ShadowParityDimension::outcome,
@@ -265,12 +265,12 @@ namespace rule_engine::python::optimizer {
                              .first_difference_index = 0,
                          });
         }
-        if (exact.verdict != optimized.verdict) {
+        if (exact.evaluation.verdict != optimized.evaluation.verdict) {
             add_mismatch(report, limits,
                          RedactedShadowMismatch {
                              .dimension = ShadowParityDimension::verdict,
-                             .exact_count = exact.verdict.has_value() ? 1u : 0u,
-                             .optimized_count = optimized.verdict.has_value() ? 1u : 0u,
+                             .exact_count = exact.evaluation.verdict.has_value() ? 1u : 0u,
+                             .optimized_count = optimized.evaluation.verdict.has_value() ? 1u : 0u,
                              .first_difference_index = 0,
                          });
         }
@@ -286,25 +286,25 @@ namespace rule_engine::python::optimizer {
                              .first_difference_index = difference,
                          });
         }
-        if (const auto difference =
-                first_difference(std::span {exact.ordered_effects}, std::span {optimized.ordered_effects}, same_effect);
+        if (const auto difference = first_difference(std::span {exact.evaluation.committed_effects},
+                                                     std::span {optimized.evaluation.committed_effects}, same_effect);
             difference.has_value()) {
             add_mismatch(report, limits,
                          RedactedShadowMismatch {
                              .dimension = ShadowParityDimension::ordered_effects,
-                             .exact_count = exact.ordered_effects.size(),
-                             .optimized_count = optimized.ordered_effects.size(),
+                             .exact_count = exact.evaluation.committed_effects.size(),
+                             .optimized_count = optimized.evaluation.committed_effects.size(),
                              .first_difference_index = difference,
                          });
         }
-        if (const auto difference =
-                first_difference(std::span {exact.ordered_state}, std::span {optimized.ordered_state}, same_state);
+        if (const auto difference = first_difference(std::span {exact.evaluation.state_mutations},
+                                                     std::span {optimized.evaluation.state_mutations}, same_state);
             difference.has_value()) {
             add_mismatch(report, limits,
                          RedactedShadowMismatch {
                              .dimension = ShadowParityDimension::state,
-                             .exact_count = exact.ordered_state.size(),
-                             .optimized_count = optimized.ordered_state.size(),
+                             .exact_count = exact.evaluation.state_mutations.size(),
+                             .optimized_count = optimized.evaluation.state_mutations.size(),
                              .first_difference_index = difference,
                          });
         }
@@ -319,12 +319,23 @@ namespace rule_engine::python::optimizer {
                              .first_difference_index = difference,
                          });
         }
-        if (!same_fault(exact.fault, optimized.fault)) {
+        if (!same_fault(exact.evaluation.fault, optimized.evaluation.fault)) {
+            add_mismatch(
+                report, limits,
+                RedactedShadowMismatch {
+                    .dimension = ShadowParityDimension::fault,
+                    .exact_count = exact.evaluation.fault.has_value() ? exact.evaluation.fault->frames.size() : 0u,
+                    .optimized_count =
+                        optimized.evaluation.fault.has_value() ? optimized.evaluation.fault->frames.size() : 0u,
+                    .first_difference_index = 0,
+                });
+        }
+        if (exact.resources != optimized.resources) {
             add_mismatch(report, limits,
                          RedactedShadowMismatch {
-                             .dimension = ShadowParityDimension::fault,
-                             .exact_count = exact.fault.has_value() ? exact.fault->frames.size() : 0u,
-                             .optimized_count = optimized.fault.has_value() ? optimized.fault->frames.size() : 0u,
+                             .dimension = ShadowParityDimension::semantic_resources,
+                             .exact_count = 1,
+                             .optimized_count = 1,
                              .first_difference_index = 0,
                          });
         }

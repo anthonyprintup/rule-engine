@@ -1,8 +1,5 @@
 #include "rule_engine/python/optimizer/scanner.hpp"
-
-#if defined(RULE_ENGINE_PYTHON_OPTIMIZER_HAS_RE2)
-#include <re2/re2.h>
-#endif
+#include "re2_bridge.hpp"
 
 #include <algorithm>
 #include <array>
@@ -10,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -28,6 +26,68 @@ namespace rule_engine::python::optimizer {
                 .input_offset = input_offset,
                 .message = std::move(message),
             };
+        }
+
+        struct Re2CallContext {
+            std::array<char, 512> message {};
+            rule_engine_re2_bridge_options options {
+                .structure_size = sizeof(rule_engine_re2_bridge_options),
+                .abi_version = RULE_ENGINE_RE2_BRIDGE_ABI_VERSION,
+                .encoding = RULE_ENGINE_RE2_BRIDGE_ENCODING_UTF8,
+                .case_sensitive = 1,
+                .dot_nl = 0,
+                .multiline = 0,
+                .reserved = {},
+            };
+            rule_engine_re2_bridge_diagnostic diagnostic {
+                .message_data = message.data(),
+                .message_capacity = message.size(),
+                .message_size = 0,
+                .pattern_offset = RULE_ENGINE_RE2_BRIDGE_NO_PATTERN_OFFSET,
+                .message_truncated = 0,
+                .reserved = {},
+            };
+        };
+
+        struct Re2PatternDeleter {
+            void operator()(rule_engine_re2_bridge_pattern *pattern) const noexcept {
+                rule_engine_re2_bridge_destroy_pattern(pattern);
+            }
+        };
+
+        using CompiledRe2Pattern = std::unique_ptr<rule_engine_re2_bridge_pattern, Re2PatternDeleter>;
+
+        void configure_re2_context(Re2CallContext &context, const RegexOptions &options) noexcept {
+            context.options.encoding = options.encoding == RegexEncoding::utf8 ? RULE_ENGINE_RE2_BRIDGE_ENCODING_UTF8 :
+                                                                                 RULE_ENGINE_RE2_BRIDGE_ENCODING_LATIN1;
+            context.options.case_sensitive = options.case_sensitive ? 1U : 0U;
+            context.options.dot_nl = options.dot_matches_newline ? 1U : 0U;
+            context.options.multiline = options.multiline ? 1U : 0U;
+        }
+
+        [[nodiscard]] ScanError re2_error(const rule_engine_re2_bridge_status status, const Re2CallContext &context,
+                                          const std::string &pattern_id) {
+            const auto code =
+                status == RULE_ENGINE_RE2_BRIDGE_STATUS_REGEX_SYNTAX       ? ScanErrorCode::regex_syntax :
+                status == RULE_ENGINE_RE2_BRIDGE_STATUS_RESOURCE_EXHAUSTED ? ScanErrorCode::regex_resource_exhausted :
+                                                                             ScanErrorCode::invalid_pattern;
+            const auto message_size =
+                std::min<std::size_t>(context.diagnostic.message_size, context.message.size() - 1U);
+            auto message = std::string {context.message.data(), message_size};
+            if (message.empty()) {
+                message = "RE2 bridge rejected the pattern or options";
+            } else if (context.diagnostic.message_truncated != 0) {
+                message += " [diagnostic truncated]";
+            }
+            const auto offset = context.diagnostic.pattern_offset == RULE_ENGINE_RE2_BRIDGE_NO_PATTERN_OFFSET ?
+                                    0U :
+                                    static_cast<std::size_t>(context.diagnostic.pattern_offset);
+            return error(code, std::move(message), pattern_id, offset);
+        }
+
+        [[nodiscard]] bool default_regex_options(const RegexOptions &options) noexcept {
+            return options.encoding == RegexEncoding::utf8 && options.case_sensitive && !options.dot_matches_newline &&
+                   !options.multiline;
         }
 
         [[nodiscard]] std::byte ascii_lower(const std::byte value) noexcept {
@@ -101,6 +161,62 @@ namespace rule_engine::python::optimizer {
             output.push_back(low);
         }
 
+        [[nodiscard]] std::uint16_t read_u16(const std::span<const std::byte> input, const std::size_t offset,
+                                             const TextEncoding encoding) noexcept {
+            const auto first = std::to_integer<std::uint16_t>(input[offset]);
+            const auto second = std::to_integer<std::uint16_t>(input[offset + 1U]);
+            return encoding == TextEncoding::utf16_little_endian ? static_cast<std::uint16_t>(first | (second << 8U)) :
+                                                                   static_cast<std::uint16_t>((first << 8U) | second);
+        }
+
+        [[nodiscard]] std::expected<void, ScanError> validate_encoded_text(const StaticScanPattern &pattern) {
+            if (pattern.text_encoding == TextEncoding::utf8) {
+                const auto *characters = reinterpret_cast<const char *>(pattern.bytes.data());
+                const std::string_view input {characters, pattern.bytes.size()};
+                std::size_t offset {};
+                while (offset < input.size()) {
+                    const auto scalar = decode_utf8_code_point(input, offset, pattern.pattern_id);
+                    if (!scalar.has_value()) {
+                        return std::unexpected(scalar.error());
+                    }
+                }
+                return {};
+            }
+            if (pattern.text_encoding != TextEncoding::utf16_little_endian &&
+                pattern.text_encoding != TextEncoding::utf16_big_endian) {
+                return std::unexpected(
+                    error(ScanErrorCode::invalid_pattern, "text encoding is unknown", pattern.pattern_id));
+            }
+            if ((pattern.bytes.size() & 1U) != 0U) {
+                return std::unexpected(error(ScanErrorCode::invalid_pattern, "UTF-16 text pattern has odd byte length",
+                                             pattern.pattern_id));
+            }
+            for (std::size_t offset = 0; offset < pattern.bytes.size(); offset += 2U) {
+                const auto unit = read_u16(pattern.bytes, offset, pattern.text_encoding);
+                if (unit >= 0xDC00U && unit <= 0xDFFFU) {
+                    return std::unexpected(error(ScanErrorCode::invalid_pattern,
+                                                 "UTF-16 text pattern has an unpaired low surrogate",
+                                                 pattern.pattern_id, offset));
+                }
+                if (unit < 0xD800U || unit > 0xDBFFU) {
+                    continue;
+                }
+                if (offset + 3U >= pattern.bytes.size()) {
+                    return std::unexpected(error(ScanErrorCode::invalid_pattern,
+                                                 "UTF-16 text pattern has a truncated surrogate pair",
+                                                 pattern.pattern_id, offset));
+                }
+                const auto low = read_u16(pattern.bytes, offset + 2U, pattern.text_encoding);
+                if (low < 0xDC00U || low > 0xDFFFU) {
+                    return std::unexpected(error(ScanErrorCode::invalid_pattern,
+                                                 "UTF-16 text pattern has an invalid surrogate pair",
+                                                 pattern.pattern_id, offset));
+                }
+                offset += 2U;
+            }
+            return {};
+        }
+
         [[nodiscard]] std::expected<std::vector<std::byte>, ScanError>
         encode_text(const std::string_view utf8, const TextEncoding encoding, const std::string &pattern_id) {
             std::vector<std::byte> result;
@@ -154,6 +270,23 @@ namespace rule_engine::python::optimizer {
                                         const std::size_t offset) noexcept {
             if (pattern.bytes.size() > input.size() - offset) {
                 return false;
+            }
+            if (pattern.kind == StaticPatternKind::text_literal && pattern.ascii_case_insensitive &&
+                pattern.text_encoding != TextEncoding::utf8) {
+                for (std::size_t index = 0; index < pattern.bytes.size(); index += 2U) {
+                    auto actual = read_u16(input, offset + index, pattern.text_encoding);
+                    auto expected = read_u16(pattern.bytes, index, pattern.text_encoding);
+                    if (actual >= static_cast<std::uint16_t>('A') && actual <= static_cast<std::uint16_t>('Z')) {
+                        actual = static_cast<std::uint16_t>(actual + static_cast<std::uint16_t>('a' - 'A'));
+                    }
+                    if (expected >= static_cast<std::uint16_t>('A') && expected <= static_cast<std::uint16_t>('Z')) {
+                        expected = static_cast<std::uint16_t>(expected + static_cast<std::uint16_t>('a' - 'A'));
+                    }
+                    if (actual != expected) {
+                        return false;
+                    }
+                }
+                return true;
             }
             for (std::size_t index = 0; index < pattern.bytes.size(); ++index) {
                 auto actual = input[offset + index];
@@ -232,38 +365,35 @@ namespace rule_engine::python::optimizer {
         [[nodiscard]] std::expected<void, ScanError>
         scan_regex_pattern(MatchSet &result, const ExplicitScanSpace &space, const TypedScanPlan &plan,
                            const std::span<const std::byte> input, const StaticScanPattern &pattern) {
-#if defined(RULE_ENGINE_PYTHON_OPTIMIZER_HAS_RE2)
-            re2::RE2::Options options;
-            options.set_log_errors(false);
-            options.set_never_capture(true);
-            options.set_case_sensitive(pattern.regex_options.case_sensitive);
-            options.set_dot_nl(pattern.regex_options.dot_matches_newline);
-            options.set_one_line(pattern.regex_options.one_line);
-            options.set_encoding(pattern.regex_options.encoding == RegexEncoding::utf8 ?
-                                     re2::RE2::Options::EncodingUTF8 :
-                                     re2::RE2::Options::EncodingLatin1);
-            const re2::RE2 expression {pattern.regex_source, options};
-            if (!expression.ok()) {
-                const auto source_begin = reinterpret_cast<std::uintptr_t>(pattern.regex_source.data());
-                const auto source_end = source_begin + pattern.regex_source.size();
-                const auto argument = reinterpret_cast<std::uintptr_t>(expression.error_arg().data());
-                const auto error_offset = argument >= source_begin && argument <= source_end ?
-                                              static_cast<std::size_t>(argument - source_begin) :
-                                              0U;
-                return std::unexpected(
-                    error(ScanErrorCode::regex_syntax, expression.error(), pattern.pattern_id, error_offset));
+            Re2CallContext context;
+            configure_re2_context(context, pattern.regex_options);
+            rule_engine_re2_bridge_pattern *raw_compiled {};
+            const auto compile_status = rule_engine_re2_bridge_compile_pattern(
+                reinterpret_cast<const std::uint8_t *>(pattern.regex_source.data()),
+                static_cast<std::uint64_t>(pattern.regex_source.size()), &context.options, &raw_compiled,
+                &context.diagnostic);
+            CompiledRe2Pattern compiled {raw_compiled};
+            if (compile_status != RULE_ENGINE_RE2_BRIDGE_STATUS_OK) {
+                return std::unexpected(re2_error(compile_status, context, pattern.pattern_id));
             }
-
-            const auto *characters = reinterpret_cast<const char *>(input.data());
-            const re2::StringPiece text {characters, input.size()};
-            std::size_t cursor {};
+            std::uint64_t cursor {};
             while (cursor <= input.size()) {
-                std::array<re2::StringPiece, 1> match;
-                if (!expression.Match(text, cursor, input.size(), re2::RE2::UNANCHORED, match.data(), 1)) {
+                rule_engine_re2_bridge_match match {};
+                const auto status = rule_engine_re2_bridge_find_next_compiled(
+                    compiled.get(), reinterpret_cast<const std::uint8_t *>(input.data()),
+                    static_cast<std::uint64_t>(input.size()), cursor, &match, &context.diagnostic);
+                if (status == RULE_ENGINE_RE2_BRIDGE_STATUS_NO_MATCH) {
                     break;
                 }
-                const auto offset = static_cast<std::size_t>(match.front().data() - characters);
-                const auto length = match.front().size();
+                if (status != RULE_ENGINE_RE2_BRIDGE_STATUS_OK) {
+                    return std::unexpected(re2_error(status, context, pattern.pattern_id));
+                }
+                if (match.offset > input.size() || match.length > input.size() - match.offset) {
+                    return std::unexpected(error(ScanErrorCode::invalid_pattern,
+                                                 "RE2 bridge returned a match outside the input", pattern.pattern_id));
+                }
+                const auto offset = static_cast<std::size_t>(match.offset);
+                const auto length = static_cast<std::size_t>(match.length);
                 const auto appended = append_match(result, space, plan, input, pattern, offset, length);
                 if (!appended.has_value()) {
                     return appended;
@@ -272,27 +402,21 @@ namespace rule_engine::python::optimizer {
                     if (offset == input.size()) {
                         break;
                     }
-                    cursor = offset + 1U;
+                    cursor = static_cast<std::uint64_t>(offset) + 1U;
                 } else {
-                    cursor = offset + length;
+                    cursor = static_cast<std::uint64_t>(offset + length);
                 }
             }
             return {};
-#else
-            static_cast<void>(result);
-            static_cast<void>(space);
-            static_cast<void>(plan);
-            static_cast<void>(input);
-            return std::unexpected(
-                error(ScanErrorCode::regex_engine_unavailable, "RE2 support is not linked", pattern.pattern_id));
-#endif
         }
 
         [[nodiscard]] std::expected<void, ScanError> validate_plan(const ExplicitScanSpace &space,
                                                                    const TypedScanPlan &plan) {
-            if (space.identity.empty() || space.size == 0 || (space.permissions & scan_permission_read) == 0) {
+            constexpr auto known_permissions = scan_permission_read | scan_permission_write | scan_permission_execute;
+            if (space.identity.empty() || space.size == 0 || (space.permissions & scan_permission_read) == 0 ||
+                (space.permissions & ~known_permissions) != 0) {
                 return std::unexpected(error(ScanErrorCode::invalid_space,
-                                             "scan space must have identity, non-zero size, and read permission"));
+                                             "scan space must have identity, bounds, and known read permission"));
             }
             switch (space.kind) {
                 case ScanSpaceKind::image_file:
@@ -327,23 +451,48 @@ namespace rule_engine::python::optimizer {
                 }
                 switch (pattern.kind) {
                     case StaticPatternKind::byte_literal:
-                    case StaticPatternKind::text_literal:
-                        if (pattern.bytes.empty() || !pattern.mask.empty() || !pattern.regex_source.empty()) {
+                        if (pattern.bytes.empty() || !pattern.mask.empty() || !pattern.regex_source.empty() ||
+                            pattern.text_encoding != TextEncoding::utf8 || pattern.ascii_case_insensitive ||
+                            !default_regex_options(pattern.regex_options)) {
                             return std::unexpected(error(ScanErrorCode::invalid_pattern,
-                                                         "literal pattern representation is inconsistent",
+                                                         "byte literal representation is inconsistent",
                                                          pattern.pattern_id));
+                        }
+                        break;
+                    case StaticPatternKind::text_literal:
+                        if (pattern.bytes.empty() || !pattern.mask.empty() || !pattern.regex_source.empty() ||
+                            !default_regex_options(pattern.regex_options)) {
+                            return std::unexpected(error(ScanErrorCode::invalid_pattern,
+                                                         "text literal representation is inconsistent",
+                                                         pattern.pattern_id));
+                        }
+                        if (const auto valid = validate_encoded_text(pattern); !valid.has_value()) {
+                            return valid;
                         }
                         break;
                     case StaticPatternKind::masked_bytes:
                         if (pattern.bytes.empty() || pattern.mask.size() != pattern.bytes.size() ||
-                            !pattern.regex_source.empty()) {
+                            !pattern.regex_source.empty() || pattern.ascii_case_insensitive ||
+                            pattern.text_encoding != TextEncoding::utf8 ||
+                            !default_regex_options(pattern.regex_options)) {
                             return std::unexpected(error(ScanErrorCode::invalid_pattern,
                                                          "masked pattern representation is inconsistent",
                                                          pattern.pattern_id));
                         }
+                        for (std::size_t index = 0; index < pattern.mask.size(); ++index) {
+                            const auto mask = std::to_integer<std::uint8_t>(pattern.mask[index]);
+                            const auto byte = std::to_integer<std::uint8_t>(pattern.bytes[index]);
+                            if ((mask != 0U && mask != 0x0FU && mask != 0xF0U && mask != 0xFFU) ||
+                                (byte & static_cast<std::uint8_t>(~mask)) != 0U) {
+                                return std::unexpected(error(ScanErrorCode::invalid_pattern,
+                                                             "masked pattern contains a noncanonical nibble mask",
+                                                             pattern.pattern_id, index));
+                            }
+                        }
                         break;
                     case StaticPatternKind::re2_regex:
-                        if (!pattern.bytes.empty() || !pattern.mask.empty() || pattern.regex_source.empty()) {
+                        if (!pattern.bytes.empty() || !pattern.mask.empty() || pattern.regex_source.empty() ||
+                            pattern.text_encoding != TextEncoding::utf8 || pattern.ascii_case_insensitive) {
                             return std::unexpected(error(ScanErrorCode::invalid_pattern,
                                                          "regex pattern representation is inconsistent",
                                                          pattern.pattern_id));
@@ -382,6 +531,7 @@ namespace rule_engine::python::optimizer {
             .origin = origin,
             .bytes = std::vector<std::byte> {bytes.begin(), bytes.end()},
             .mask = {},
+            .text_encoding = TextEncoding::utf8,
             .ascii_case_insensitive = false,
             .regex_source = {},
             .regex_options = {},
@@ -395,6 +545,12 @@ namespace rule_engine::python::optimizer {
             return std::unexpected(error(ScanErrorCode::invalid_pattern, "text pattern requires non-empty ID and text",
                                          std::move(pattern_id)));
         }
+        if ((encoding != TextEncoding::utf8 && encoding != TextEncoding::utf16_little_endian &&
+             encoding != TextEncoding::utf16_big_endian) ||
+            (text_case != TextCase::sensitive && text_case != TextCase::ascii_insensitive)) {
+            return std::unexpected(
+                error(ScanErrorCode::invalid_pattern, "text pattern encoding or case mode is unknown", pattern_id));
+        }
         auto encoded = encode_text(utf8, encoding, pattern_id);
         if (!encoded.has_value()) {
             return std::unexpected(std::move(encoded.error()));
@@ -405,6 +561,7 @@ namespace rule_engine::python::optimizer {
             .origin = origin,
             .bytes = std::move(*encoded),
             .mask = {},
+            .text_encoding = encoding,
             .ascii_case_insensitive = text_case == TextCase::ascii_insensitive,
             .regex_source = {},
             .regex_options = {},
@@ -467,6 +624,7 @@ namespace rule_engine::python::optimizer {
             .origin = origin,
             .bytes = std::move(bytes),
             .mask = std::move(mask),
+            .text_encoding = TextEncoding::utf8,
             .ascii_case_insensitive = false,
             .regex_source = {},
             .regex_options = {},
@@ -481,24 +639,21 @@ namespace rule_engine::python::optimizer {
             return std::unexpected(error(ScanErrorCode::invalid_pattern,
                                          "regex pattern requires non-empty ID and expression", std::move(pattern_id)));
         }
-#if defined(RULE_ENGINE_PYTHON_OPTIMIZER_HAS_RE2)
-        re2::RE2::Options re2_options;
-        re2_options.set_log_errors(false);
-        re2_options.set_never_capture(true);
-        re2_options.set_case_sensitive(options.case_sensitive);
-        re2_options.set_dot_nl(options.dot_matches_newline);
-        re2_options.set_one_line(options.one_line);
-        re2_options.set_encoding(options.encoding == RegexEncoding::utf8 ? re2::RE2::Options::EncodingUTF8 :
-                                                                           re2::RE2::Options::EncodingLatin1);
-        const re2::RE2 compiled {expression, re2_options};
-        if (!compiled.ok()) {
-            const auto source_begin = reinterpret_cast<std::uintptr_t>(expression.data());
-            const auto source_end = source_begin + expression.size();
-            const auto argument = reinterpret_cast<std::uintptr_t>(compiled.error_arg().data());
-            const auto error_offset = argument >= source_begin && argument <= source_end ?
-                                          static_cast<std::size_t>(argument - source_begin) :
-                                          0U;
-            return std::unexpected(error(ScanErrorCode::regex_syntax, compiled.error(), pattern_id, error_offset));
+        switch (options.encoding) {
+            case RegexEncoding::utf8:
+            case RegexEncoding::latin1: break;
+            default:
+                return std::unexpected(
+                    error(ScanErrorCode::invalid_pattern, "regex encoding is unknown", std::move(pattern_id)));
+        }
+
+        Re2CallContext context;
+        configure_re2_context(context, options);
+        const auto status = rule_engine_re2_bridge_validate_pattern(
+            reinterpret_cast<const std::uint8_t *>(expression.data()), static_cast<std::uint64_t>(expression.size()),
+            &context.options, &context.diagnostic);
+        if (status != RULE_ENGINE_RE2_BRIDGE_STATUS_OK) {
+            return std::unexpected(re2_error(status, context, pattern_id));
         }
         return StaticScanPattern {
             .pattern_id = std::move(pattern_id),
@@ -506,24 +661,11 @@ namespace rule_engine::python::optimizer {
             .origin = origin,
             .bytes = {},
             .mask = {},
+            .text_encoding = TextEncoding::utf8,
             .ascii_case_insensitive = false,
             .regex_source = std::string {expression},
             .regex_options = options,
         };
-#else
-        static_cast<void>(options);
-        static_cast<void>(origin);
-        return std::unexpected(
-            error(ScanErrorCode::regex_engine_unavailable, "RE2 support is not linked", std::move(pattern_id)));
-#endif
-    }
-
-    bool re2_engine_available() noexcept {
-#if defined(RULE_ENGINE_PYTHON_OPTIMIZER_HAS_RE2)
-        return true;
-#else
-        return false;
-#endif
     }
 
     std::expected<MatchSet, ScanError> execute_scan(const ExplicitScanSpace &space, const TypedScanPlan &plan,
