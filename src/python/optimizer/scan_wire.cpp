@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <set>
 #include <span>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -39,8 +41,10 @@ namespace rule_engine::python::optimizer {
                 limits.maximum_patterns == 0 || limits.maximum_pattern_bytes == 0 ||
                 limits.maximum_total_pattern_bytes == 0 || limits.maximum_regex_source_bytes == 0 ||
                 limits.maximum_scan_bytes == 0 || limits.maximum_scan_matches == 0 ||
-                limits.maximum_subject_depth == 0 || limits.maximum_identity_fields == 0 ||
-                limits.maximum_subject_component_bytes == 0 || limits.maximum_subject_bytes == 0) {
+                limits.maximum_result_payload_bytes == 0 || limits.maximum_label_categories == 0 ||
+                limits.maximum_label_bytes == 0 || limits.maximum_subject_depth == 0 ||
+                limits.maximum_identity_fields == 0 || limits.maximum_subject_component_bytes == 0 ||
+                limits.maximum_subject_bytes == 0) {
                 return std::unexpected(
                     wire_error(ScanWireErrorCode::invalid_limits, "scan wire limits must be non-zero"));
             }
@@ -215,6 +219,29 @@ namespace rule_engine::python::optimizer {
             return {};
         }
 
+        [[nodiscard]] std::expected<void, ScanWireError> validate_label(const DataLabel &label,
+                                                                        const ScanWireLimits &limits) {
+            if (label.classification > Classification::secret ||
+                label.categories.size() > limits.maximum_label_categories ||
+                !std::ranges::is_sorted(label.categories) ||
+                std::ranges::adjacent_find(label.categories) != label.categories.end()) {
+                return std::unexpected(
+                    wire_error(ScanWireErrorCode::invalid_label, "scan data label is not canonical"));
+            }
+            std::size_t total_bytes {};
+            for (const auto &category : label.categories) {
+                if (category.empty() || category.size() > limits.maximum_identifier_bytes || !valid_utf8(category)) {
+                    return std::unexpected(
+                        wire_error(ScanWireErrorCode::invalid_label, "scan data label category is invalid"));
+                }
+                if (!checked_accumulate(total_bytes, category.size(), limits.maximum_label_bytes)) {
+                    return std::unexpected(
+                        wire_error(ScanWireErrorCode::limit_exceeded, "scan data label exceeds the byte limit"));
+                }
+            }
+            return {};
+        }
+
         [[nodiscard]] std::string_view space_kind_name(const ScanSpaceKind kind) noexcept {
             switch (kind) {
                 case ScanSpaceKind::image_file: return "file";
@@ -271,6 +298,9 @@ namespace rule_engine::python::optimizer {
                 return std::unexpected(
                     wire_error(ScanWireErrorCode::limit_exceeded, "scan space exceeds the byte limit"));
             }
+            if (auto valid = validate_label(space.label, limits); !valid) {
+                return valid;
+            }
             if (auto valid = validate_identifier(plan.plan_id, limits, "scan plan ID"); !valid) {
                 return valid;
             }
@@ -281,6 +311,9 @@ namespace rule_engine::python::optimizer {
                 plan.context_bytes_after > limits.maximum_context_bytes) {
                 return std::unexpected(wire_error(ScanWireErrorCode::invalid_plan,
                                                   "scan plan patterns, budgets, or context limits are invalid"));
+            }
+            if (plan.result_mode != ScanResultMode::exact_complete && plan.result_mode != ScanResultMode::existential) {
+                return std::unexpected(wire_error(ScanWireErrorCode::invalid_plan, "scan plan result mode is unknown"));
             }
 
             std::set<std::string_view> pattern_ids;
@@ -373,8 +406,7 @@ namespace rule_engine::python::optimizer {
         }
 
         [[nodiscard]] std::expected<void, ScanWireError> validate_provider_request(const ProviderScanRequest &request,
-                                                                                   const ScanWireLimits &limits,
-                                                                                   const bool wire_shape_required) {
+                                                                                   const ScanWireLimits &limits) {
             if (auto valid = validate_limits(limits); !valid) {
                 return valid;
             }
@@ -391,12 +423,6 @@ namespace rule_engine::python::optimizer {
             }
             if (auto valid = validate_space_and_plan(request.space, request.plan, limits); !valid) {
                 return valid;
-            }
-            if (wire_shape_required && (request.plan.patterns.size() != 1U || request.plan.context_bytes_before != 0 ||
-                                        request.plan.context_bytes_after != 0)) {
-                return std::unexpected(
-                    wire_error(ScanWireErrorCode::unsupported_shape,
-                               "protocol ScanMatch requires exactly one pattern and zero context bytes"));
             }
             return {};
         }
@@ -833,17 +859,165 @@ namespace rule_engine::python::optimizer {
             return !left_key.empty() && left_key == canonical_subject_key(right);
         }
 
-        [[nodiscard]] std::expected<void, ScanWireError> validate_match_bounds(const ProviderScanRequest &request,
-                                                                               const std::uint64_t offset,
-                                                                               const std::uint64_t length) {
-            if (offset > request.space.size || length > request.space.size - offset) {
+        struct MatchView {
+            std::string_view pattern_id;
+            std::string_view scan_space_identity;
+            std::uint64_t offset {};
+            std::uint64_t absolute_address {};
+            std::uint64_t length {};
+            std::uint32_t permissions {};
+            std::span<const std::byte> matched_bytes;
+            std::span<const std::byte> context_before;
+            std::span<const std::byte> context_after;
+            const DataLabel *label {};
+            std::uint64_t subject_generation {};
+        };
+
+        [[nodiscard]] MatchView view_of(const TypedScanMatch &match) noexcept {
+            return MatchView {
+                .pattern_id = match.pattern_id,
+                .scan_space_identity = match.scan_space_identity,
+                .offset = match.offset,
+                .absolute_address = match.absolute_address,
+                .length = match.length,
+                .permissions = match.permissions,
+                .matched_bytes = match.matched_bytes,
+                .context_before = match.context_before,
+                .context_after = match.context_after,
+                .label = &match.label,
+                .subject_generation = match.subject_generation,
+            };
+        }
+
+        [[nodiscard]] MatchView view_of(const ScanMatch &match) noexcept {
+            return MatchView {
+                .pattern_id = match.pattern_id,
+                .scan_space_identity = match.scan_space_id,
+                .offset = match.offset,
+                .absolute_address = match.absolute_address,
+                .length = match.length,
+                .permissions = match.permission_snapshot,
+                .matched_bytes = match.matched_bytes,
+                .context_before = match.before_bytes,
+                .context_after = match.after_bytes,
+                .label = &match.label,
+                .subject_generation = match.subject_generation,
+            };
+        }
+
+        [[nodiscard]] const StaticScanPattern *find_pattern(const ProviderScanRequest &request,
+                                                            const std::string_view pattern_id) noexcept {
+            const auto found = std::ranges::find(request.plan.patterns, pattern_id, &StaticScanPattern::pattern_id);
+            return found == request.plan.patterns.end() ? nullptr : &*found;
+        }
+
+        [[nodiscard]] std::byte ascii_lower(std::byte value) noexcept {
+            const auto byte = std::to_integer<std::uint8_t>(value);
+            return byte >= static_cast<std::uint8_t>('A') && byte <= static_cast<std::uint8_t>('Z') ?
+                       static_cast<std::byte>(byte + static_cast<std::uint8_t>('a' - 'A')) :
+                       value;
+        }
+
+        [[nodiscard]] bool fixed_payload_matches(const StaticScanPattern &pattern,
+                                                 const std::span<const std::byte> payload) noexcept {
+            if (pattern.kind == StaticPatternKind::re2_regex) {
+                return true;
+            }
+            if (payload.size() != pattern.bytes.size()) {
+                return false;
+            }
+            if (pattern.kind == StaticPatternKind::text_literal && pattern.ascii_case_insensitive &&
+                pattern.text_encoding != TextEncoding::utf8) {
+                for (std::size_t index = 0; index < pattern.bytes.size(); index += 2U) {
+                    auto actual = read_u16(payload, index, pattern.text_encoding);
+                    auto expected = read_u16(pattern.bytes, index, pattern.text_encoding);
+                    if (actual >= static_cast<std::uint16_t>('A') && actual <= static_cast<std::uint16_t>('Z')) {
+                        actual = static_cast<std::uint16_t>(actual + static_cast<std::uint16_t>('a' - 'A'));
+                    }
+                    if (expected >= static_cast<std::uint16_t>('A') && expected <= static_cast<std::uint16_t>('Z')) {
+                        expected = static_cast<std::uint16_t>(expected + static_cast<std::uint16_t>('a' - 'A'));
+                    }
+                    if (actual != expected) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            for (std::size_t index = 0; index < pattern.bytes.size(); ++index) {
+                auto actual = payload[index];
+                auto expected = pattern.bytes[index];
+                if (pattern.ascii_case_insensitive) {
+                    actual = ascii_lower(actual);
+                    expected = ascii_lower(expected);
+                }
+                const auto mask = pattern.mask.empty() ? std::byte {0xFF} : pattern.mask[index];
+                if ((actual & mask) != (expected & mask)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        [[nodiscard]] std::expected<void, ScanWireError> validate_match(const ProviderScanRequest &request,
+                                                                        const MatchView match,
+                                                                        const ScanWireLimits &limits,
+                                                                        std::size_t &total_payload_bytes) {
+            const auto *pattern = find_pattern(request, match.pattern_id);
+            if (pattern == nullptr) {
+                return std::unexpected(wire_error(ScanWireErrorCode::mismatched_response,
+                                                  "scan match pattern is not in the requested plan"));
+            }
+            if (match.offset > request.space.size || match.length > request.space.size - match.offset) {
                 return std::unexpected(
                     wire_error(ScanWireErrorCode::mismatched_response, "scan match is outside the requested space"));
             }
-            const auto &pattern = request.plan.patterns.front();
-            if (pattern.kind != StaticPatternKind::re2_regex && length != pattern.bytes.size()) {
+            if (pattern->kind != StaticPatternKind::re2_regex && match.length != pattern->bytes.size()) {
                 return std::unexpected(wire_error(ScanWireErrorCode::mismatched_response,
                                                   "fixed scan match length does not equal its pattern length"));
+            }
+            if (match.matched_bytes.size() != match.length || !fixed_payload_matches(*pattern, match.matched_bytes)) {
+                return std::unexpected(wire_error(ScanWireErrorCode::mismatched_response,
+                                                  "scan match bytes do not satisfy the requested pattern"));
+            }
+            if (match.scan_space_identity != request.space.identity || match.permissions != request.space.permissions ||
+                match.label == nullptr || *match.label != request.space.label ||
+                match.subject_generation != request.space.subject_generation) {
+                return std::unexpected(wire_error(ScanWireErrorCode::mismatched_response,
+                                                  "scan match attribution does not match its request"));
+            }
+            if (auto valid = validate_label(*match.label, limits); !valid) {
+                return valid;
+            }
+            if (match.offset > std::numeric_limits<std::uint64_t>::max() - request.space.begin ||
+                match.absolute_address != request.space.begin + match.offset) {
+                return std::unexpected(
+                    wire_error(ScanWireErrorCode::mismatched_response, "scan match absolute address is invalid"));
+            }
+            const auto remaining = request.space.size - match.offset - match.length;
+            const auto expected_before = std::min<std::uint64_t>(request.plan.context_bytes_before, match.offset);
+            const auto expected_after = std::min<std::uint64_t>(request.plan.context_bytes_after, remaining);
+            if (match.context_before.size() != expected_before || match.context_after.size() != expected_after) {
+                return std::unexpected(wire_error(ScanWireErrorCode::mismatched_response,
+                                                  "scan match context is incomplete or exceeds its request"));
+            }
+            if (!checked_accumulate(total_payload_bytes, match.pattern_id.size(),
+                                    limits.maximum_result_payload_bytes) ||
+                !checked_accumulate(total_payload_bytes, match.scan_space_identity.size(),
+                                    limits.maximum_result_payload_bytes) ||
+                !checked_accumulate(total_payload_bytes, match.matched_bytes.size(),
+                                    limits.maximum_result_payload_bytes) ||
+                !checked_accumulate(total_payload_bytes, match.context_before.size(),
+                                    limits.maximum_result_payload_bytes) ||
+                !checked_accumulate(total_payload_bytes, match.context_after.size(),
+                                    limits.maximum_result_payload_bytes)) {
+                return std::unexpected(
+                    wire_error(ScanWireErrorCode::limit_exceeded, "scan result payload exceeds the byte limit"));
+            }
+            for (const auto &category : match.label->categories) {
+                if (!checked_accumulate(total_payload_bytes, category.size(), limits.maximum_result_payload_bytes)) {
+                    return std::unexpected(
+                        wire_error(ScanWireErrorCode::limit_exceeded, "scan result payload exceeds the byte limit"));
+                }
             }
             return {};
         }
@@ -891,11 +1065,18 @@ namespace rule_engine::python::optimizer {
             return std::unexpected(std::move(result.error()));
         }
 
+        std::vector<std::string> pattern_ids;
+        pattern_ids.reserve(plan.patterns.size());
+        for (const auto &pattern : plan.patterns) { pattern_ids.push_back(pattern.pattern_id); }
         return ScanPlan {
             .plan_id = plan.plan_id,
             .encoded_pattern = std::move(writer).take(),
             .maximum_bytes = plan.maximum_bytes,
             .maximum_matches = plan.maximum_matches,
+            .context_bytes_before = plan.context_bytes_before,
+            .context_bytes_after = plan.context_bytes_after,
+            .result_mode = plan.result_mode,
+            .pattern_ids = std::move(pattern_ids),
         };
     }
 
@@ -908,10 +1089,17 @@ namespace rule_engine::python::optimizer {
         if (!kind) {
             return std::unexpected(std::move(kind.error()));
         }
-        if (space.size == 0 || (space.permissions & scan_permission_read) == 0 ||
+        if (auto valid = validate_identifier(space.identity, limits, "contract scan space identity"); !valid) {
+            return std::unexpected(std::move(valid.error()));
+        }
+        if (auto valid = validate_label(space.label, limits); !valid) {
+            return std::unexpected(std::move(valid.error()));
+        }
+        if (space.subject_generation == 0 || space.size == 0 || (space.permissions & scan_permission_read) == 0 ||
             (space.permissions & ~known_permissions) != 0) {
             return std::unexpected(
-                wire_error(ScanWireErrorCode::invalid_space, "contract scan space has invalid bounds or permissions"));
+                wire_error(ScanWireErrorCode::invalid_space,
+                           "contract scan space has invalid identity, generation, bounds, or permissions"));
         }
         if (space.size > std::numeric_limits<std::uint64_t>::max() - space.begin) {
             return std::unexpected(
@@ -924,6 +1112,23 @@ namespace rule_engine::python::optimizer {
         if (!plan.encoded_pattern.starts_with(wire_magic)) {
             return std::unexpected(
                 wire_error(ScanWireErrorCode::malformed, "encoded scan plan has an unsupported magic"));
+        }
+        if (plan.context_bytes_before > limits.maximum_context_bytes ||
+            plan.context_bytes_after > limits.maximum_context_bytes ||
+            (plan.result_mode != ScanResultMode::exact_complete && plan.result_mode != ScanResultMode::existential) ||
+            plan.pattern_ids.empty() || plan.pattern_ids.size() > limits.maximum_patterns) {
+            return std::unexpected(wire_error(ScanWireErrorCode::invalid_plan,
+                                              "contract scan plan context, result mode, or pattern IDs are invalid"));
+        }
+        std::set<std::string_view> contract_pattern_ids;
+        for (const auto &pattern_id : plan.pattern_ids) {
+            if (auto valid = validate_identifier(pattern_id, limits, "contract scan pattern ID"); !valid) {
+                return std::unexpected(std::move(valid.error()));
+            }
+            if (!contract_pattern_ids.insert(pattern_id).second) {
+                return std::unexpected(
+                    wire_error(ScanWireErrorCode::duplicate_pattern_id, "contract scan pattern IDs must be unique"));
+            }
         }
 
         WireReader reader {plan.encoded_pattern};
@@ -951,6 +1156,12 @@ namespace rule_engine::python::optimizer {
             return std::unexpected(wire_error(ScanWireErrorCode::malformed,
                                               "encoded and contract scan space kinds do not agree", reader.offset()));
         }
+        if (*identity != space.identity || *generation != space.subject_generation ||
+            *context_before != plan.context_bytes_before || *context_after != plan.context_bytes_after) {
+            return std::unexpected(wire_error(ScanWireErrorCode::malformed,
+                                              "encoded scan bindings do not agree with the typed contract fields",
+                                              reader.offset()));
+        }
         if (*pattern_count == 0 || *pattern_count > limits.maximum_patterns) {
             return std::unexpected(wire_error(ScanWireErrorCode::limit_exceeded,
                                               "encoded scan pattern count exceeds limits", reader.offset()));
@@ -964,6 +1175,12 @@ namespace rule_engine::python::optimizer {
                 return std::unexpected(std::move(pattern.error()));
             }
             patterns.push_back(std::move(*pattern));
+        }
+        if (patterns.size() != plan.pattern_ids.size() ||
+            !std::ranges::equal(patterns, plan.pattern_ids, {}, &StaticScanPattern::pattern_id, std::identity {})) {
+            return std::unexpected(wire_error(ScanWireErrorCode::malformed,
+                                              "encoded scan patterns do not agree with the declared pattern IDs",
+                                              reader.offset()));
         }
 
         const auto checksum_offset = reader.offset();
@@ -989,6 +1206,7 @@ namespace rule_engine::python::optimizer {
                     .begin = space.begin,
                     .size = space.size,
                     .permissions = space.permissions,
+                    .label = space.label,
                     .subject_generation = *generation,
                 },
             .plan =
@@ -999,6 +1217,7 @@ namespace rule_engine::python::optimizer {
                     .maximum_matches = plan.maximum_matches,
                     .context_bytes_before = *context_before,
                     .context_bytes_after = *context_after,
+                    .result_mode = plan.result_mode,
                 },
         };
         if (auto valid = validate_space_and_plan(result.space, result.plan, limits); !valid) {
@@ -1009,7 +1228,7 @@ namespace rule_engine::python::optimizer {
 
     std::expected<ScanRequest, ScanWireError> to_contract_scan_request(const ProviderScanRequest &request,
                                                                        const ScanWireLimits &limits) {
-        if (auto valid = validate_provider_request(request, limits, true); !valid) {
+        if (auto valid = validate_provider_request(request, limits); !valid) {
             return std::unexpected(std::move(valid.error()));
         }
         auto plan = serialize_scan_plan(request.space, request.plan, limits);
@@ -1025,6 +1244,9 @@ namespace rule_engine::python::optimizer {
                     .begin = request.space.begin,
                     .size = request.space.size,
                     .permissions = request.space.permissions,
+                    .identity = request.space.identity,
+                    .label = request.space.label,
+                    .subject_generation = request.space.subject_generation,
                 },
             .plan = std::move(*plan),
             .deadline_unix_ms = request.deadline_unix_ms,
@@ -1057,7 +1279,7 @@ namespace rule_engine::python::optimizer {
             .plan = std::move(decoded->plan),
             .deadline_unix_ms = request.deadline_unix_ms,
         };
-        if (auto valid = validate_provider_request(result, limits, true); !valid) {
+        if (auto valid = validate_provider_request(result, limits); !valid) {
             return std::unexpected(std::move(valid.error()));
         }
         return result;
@@ -1066,34 +1288,25 @@ namespace rule_engine::python::optimizer {
     std::expected<ScanResponse, ScanWireError> to_contract_scan_response(const ProviderScanRequest &request,
                                                                          const MatchSet &matches,
                                                                          const ScanWireLimits &limits) {
-        if (auto valid = validate_provider_request(request, limits, true); !valid) {
+        if (auto valid = validate_provider_request(request, limits); !valid) {
             return std::unexpected(std::move(valid.error()));
         }
         if (matches.matches.size() > request.plan.maximum_matches ||
-            matches.matches.size() > limits.maximum_scan_matches) {
+            matches.matches.size() > limits.maximum_scan_matches ||
+            (request.plan.result_mode == ScanResultMode::existential && matches.matches.size() > 1U)) {
             return std::unexpected(
                 wire_error(ScanWireErrorCode::limit_exceeded, "scan match set exceeds the requested limit"));
         }
 
         std::vector<ScanMatch> result_matches;
         result_matches.reserve(matches.matches.size());
-        std::optional<std::pair<std::uint64_t, std::uint64_t>> previous;
+        std::optional<std::tuple<std::uint64_t, std::string, std::uint64_t>> previous;
+        std::size_t total_payload_bytes {};
         for (const auto &match : matches.matches) {
-            if (match.pattern_id != request.plan.patterns.front().pattern_id ||
-                match.scan_space_identity != request.space.identity || match.permissions != request.space.permissions ||
-                !match.context_before.empty() || !match.context_after.empty()) {
-                return std::unexpected(wire_error(ScanWireErrorCode::mismatched_response,
-                                                  "typed scan match metadata does not match its request"));
-            }
-            if (auto valid = validate_match_bounds(request, match.offset, match.length); !valid) {
+            if (auto valid = validate_match(request, view_of(match), limits, total_payload_bytes); !valid) {
                 return std::unexpected(std::move(valid.error()));
             }
-            if (match.offset > std::numeric_limits<std::uint64_t>::max() - request.space.begin ||
-                match.absolute_address != request.space.begin + match.offset) {
-                return std::unexpected(
-                    wire_error(ScanWireErrorCode::mismatched_response, "typed scan match absolute address is invalid"));
-            }
-            const std::pair key {match.offset, match.length};
+            const std::tuple key {match.offset, match.pattern_id, match.length};
             if (previous && key == *previous) {
                 return std::unexpected(
                     wire_error(ScanWireErrorCode::duplicate_match, "typed scan match is duplicated"));
@@ -1103,7 +1316,19 @@ namespace rule_engine::python::optimizer {
                                                   "typed scan matches are not deterministically ordered"));
             }
             previous = key;
-            result_matches.push_back(ScanMatch {.offset = match.offset, .length = match.length});
+            result_matches.push_back(ScanMatch {
+                .offset = match.offset,
+                .length = match.length,
+                .pattern_id = match.pattern_id,
+                .scan_space_id = match.scan_space_identity,
+                .absolute_address = match.absolute_address,
+                .permission_snapshot = match.permissions,
+                .matched_bytes = match.matched_bytes,
+                .before_bytes = match.context_before,
+                .after_bytes = match.context_after,
+                .label = match.label,
+                .subject_generation = match.subject_generation,
+            });
         }
         return ScanResponse {
             .request_id = request.request_id,
@@ -1112,13 +1337,14 @@ namespace rule_engine::python::optimizer {
             .matches = std::move(result_matches),
             .truncated = false,
             .diagnostic = std::nullopt,
+            .mode = request.plan.result_mode,
         };
     }
 
     std::expected<MatchSet, ScanWireError> from_contract_scan_response(const ProviderScanRequest &request,
                                                                        const ScanResponse &response,
                                                                        const ScanWireLimits &limits) {
-        if (auto valid = validate_provider_request(request, limits, true); !valid) {
+        if (auto valid = validate_provider_request(request, limits); !valid) {
             return std::unexpected(std::move(valid.error()));
         }
         if (auto valid = validate_identifier(response.request_id.value, limits, "scan response request ID"); !valid) {
@@ -1137,38 +1363,48 @@ namespace rule_engine::python::optimizer {
                 wire_error(ScanWireErrorCode::unsupported_shape,
                            "only complete successful contract scan responses can become MatchSet values"));
         }
+        if (response.mode != request.plan.result_mode) {
+            return std::unexpected(
+                wire_error(ScanWireErrorCode::mismatched_response, "scan response result mode does not match"));
+        }
         if (response.matches.size() > request.plan.maximum_matches ||
-            response.matches.size() > limits.maximum_scan_matches) {
+            response.matches.size() > limits.maximum_scan_matches ||
+            (response.mode == ScanResultMode::existential && response.matches.size() > 1U)) {
             return std::unexpected(
                 wire_error(ScanWireErrorCode::limit_exceeded, "contract scan response exceeds match limits"));
         }
 
         std::vector<ScanMatch> ordered = response.matches;
         std::ranges::sort(ordered, [](const ScanMatch &left, const ScanMatch &right) {
-            return std::pair {left.offset, left.length} < std::pair {right.offset, right.length};
+            return std::tuple {left.offset, left.pattern_id, left.length} <
+                   std::tuple {right.offset, right.pattern_id, right.length};
         });
         MatchSet result;
         result.matches.reserve(ordered.size());
-        std::optional<std::pair<std::uint64_t, std::uint64_t>> previous;
+        std::optional<std::tuple<std::uint64_t, std::string, std::uint64_t>> previous;
+        std::size_t total_payload_bytes {};
         for (const auto &match : ordered) {
-            if (auto valid = validate_match_bounds(request, match.offset, match.length); !valid) {
+            if (auto valid = validate_match(request, view_of(match), limits, total_payload_bytes); !valid) {
                 return std::unexpected(std::move(valid.error()));
             }
-            const std::pair key {match.offset, match.length};
+            const std::tuple key {match.offset, match.pattern_id, match.length};
             if (previous && key == *previous) {
                 return std::unexpected(
                     wire_error(ScanWireErrorCode::duplicate_match, "contract scan response duplicates a match"));
             }
             previous = key;
             result.matches.push_back(TypedScanMatch {
-                .pattern_id = request.plan.patterns.front().pattern_id,
-                .scan_space_identity = request.space.identity,
+                .pattern_id = match.pattern_id,
+                .scan_space_identity = match.scan_space_id,
                 .offset = match.offset,
-                .absolute_address = request.space.begin + match.offset,
+                .absolute_address = match.absolute_address,
                 .length = match.length,
-                .permissions = request.space.permissions,
-                .context_before = {},
-                .context_after = {},
+                .permissions = match.permission_snapshot,
+                .matched_bytes = match.matched_bytes,
+                .context_before = match.before_bytes,
+                .context_after = match.after_bytes,
+                .label = match.label,
+                .subject_generation = match.subject_generation,
             });
         }
         return result;
