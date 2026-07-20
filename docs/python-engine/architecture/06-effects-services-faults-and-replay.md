@@ -1,8 +1,8 @@
 # Effects, Services, Faults, and Replay
 
-Plan version: `design-v1`  
-Status: normative architecture  
-Primary task IDs: `V4`, `E1`, `E2`, `E3`, `R2`, `S2`, `O1`, `I1`, `Q1`  
+Plan version: `design-v1`\
+Status: normative architecture\
+Primary task IDs: `V4`, `E1`, `E2`, `E3`, `R2`, `S2`, `O1`, `I1`, `Q1`\
 Decisions: [ADR-008](../decisions/ADR-008-transactional-reach-effects.md), [ADR-009](../decisions/ADR-009-structured-async-capabilities.md), [ADR-015](../decisions/ADR-015-runtime-data-labels.md)
 
 ## 1. Purpose

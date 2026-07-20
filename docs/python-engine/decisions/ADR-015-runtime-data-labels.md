@@ -1,7 +1,7 @@
 # ADR-015: Runtime Data Labels with Control-Flow Propagation
 
-Status: accepted for `design-v1`  
-Date: 2026-07-20  
+Status: accepted for `design-v1`\
+Date: 2026-07-20\
 Tasks: `C2`, `V1`, `V2`, `E1`, `E2`, `E3`, `R1`, `R2`, `R3`, `S1`, `Q1`
 
 ## Context
@@ -112,4 +112,3 @@ Rejected as the primary mechanism. Separate deployment can be an additional defe
 ## Revisit conditions
 
 Revisit precision if production evidence shows material false-positive restriction. A change must preserve noninterference at every supported control construct, update optimizer certificates and VM costs, and add leak-regression tests. Adding new levels/categories or label lowering requires schema/policy versioning and an ADR amendment. The design must not weaken runtime enforcement merely to improve convenience or performance.
-

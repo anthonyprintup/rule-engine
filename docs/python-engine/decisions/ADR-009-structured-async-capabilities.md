@@ -1,7 +1,7 @@
 # ADR-009: Structured Async Capabilities
 
-Status: accepted for `design-v1`  
-Date: 2026-07-20  
+Status: accepted for `design-v1`\
+Date: 2026-07-20\
 Tasks: `V3`, `E3`, `V4`, `S2`, `I1`, `Q1`
 
 ## Context
@@ -110,4 +110,3 @@ Rejected. Awaiting an external write before durable commit would expose partial 
 ## Revisit conditions
 
 Revisit if representative packs demonstrate that the structured API cannot express a needed bounded pattern, or if transport data proves a different retry/deadline default is necessary. Adding a construct requires explicit ownership, escape analysis, cancellation, budget charges, capture/replay semantics, and cross-platform tests. General ambient `asyncio` or detached work remains outside this ADR unless the entire scheduler and transaction model is replaced.
-

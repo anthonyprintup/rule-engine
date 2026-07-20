@@ -1,9 +1,9 @@
 # Protocol, Storage, and Cluster Architecture
 
-Status: normative pre-implementation design  
-Owners: protocol-v2 and python-cluster lanes  
-Tasks: P1, P2, P3, S1, S2, S3, I1, Q1  
-Decisions: [ADR-011](../decisions/ADR-011-protocol-v2-clean-break.md), [ADR-012](../decisions/ADR-012-postgresql-active-active.md), ADR-013  
+Status: normative pre-implementation design\
+Owners: protocol-v2 and python-cluster lanes\
+Tasks: P1, P2, P3, S1, S2, S3, I1, Q1\
+Decisions: [ADR-011](../decisions/ADR-011-protocol-v2-clean-break.md), [ADR-012](../decisions/ADR-012-postgresql-active-active.md), ADR-013\
 Foundation contracts: [CONTRACTS.md](../CONTRACTS.md)
 
 ## 1. Purpose and goals

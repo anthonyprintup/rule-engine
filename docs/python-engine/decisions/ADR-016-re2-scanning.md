@@ -89,4 +89,3 @@ The semantic `MatchSet` is immutable, complete, and deterministically ordered. I
 ## Revisit conditions
 
 Add another pattern or scan-space kind only after defining canonical syntax, typing, platform semantics, worst-case resource behavior, classification, result validation, VM visibility, optimizer rules, and cross-platform tests. A different regex engine is acceptable only if it preserves or strengthens RE2's resource guarantees and is introduced as a separately versioned dialect rather than silently changing existing patterns.
-

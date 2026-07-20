@@ -1,9 +1,9 @@
 # ADR-010: MVCC State with Captured-Input Replay
 
-Status: accepted for `design-v1`  
-Date: 2026-07-20  
-Owners: integration and events/state lanes  
-Tasks: `R2`, with coordinator support from `S1` and `S2`  
+Status: accepted for `design-v1`\
+Date: 2026-07-20\
+Owners: integration and events/state lanes\
+Tasks: `R2`, with coordinator support from `S1` and `S2`\
 Architecture: `architecture/07-events-history-state-and-correlation.md`
 
 ## Context

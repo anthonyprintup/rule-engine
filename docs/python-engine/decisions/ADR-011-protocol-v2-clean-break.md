@@ -1,9 +1,9 @@
 # ADR-011: Protocol v2 Is a Clean Break
 
-Status: accepted for implementation  
-Date: 2026-07-20  
-Owners: protocol-v2 lane and integration owner  
-Tasks: P1, P2, P3, I1, X1, Q1  
+Status: accepted for implementation\
+Date: 2026-07-20\
+Owners: protocol-v2 lane and integration owner\
+Tasks: P1, P2, P3, I1, X1, Q1\
 Architecture: [08-protocol-storage-and-cluster.md](../architecture/08-protocol-storage-and-cluster.md)
 
 ## Context
@@ -149,4 +149,3 @@ Revisit only through a new ADR and protocol-minor/major review if one of these b
 - Linux provider agents enter scope;
 - schema evolution needs capabilities that cannot be expressed as compatible optional projections;
 - product requirements mandate simultaneous multi-node sessions for one peer and define how provider work and authoritative inventories remain singular.
-

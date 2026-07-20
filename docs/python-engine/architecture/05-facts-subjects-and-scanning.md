@@ -379,4 +379,3 @@ Acceptance requires all tests above, protocol-provider integration against Windo
 | Atomic inventories | ADR-007 | begin/chunk/commit provider contract | P1, P2, P3, S1 | Snapshot failure matrix |
 | Least-data prefetch | ADR-006, ADR-014 | `OptimizationCertificate`, logical-read ledger | C3, V2, O1 | Exact/optimized observability parity |
 | Bounded typed scanning | ADR-016 | scan request/result and `MatchSet` descriptors | C2, P3, O2 | Scanner golden/fuzz/integration suite |
-

@@ -79,4 +79,3 @@ Provider terminals are typed (`not_found`, `unsupported`, `access_denied`, `time
 ## Revisit conditions
 
 Revisit only if production evidence shows fact latency cannot be met by certified prefetch/batching, or if a new provider consistency requirement demands multi-fact snapshot semantics. Any change must retain property syntax, C++ semantic ownership, least-data behavior, typed failures, replayability, and observational parity.
-

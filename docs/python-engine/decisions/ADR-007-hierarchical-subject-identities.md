@@ -93,4 +93,3 @@ Each collection is independently scheduled and reconciled through begin/chunk/co
 ## Revisit conditions
 
 Revisit a built-in identity tuple only when provider evidence proves it is not stable or unique. That is a schema-breaking change requiring a new scope schema ID and an explicit history/state migration policy. Revisit snapshot granularity only if measured staging cost is unacceptable and an alternative can prove the same atomic no-false-removal guarantee.
-

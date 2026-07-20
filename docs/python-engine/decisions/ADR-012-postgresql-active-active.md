@@ -1,9 +1,9 @@
 # ADR-012: PostgreSQL-Backed Active-Active Servers
 
-Status: accepted for implementation  
-Date: 2026-07-20  
-Owners: python-cluster lane and integration owner  
-Tasks: S1, S2, S3, R2, R3, E3, I1, Q1  
+Status: accepted for implementation\
+Date: 2026-07-20\
+Owners: python-cluster lane and integration owner\
+Tasks: S1, S2, S3, R2, R3, E3, I1, Q1\
 Architecture: [08-protocol-storage-and-cluster.md](../architecture/08-protocol-storage-and-cluster.md)
 
 ## Context
@@ -161,4 +161,3 @@ Revisit through a new ADR when evidence supports one of these changes:
 - PostgreSQL history volume requires a separate analytical/archive store, with PostgreSQL retaining authoritative cursors and transaction references;
 - an end-to-end sink protocol can provide a stronger exactly-once contract than idempotent at-least-once delivery;
 - SQLite development behavior diverges enough that an ephemeral local PostgreSQL distribution is preferable.
-

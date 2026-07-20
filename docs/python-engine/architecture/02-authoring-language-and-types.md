@@ -1,8 +1,8 @@
 # Authoring Language, Static Types, and Models
 
-Status: normative for `design-v1`  
-Owners: compiler lane (`C1`, `C2`, `C3`) with integration ownership of the public API  
-Related decisions: [ADR-003](../decisions/ADR-003-python-314-static-language.md), [ADR-001](../decisions/ADR-001-cpp-owns-semantics.md), [ADR-015](../decisions/ADR-015-runtime-data-labels.md)  
+Status: normative for `design-v1`\
+Owners: compiler lane (`C1`, `C2`, `C3`) with integration ownership of the public API\
+Related decisions: [ADR-003](../decisions/ADR-003-python-314-static-language.md), [ADR-001](../decisions/ADR-001-cpp-owns-semantics.md), [ADR-015](../decisions/ADR-015-runtime-data-labels.md)\
 Known limitations: [L-002, L-003, L-004, L-011, L-014, L-016, L-017](../LIMITATIONS.md)
 
 ## 1. Purpose and goals

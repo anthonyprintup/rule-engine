@@ -1,8 +1,8 @@
 # Rule Packs, Signatures, Generators, and the Private Python Worker
 
-Status: normative for `design-v1`  
-Owners: packaging lane (`PK1`, `PK2`, `PK3`) with compiler integration (`C1`, `C2`)  
-Related decisions: [ADR-005](../decisions/ADR-005-source-only-signed-rulepacks.md), [ADR-017](../decisions/ADR-017-short-lived-python-worker.md), [ADR-002](../decisions/ADR-002-trusted-signed-pack-boundary.md), [ADR-003](../decisions/ADR-003-python-314-static-language.md)  
+Status: normative for `design-v1`\
+Owners: packaging lane (`PK1`, `PK2`, `PK3`) with compiler integration (`C1`, `C2`)\
+Related decisions: [ADR-005](../decisions/ADR-005-source-only-signed-rulepacks.md), [ADR-017](../decisions/ADR-017-short-lived-python-worker.md), [ADR-002](../decisions/ADR-002-trusted-signed-pack-boundary.md), [ADR-003](../decisions/ADR-003-python-314-static-language.md)\
 Known limitations: [L-001, L-004, L-005, L-012, L-016](../LIMITATIONS.md)
 
 ## 1. Purpose and goals

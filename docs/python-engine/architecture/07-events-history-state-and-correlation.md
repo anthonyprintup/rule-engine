@@ -1,8 +1,8 @@
 # Events, History, State, and Correlation
 
-Status: frozen for the `design-v1` foundation  
-Primary tasks: `R1`, `R2`, `R3`  
-Related contracts: event envelopes, `FrozenValue`, `IRuntimeStore::transact_event`, effect journals, fence tokens  
+Status: frozen for the `design-v1` foundation\
+Primary tasks: `R1`, `R2`, `R3`\
+Related contracts: event envelopes, `FrozenValue`, `IRuntimeStore::transact_event`, effect journals, fence tokens\
 Related decisions: `ADR-008`, `ADR-009`, `ADR-010`, `ADR-012`, `ADR-013`, `ADR-015`
 
 ## 1. Purpose

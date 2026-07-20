@@ -1,7 +1,7 @@
 # ADR-008: Transactional Reach-Based Effects
 
-Status: accepted for `design-v1`  
-Date: 2026-07-20  
+Status: accepted for `design-v1`\
+Date: 2026-07-20\
 Tasks: `E1`, `E2`, `E3`, `R2`, `S2`, `I1`, `Q1`
 
 ## Context
@@ -115,4 +115,3 @@ Revisit only if:
 - formal parity evidence supports additional optimizer elision without changing recorder/effect observability.
 
 Any revisit requires updates to the effect/store contracts, failure matrix, replay model, limitations registry, and cross-platform crash tests.
-
