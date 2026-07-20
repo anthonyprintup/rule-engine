@@ -1,0 +1,113 @@
+#pragma once
+
+#include "rule_engine/python/contract.hpp"
+#include "rule_engine/python/vm/value.hpp"
+
+#include <chrono>
+#include <cstdint>
+#include <expected>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string_view>
+#include <vector>
+
+namespace rule_engine::python::vm {
+
+    inline constexpr std::string_view fact_operand_schema = "rule-engine.vm.fact-operand.v1";
+    inline constexpr std::string_view capability_operand_schema = "rule-engine.vm.capability-operand.v1";
+
+    // Instruction operand encoding used by the C++ compiler and the exact VM.
+    // - load_const: immediate is the constant index.
+    // - unary/binary/compare: immediate is the corresponding operation enum.
+    // - call: immediate is the function index, operand_a is the first argument register,
+    //   and operand_b is the argument count.
+    // - return/yield/raise: operand_a is the value register.
+    // - await_fact: immediate names a fact operand constant; the invocation subject is used.
+    // - await_capability: immediate names a capability operand constant and operand_a is the argument register.
+    // - append_effect: immediate names a Unicode effect-kind constant and operand_a is the payload register.
+    [[nodiscard]] FactValue make_fact_operand(FactRoute route, SchemaId expected_schema);
+    [[nodiscard]] FactValue make_capability_operand(CapabilityId capability, SchemaId request_schema);
+
+    struct VmCounters {
+        std::uint64_t instructions {};
+        std::uint32_t peak_frames {};
+        std::uint64_t loop_iterations_and_yields {};
+        std::uint32_t logical_facts {};
+        std::uint32_t provider_rounds {};
+        std::size_t fact_bytes {};
+        std::uint32_t service_calls {};
+        std::uint32_t peak_active_service_calls {};
+        std::size_t service_response_bytes {};
+        std::uint32_t effect_intents {};
+        std::size_t effect_bytes {};
+        std::chrono::nanoseconds active_time {};
+    };
+
+    enum struct GeneratorState : std::uint8_t { created, running, suspended, closed, faulted };
+    enum struct TaskState : std::uint8_t { cold, ready, running, waiting, complete, canceled, faulted };
+    enum struct TaskGroupExitMode : std::uint8_t { cancel_pending, wait_pending };
+
+    using TaskId = std::uint64_t;
+    using TaskGroupId = std::uint64_t;
+
+    struct StructuredTask {
+        TaskId id {};
+        TaskGroupId owner {};
+        TaskState state {TaskState::cold};
+        std::optional<PyValue> coroutine;
+    };
+
+    struct StructuredTaskGroup {
+        TaskGroupId id {};
+        std::optional<TaskGroupId> parent;
+        bool open {true};
+    };
+
+    struct StructuredTasks {
+        [[nodiscard]] TaskGroupId open_group(std::optional<TaskGroupId> parent = std::nullopt);
+        [[nodiscard]] std::expected<TaskId, VmError> start(TaskGroupId owner,
+                                                           std::optional<PyValue> coroutine = std::nullopt);
+        [[nodiscard]] std::expected<void, VmError> set_state(TaskId task, TaskState state);
+        [[nodiscard]] std::optional<TaskId> next_ready() const noexcept;
+        [[nodiscard]] std::expected<void, VmError> close(TaskGroupId group, TaskGroupExitMode mode);
+        [[nodiscard]] bool owns(TaskGroupId group, TaskId task) const noexcept;
+        [[nodiscard]] bool has_live_tasks(TaskGroupId group) const noexcept;
+        [[nodiscard]] std::span<const StructuredTask> tasks() const noexcept;
+
+    private:
+        std::uint64_t next_group_id_ {1U};
+        std::uint64_t next_task_id_ {1U};
+        std::vector<StructuredTaskGroup> groups_;
+        std::vector<StructuredTask> tasks_;
+    };
+
+    struct RegisterVmSession final: VmSession {
+        RegisterVmSession(const RegisterVmSession &) = delete;
+        RegisterVmSession &operator=(const RegisterVmSession &) = delete;
+        ~RegisterVmSession() override;
+
+        [[nodiscard]] VmStep step(HostResponses responses) override;
+        [[nodiscard]] VmCounters counters() const noexcept;
+        [[nodiscard]] HeapStats heap_stats() const noexcept;
+        [[nodiscard]] std::size_t logical_read_count() const noexcept;
+        [[nodiscard]] std::size_t journal_size() const noexcept;
+        [[nodiscard]] std::expected<FrozenValue, FreezeError> freeze_value(PyValue value) const;
+
+        [[nodiscard]] static std::expected<std::unique_ptr<RegisterVmSession>, DiagnosticSet>
+        create(const CompiledPack &pack, const VmInvocation &invocation);
+
+    private:
+        struct Impl;
+        explicit RegisterVmSession(Impl *implementation) noexcept;
+        Impl *impl_ {};
+    };
+
+    struct RegisterVmFactory final: VmFactory {
+        [[nodiscard]] std::expected<std::unique_ptr<VmSession>, DiagnosticSet>
+        start(const CompiledPack &pack, const VmInvocation &invocation) override;
+    };
+
+    [[nodiscard]] std::unique_ptr<VmFactory> make_register_vm_factory();
+
+} // namespace rule_engine::python::vm
