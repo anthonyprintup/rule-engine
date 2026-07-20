@@ -373,3 +373,27 @@ target_compile_options(
         >
 )
 catch_discover_tests(rule_engine_python_engine_tests)
+
+add_executable(rule_engine_python_integration_tests tests/python_integration_tests.cpp)
+target_link_libraries(
+    rule_engine_python_integration_tests
+    PRIVATE
+        rule_engine::python_engine
+        rule_engine::python_compiler
+        rule_engine::python_vm
+        rule_engine::python_cluster
+        Catch2::Catch2WithMain
+)
+target_compile_options(
+    rule_engine_python_integration_tests
+    PRIVATE
+        $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:
+            /clang:-Wno-c2y-extensions
+            /clang:-Wno-missing-designated-field-initializers
+        >
+        $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:GNU>>:
+            -Wno-c2y-extensions
+            -Wno-missing-designated-field-initializers
+        >
+)
+catch_discover_tests(rule_engine_python_integration_tests)
