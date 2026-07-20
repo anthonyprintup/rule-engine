@@ -161,6 +161,17 @@ namespace {
         append_u64(out, value);
     }
 
+    void append_string_array(std::string &out, const std::vector<std::string> &values) {
+        out.push_back('[');
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            if (index != 0u) {
+                out.push_back(',');
+            }
+            append_json_string(out, values[index]);
+        }
+        out.push_back(']');
+    }
+
     void append_value(std::string &out, const rule_engine::Value &value);
 
     void append_pattern(std::string &out, const rule_engine::PatternValue &pattern) {
@@ -421,6 +432,43 @@ namespace {
         out.push_back('}');
     }
 
+    void append_optimized_summary(
+        std::string &out, const rule_engine::client_protocol::ClientOptimizedEvaluationSummary &summary) {
+        out.push_back('{');
+        append_key_u64(out, "baselineExactVmRuleExecutions", summary.baseline_exact_vm_rule_executions);
+        out.push_back(',');
+        append_key_u64(out, "optimizedExactVmRuleExecutions", summary.optimized_exact_vm_rule_executions);
+        out.push_back(',');
+        append_key_u64(out, "exactVmRuleExecutionsAvoided", summary.exact_vm_rule_executions_avoided);
+        out.push_back(',');
+        append_key_u64(out, "rulesPrunedBeforeExactVm", summary.rules_pruned_before_exact_vm);
+        out.push_back(',');
+        append_key_u64(out, "candidateProviderRequests", summary.candidate_provider_requests);
+        out.push_back(',');
+        append_key_u64(out, "candidateProviderPlannedRequests", summary.candidate_provider_planned_requests);
+        out.push_back(',');
+        append_key_u64(out, "candidateProviderSubjectsReturned", summary.candidate_provider_subjects_returned);
+        out.push_back(',');
+        append_key_u64(out, "candidateProviderBroadResults", summary.candidate_provider_broad_results);
+        out.push_back(',');
+        append_key_u64(out,
+                       "candidateProviderFallbackPredicateEvaluations",
+                       summary.candidate_provider_fallback_predicate_evaluations);
+        out.push_back(',');
+        append_key_u64(out, "peakCandidateSetSubjects", summary.peak_candidate_set_subjects);
+        out.push_back(',');
+        append_key_u64(out, "peakCandidateSetBytes", summary.peak_candidate_set_bytes);
+        out.push_back(',');
+        append_key_u64(out, "replaySubjectMismatches", summary.replay_subject_mismatches);
+        out.push_back(',');
+        append_key_u64(out, "replayRuleResultMismatches", summary.replay_rule_result_mismatches);
+        out.push_back(',');
+        append_key_u64(out, "replayTraceEventMismatches", summary.replay_trace_event_mismatches);
+        out.push_back(',');
+        append_key_u64(out, "replayMetricMismatches", summary.replay_metric_mismatches);
+        out.push_back('}');
+    }
+
     void append_common_prefix(std::string &out,
                               const std::string_view host,
                               const std::uint16_t port,
@@ -452,6 +500,13 @@ namespace rule_engine::server_output {
         append_common_prefix(out, host, port, session.handshake, session.subjects.subjects.size());
         out.push_back(',');
         append_key_size(out, "evaluated", session.evaluations.size());
+        out.push_back(',');
+        append_key_string(out, "executionMode", session.execution_mode);
+        if (session.optimized_summary.has_value()) {
+            out.push_back(',');
+            append_key(out, "optimizedVm");
+            append_optimized_summary(out, *session.optimized_summary);
+        }
         if (instrumentation != nullptr) {
             out.push_back(',');
             append_key(out, "instrumentation");
@@ -474,6 +529,12 @@ namespace rule_engine::server_output {
             out.push_back(',');
             append_key(out, "requests");
             append_requests(out, evaluation.final_step.requests);
+            out.push_back(',');
+            append_key(out, "exactVmRuleIds");
+            append_string_array(out, evaluation.exact_vm_rule_identifiers);
+            out.push_back(',');
+            append_key(out, "prunedRuleIds");
+            append_string_array(out, evaluation.pruned_rule_identifiers);
             out.push_back(',');
             append_key(out, "rules");
             append_rules(out, evaluation.final_step.rule_results);

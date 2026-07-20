@@ -832,6 +832,62 @@ TEST_CASE("client handshake advertises configured custom provider capabilities")
                               [](const auto &capability) { return capability.route == "endpoint.demo.functions"; }));
 }
 
+TEST_CASE("client handshake advertises default process inventory candidate provider") {
+    const auto handshake = rule_engine::client_protocol::client_handshake();
+
+    CHECK(std::ranges::any_of(handshake.capabilities, [](const auto &capability) {
+        return capability.route == "endpoint.process.inventory" &&
+               capability.filter_key == "process.inventory.by_image_name" &&
+               capability.argument_types == std::vector<rule_engine::ValueType> {rule_engine::ValueType::string} &&
+               capability.result_kind == "subject_set";
+    }));
+}
+
+TEST_CASE("candidate provider capability matching requires an exact argument type signature") {
+    const rule_engine::protocol::Capability capability {
+        .route = "endpoint.process.inventory",
+        .filter_key = "process.inventory.by_image_name",
+        .argument_types = {rule_engine::ValueType::string},
+        .result_kind = "subject_set",
+    };
+    const auto matches = [&](const rule_engine::protocol::Capability &candidate,
+                             const std::string_view route = "endpoint.process.inventory",
+                             const std::string_view filter_key = "process.inventory.by_image_name",
+                             const std::string_view argument_kind = "string") {
+        return rule_engine::client_protocol::detail::candidate_provider_capability_matches(
+            candidate, route, filter_key, argument_kind);
+    };
+
+    CHECK(matches(capability));
+
+    auto wrong_route = capability;
+    wrong_route.route = "endpoint.process.other";
+    CHECK_FALSE(matches(wrong_route));
+
+    auto wrong_filter = capability;
+    wrong_filter.filter_key = "process.inventory.other";
+    CHECK_FALSE(matches(wrong_filter));
+
+    auto wrong_result = capability;
+    wrong_result.result_kind = "facts";
+    CHECK_FALSE(matches(wrong_result));
+
+    auto wrong_argument_type = capability;
+    wrong_argument_type.argument_types = {rule_engine::ValueType::integer};
+    CHECK_FALSE(matches(wrong_argument_type));
+    CHECK(matches(wrong_argument_type, "endpoint.process.inventory", "process.inventory.by_image_name", "integer"));
+
+    auto empty_argument_types = capability;
+    empty_argument_types.argument_types.clear();
+    CHECK_FALSE(matches(empty_argument_types));
+
+    auto extra_argument_type = capability;
+    extra_argument_type.argument_types.push_back(rule_engine::ValueType::integer);
+    CHECK_FALSE(matches(extra_argument_type));
+
+    CHECK_FALSE(matches(capability, "endpoint.process.inventory", "process.inventory.by_image_name", "opaque"));
+}
+
 TEST_CASE("client handshake preserves distinct candidate provider filters on one route") {
     const auto handshake =
         rule_engine::client_protocol::client_handshake(std::vector<rule_engine::protocol::Capability> {
@@ -1599,6 +1655,17 @@ TEST_CASE("Windows PE provider extracts TLS callbacks from a fixture image") {
     CHECK(find_entry(*callback, "va")->as_i64() == 0x0040'1234);
     REQUIRE(find_entry(*callback, "rva") != nullptr);
     CHECK(find_entry(*callback, "rva")->as_i64() == 0x1234);
+}
+
+TEST_CASE("Windows process snapshot iteration distinguishes completion from failure") {
+    const auto completed = rule_engine::windows::detail::validate_process_snapshot_iteration_end(ERROR_NO_MORE_FILES);
+    CHECK(completed.has_value());
+
+    const auto failed = rule_engine::windows::detail::validate_process_snapshot_iteration_end(ERROR_ACCESS_DENIED);
+    REQUIRE_FALSE(failed.has_value());
+    REQUIRE_FALSE(failed.error().diagnostics.empty());
+    CHECK(failed.error().diagnostics[0].source == "process");
+    CHECK(failed.error().diagnostics[0].message.find("Process32NextW") != std::string::npos);
 }
 
 TEST_CASE("Windows process provider can enumerate at least the current process") {
@@ -2885,6 +2952,118 @@ TEST_CASE("localhost client session round-trips candidate provider subject sets"
     CHECK(session->candidate_provider_responses[0].results[0].ttl == 30s);
 }
 
+TEST_CASE("client session rejects an unadvertised candidate provider argument type before dispatch") {
+    using namespace std::chrono_literals;
+
+    rule_engine::protocol::CandidateProviderRequestMessage candidate_request;
+    candidate_request.route = "endpoint.process.inventory";
+    candidate_request.filters.push_back(rule_engine::protocol::CandidateProviderFilterRequest {
+        .request_id = "process.inventory.by_image_name|opaque:powershell.exe",
+        .filter_key = "process.inventory.by_image_name",
+        .argument_kind = "opaque",
+        .argument_value = "powershell.exe",
+    });
+
+    bool candidate_provider_called {};
+    std::promise<std::uint16_t> listening_port;
+    auto listening = listening_port.get_future();
+    std::optional<rule_engine::ErrorSet> server_error;
+
+    std::thread server {[&] {
+        auto result = rule_engine::client_protocol::serve_client_once(
+            rule_engine::client_protocol::ClientListenOptions {
+                .bind_address = "127.0.0.1",
+                .port = 0u,
+                .pattern_fixture_path = {},
+                .io_timeout = 5000ms,
+                .extra_capabilities = {},
+                .extra_fact_handler = {},
+                .extra_candidate_provider_handler =
+                    [&](const rule_engine::protocol::CandidateProviderRequestMessage &)
+                    -> std::optional<rule_engine::protocol::CandidateProviderResponseMessage> {
+                    candidate_provider_called = true;
+                    return std::nullopt;
+                },
+            },
+            [&](const std::uint16_t port) { listening_port.set_value(port); });
+        if (!result) {
+            server_error = std::move(result.error());
+        }
+    }};
+
+    REQUIRE(listening.wait_for(5s) == std::future_status::ready);
+    const auto session = rule_engine::client_protocol::run_client_session(
+        rule_engine::client_protocol::ClientConnectionOptions {
+            .host = "127.0.0.1",
+            .port = listening.get(),
+            .io_timeout = 5000ms,
+        },
+        {}, std::vector<rule_engine::protocol::CandidateProviderRequestMessage> {candidate_request});
+
+    server.join();
+
+    REQUIRE_FALSE(server_error.has_value());
+    REQUIRE_FALSE(session.has_value());
+    CHECK_FALSE(candidate_provider_called);
+    REQUIRE_FALSE(session.error().diagnostics.empty());
+    CHECK(session.error().diagnostics[0].message.find(
+              "does not advertise candidate provider filter endpoint.process.inventory/"
+              "process.inventory.by_image_name") != std::string::npos);
+}
+
+TEST_CASE("client session rejects an empty candidate provider filter batch before dispatch") {
+    using namespace std::chrono_literals;
+
+    rule_engine::protocol::CandidateProviderRequestMessage candidate_request;
+    candidate_request.route = "endpoint.unadvertised.candidate";
+
+    bool candidate_provider_called {};
+    std::promise<std::uint16_t> listening_port;
+    auto listening = listening_port.get_future();
+    std::optional<rule_engine::ErrorSet> server_error;
+
+    std::thread server {[&] {
+        auto result = rule_engine::client_protocol::serve_client_once(
+            rule_engine::client_protocol::ClientListenOptions {
+                .bind_address = "127.0.0.1",
+                .port = 0u,
+                .pattern_fixture_path = {},
+                .io_timeout = 5000ms,
+                .extra_capabilities = {},
+                .extra_fact_handler = {},
+                .extra_candidate_provider_handler =
+                    [&](const rule_engine::protocol::CandidateProviderRequestMessage &)
+                    -> std::optional<rule_engine::protocol::CandidateProviderResponseMessage> {
+                    candidate_provider_called = true;
+                    return std::nullopt;
+                },
+            },
+            [&](const std::uint16_t port) { listening_port.set_value(port); });
+        if (!result) {
+            server_error = std::move(result.error());
+        }
+    }};
+
+    REQUIRE(listening.wait_for(5s) == std::future_status::ready);
+    const auto session = rule_engine::client_protocol::run_client_session(
+        rule_engine::client_protocol::ClientConnectionOptions {
+            .host = "127.0.0.1",
+            .port = listening.get(),
+            .io_timeout = 5000ms,
+        },
+        {}, std::vector<rule_engine::protocol::CandidateProviderRequestMessage> {candidate_request});
+
+    server.join();
+
+    REQUIRE_FALSE(server_error.has_value());
+    REQUIRE_FALSE(session.has_value());
+    CHECK_FALSE(candidate_provider_called);
+    REQUIRE_FALSE(session.error().diagnostics.empty());
+    CHECK(session.error().diagnostics[0].source == "client.evaluator");
+    CHECK(session.error().diagnostics[0].message ==
+          "candidate provider request for route endpoint.unadvertised.candidate has no filters");
+}
+
 TEST_CASE("localhost optimizer plan uses candidate provider transport before exact VM") {
     using namespace std::chrono_literals;
 
@@ -2918,6 +3097,7 @@ rule current_name {
     std::promise<std::uint16_t> listening_port;
     auto listening = listening_port.get_future();
     std::optional<rule_engine::ErrorSet> server_error;
+    bool observed_rule_identifier_in_candidate_request {};
 
     std::thread server {[&] {
         auto result = rule_engine::client_protocol::serve_client_once(
@@ -2939,9 +3119,17 @@ rule current_name {
                 .extra_candidate_provider_handler =
                     [&](const rule_engine::protocol::CandidateProviderRequestMessage &request)
                     -> std::optional<rule_engine::protocol::CandidateProviderResponseMessage> {
+                    observed_rule_identifier_in_candidate_request =
+                        request.route.find("current_name") != std::string::npos;
                     rule_engine::protocol::CandidateProviderResponseMessage response;
                     response.route = request.route;
                     for (const auto &filter : request.filters) {
+                        observed_rule_identifier_in_candidate_request =
+                            observed_rule_identifier_in_candidate_request ||
+                            filter.request_id.find("current_name") != std::string::npos ||
+                            filter.filter_key.find("current_name") != std::string::npos ||
+                            filter.argument_kind.find("current_name") != std::string::npos ||
+                            filter.argument_value.find("current_name") != std::string::npos;
                         response.results.push_back(rule_engine::protocol::CandidateProviderSubjectSet {
                             .request_id = filter.request_id,
                             .filter_key = filter.filter_key,
@@ -2980,6 +3168,7 @@ rule current_name {
     server.join();
     REQUIRE_FALSE(server_error.has_value());
     REQUIRE(evaluation.has_value());
+    CHECK_FALSE(observed_rule_identifier_in_candidate_request);
     CHECK(evaluation->sweep.candidate_provider_requests == 1u);
     CHECK(evaluation->sweep.candidate_provider_subjects_returned == 1u);
     CHECK(evaluation->sweep.candidate_provider_broad_results == 0u);
@@ -3044,6 +3233,280 @@ rule current_name {
     CHECK(evaluation->sweep.subjects[1].pruned_rule_identifiers == std::vector<std::string> {"current_name"});
     REQUIRE(evaluation->sweep.subjects[1].rule_results.size() == 1u);
     CHECK_FALSE(evaluation->sweep.subjects[1].rule_results[0].matched);
+}
+
+TEST_CASE("localhost client session uses default process name candidate provider pruning") {
+    constexpr std::string_view source = R"(
+import "process"
+
+rule current_name {
+    condition:
+        process.name == "rule_engine_tests.exe"
+}
+)";
+    auto parsed = rule_engine::parse_source("client_default_process_name_candidate_provider.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+
+    const auto current_subject_id = "pid:" + std::to_string(GetCurrentProcessId());
+    const std::vector<rule_engine::Subject> requested_subjects {
+        rule_engine::Subject {.kind = "process", .id = current_subject_id},
+        rule_engine::Subject {.kind = "process", .id = "pid:0"},
+    };
+
+    std::promise<std::uint16_t> listening_port;
+    auto listening = listening_port.get_future();
+    std::optional<rule_engine::ErrorSet> server_error;
+
+    std::thread server {[&] {
+        auto result = rule_engine::client_protocol::serve_client_once(
+            rule_engine::client_protocol::ClientListenOptions {
+                .bind_address = "127.0.0.1",
+                .port = 0u,
+                .pattern_fixture_path = {},
+                .io_timeout = std::chrono::milliseconds {5000},
+            },
+            [&](const std::uint16_t port) { listening_port.set_value(port); });
+        if (!result) {
+            server_error = std::move(result.error());
+        }
+    }};
+
+    REQUIRE(listening.wait_for(std::chrono::seconds {5}) == std::future_status::ready);
+    const auto port = listening.get();
+    rule_engine::client_protocol::ClientEvaluationInstrumentation instrumentation;
+    auto evaluation = rule_engine::client_protocol::evaluate_subjects_with_client(
+        rule_engine::client_protocol::ClientConnectionOptions {
+            .host = "127.0.0.1",
+            .port = port,
+            .io_timeout = std::chrono::milliseconds {5000},
+        },
+        *verified, requested_subjects,
+        rule_engine::client_protocol::ClientEvaluationOptions {
+            .max_subject_concurrency = 2u,
+            .vm_backpressure_subject_threshold = 1u,
+            .provider_backpressure_request_threshold = 1u,
+            .instrumentation = &instrumentation,
+        });
+
+    server.join();
+    REQUIRE_FALSE(server_error.has_value());
+    REQUIRE(evaluation.has_value());
+    CHECK(instrumentation.candidate_provider_requests == 1u);
+    CHECK(instrumentation.candidate_provider_filters_requested == 1u);
+    CHECK(instrumentation.candidate_provider_subjects_returned == 1u);
+    CHECK(instrumentation.candidate_provider_broad_results == 0u);
+    CHECK(instrumentation.candidate_provider_filters_not_advertised == 0u);
+    CHECK(instrumentation.provider_fact_keys_requested == 1u);
+    REQUIRE(evaluation->optimized_summary.has_value());
+    CHECK(evaluation->optimized_summary->candidate_provider_requests == 1u);
+    CHECK(evaluation->optimized_summary->candidate_provider_planned_requests == 1u);
+    CHECK(evaluation->optimized_summary->candidate_provider_subjects_returned == 1u);
+    CHECK(evaluation->optimized_summary->rules_pruned_before_exact_vm == 1u);
+    CHECK(evaluation->optimized_summary->optimized_exact_vm_rule_executions == 1u);
+    CHECK(std::ranges::any_of(evaluation->handshake.capabilities, [](const auto &capability) {
+        return capability.route == "endpoint.process.inventory" &&
+               capability.filter_key == "process.inventory.by_image_name" &&
+               capability.argument_types == std::vector<rule_engine::ValueType> {rule_engine::ValueType::string} &&
+               capability.result_kind == "subject_set";
+    }));
+
+    REQUIRE(evaluation->evaluations.size() == 2u);
+    CHECK(evaluation->evaluations[0].subject.id == current_subject_id);
+    CHECK(evaluation->evaluations[0].exact_vm_rule_identifiers == std::vector<std::string> {"current_name"});
+    CHECK(evaluation->evaluations[0].pruned_rule_identifiers.empty());
+    REQUIRE(evaluation->evaluations[0].final_step.rule_results.size() == 1u);
+    CHECK(evaluation->evaluations[0].final_step.rule_results[0].matched);
+    CHECK(evaluation->evaluations[1].subject.id == "pid:0");
+    CHECK(evaluation->evaluations[1].exact_vm_rule_identifiers.empty());
+    CHECK(evaluation->evaluations[1].pruned_rule_identifiers == std::vector<std::string> {"current_name"});
+    REQUIRE(evaluation->evaluations[1].final_step.rule_results.size() == 1u);
+    CHECK_FALSE(evaluation->evaluations[1].final_step.rule_results[0].matched);
+}
+
+TEST_CASE("default process name candidate provider is unavailable when inventory names are incomplete") {
+    const rule_engine::protocol::CandidateProviderFilterRequest filter {
+        .request_id = "process.inventory.by_image_name|string:target.exe",
+        .filter_key = "process.inventory.by_image_name",
+        .argument_kind = "string",
+        .argument_value = "target.exe",
+    };
+    const std::vector<rule_engine::Subject> subjects {
+        rule_engine::Subject {.kind = "process", .id = "pid:100"},
+        rule_engine::Subject {.kind = "process", .id = "pid:200"},
+    };
+    const std::vector<rule_engine::Fact> facts {
+        rule_engine::Fact {
+            .subject_id = "pid:100",
+            .key = "process.name",
+            .value = rule_engine::Value::string("target.exe"),
+            .status = rule_engine::FactStatus::available,
+            .diagnostic = {},
+            .ttl = std::chrono::seconds {0},
+        },
+        rule_engine::Fact {
+            .subject_id = "pid:200",
+            .key = "process.name",
+            .value = rule_engine::Value::undefined(),
+            .status = rule_engine::FactStatus::unavailable,
+            .diagnostic = "process not found",
+            .ttl = std::chrono::seconds {0},
+        },
+    };
+
+    const auto result = rule_engine::client_protocol::detail::process_name_candidate_subjects_for_inventory(
+        filter, subjects, facts);
+
+    CHECK(result.request_id == filter.request_id);
+    CHECK(result.filter_key == filter.filter_key);
+    CHECK(result.status == rule_engine::FactStatus::unavailable);
+    CHECK(result.subject_ids.empty());
+    CHECK(result.diagnostic.find("incomplete process inventory") != std::string::npos);
+}
+
+TEST_CASE("default process name candidate provider indexes multi-filter inventory once") {
+    const std::vector<rule_engine::protocol::CandidateProviderFilterRequest> filters {
+        rule_engine::protocol::CandidateProviderFilterRequest {
+            .request_id = "alpha",
+            .filter_key = "process.inventory.by_image_name",
+            .argument_kind = "string",
+            .argument_value = "alpha.exe",
+        },
+        rule_engine::protocol::CandidateProviderFilterRequest {
+            .request_id = "beta",
+            .filter_key = "process.inventory.by_image_name",
+            .argument_kind = "string",
+            .argument_value = "beta.exe",
+        },
+        rule_engine::protocol::CandidateProviderFilterRequest {
+            .request_id = "unsupported",
+            .filter_key = "process.inventory.unsupported",
+            .argument_kind = "string",
+            .argument_value = "alpha.exe",
+        },
+    };
+    const std::vector<rule_engine::Subject> subjects {
+        rule_engine::Subject {.kind = "process", .id = "pid:10"},
+        rule_engine::Subject {.kind = "process", .id = "pid:20"},
+        rule_engine::Subject {.kind = "process", .id = "pid:30"},
+    };
+    const auto process_name_fact = [](std::string subject_id, std::string name) {
+        return rule_engine::Fact {
+            .subject_id = std::move(subject_id),
+            .key = "process.name",
+            .value = rule_engine::Value::string(std::move(name)),
+            .status = rule_engine::FactStatus::available,
+            .diagnostic = {},
+            .ttl = std::chrono::seconds {0},
+        };
+    };
+    const std::vector<rule_engine::Fact> complete_facts {
+        process_name_fact("pid:30", "alpha.exe"),
+        process_name_fact("pid:20", "beta.exe"),
+        process_name_fact("pid:10", "alpha.exe"),
+    };
+
+    const auto complete =
+        rule_engine::client_protocol::detail::process_name_candidate_subjects_for_inventory_batch(
+            filters, subjects, complete_facts);
+    REQUIRE(complete.size() == 3u);
+    CHECK(complete[0].status == rule_engine::FactStatus::available);
+    CHECK(complete[0].subject_ids == std::vector<std::string> {"pid:10", "pid:30"});
+    CHECK(complete[1].status == rule_engine::FactStatus::available);
+    CHECK(complete[1].subject_ids == std::vector<std::string> {"pid:20"});
+    CHECK(complete[2].status == rule_engine::FactStatus::unavailable);
+    CHECK(complete[2].diagnostic == "unsupported candidate provider route");
+
+    const std::vector<rule_engine::Fact> incomplete_facts {
+        process_name_fact("pid:30", "alpha.exe"),
+        process_name_fact("pid:10", "alpha.exe"),
+    };
+    const auto incomplete =
+        rule_engine::client_protocol::detail::process_name_candidate_subjects_for_inventory_batch(
+            filters, subjects, incomplete_facts);
+    REQUIRE(incomplete.size() == 3u);
+    CHECK(incomplete[0].status == rule_engine::FactStatus::unavailable);
+    CHECK(incomplete[0].diagnostic.find("pid:20") != std::string::npos);
+    CHECK(incomplete[1].status == rule_engine::FactStatus::unavailable);
+    CHECK(incomplete[1].diagnostic.find("pid:20") != std::string::npos);
+    CHECK(incomplete[2].status == rule_engine::FactStatus::unavailable);
+    CHECK(incomplete[2].diagnostic == "unsupported candidate provider route");
+}
+
+TEST_CASE("localhost client session does not dispatch candidate provider for private-only process name predicate") {
+    constexpr std::string_view source = R"(
+import "process"
+
+private rule hidden_current_name {
+    condition:
+        process.name == "rule_engine_tests.exe"
+}
+
+rule visible_detection {
+    condition:
+        hidden_current_name
+}
+)";
+    auto parsed = rule_engine::parse_source("client_private_process_name_candidate_provider.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+
+    const auto current_subject_id = "pid:" + std::to_string(GetCurrentProcessId());
+    bool candidate_provider_called {};
+    std::promise<std::uint16_t> listening_port;
+    auto listening = listening_port.get_future();
+    std::optional<rule_engine::ErrorSet> server_error;
+
+    std::thread server {[&] {
+        auto result = rule_engine::client_protocol::serve_client_once(
+            rule_engine::client_protocol::ClientListenOptions {
+                .bind_address = "127.0.0.1",
+                .port = 0u,
+                .pattern_fixture_path = {},
+                .io_timeout = std::chrono::milliseconds {5000},
+                .extra_candidate_provider_handler = [&](const rule_engine::protocol::CandidateProviderRequestMessage &)
+                    -> std::optional<rule_engine::protocol::CandidateProviderResponseMessage> {
+                    candidate_provider_called = true;
+                    return std::nullopt;
+                },
+            },
+            [&](const std::uint16_t port) { listening_port.set_value(port); });
+        if (!result) {
+            server_error = std::move(result.error());
+        }
+    }};
+
+    REQUIRE(listening.wait_for(std::chrono::seconds {5}) == std::future_status::ready);
+    const auto port = listening.get();
+    rule_engine::client_protocol::ClientEvaluationInstrumentation instrumentation;
+    auto evaluation = rule_engine::client_protocol::evaluate_subjects_with_client(
+        rule_engine::client_protocol::ClientConnectionOptions {
+            .host = "127.0.0.1",
+            .port = port,
+            .io_timeout = std::chrono::milliseconds {5000},
+        },
+        *verified, std::vector<rule_engine::Subject> {rule_engine::Subject {.kind = "process", .id = current_subject_id}},
+        rule_engine::client_protocol::ClientEvaluationOptions {
+            .max_subject_concurrency = 1u,
+            .instrumentation = &instrumentation,
+        });
+
+    server.join();
+    REQUIRE_FALSE(server_error.has_value());
+    REQUIRE(evaluation.has_value());
+    CHECK_FALSE(candidate_provider_called);
+    CHECK(instrumentation.candidate_provider_requests == 0u);
+    CHECK(instrumentation.candidate_provider_filters_requested == 0u);
+    CHECK(instrumentation.provider_fact_keys_requested == 1u);
+    REQUIRE(evaluation->optimized_summary.has_value());
+    CHECK(evaluation->optimized_summary->candidate_provider_requests == 0u);
+    CHECK(evaluation->optimized_summary->candidate_provider_planned_requests == 0u);
+    REQUIRE(evaluation->evaluations.size() == 1u);
+    REQUIRE(evaluation->evaluations[0].final_step.rule_results.size() == 1u);
+    CHECK(evaluation->evaluations[0].final_step.rule_results[0].identifier == "visible_detection");
+    CHECK(evaluation->evaluations[0].final_step.rule_results[0].matched);
 }
 
 TEST_CASE("localhost optimizer plan reports broad candidate provider results before exact VM") {
@@ -3685,6 +4148,102 @@ rule reusable_static_fact {
     CHECK(replay_report.sweep_metric_mismatches == 0u);
 }
 
+TEST_CASE("localhost client session uses static fact cache with production PE identity prefetch by default") {
+    using namespace std::chrono_literals;
+
+    auto first_process = start_hidden_ping_process();
+    auto second_process = start_hidden_ping_process();
+
+    constexpr std::string_view source = R"(
+import "pe"
+
+rule reusable_live_pe_header {
+    condition:
+        pe.number_of_sections > 0
+}
+)";
+    auto parsed = rule_engine::parse_source("client_default_optimizer_live_pe_header_static_identity.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+
+    const std::vector<rule_engine::Subject> requested_subjects {
+        rule_engine::Subject {
+            .kind = "process",
+            .id = "pid:" + std::to_string(first_process.info.dwProcessId),
+        },
+        rule_engine::Subject {
+            .kind = "process",
+            .id = "pid:" + std::to_string(second_process.info.dwProcessId),
+        },
+    };
+
+    std::promise<std::uint16_t> listening_port;
+    auto listening = listening_port.get_future();
+    std::optional<rule_engine::ErrorSet> server_error;
+
+    std::thread server {[&] {
+        auto result = rule_engine::client_protocol::serve_client_once(
+            rule_engine::client_protocol::ClientListenOptions {
+                .bind_address = "127.0.0.1",
+                .port = 0u,
+                .pattern_fixture_path = {},
+                .io_timeout = std::chrono::milliseconds {5000},
+            },
+            [&](const std::uint16_t port) { listening_port.set_value(port); });
+        if (!result) {
+            server_error = std::move(result.error());
+        }
+    }};
+
+    REQUIRE(listening.wait_for(5s) == std::future_status::ready);
+    const auto port = listening.get();
+    rule_engine::optimizer::StaticFactCache static_cache;
+    rule_engine::client_protocol::ClientEvaluationInstrumentation instrumentation;
+    auto evaluation = rule_engine::client_protocol::evaluate_subjects_with_client(
+        rule_engine::client_protocol::ClientConnectionOptions {
+            .host = "127.0.0.1",
+            .port = port,
+            .io_timeout = std::chrono::milliseconds {5000},
+        },
+        *verified, requested_subjects,
+        rule_engine::client_protocol::ClientEvaluationOptions {
+            .max_subject_concurrency = 1u,
+            .instrumentation = &instrumentation,
+            .static_fact_cache = &static_cache,
+            .static_fact_identity_route = "endpoint.process.image.pe",
+        });
+
+    server.join();
+    if (server_error.has_value()) {
+        INFO("server_error diagnostics: " << server_error->diagnostics.size());
+        for (const auto &diagnostic : server_error->diagnostics) { INFO(diagnostic.message); }
+    }
+    if (!evaluation.has_value()) {
+        INFO("evaluation diagnostics: " << evaluation.error().diagnostics.size());
+        for (const auto &diagnostic : evaluation.error().diagnostics) { INFO(diagnostic.message); }
+    }
+    REQUIRE_FALSE(server_error.has_value());
+    REQUIRE(evaluation.has_value());
+
+    CHECK(instrumentation.provider_rounds == 2u);
+    CHECK(instrumentation.provider_requests == 2u);
+    CHECK(instrumentation.provider_fact_keys_requested == 13u);
+    CHECK(instrumentation.provider_facts_returned == 13u);
+    CHECK(instrumentation.static_fact_cache_lookups == 2u);
+    CHECK(instrumentation.static_fact_cache_hits == 1u);
+    CHECK(instrumentation.static_fact_cache_misses == 1u);
+    CHECK(instrumentation.static_fact_cache_reuses == 1u);
+    CHECK(instrumentation.static_fact_cache_provider_fact_keys_avoided == 1u);
+
+    REQUIRE(evaluation->evaluations.size() == 2u);
+    for (const auto &subject_evaluation : evaluation->evaluations) {
+        REQUIRE(subject_evaluation.final_step.rule_results.size() == 1u);
+        CHECK(subject_evaluation.final_step.rule_results[0].identifier == "reusable_live_pe_header");
+        CHECK(subject_evaluation.final_step.rule_results[0].matched);
+    }
+}
+
 TEST_CASE("localhost optimizer plan reuses live PE header facts after production identity prefetch") {
     using namespace std::chrono_literals;
 
@@ -4091,7 +4650,7 @@ rule reusable_live_pe_tls_callbacks {
         "client_optimizer_plan_live_pe_tls_static_identity.yar", source, "pe.tls_callbacks");
 }
 
-TEST_CASE("localhost optimizer plan falls back when candidate provider filter is not advertised") {
+TEST_CASE("localhost optimizer plan falls back when candidate provider argument type is not advertised") {
     constexpr std::string_view source = R"(
 import "process"
 
@@ -4104,8 +4663,9 @@ rule current_name {
     REQUIRE(parsed.has_value());
     auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
     REQUIRE(verified.has_value());
-    const auto plan = rule_engine::optimizer::build_optimizer_plan(*verified);
+    auto plan = rule_engine::optimizer::build_optimizer_plan(*verified);
     REQUIRE(plan.candidate_provider_requests.size() == 1u);
+    plan.candidate_provider_requests[0].argument_kind = "opaque";
 
     const auto current_subject_id = "pid:" + std::to_string(GetCurrentProcessId());
     const std::vector<rule_engine::Subject> requested_subjects {
@@ -4746,6 +5306,162 @@ rule cancelled_demo_fact {
     CHECK(result.diagnostics[0].message == "demo value descriptor cancellation");
 }
 
+TEST_CASE("client evaluator skips optimizer prefetches when stopped before provider dispatch") {
+    using namespace std::chrono_literals;
+
+    constexpr std::string_view source = R"(
+import "demo"
+import "process"
+
+rule cancelled_optimized_demo_fact {
+    condition:
+        demo.value == 7 and process.name == "rule_engine_tests.exe"
+}
+)";
+
+    rule_engine::ModuleRegistry registry = rule_engine::default_module_registry();
+    registry.modules.push_back(rule_engine::ModuleDescriptor {
+        .name = "demo",
+        .fields =
+            {
+                rule_engine::FieldDescriptor {
+                    .key = "demo.value",
+                    .type = rule_engine::ValueType::integer,
+                    .route = "endpoint.demo.cancel_descriptor",
+                    .ttl = 30s,
+                    .timeout = 5s,
+                    .retry_policy = rule_engine::ProviderRetryPolicy::none,
+                    .retry_budget = 0u,
+                    .cancellation_diagnostic = "demo value descriptor cancellation",
+                    .cheap_prefetch = true,
+                },
+            },
+        .functions = {},
+    });
+
+    auto parsed = rule_engine::parse_source("cancelled_optimized_demo_fact.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, registry);
+    REQUIRE(verified.has_value());
+    REQUIRE(rule_engine::optimizer::build_optimizer_plan(*verified).candidate_provider_requests.size() == 1u);
+
+    const auto current_subject_id = "pid:" + std::to_string(GetCurrentProcessId());
+    std::promise<std::uint16_t> listening_port;
+    auto listening = listening_port.get_future();
+    std::optional<rule_engine::ErrorSet> server_error;
+    bool static_identity_called {};
+    bool candidate_provider_called {};
+    bool normal_provider_called {};
+
+    std::thread server {[&] {
+        auto result = rule_engine::client_protocol::serve_client_once(
+            rule_engine::client_protocol::ClientListenOptions {
+                .bind_address = "127.0.0.1",
+                .port = 0u,
+                .pattern_fixture_path = {},
+                .io_timeout = 5000ms,
+                .extra_capabilities =
+                    {
+                        rule_engine::protocol::Capability {.route = "endpoint.demo.cancel_descriptor"},
+                        rule_engine::protocol::Capability {.route = "endpoint.demo.identity"},
+                        rule_engine::protocol::Capability {
+                            .route = "endpoint.process.inventory",
+                            .filter_key = "process.inventory.by_image_name",
+                            .argument_types = {rule_engine::ValueType::string},
+                            .result_kind = "subject_set",
+                        },
+                    },
+                .extra_fact_handler = [&](const rule_engine::protocol::FactBatchRequestMessage &request)
+                    -> std::optional<rule_engine::protocol::FactBatchResponseMessage> {
+                    if (request.route == "endpoint.demo.identity") {
+                        static_identity_called = true;
+                        rule_engine::protocol::FactBatchResponseMessage response;
+                        response.route = request.route;
+                        for (const auto &key : request.keys) {
+                            response.values.push_back(rule_engine::Fact {
+                                .subject_id = key.subject_id,
+                                .key = key.key,
+                                .value = rule_engine::Value::undefined(),
+                                .status = rule_engine::FactStatus::available,
+                                .diagnostic = {},
+                                .ttl = 30s,
+                            });
+                        }
+                        return response;
+                    }
+                    if (request.route != "endpoint.demo.cancel_descriptor") {
+                        return std::nullopt;
+                    }
+                    normal_provider_called = true;
+                    return std::nullopt;
+                },
+                .extra_candidate_provider_handler =
+                    [&](const rule_engine::protocol::CandidateProviderRequestMessage &request)
+                    -> std::optional<rule_engine::protocol::CandidateProviderResponseMessage> {
+                    candidate_provider_called = true;
+                    rule_engine::protocol::CandidateProviderResponseMessage response;
+                    response.route = request.route;
+                    for (const auto &filter : request.filters) {
+                        response.results.push_back(rule_engine::protocol::CandidateProviderSubjectSet {
+                            .request_id = filter.request_id,
+                            .filter_key = filter.filter_key,
+                            .status = rule_engine::FactStatus::available,
+                            .subject_ids = {current_subject_id},
+                            .diagnostic = {},
+                            .ttl = 30s,
+                        });
+                    }
+                    return response;
+                },
+            },
+            [&](const std::uint16_t port) { listening_port.set_value(port); });
+        if (!result) {
+            server_error = std::move(result.error());
+        }
+    }};
+
+    REQUIRE(listening.wait_for(5s) == std::future_status::ready);
+    const auto port = listening.get();
+    REQUIRE(port != 0u);
+
+    std::stop_source stop_source;
+    stop_source.request_stop();
+    rule_engine::optimizer::StaticFactCache static_cache;
+    rule_engine::client_protocol::ClientEvaluationInstrumentation instrumentation;
+    auto evaluation = rule_engine::client_protocol::evaluate_subjects_with_client(
+        rule_engine::client_protocol::ClientConnectionOptions {
+            .host = "127.0.0.1",
+            .port = port,
+            .io_timeout = 5000ms,
+        },
+        *verified, std::vector<rule_engine::Subject> {rule_engine::Subject {.kind = "process", .id = current_subject_id}},
+        rule_engine::client_protocol::ClientEvaluationOptions {
+            .max_subject_concurrency = 1u,
+            .max_provider_rounds = 16u,
+            .instrumentation = &instrumentation,
+            .static_fact_cache = &static_cache,
+            .static_fact_identity_route = "endpoint.demo.identity",
+            .stop_token = stop_source.get_token(),
+        });
+
+    server.join();
+
+    REQUIRE_FALSE(server_error.has_value());
+    CHECK_FALSE(static_identity_called);
+    CHECK_FALSE(candidate_provider_called);
+    CHECK_FALSE(normal_provider_called);
+    CHECK(instrumentation.candidate_provider_requests == 0u);
+    CHECK(instrumentation.provider_requests == 0u);
+    CHECK(instrumentation.provider_fact_keys_requested == 0u);
+    REQUIRE(evaluation.has_value());
+    REQUIRE(evaluation->evaluations.size() == 1u);
+    REQUIRE(evaluation->evaluations[0].final_step.rule_results.size() == 1u);
+    const auto &result = evaluation->evaluations[0].final_step.rule_results[0];
+    CHECK_FALSE(result.matched);
+    REQUIRE(result.diagnostics.size() == 1u);
+    CHECK(result.diagnostics[0].message == "demo value descriptor cancellation");
+}
+
 TEST_CASE("localhost client session resolves custom module function facts") {
     constexpr std::string_view source = R"(
 import "process"
@@ -4994,6 +5710,256 @@ TEST_CASE("client session rejects explicit requests for routes missing from clie
     REQUIRE_FALSE(session.error().diagnostics.empty());
     CHECK(session.error().diagnostics[0].message.find("does not advertise provider route endpoint.demo.functions") !=
           std::string::npos);
+}
+
+TEST_CASE("client session does not treat a candidate-only capability as a fact provider") {
+    using namespace std::chrono_literals;
+
+    bool fact_provider_called {};
+    std::promise<std::uint16_t> listening_port;
+    auto listening = listening_port.get_future();
+    std::optional<rule_engine::ErrorSet> server_error;
+
+    std::thread server {[&] {
+        auto result = rule_engine::client_protocol::serve_client_once(
+            rule_engine::client_protocol::ClientListenOptions {
+                .bind_address = "127.0.0.1",
+                .port = 0u,
+                .pattern_fixture_path = {},
+                .io_timeout = 5000ms,
+                .extra_capabilities = {},
+                .extra_fact_handler = [&](const rule_engine::protocol::FactBatchRequestMessage &)
+                    -> std::optional<rule_engine::protocol::FactBatchResponseMessage> {
+                    fact_provider_called = true;
+                    return std::nullopt;
+                },
+            },
+            [&](const std::uint16_t port) { listening_port.set_value(port); });
+        if (!result) {
+            server_error = std::move(result.error());
+        }
+    }};
+
+    REQUIRE(listening.wait_for(5s) == std::future_status::ready);
+    rule_engine::protocol::FactBatchRequestMessage request;
+    request.route = "endpoint.process.inventory";
+    request.keys.push_back(rule_engine::protocol::FactKey {
+        .subject_id = "pid:" + std::to_string(GetCurrentProcessId()),
+        .key = "process.name",
+    });
+
+    const auto session = rule_engine::client_protocol::run_client_session(
+        rule_engine::client_protocol::ClientConnectionOptions {
+            .host = "127.0.0.1",
+            .port = listening.get(),
+            .io_timeout = 5000ms,
+        },
+        std::vector<rule_engine::protocol::FactBatchRequestMessage> {request});
+
+    server.join();
+
+    REQUIRE_FALSE(server_error.has_value());
+    REQUIRE_FALSE(session.has_value());
+    CHECK_FALSE(fact_provider_called);
+    REQUIRE_FALSE(session.error().diagnostics.empty());
+    CHECK(session.error().diagnostics[0].source == "client.evaluator");
+    CHECK(session.error().diagnostics[0].message ==
+          "client does not advertise provider route endpoint.process.inventory");
+}
+
+TEST_CASE("localhost client session falls back to fact predicates when candidate provider is unavailable") {
+    constexpr std::string_view source = R"(
+import "process"
+
+rule current_name {
+    condition:
+        process.name == "rule_engine_tests.exe"
+}
+)";
+    auto parsed = rule_engine::parse_source("client_default_optimizer_candidate_provider_fallback.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+    auto plan = rule_engine::optimizer::build_optimizer_plan(*verified);
+    REQUIRE(plan.candidate_provider_requests.size() == 1u);
+    plan.candidate_provider_requests[0].filter_key = "process.inventory.unsupported_by_image_name";
+
+    const auto current_subject_id = "pid:" + std::to_string(GetCurrentProcessId());
+    const std::vector<rule_engine::Subject> requested_subjects {
+        rule_engine::Subject {.kind = "process", .id = current_subject_id},
+        rule_engine::Subject {.kind = "process", .id = "pid:0"},
+    };
+
+    bool candidate_provider_called {false};
+    std::promise<std::uint16_t> listening_port;
+    auto listening = listening_port.get_future();
+    std::optional<rule_engine::ErrorSet> server_error;
+
+    std::thread server {[&] {
+        auto result = rule_engine::client_protocol::serve_client_once(
+            rule_engine::client_protocol::ClientListenOptions {
+                .bind_address = "127.0.0.1",
+                .port = 0u,
+                .pattern_fixture_path = {},
+                .io_timeout = std::chrono::milliseconds {5000},
+                .extra_capabilities = {},
+                .extra_fact_handler = {},
+                .extra_candidate_provider_handler = [&](const rule_engine::protocol::CandidateProviderRequestMessage &)
+                    -> std::optional<rule_engine::protocol::CandidateProviderResponseMessage> {
+                    candidate_provider_called = true;
+                    return std::nullopt;
+                },
+            },
+            [&](const std::uint16_t port) { listening_port.set_value(port); });
+        if (!result) {
+            server_error = std::move(result.error());
+        }
+    }};
+
+    REQUIRE(listening.wait_for(std::chrono::seconds {5}) == std::future_status::ready);
+    const auto port = listening.get();
+    rule_engine::client_protocol::ClientEvaluationInstrumentation instrumentation;
+    auto evaluation = rule_engine::client_protocol::evaluate_subjects_with_optimizer_plan(
+        rule_engine::client_protocol::ClientConnectionOptions {
+            .host = "127.0.0.1",
+            .port = port,
+            .io_timeout = std::chrono::milliseconds {5000},
+        },
+        *verified, plan, requested_subjects,
+        rule_engine::client_protocol::ClientEvaluationOptions {
+            .max_subject_concurrency = 2u,
+            .instrumentation = &instrumentation,
+        });
+
+    server.join();
+    REQUIRE_FALSE(server_error.has_value());
+    REQUIRE(evaluation.has_value());
+    CHECK_FALSE(candidate_provider_called);
+    CHECK(instrumentation.candidate_provider_requests == 0u);
+    CHECK(instrumentation.candidate_provider_filters_requested == 0u);
+    CHECK(instrumentation.candidate_provider_subjects_returned == 0u);
+    CHECK(instrumentation.candidate_provider_filters_not_advertised == 1u);
+    CHECK(instrumentation.provider_fact_keys_requested == 2u);
+    CHECK(evaluation->candidate_provider_requests_sent == 0u);
+    CHECK(evaluation->sweep.candidate_provider_requests == 1u);
+    CHECK(evaluation->sweep.candidate_provider_subjects_returned == 0u);
+    CHECK(evaluation->sweep.candidate_provider_fallback_predicate_evaluations == 2u);
+
+    REQUIRE(evaluation->sweep.subjects.size() == 2u);
+    CHECK(evaluation->sweep.subjects[0].subject_id == current_subject_id);
+    REQUIRE(evaluation->sweep.subjects[0].rule_results.size() == 1u);
+    CHECK(evaluation->sweep.subjects[0].rule_results[0].matched);
+    CHECK(evaluation->sweep.subjects[1].subject_id == "pid:0");
+    REQUIRE(evaluation->sweep.subjects[1].rule_results.size() == 1u);
+    CHECK_FALSE(evaluation->sweep.subjects[1].rule_results[0].matched);
+}
+
+TEST_CASE("localhost client session falls back when advertised candidate provider is unavailable") {
+    constexpr std::string_view source = R"(
+import "process"
+
+rule current_name {
+    condition:
+        process.name == "rule_engine_tests.exe"
+}
+)";
+    auto parsed =
+        rule_engine::parse_source("client_default_optimizer_advertised_candidate_provider_unavailable.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+
+    const auto current_subject_id = "pid:" + std::to_string(GetCurrentProcessId());
+    const std::vector<rule_engine::Subject> requested_subjects {
+        rule_engine::Subject {.kind = "process", .id = current_subject_id},
+        rule_engine::Subject {.kind = "process", .id = "pid:0"},
+    };
+
+    bool candidate_provider_called {false};
+    std::string observed_candidate_diagnostic;
+    std::promise<std::uint16_t> listening_port;
+    auto listening = listening_port.get_future();
+    std::optional<rule_engine::ErrorSet> server_error;
+
+    std::thread server {[&] {
+        auto result = rule_engine::client_protocol::serve_client_once(
+            rule_engine::client_protocol::ClientListenOptions {
+                .bind_address = "127.0.0.1",
+                .port = 0u,
+                .pattern_fixture_path = {},
+                .io_timeout = std::chrono::milliseconds {5000},
+                .extra_capabilities =
+                    {
+                        rule_engine::protocol::Capability {
+                            .route = "endpoint.process.inventory",
+                            .filter_key = "process.inventory.by_image_name",
+                            .argument_types = {rule_engine::ValueType::string},
+                            .result_kind = "subject_set",
+                        },
+                    },
+                .extra_fact_handler = {},
+                .extra_candidate_provider_handler =
+                    [&](const rule_engine::protocol::CandidateProviderRequestMessage &request)
+                    -> std::optional<rule_engine::protocol::CandidateProviderResponseMessage> {
+                    candidate_provider_called = true;
+                    rule_engine::protocol::CandidateProviderResponseMessage response;
+                    response.route = request.route;
+                    for (const auto &filter : request.filters) {
+                        observed_candidate_diagnostic = "inventory provider unavailable";
+                        response.results.push_back(rule_engine::protocol::CandidateProviderSubjectSet {
+                            .request_id = filter.request_id,
+                            .filter_key = filter.filter_key,
+                            .status = rule_engine::FactStatus::unavailable,
+                            .subject_ids = {},
+                            .diagnostic = observed_candidate_diagnostic,
+                            .ttl = std::chrono::seconds {0},
+                        });
+                    }
+                    return response;
+                },
+            },
+            [&](const std::uint16_t port) { listening_port.set_value(port); });
+        if (!result) {
+            server_error = std::move(result.error());
+        }
+    }};
+
+    REQUIRE(listening.wait_for(std::chrono::seconds {5}) == std::future_status::ready);
+    const auto port = listening.get();
+    rule_engine::client_protocol::ClientEvaluationInstrumentation instrumentation;
+    auto evaluation = rule_engine::client_protocol::evaluate_subjects_with_client(
+        rule_engine::client_protocol::ClientConnectionOptions {
+            .host = "127.0.0.1",
+            .port = port,
+            .io_timeout = std::chrono::milliseconds {5000},
+        },
+        *verified, requested_subjects,
+        rule_engine::client_protocol::ClientEvaluationOptions {
+            .max_subject_concurrency = 2u,
+            .instrumentation = &instrumentation,
+        });
+
+    server.join();
+    REQUIRE_FALSE(server_error.has_value());
+    REQUIRE(evaluation.has_value());
+    CHECK(candidate_provider_called);
+    CHECK(observed_candidate_diagnostic == "inventory provider unavailable");
+    CHECK(instrumentation.candidate_provider_requests == 1u);
+    CHECK(instrumentation.candidate_provider_filters_requested == 1u);
+    CHECK(instrumentation.candidate_provider_subjects_returned == 0u);
+    CHECK(instrumentation.candidate_provider_filters_not_advertised == 0u);
+    CHECK(instrumentation.provider_fact_keys_requested == 2u);
+    REQUIRE(evaluation->optimized_summary.has_value());
+    CHECK(evaluation->optimized_summary->candidate_provider_requests == 1u);
+    CHECK(evaluation->optimized_summary->candidate_provider_planned_requests == 1u);
+
+    REQUIRE(evaluation->evaluations.size() == 2u);
+    CHECK(evaluation->evaluations[0].subject.id == current_subject_id);
+    REQUIRE(evaluation->evaluations[0].final_step.rule_results.size() == 1u);
+    CHECK(evaluation->evaluations[0].final_step.rule_results[0].matched);
+    CHECK(evaluation->evaluations[1].subject.id == "pid:0");
+    REQUIRE(evaluation->evaluations[1].final_step.rule_results.size() == 1u);
+    CHECK_FALSE(evaluation->evaluations[1].final_step.rule_results[0].matched);
 }
 
 TEST_CASE("client evaluator preflights verified provider routes before short-circuit evaluation") {

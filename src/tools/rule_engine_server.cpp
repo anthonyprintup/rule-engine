@@ -92,6 +92,18 @@ namespace {
         return "<complex>";
     }
 
+    [[nodiscard]] std::string rule_id_list_text(const std::vector<std::string> &rule_ids) {
+        std::string out {"["};
+        for (std::size_t index = 0; index < rule_ids.size(); ++index) {
+            if (index != 0u) {
+                out += ",";
+            }
+            out += rule_ids[index];
+        }
+        out += "]";
+        return out;
+    }
+
     void print_errors(const rule_engine::ErrorSet &errors) {
         for (const auto &diagnostic : errors.diagnostics) {
             fmt::print(stderr, "{}\n", diagnostic.message);
@@ -262,27 +274,65 @@ int main(int argc, char **argv) {
             return 0;
         }
 
-        fmt::print("connected to {}:{} protocol={} version={} subjects={} evaluated={}\n",
+        fmt::print("connected to {}:{} protocol={} version={} subjects={} evaluated={} execution_mode={}\n",
                    host,
                    port,
                    evaluation->handshake.protocol,
                    evaluation->handshake.version,
                    evaluation->subjects.subjects.size(),
-                   evaluation->evaluations.size());
+                   evaluation->evaluations.size(),
+                   evaluation->execution_mode);
+        if (evaluation->optimized_summary.has_value()) {
+            const auto &optimized = *evaluation->optimized_summary;
+            fmt::print("optimized_vm baseline_exact_vm_rule_executions={} "
+                       "optimized_exact_vm_rule_executions={} exact_vm_rule_executions_avoided={} "
+                       "rules_pruned_before_exact_vm={} candidate_provider_requests={} "
+                       "candidate_provider_planned_requests={} candidate_provider_subjects_returned={} "
+                       "candidate_provider_broad_results={} "
+                       "candidate_provider_fallback_predicate_evaluations={} peak_candidate_set_subjects={} "
+                       "peak_candidate_set_bytes={} replay_subject_mismatches={} "
+                       "replay_rule_result_mismatches={} replay_trace_event_mismatches={} "
+                       "replay_metric_mismatches={}\n",
+                       optimized.baseline_exact_vm_rule_executions,
+                       optimized.optimized_exact_vm_rule_executions,
+                       optimized.exact_vm_rule_executions_avoided,
+                       optimized.rules_pruned_before_exact_vm,
+                       optimized.candidate_provider_requests,
+                       optimized.candidate_provider_planned_requests,
+                       optimized.candidate_provider_subjects_returned,
+                       optimized.candidate_provider_broad_results,
+                       optimized.candidate_provider_fallback_predicate_evaluations,
+                       optimized.peak_candidate_set_subjects,
+                       optimized.peak_candidate_set_bytes,
+                       optimized.replay_subject_mismatches,
+                       optimized.replay_rule_result_mismatches,
+                       optimized.replay_trace_event_mismatches,
+                       optimized.replay_metric_mismatches);
+        }
         fmt::print("instrumentation provider_rounds={} provider_requests={} peak_vm_subjects={} peak_provider_requests={} "
-                   "vm_backpressure_events={} provider_backpressure_events={} static_cache_hits={} "
-                   "static_cache_invalidations={} static_cache_provider_fact_keys_avoided={}\n",
+                   "vm_backpressure_events={} provider_backpressure_events={} static_cache_lookups={} "
+                   "static_cache_hits={} static_cache_misses={} static_cache_reuses={} "
+                   "static_cache_invalidations={} static_cache_subject_scoped={} "
+                   "static_cache_provider_fact_keys_avoided={}\n",
                    instrumentation.provider_rounds,
                    instrumentation.provider_requests,
                    instrumentation.peak_pending_vm_subjects,
                    instrumentation.peak_pending_provider_requests,
                    instrumentation.vm_backpressure_events,
                    instrumentation.provider_backpressure_events,
+                   instrumentation.static_fact_cache_lookups,
                    instrumentation.static_fact_cache_hits,
+                   instrumentation.static_fact_cache_misses,
+                   instrumentation.static_fact_cache_reuses,
                    instrumentation.static_fact_cache_invalidations,
+                   instrumentation.static_fact_cache_subject_scoped,
                    instrumentation.static_fact_cache_provider_fact_keys_avoided);
         for (const auto &subject_evaluation : evaluation->evaluations) {
             fmt::print("subject {}\n", subject_evaluation.subject.id);
+            fmt::print("  exact_vm_rule_ids {}\n",
+                       rule_id_list_text(subject_evaluation.exact_vm_rule_identifiers));
+            fmt::print("  pruned_rule_ids {}\n",
+                       rule_id_list_text(subject_evaluation.pruned_rule_identifiers));
             for (const auto &result : subject_evaluation.final_step.rule_results) {
                 fmt::print("  {} {}\n", result.identifier, result.matched ? "match" : "no_match");
                 for (const auto &diagnostic : result.diagnostics) {

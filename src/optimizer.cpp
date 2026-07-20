@@ -792,6 +792,7 @@ namespace rule_engine::optimizer {
                               .rule_identifier = rule_identifier(rule),
                               .span = expr.span,
                               .prune_safe = required_context,
+                              .reportable = !rule.is_global && !rule.is_private,
                           });
                 return;
             }
@@ -1304,13 +1305,15 @@ namespace rule_engine::optimizer {
             return out;
         }
 
-        [[nodiscard]] bool has_prune_safe_owner(const CanonicalPredicate &predicate) {
-            return std::ranges::any_of(predicate.owners, [](const auto &owner) { return owner.prune_safe; });
+        [[nodiscard]] bool has_prune_safe_reportable_owner(const CanonicalPredicate &predicate) {
+            return std::ranges::any_of(predicate.owners, [](const auto &owner) {
+                return owner.prune_safe && owner.reportable;
+            });
         }
 
         [[nodiscard]] std::optional<CandidateProviderRequest>
         candidate_provider_request_for(const CanonicalPredicate &predicate) {
-            if (!has_prune_safe_owner(predicate)) {
+            if (!has_prune_safe_reportable_owner(predicate)) {
                 return std::nullopt;
             }
             if (predicate.fact_key == "process.name" && predicate.operation == "equal" &&

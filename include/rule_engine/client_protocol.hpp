@@ -15,6 +15,7 @@
 #include <span>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace rule_engine::client_protocol {
@@ -109,12 +110,34 @@ namespace rule_engine::client_protocol {
     struct ClientSubjectEvaluation {
         Subject subject;
         EvaluationStep final_step;
+        std::vector<std::string> exact_vm_rule_identifiers;
+        std::vector<std::string> pruned_rule_identifiers;
+    };
+
+    struct ClientOptimizedEvaluationSummary {
+        std::uint64_t baseline_exact_vm_rule_executions {};
+        std::uint64_t optimized_exact_vm_rule_executions {};
+        std::uint64_t exact_vm_rule_executions_avoided {};
+        std::uint64_t rules_pruned_before_exact_vm {};
+        std::uint64_t candidate_provider_requests {};
+        std::uint64_t candidate_provider_planned_requests {};
+        std::uint64_t candidate_provider_subjects_returned {};
+        std::uint64_t candidate_provider_broad_results {};
+        std::uint64_t candidate_provider_fallback_predicate_evaluations {};
+        std::uint64_t peak_candidate_set_subjects {};
+        std::uint64_t peak_candidate_set_bytes {};
+        std::uint64_t replay_subject_mismatches {};
+        std::uint64_t replay_rule_result_mismatches {};
+        std::uint64_t replay_trace_event_mismatches {};
+        std::uint64_t replay_metric_mismatches {};
     };
 
     struct ClientMultiEvaluationSession {
         protocol::HandshakeMessage handshake;
         protocol::SubjectListMessage subjects;
         std::vector<ClientSubjectEvaluation> evaluations;
+        std::string execution_mode {"optimized_vm"};
+        std::optional<ClientOptimizedEvaluationSummary> optimized_summary;
     };
 
     struct OptimizedClientEvaluationSession {
@@ -124,6 +147,7 @@ namespace rule_engine::client_protocol {
         std::vector<Fact> facts;
         std::vector<optimizer::CandidateProviderResult> candidate_provider_results;
         std::vector<optimizer::OptimizerTraceEvent> static_fact_cache_trace_events;
+        std::uint64_t candidate_provider_requests_sent {};
         optimizer::OptimizedEvaluationSweep sweep;
     };
 
@@ -168,4 +192,22 @@ namespace rule_engine::client_protocol {
     replay_optimized_client_evaluation_with_parity_report(const VerifiedProgram &program,
                                                           const optimizer::OptimizerPlan &plan,
                                                           const OptimizedClientEvaluationSession &session);
+
+    namespace detail {
+        [[nodiscard]] bool candidate_provider_capability_matches(
+            const protocol::Capability &capability,
+            std::string_view route,
+            std::string_view filter_key,
+            std::string_view argument_kind);
+
+        [[nodiscard]] protocol::CandidateProviderSubjectSet process_name_candidate_subjects_for_inventory(
+            const protocol::CandidateProviderFilterRequest &filter,
+            std::span<const Subject> inventory_subjects,
+            std::span<const Fact> process_name_facts);
+        [[nodiscard]] std::vector<protocol::CandidateProviderSubjectSet>
+        process_name_candidate_subjects_for_inventory_batch(
+            std::span<const protocol::CandidateProviderFilterRequest> filters,
+            std::span<const Subject> inventory_subjects,
+            std::span<const Fact> process_name_facts);
+    } // namespace detail
 } // namespace rule_engine::client_protocol

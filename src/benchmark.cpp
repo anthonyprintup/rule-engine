@@ -1149,7 +1149,7 @@ namespace rule_engine::benchmark {
         report.metadata.build_type = build_type_name();
         report.metadata.optimizer_flags = optimizer_flags_for(options);
         if (options.simulate_optimization_comparison) {
-            report.metadata.mode = "baseline_with_optimization_comparison_simulation";
+            report.metadata.mode = "default_optimized_vm_acceptance_with_exact_baseline_comparison";
         } else if (options.simulate_scheduler_controls) {
             report.metadata.mode = "baseline_with_scheduler_control_simulation";
             report.metadata.benchmark_tier = "stress";

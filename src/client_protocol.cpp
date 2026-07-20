@@ -53,6 +53,9 @@ namespace {
     constexpr std::uint32_t max_payload_size = 16u * 1024u * 1024u;
     constexpr std::chrono::milliseconds shutdown_poll_interval {10};
     constexpr std::string_view provider_request_cancelled_diagnostic {"provider request cancelled by listener shutdown"};
+    constexpr std::string_view process_inventory_route {"endpoint.process.inventory"};
+    constexpr std::string_view process_inventory_by_image_name_filter {"process.inventory.by_image_name"};
+    constexpr std::string_view process_name_fact_key {"process.name"};
 
     [[nodiscard]] bool is_timeout_error(const asio::error_code &ec) noexcept {
         if (ec == asio::error::timed_out || ec == asio::error::would_block || ec == asio::error::try_again) {
@@ -234,18 +237,26 @@ namespace {
         capabilities.push_back(std::move(capability));
     }
 
-    [[nodiscard]] bool has_capability(const rule_engine::protocol::HandshakeMessage &handshake,
-                                      const std::string_view route) {
-        return std::ranges::any_of(handshake.capabilities,
-                                   [&](const auto &capability) { return capability.route == route; });
+    [[nodiscard]] bool fact_provider_capability_matches(const rule_engine::protocol::Capability &capability,
+                                                        const std::string_view route) {
+        return capability.route == route && capability.filter_key.empty() && capability.argument_types.empty() &&
+               capability.result_kind.empty();
+    }
+
+    [[nodiscard]] bool has_fact_provider_capability(const rule_engine::protocol::HandshakeMessage &handshake,
+                                                    const std::string_view route) {
+        return std::ranges::any_of(handshake.capabilities, [&](const auto &capability) {
+            return fact_provider_capability_matches(capability, route);
+        });
     }
 
     [[nodiscard]] bool has_candidate_provider_capability(const rule_engine::protocol::HandshakeMessage &handshake,
                                                          const std::string_view route,
-                                                         const std::string_view filter_key) {
+                                                         const std::string_view filter_key,
+                                                         const std::string_view argument_kind) {
         return std::ranges::any_of(handshake.capabilities, [&](const auto &capability) {
-            return capability.route == route && capability.filter_key == filter_key &&
-                   capability.result_kind == "subject_set";
+            return rule_engine::client_protocol::detail::candidate_provider_capability_matches(
+                capability, route, filter_key, argument_kind);
         });
     }
 
@@ -414,6 +425,48 @@ namespace {
             return out;
         }
         return *facts;
+    }
+
+    [[nodiscard]] rule_engine::protocol::CandidateProviderSubjectSet
+    make_unavailable_candidate_provider_subject_set(
+        const rule_engine::protocol::CandidateProviderFilterRequest &filter,
+        const std::string_view diagnostic) {
+        return rule_engine::protocol::CandidateProviderSubjectSet {
+            .request_id = filter.request_id,
+            .filter_key = filter.filter_key,
+            .status = rule_engine::FactStatus::unavailable,
+            .subject_ids = {},
+            .diagnostic = std::string {diagnostic},
+            .ttl = std::chrono::seconds {0},
+        };
+    }
+
+    [[nodiscard]] std::optional<rule_engine::protocol::CandidateProviderResponseMessage>
+    default_process_inventory_candidate_provider_response(
+        const rule_engine::protocol::CandidateProviderRequestMessage &request) {
+        if (request.route != process_inventory_route) {
+            return std::nullopt;
+        }
+
+        auto inventory = rule_engine::windows::read_process_name_inventory();
+        if (!inventory) {
+            rule_engine::protocol::CandidateProviderResponseMessage response;
+            response.route = request.route;
+            response.results.reserve(request.filters.size());
+            const auto diagnostic = inventory.error().diagnostics.empty() ? std::string {"process inventory failed"} :
+                                                                            inventory.error().diagnostics[0].message;
+            for (const auto &filter : request.filters) {
+                response.results.push_back(make_unavailable_candidate_provider_subject_set(filter, diagnostic));
+            }
+            return response;
+        }
+
+        rule_engine::protocol::CandidateProviderResponseMessage response;
+        response.route = request.route;
+        response.results =
+            rule_engine::client_protocol::detail::process_name_candidate_subjects_for_inventory_batch(
+                request.filters, inventory->subjects, inventory->facts);
+        return response;
     }
 
     [[nodiscard]] std::vector<rule_engine::Fact>
@@ -595,19 +648,17 @@ namespace {
                 return *custom_response;
             }
         }
+        if (auto default_response = default_process_inventory_candidate_provider_response(request);
+            default_response.has_value()) {
+            return *default_response;
+        }
 
         rule_engine::protocol::CandidateProviderResponseMessage response;
         response.route = request.route;
         response.results.reserve(request.filters.size());
         for (const auto &filter : request.filters) {
-            response.results.push_back(rule_engine::protocol::CandidateProviderSubjectSet {
-                .request_id = filter.request_id,
-                .filter_key = filter.filter_key,
-                .status = rule_engine::FactStatus::unavailable,
-                .subject_ids = {},
-                .diagnostic = "unsupported candidate provider route",
-                .ttl = std::chrono::seconds {0},
-            });
+            response.results.push_back(
+                make_unavailable_candidate_provider_subject_set(filter, "unsupported candidate provider route"));
         }
         return response;
     }
@@ -858,7 +909,7 @@ namespace {
     [[nodiscard]] std::expected<void, rule_engine::ErrorSet>
     validate_request_capability(const rule_engine::protocol::HandshakeMessage &handshake,
                                 const rule_engine::protocol::FactBatchRequestMessage &request) {
-        if (has_capability(handshake, request.route)) {
+        if (has_fact_provider_capability(handshake, request.route)) {
             return {};
         }
         return std::unexpected(
@@ -868,8 +919,12 @@ namespace {
     [[nodiscard]] std::expected<void, rule_engine::ErrorSet>
     validate_request_capability(const rule_engine::protocol::HandshakeMessage &handshake,
                                 const rule_engine::protocol::CandidateProviderRequestMessage &request) {
+        if (request.filters.empty()) {
+            return std::unexpected(rule_engine::single_error(
+                "client.evaluator", "candidate provider request for route " + request.route + " has no filters"));
+        }
         for (const auto &filter : request.filters) {
-            if (has_candidate_provider_capability(handshake, request.route, filter.filter_key)) {
+            if (has_candidate_provider_capability(handshake, request.route, filter.filter_key, filter.argument_kind)) {
                 continue;
             }
             return std::unexpected(
@@ -883,7 +938,7 @@ namespace {
     validate_program_capabilities(const rule_engine::protocol::HandshakeMessage &handshake,
                                   const rule_engine::VerifiedProgram &program) {
         for (const auto &route : rule_engine::required_provider_routes(program)) {
-            if (has_capability(handshake, route)) {
+            if (has_fact_provider_capability(handshake, route)) {
                 continue;
             }
             return std::unexpected(rule_engine::single_error(
@@ -1059,12 +1114,6 @@ namespace {
         }
     }
 
-    struct SubjectEvaluationState {
-        rule_engine::Subject subject;
-        rule_engine::FactCache facts;
-        std::optional<rule_engine::EvaluationStep> final_step;
-    };
-
     struct OptimizedSubjectEvaluationState {
         rule_engine::Subject subject;
         rule_engine::FactCache facts;
@@ -1104,14 +1153,6 @@ namespace {
     pending_exact_vm_subjects(const std::vector<OptimizedSubjectEvaluationState> &states) noexcept {
         return static_cast<std::size_t>(
             std::ranges::count_if(states, [](const auto &state) { return !state.exact_vm_rule_identifiers.empty(); }));
-    }
-
-    void store_fact_for_matching_subjects(std::vector<SubjectEvaluationState> &states, const rule_engine::Fact &fact) {
-        for (auto &state : states) {
-            if (state.subject.id == fact.subject_id) {
-                state.facts.store(fact);
-            }
-        }
     }
 
     void store_fact_for_matching_subjects(std::vector<OptimizedSubjectEvaluationState> &states,
@@ -1171,19 +1212,6 @@ namespace {
             for (const auto &metadata : request.metadata) {
                 store_fact_for_matching_subjects(states, cancellation_fact_for_metadata(metadata));
             }
-        }
-    }
-
-    template<typename States>
-    void store_response_facts_with_retry(States &states, const PlannedFactRequest &request,
-                                         const rule_engine::protocol::FactBatchResponseMessage &response,
-                                         std::unordered_map<std::string, std::uint8_t> &retry_attempts) {
-        for (const auto &fact : response.values) {
-            const auto *metadata = find_metadata_for_fact(request, fact);
-            if (metadata != nullptr && retryable_provider_fact(*metadata, fact, retry_attempts)) {
-                continue;
-            }
-            store_fact_for_matching_subjects(states, fact);
         }
     }
 
@@ -1449,7 +1477,8 @@ namespace {
                                                    const std::chrono::milliseconds timeout) {
         CandidateProviderRequestSelection out;
         for (const auto &request : plan.candidate_provider_requests) {
-            if (!has_candidate_provider_capability(handshake, request.route, request.filter_key)) {
+            if (!has_candidate_provider_capability(
+                    handshake, request.route, request.filter_key, request.argument_kind)) {
                 ++out.filters_not_advertised;
                 continue;
             }
@@ -1499,6 +1528,76 @@ namespace {
                        std::make_move_iterator(subject_facts.end()));
         }
         return out;
+    }
+
+    [[nodiscard]] std::expected<rule_engine::client_protocol::ClientMultiEvaluationSession, rule_engine::ErrorSet>
+    to_client_multi_evaluation_session(
+        rule_engine::client_protocol::OptimizedClientEvaluationSession optimized,
+        const rule_engine::client_protocol::OptimizedClientReplayReport *replay_report = nullptr) {
+        if (!optimized.sweep.incomplete_subjects.empty()) {
+            return std::unexpected(
+                rule_engine::single_error("client.evaluator", "optimized evaluation did not complete for all subjects"));
+        }
+        if (optimized.sweep.subjects.size() != optimized.evaluated_subjects.size()) {
+            return std::unexpected(
+                rule_engine::single_error("client.evaluator", "optimized evaluation returned incomplete results"));
+        }
+
+        rule_engine::client_protocol::ClientMultiEvaluationSession session {
+            .handshake = std::move(optimized.handshake),
+            .subjects = std::move(optimized.subjects),
+            .evaluations = {},
+            .execution_mode = "optimized_vm",
+            .optimized_summary =
+                rule_engine::client_protocol::ClientOptimizedEvaluationSummary {
+                    .baseline_exact_vm_rule_executions = optimized.sweep.baseline_exact_vm_rule_executions,
+                    .optimized_exact_vm_rule_executions = optimized.sweep.optimized_exact_vm_rule_executions,
+                    .exact_vm_rule_executions_avoided = optimized.sweep.exact_vm_rule_executions_avoided,
+                    .rules_pruned_before_exact_vm = optimized.sweep.shared_dag.pruned_rule_subjects,
+                    .candidate_provider_requests = optimized.candidate_provider_requests_sent,
+                    .candidate_provider_planned_requests = optimized.sweep.candidate_provider_requests,
+                    .candidate_provider_subjects_returned = optimized.sweep.candidate_provider_subjects_returned,
+                    .candidate_provider_broad_results = optimized.sweep.candidate_provider_broad_results,
+                    .candidate_provider_fallback_predicate_evaluations =
+                        optimized.sweep.candidate_provider_fallback_predicate_evaluations,
+                    .peak_candidate_set_subjects =
+                        static_cast<std::uint64_t>(optimized.sweep.shared_dag.peak_candidate_set_subjects),
+                    .peak_candidate_set_bytes = optimized.sweep.shared_dag.peak_candidate_set_bytes,
+                    .replay_subject_mismatches =
+                        replay_report != nullptr ? replay_report->subject_mismatches : 0u,
+                    .replay_rule_result_mismatches =
+                        replay_report != nullptr ? replay_report->rule_result_mismatches : 0u,
+                    .replay_trace_event_mismatches =
+                        replay_report != nullptr ? replay_report->trace_event_mismatches : 0u,
+                    .replay_metric_mismatches =
+                        replay_report != nullptr ? replay_report->sweep_metric_mismatches : 0u,
+                },
+        };
+        session.evaluations.reserve(optimized.evaluated_subjects.size());
+
+        for (std::size_t index = 0; index < optimized.evaluated_subjects.size(); ++index) {
+            auto &subject = optimized.evaluated_subjects[index];
+            auto &subject_report = optimized.sweep.subjects[index];
+            if (subject_report.subject_id != subject.id) {
+                return std::unexpected(rule_engine::single_error(
+                    "client.evaluator", "optimized evaluation returned subject results out of order"));
+            }
+
+            session.evaluations.push_back(rule_engine::client_protocol::ClientSubjectEvaluation {
+                .subject = std::move(subject),
+                .final_step =
+                    rule_engine::EvaluationStep {
+                        .state = rule_engine::EvaluationState::complete,
+                        .requests = {},
+                        .rule_results = std::move(subject_report.rule_results),
+                        .expression_traces = {},
+                    },
+                .exact_vm_rule_identifiers = std::move(subject_report.exact_vm_rule_identifiers),
+                .pruned_rule_identifiers = std::move(subject_report.pruned_rule_identifiers),
+            });
+        }
+
+        return session;
     }
 
     [[nodiscard]] bool
@@ -1621,6 +1720,157 @@ namespace {
     }
 } // namespace
 
+namespace rule_engine::client_protocol::detail {
+    [[nodiscard]] static std::optional<ValueType>
+    candidate_provider_argument_type(const std::string_view argument_kind) {
+        if (argument_kind == "boolean") {
+            return ValueType::boolean;
+        }
+        if (argument_kind == "integer") {
+            return ValueType::integer;
+        }
+        if (argument_kind == "floating") {
+            return ValueType::floating;
+        }
+        if (argument_kind == "string") {
+            return ValueType::string;
+        }
+        if (argument_kind == "bytes") {
+            return ValueType::bytes;
+        }
+        if (argument_kind == "array") {
+            return ValueType::array;
+        }
+        if (argument_kind == "pattern") {
+            return ValueType::pattern;
+        }
+        if (argument_kind == "object") {
+            return ValueType::object;
+        }
+        if (argument_kind == "undefined") {
+            return ValueType::undefined;
+        }
+        return std::nullopt;
+    }
+
+    bool candidate_provider_capability_matches(const protocol::Capability &capability,
+                                               const std::string_view route,
+                                               const std::string_view filter_key,
+                                               const std::string_view argument_kind) {
+        const auto argument_type = candidate_provider_argument_type(argument_kind);
+        return capability.route == route && capability.filter_key == filter_key &&
+               capability.result_kind == "subject_set" && argument_type.has_value() &&
+               capability.argument_types.size() == 1u && capability.argument_types.front() == *argument_type;
+    }
+
+    [[nodiscard]] static protocol::CandidateProviderSubjectSet
+    incomplete_process_inventory_subject_set(const protocol::CandidateProviderFilterRequest &filter,
+                                             const std::string_view subject_id) {
+        return protocol::CandidateProviderSubjectSet {
+            .request_id = filter.request_id,
+            .filter_key = filter.filter_key,
+            .status = FactStatus::unavailable,
+            .subject_ids = {},
+            .diagnostic = "incomplete process inventory: missing available process.name fact for " +
+                          std::string {subject_id},
+            .ttl = std::chrono::seconds {0},
+        };
+    }
+
+    [[nodiscard]] static protocol::CandidateProviderSubjectSet
+    unsupported_process_inventory_subject_set(const protocol::CandidateProviderFilterRequest &filter) {
+        return protocol::CandidateProviderSubjectSet {
+            .request_id = filter.request_id,
+            .filter_key = filter.filter_key,
+            .status = FactStatus::unavailable,
+            .subject_ids = {},
+            .diagnostic = "unsupported candidate provider route",
+            .ttl = std::chrono::seconds {0},
+        };
+    }
+
+    struct ProcessNameInventoryIndex {
+        std::unordered_map<std::string, std::vector<std::string>> subject_ids_by_name;
+        std::optional<std::string> incomplete_subject_id;
+    };
+
+    [[nodiscard]] static ProcessNameInventoryIndex
+    build_process_name_inventory_index(const std::span<const Subject> inventory_subjects,
+                                       const std::span<const Fact> process_name_facts) {
+        std::unordered_map<std::string_view, std::string_view> available_names_by_subject;
+        available_names_by_subject.reserve(process_name_facts.size());
+        for (const auto &fact : process_name_facts) {
+            if (fact.status != FactStatus::available || fact.key != process_name_fact_key) {
+                continue;
+            }
+            const auto *name = fact.value.as_string();
+            if (name != nullptr) {
+                available_names_by_subject.try_emplace(fact.subject_id, *name);
+            }
+        }
+
+        ProcessNameInventoryIndex index;
+        index.subject_ids_by_name.reserve(inventory_subjects.size());
+        for (const auto &subject : inventory_subjects) {
+            if (subject.kind != "process") {
+                continue;
+            }
+            const auto found = available_names_by_subject.find(subject.id);
+            if (found == available_names_by_subject.end()) {
+                index.incomplete_subject_id = subject.id;
+                break;
+            }
+            index.subject_ids_by_name[std::string {found->second}].push_back(subject.id);
+        }
+        return index;
+    }
+
+    std::vector<protocol::CandidateProviderSubjectSet> process_name_candidate_subjects_for_inventory_batch(
+        const std::span<const protocol::CandidateProviderFilterRequest> filters,
+        const std::span<const Subject> inventory_subjects,
+        const std::span<const Fact> process_name_facts) {
+        const auto index = build_process_name_inventory_index(inventory_subjects, process_name_facts);
+        std::vector<protocol::CandidateProviderSubjectSet> results;
+        results.reserve(filters.size());
+        for (const auto &filter : filters) {
+            if (filter.filter_key != process_inventory_by_image_name_filter || filter.argument_kind != "string") {
+                results.push_back(unsupported_process_inventory_subject_set(filter));
+                continue;
+            }
+            if (index.incomplete_subject_id.has_value()) {
+                results.push_back(incomplete_process_inventory_subject_set(filter, *index.incomplete_subject_id));
+                continue;
+            }
+
+            protocol::CandidateProviderSubjectSet result {
+                .request_id = filter.request_id,
+                .filter_key = filter.filter_key,
+                .status = FactStatus::available,
+                .subject_ids = {},
+                .diagnostic = {},
+                .ttl = std::chrono::seconds {0},
+            };
+            const auto found = index.subject_ids_by_name.find(filter.argument_value);
+            if (found != index.subject_ids_by_name.end()) {
+                result.subject_ids = found->second;
+            }
+            results.push_back(std::move(result));
+        }
+        return results;
+    }
+
+    protocol::CandidateProviderSubjectSet process_name_candidate_subjects_for_inventory(
+        const protocol::CandidateProviderFilterRequest &filter,
+        const std::span<const Subject> inventory_subjects,
+        const std::span<const Fact> process_name_facts) {
+        auto results = process_name_candidate_subjects_for_inventory_batch(
+            std::span<const protocol::CandidateProviderFilterRequest> {std::addressof(filter), 1u},
+            inventory_subjects,
+            process_name_facts);
+        return std::move(results.front());
+    }
+} // namespace rule_engine::client_protocol::detail
+
 namespace rule_engine::client_protocol {
     protocol::HandshakeMessage client_handshake(const std::span<const protocol::Capability> extra_capabilities) {
         protocol::HandshakeMessage message;
@@ -1631,6 +1881,12 @@ namespace rule_engine::client_protocol {
         add_capability(message.capabilities, protocol::Capability {.route = "endpoint.process.signer"});
         add_capability(message.capabilities, protocol::Capability {.route = "endpoint.process.image.pe"});
         add_capability(message.capabilities, protocol::Capability {.route = "endpoint.scan.patterns"});
+        add_capability(message.capabilities, protocol::Capability {
+                                                 .route = std::string {process_inventory_route},
+                                                 .filter_key = std::string {process_inventory_by_image_name_filter},
+                                                 .argument_types = {ValueType::string},
+                                                 .result_kind = "subject_set",
+                                             });
         for (const auto &capability : extra_capabilities) { add_capability(message.capabilities, capability); }
         return message;
     }
@@ -1846,6 +2102,20 @@ namespace rule_engine::client_protocol {
     std::expected<ClientMultiEvaluationSession, ErrorSet>
     evaluate_subjects_with_client(const ClientConnectionOptions &options, const VerifiedProgram &program,
                                   const std::vector<Subject> &subjects, ClientEvaluationOptions evaluation_options) {
+        auto plan = optimizer::build_optimizer_plan(program);
+        auto optimized = evaluate_subjects_with_optimizer_plan(
+            options, program, plan, subjects, std::move(evaluation_options));
+        if (!optimized) {
+            return std::unexpected(std::move(optimized.error()));
+        }
+        const auto replay_report = replay_optimized_client_evaluation_with_parity_report(program, plan, *optimized);
+        return to_client_multi_evaluation_session(std::move(*optimized), &replay_report);
+    }
+
+    std::expected<OptimizedClientEvaluationSession, ErrorSet>
+    evaluate_subjects_with_optimizer_plan(const ClientConnectionOptions &options, const VerifiedProgram &program,
+                                          const optimizer::OptimizerPlan &plan, const std::vector<Subject> &subjects,
+                                          ClientEvaluationOptions evaluation_options) {
         asio::io_context io;
         tcp::socket socket {io};
         if (auto result = connect_socket(socket, options); !result) {
@@ -1868,181 +2138,64 @@ namespace rule_engine::client_protocol {
             return std::unexpected(single_error("client.evaluator", "no subjects available for evaluation"));
         }
 
-        const auto subject_concurrency = std::max<std::size_t>(evaluation_options.max_subject_concurrency, 1u);
-        const auto max_rounds = std::max<std::size_t>(evaluation_options.max_provider_rounds, 1u);
-        ClientMultiEvaluationSession session {
-            .handshake = std::move(preamble->handshake),
-            .subjects = std::move(preamble->subjects),
-            .evaluations = {},
-        };
-        session.evaluations.reserve(requested_subjects.size());
-
-        for (std::size_t offset = 0; offset < requested_subjects.size(); offset += subject_concurrency) {
-            const auto end = std::min(offset + subject_concurrency, requested_subjects.size());
-            std::vector<SubjectEvaluationState> states;
-            states.reserve(end - offset);
-            for (std::size_t index = offset; index < end; ++index) {
-                states.push_back(SubjectEvaluationState {
-                    .subject = requested_subjects[index],
-                    .facts = {},
-                    .final_step = {},
-                });
+        std::optional<FactCache> prefetched_identity_fact_cache;
+        if (!evaluation_options.stop_token.stop_requested()) {
+            auto prefetched_identity_facts = prefetch_static_fact_identity_facts(
+                socket, preamble->handshake, evaluation_options, requested_subjects, options.io_timeout);
+            if (!prefetched_identity_facts) {
+                return std::unexpected(std::move(prefetched_identity_facts.error()));
             }
-            record_vm_queue_pressure(evaluation_options, states.size());
-            std::unordered_map<std::string, std::uint8_t> retry_attempts;
-
-            for (std::size_t round = 0; round < max_rounds; ++round) {
-                bool all_complete {true};
-                std::vector<PlannedFactRequest> requests;
-                for (auto &state : states) {
-                    if (state.final_step.has_value()) {
-                        continue;
-                    }
-
-                    const Evaluator evaluator {program, state.facts};
-                    auto step = evaluator.step(state.subject);
-                    if (step.state == EvaluationState::complete) {
-                        state.final_step = std::move(step);
-                        continue;
-                    }
-                    all_complete = false;
-                    if (step.requests.empty()) {
-                        return std::unexpected(
-                            single_error("client.evaluator", "evaluation waited without fact requests"));
-                    }
-                    for (const auto &batch : step.requests) { add_fact_request(requests, state.subject, batch); }
-                }
-
-                if (all_complete) {
-                    break;
-                }
-                if (requests.empty()) {
-                    return std::unexpected(single_error("client.evaluator", "evaluation had no provider requests"));
-                }
-                if (evaluation_options.stop_token.stop_requested()) {
-                    store_cancellation_facts(states, requests);
-                    continue;
-                }
-                record_provider_queue_pressure(evaluation_options, requests.size());
-                if (evaluation_options.instrumentation != nullptr) {
-                    ++evaluation_options.instrumentation->provider_rounds;
-                }
-
-                for (const auto &request : requests) {
-                    if (auto valid = validate_request_capability(session.handshake, request.message); !valid) {
-                        return std::unexpected(std::move(valid.error()));
-                    }
-                    if (evaluation_options.instrumentation != nullptr) {
-                        ++evaluation_options.instrumentation->provider_requests;
-                        evaluation_options.instrumentation->provider_fact_keys_requested += request.message.keys.size();
-                    }
-                    const auto request_started = std::chrono::steady_clock::now();
-                    auto response = send_request_and_read_response(socket, request.message);
-                    if (evaluation_options.instrumentation != nullptr) {
-                        const auto elapsed = std::chrono::steady_clock::now() - request_started;
-                        evaluation_options.instrumentation->provider_elapsed_us += static_cast<std::uint64_t>(
-                            std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
-                    }
-                    if (!response) {
-                        return std::unexpected(std::move(response.error()));
-                    }
-                    if (evaluation_options.instrumentation != nullptr) {
-                        evaluation_options.instrumentation->provider_facts_returned += response->values.size();
-                    }
-                    store_response_facts_with_retry(states, request, *response, retry_attempts);
-                }
+            prefetched_identity_fact_cache = std::move(*prefetched_identity_facts);
+            if (prefetched_identity_fact_cache.has_value()) {
+                evaluation_options.static_fact_identity_facts = std::addressof(*prefetched_identity_fact_cache);
             }
-
-            for (auto &state : states) {
-                if (!state.final_step.has_value()) {
-                    return std::unexpected(
-                        single_error("client.evaluator", "evaluation did not converge after provider rounds"));
-                }
-                session.evaluations.push_back(ClientSubjectEvaluation {
-                    .subject = std::move(state.subject),
-                    .final_step = std::move(*state.final_step),
-                });
-            }
-        }
-
-        close_socket(socket);
-        return session;
-    }
-
-    std::expected<OptimizedClientEvaluationSession, ErrorSet>
-    evaluate_subjects_with_optimizer_plan(const ClientConnectionOptions &options, const VerifiedProgram &program,
-                                          const optimizer::OptimizerPlan &plan, const std::vector<Subject> &subjects,
-                                          ClientEvaluationOptions evaluation_options) {
-        asio::io_context io;
-        tcp::socket socket {io};
-        if (auto result = connect_socket(socket, options); !result) {
-            return std::unexpected(std::move(result.error()));
-        }
-
-        auto preamble = read_client_preamble(socket);
-        if (!preamble) {
-            return std::unexpected(std::move(preamble.error()));
-        }
-
-        auto requested_subjects = subjects;
-        if (requested_subjects.empty()) {
-            requested_subjects = preamble->subjects.subjects;
-        }
-        if (requested_subjects.empty()) {
-            return std::unexpected(single_error("client.evaluator", "no subjects available for evaluation"));
-        }
-
-        auto prefetched_identity_facts = prefetch_static_fact_identity_facts(
-            socket, preamble->handshake, evaluation_options, requested_subjects, options.io_timeout);
-        if (!prefetched_identity_facts) {
-            return std::unexpected(std::move(prefetched_identity_facts.error()));
-        }
-        auto prefetched_identity_fact_cache = std::move(*prefetched_identity_facts);
-        if (prefetched_identity_fact_cache.has_value()) {
-            evaluation_options.static_fact_identity_facts = std::addressof(*prefetched_identity_fact_cache);
         }
 
         append_static_fact_cache_candidates_from_identity_facts(evaluation_options, plan, requested_subjects);
 
-        const auto candidate_selection =
-            candidate_provider_requests_for_optimizer_plan(preamble->handshake, plan, options.io_timeout);
-        if (evaluation_options.instrumentation != nullptr) {
-            evaluation_options.instrumentation->candidate_provider_filters_not_advertised +=
-                candidate_selection.filters_not_advertised;
-        }
-
         std::vector<optimizer::CandidateProviderResult> candidate_provider_results;
-        for (const auto &request : candidate_selection.requests) {
-            if (auto valid = validate_request_capability(preamble->handshake, request); !valid) {
-                return std::unexpected(std::move(valid.error()));
-            }
+        std::uint64_t candidate_provider_requests_sent {};
+        if (!evaluation_options.stop_token.stop_requested()) {
+            const auto candidate_selection =
+                candidate_provider_requests_for_optimizer_plan(preamble->handshake, plan, options.io_timeout);
             if (evaluation_options.instrumentation != nullptr) {
-                ++evaluation_options.instrumentation->candidate_provider_requests;
-                evaluation_options.instrumentation->candidate_provider_filters_requested += request.filters.size();
+                evaluation_options.instrumentation->candidate_provider_filters_not_advertised +=
+                    candidate_selection.filters_not_advertised;
             }
-            const auto request_started = std::chrono::steady_clock::now();
-            auto response = send_request_and_read_response(socket, request);
-            if (evaluation_options.instrumentation != nullptr) {
-                const auto elapsed = std::chrono::steady_clock::now() - request_started;
-                evaluation_options.instrumentation->candidate_provider_elapsed_us +=
-                    static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
-            }
-            if (!response) {
-                return std::unexpected(std::move(response.error()));
-            }
-            if (evaluation_options.instrumentation != nullptr) {
-                for (const auto &result : response->results) {
-                    evaluation_options.instrumentation->candidate_provider_subjects_returned +=
-                        result.subject_ids.size();
-                    if (candidate_provider_subject_set_covers_subjects(result, requested_subjects)) {
-                        ++evaluation_options.instrumentation->candidate_provider_broad_results;
+
+            for (const auto &request : candidate_selection.requests) {
+                if (auto valid = validate_request_capability(preamble->handshake, request); !valid) {
+                    return std::unexpected(std::move(valid.error()));
+                }
+                ++candidate_provider_requests_sent;
+                if (evaluation_options.instrumentation != nullptr) {
+                    ++evaluation_options.instrumentation->candidate_provider_requests;
+                    evaluation_options.instrumentation->candidate_provider_filters_requested += request.filters.size();
+                }
+                const auto request_started = std::chrono::steady_clock::now();
+                auto response = send_request_and_read_response(socket, request);
+                if (evaluation_options.instrumentation != nullptr) {
+                    const auto elapsed = std::chrono::steady_clock::now() - request_started;
+                    evaluation_options.instrumentation->candidate_provider_elapsed_us += static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
+                }
+                if (!response) {
+                    return std::unexpected(std::move(response.error()));
+                }
+                if (evaluation_options.instrumentation != nullptr) {
+                    for (const auto &result : response->results) {
+                        evaluation_options.instrumentation->candidate_provider_subjects_returned +=
+                            result.subject_ids.size();
+                        if (candidate_provider_subject_set_covers_subjects(result, requested_subjects)) {
+                            ++evaluation_options.instrumentation->candidate_provider_broad_results;
+                        }
                     }
                 }
+                auto results = optimizer::candidate_provider_results_from_protocol(response->results);
+                candidate_provider_results.insert(candidate_provider_results.end(),
+                                                  std::make_move_iterator(results.begin()),
+                                                  std::make_move_iterator(results.end()));
             }
-            auto results = optimizer::candidate_provider_results_from_protocol(response->results);
-            candidate_provider_results.insert(candidate_provider_results.end(),
-                                              std::make_move_iterator(results.begin()),
-                                              std::make_move_iterator(results.end()));
         }
 
         const FactCache planning_facts;
@@ -2176,6 +2329,7 @@ namespace rule_engine::client_protocol {
             .facts = snapshot_subject_facts(optimized_facts, requested_subjects),
             .candidate_provider_results = std::move(candidate_provider_results),
             .static_fact_cache_trace_events = std::move(static_fact_cache_trace_events),
+            .candidate_provider_requests_sent = candidate_provider_requests_sent,
             .sweep = std::move(final_sweep),
         };
 

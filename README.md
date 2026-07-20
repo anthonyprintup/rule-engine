@@ -77,27 +77,33 @@ budget. If evaluation is cancelled before provider dispatch, the server
 synthesizes unavailable facts with the descriptor cancellation diagnostic instead
 of asking the client to decide anything about the rule.
 
-An offline optimizer POC can extract canonical descriptor-backed comparison
-predicates, simulate shared predicate DAG candidate sets, derive lazy provider
-expansion plans, model generic candidate-provider subject sets, and report
-exact-VM-only or unsafe-pruning shapes; it does not affect evaluation decisions.
-`build_optimizer_plan` packages those pieces into an opt-in server-owned
-artifact with predicate nodes, safe order, exact-VM fallback notes, provider
-requirements, and generic candidate-provider requests.
-`evaluate_with_optimizer_plan` consumes that artifact for an opt-in C++ sweep
+The optimizer extracts canonical descriptor-backed comparison predicates, builds
+shared predicate DAG candidate sets, derives lazy provider expansion plans,
+models generic candidate-provider subject sets, and reports exact-VM-only or
+unsafe-pruning shapes. `build_optimizer_plan` packages those pieces into a
+server-owned artifact with predicate nodes, safe order, exact-VM fallback notes,
+provider requirements, and generic candidate-provider requests.
+`evaluate_with_optimizer_plan` consumes that artifact for the optimized VM sweep
 path that runs exact VM only for surviving rule/subject pairs and synthesizes
-no-match results for pruned pairs. The benchmark CLI can measure this path with
-`--simulate-optimizer-plan-prefilter`, including exact-VM work avoided, skip
-trace events, result mismatches, and incomplete subjects. When combined with
-`--simulate-candidate-provider`, the same plan-driven path consumes generic
-provider-scope subject sets before exact-VM final evaluation and falls back to
-server-side predicate evaluation when those results are unavailable.
+no-match results for pruned pairs. Developer trace/report artifacts and new
+optimizer experiments can still be opt-in, but the standard localhost
+client/server evaluation path is now optimized VM-backed by default. The exact
+baseline remains available for tests, benchmarks, and parity checks. The
+benchmark CLI can measure this path with `--simulate-optimizer-plan-prefilter`,
+including exact-VM work avoided, skip trace events, result mismatches, and
+incomplete subjects. When combined with `--simulate-candidate-provider`, the
+same plan-driven path consumes generic provider-scope subject sets before
+exact-VM final evaluation and falls back to server-side predicate evaluation
+when those results are unavailable.
 The v1 protocol also has generic candidate-provider request/response messages
 for route/filter/argument subject-set filters with status, diagnostics, and TTLs;
 these messages intentionally carry no rule identifiers. The localhost client
-session helpers can exchange those messages through an optional
-candidate-provider handler. The opt-in
-`evaluate_subjects_with_optimizer_plan` client path uses those advertised
+session helpers can exchange those messages through built-in generic providers
+and optional candidate-provider handlers. The default localhost client advertises
+`endpoint.process.inventory` / `process.inventory.by_image_name`, backed only by
+`process.name` facts and generic matching subject ids. The default
+`evaluate_subjects_with_client` path uses optimized VM-backed evaluation, and
+`evaluate_subjects_with_optimizer_plan` uses those advertised
 filters before exact VM and only requests provider facts for rule/subject pairs
 that survive the server-owned optimizer plan. If a filter is not advertised, the
 client path skips that frame and rebuilds the same candidates from ordinary fact
@@ -108,9 +114,8 @@ beside the ordinary provider-fact counters. Optimized client sessions also
 expose the evaluated subjects, fact snapshot, and
 candidate-provider results needed to replay the same server-owned optimized
 sweep without live providers through `replay_optimized_client_evaluation`.
-An opt-in prefiltered evaluation comparison can run exact VM only for shared-DAG
-candidate rule/subject pairs, synthesize pruned no-match results, and report
-parity against baseline evaluation before any runtime path is made default.
+The exact baseline comparison remains available for tests and benchmarks to
+prove parity with optimized VM-backed evaluation.
 
 Facts carry a subject id, key, typed `Value`, status, diagnostic text, and TTL.
 Available facts participate in expression evaluation. Unavailable or
@@ -315,8 +320,13 @@ Debug IR artifacts use `rule-engine-debug-ir.v1`, schedule artifacts use
 - `rule_engine_check` parses and validates rules.
 - `rule_engine_server` evaluates rules against process subjects through the v1
   client protocol. Pass `--json` to emit structured JSON for both rule
-  evaluation and smoke fact round trips. Rule-evaluation JSON includes runtime
-  provider/VM queue, candidate-provider, and static-cache instrumentation; use
+  evaluation and smoke fact round trips. Rule evaluation uses `optimized_vm` by
+  default, with exact VM retained as the final executor for surviving optimized
+  rule/subject pairs. Rule-evaluation JSON includes `executionMode`,
+  `optimizedVm` summary counters, per-subject `exactVmRuleIds` and
+  `prunedRuleIds`, replay drift counters, runtime provider/VM queue
+  instrumentation, actual/planned candidate-provider request counters, and
+  static-cache instrumentation; use
   `--vm-backpressure-subject-threshold <n>` and
   `--provider-backpressure-request-threshold <n>` to record threshold-crossing
   scheduler pressure events.
@@ -376,9 +386,10 @@ Debug IR artifacts use `rule-engine-debug-ir.v1`, schedule artifacts use
   build a server-owned observed-selectivity profile from a warm-up shared-DAG
   sweep and use it as a same-cost predicate-order tie-breaker. Pass
   `--simulate-optimization-comparison`
-  with `production_scale_validation` to emit baseline-versus-optimized
-  comparison counters for exact-VM executions, expensive provider facts,
-  expression evaluations, parity, and broad candidate-state boundedness. Pass
+  with `production_scale_validation` to emit the default optimized VM acceptance
+  report with exact-baseline comparison counters for exact-VM executions,
+  expensive provider facts, expression evaluations, parity, replay drift, and
+  broad candidate-state boundedness. Pass
   `--simulate-watchdogs` to add trace-only watchdog budget counters for broad
   predicate selectivity and oversized lazy provider route batches without
   enforcing cooldowns. Pass `--simulate-watchdog-enforcement` to add explicit

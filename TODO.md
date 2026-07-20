@@ -171,13 +171,16 @@ goal-oriented optimizer backed by a canonical predicate DAG and adaptive
 candidate sets. Keep the existing exact VM semantics as the final evaluator and
 fallback path while adding shared predicate execution in front of it.
 
-- Treat optimization work as validation-gated, POC-first development:
+- Treat future optimization work as validation-gated, POC-first development
+  while preserving the now-standard optimized VM-backed client runtime:
   - Do not land a production optimizer rewrite until a baseline report exists for
     the current unoptimized evaluator.
-  - Keep each optimizer experiment behind an explicit opt-in path until
-    optimized and unoptimized evaluation produce identical rule results,
+  - Keep each new optimizer experiment behind an explicit opt-in path until
+    optimized and exact-baseline evaluation produce identical rule results,
     diagnostics, and trace-replay-compatible fact snapshots for the same
-    verified program and fact responses.
+    verified program and fact responses. The standard localhost client/server
+    evaluation path is already optimized VM-backed after that parity gate; exact
+    baseline remains available for tests, benchmarks, and parity checks.
   - Every POC should produce a machine-readable benchmark report plus a readable
     summary that compares baseline and candidate behavior.
   - Reports should include wall-clock sweep time, provider rounds, facts
@@ -323,10 +326,10 @@ fallback path while adding shared predicate execution in front of it.
     - [x] POC: add an optimizer-side prefiltered evaluation comparison that runs
       exact VM only for shared-DAG candidate rule/subject pairs, synthesizes
       pruned no-match results, and checks parity against baseline rule results.
-    - [x] POC: add `evaluate_with_optimizer_plan` as an opt-in C++ sweep path
-      that consumes `OptimizerPlan`, builds shared-DAG candidate state, runs the
-      exact VM only for surviving reportable rule/subject pairs, and synthesizes
-      no-match results for pruned pairs.
+    - [x] POC: add `evaluate_with_optimizer_plan` as the plan-driven C++ sweep
+      path that consumes `OptimizerPlan`, builds shared-DAG candidate state,
+      runs the exact VM only for surviving reportable rule/subject pairs, and
+      synthesizes no-match results for pruned pairs.
     - [x] POC: extend the plan-driven sweep path so it can consume generic
       candidate-provider subject sets, expose provider/fallback counters, and
       still run exact VM only for surviving rule/subject pairs.
@@ -408,6 +411,19 @@ fallback path while adding shared predicate execution in front of it.
     traits.
     - [x] POC: derive a generic `process.inventory.by_image_name` candidate
       provider request from shared `process.name == <literal>` predicates.
+    - [x] Milestone: the default localhost client advertises and serves only the
+      `process.inventory.by_image_name` category on
+      `endpoint.process.inventory`. One Toolhelp snapshot supplies process
+      subjects and `process.name` facts, which are indexed once per request
+      batch; incomplete names or abnormal snapshot termination fail closed as
+      unavailable. Request derivation requires an owner that is both prune-safe
+      and reportable, and dispatch requires the exact
+      route/filter/`subject_set`/single-string-argument signature. Empty batches
+      reject, candidate-only capabilities do not satisfy fact-provider routes,
+      and mismatches or unavailable results fall back to ordinary fact
+      evaluation. Wire requests contain no rule ids and exact VM evaluation
+      remains authoritative. The other generic provider categories above remain
+      future work.
   - Ensure candidate providers are optional optimizations; the server must be
     able to fall back to per-subject facts and server-side candidate-set
     construction.
@@ -489,7 +505,7 @@ fallback path while adding shared predicate execution in front of it.
       candidate-provider filter and round-trip status-bearing subject-set
       responses through `serve_client_once` / `run_client_session` using an
       optional candidate-provider handler.
-    - [x] POC: an opt-in localhost optimizer-plan evaluator requests advertised
+    - [x] POC: the localhost optimizer-plan evaluator requests advertised
       candidate-provider filters before exact VM, converts status-bearing
       subject sets into optimizer inputs, and materializes provider facts only
       for surviving exact-VM rule/subject pairs; when a filter is not
@@ -576,22 +592,20 @@ fallback path while adding shared predicate execution in front of it.
       rewrites reused facts to the requesting subject id, rejects changed
       identities with invalidation trace events, and refuses volatile
       process-inventory facts.
-    - [x] POC: opt-in localhost optimizer-plan evaluation can use caller-supplied
-      static fact cache candidates to avoid repeated static provider fact
-      requests across subjects with identical verified file identity, while
-      replay captures the same static-cache trace events.
+    - [x] POC: localhost optimizer-plan evaluation can use caller-supplied static
+      fact cache candidates to avoid repeated static provider fact requests
+      across subjects with identical verified file identity, while replay
+      captures the same static-cache trace events.
     - [x] POC: derive static fact cache candidates from server-owned identity
       facts in `FactCache`, emitting candidates only for static cacheable
       provider requirements and subjects with complete available file identity
       observations.
-    - [x] POC: opt-in localhost optimizer-plan evaluation can derive runtime
-      static cache candidates from a supplied server-owned identity fact
-      snapshot, avoiding manual candidate construction while preserving replay
-      parity.
-    - [x] POC: opt-in localhost optimizer-plan evaluation can prefetch static
-      identity facts from a configured provider route, derive static cache
-      candidates from that typed response, and count the prefetch as ordinary
-      provider work.
+    - [x] POC: localhost optimizer-plan evaluation can derive runtime static
+      cache candidates from a supplied server-owned identity fact snapshot,
+      avoiding manual candidate construction while preserving replay parity.
+    - [x] POC: localhost optimizer-plan evaluation can prefetch static identity
+      facts from a configured provider route, derive static cache candidates
+      from that typed response, and count the prefetch as ordinary provider work.
     - [x] Promote production PE image identity facts through the default
       descriptors and Windows PE provider: `pe.identity.path`,
       `pe.identity.file_id`, `pe.identity.file_size`,
@@ -677,8 +691,8 @@ fallback path while adding shared predicate execution in front of it.
     - [x] POC: candidate-provider fallback trace records appear in optimizer
       JSON/Markdown reports, including the provider diagnostic, without exposing
       rule identifiers in the provider request shape.
-    - [x] POC: opt-in localhost optimizer-plan sessions now expose the ordinary
-      fact snapshot plus candidate-provider results needed to replay the same
+    - [x] POC: localhost optimizer-plan sessions now expose the ordinary fact
+      snapshot plus candidate-provider results needed to replay the same
       server-owned optimized sweep offline without live providers.
     - [x] POC: `replay_optimized_client_evaluation` reconstructs an optimized
       client sweep from the captured evaluated subjects, fact snapshot, and
@@ -716,10 +730,12 @@ fallback path while adding shared predicate execution in front of it.
     queue peaks, provider request queue peaks, and threshold-crossing
     backpressure events for ordinary and optimizer-plan sessions without
     changing final rule results or provider request ordering.
-  - [x] POC: `rule_engine_server --json` now emits runtime evaluation
-    instrumentation for VM/provider queue peaks, provider request work, elapsed
-    provider time, and backpressure events, with CLI thresholds for VM subject
-    and provider request pressure.
+  - [x] `rule_engine_server --json` now emits default optimized VM runtime
+    evidence, including `executionMode: optimized_vm`, an `optimizedVm` summary,
+    exact/pruned rule id arrays, actual/planned candidate-provider counters, replay drift
+    counters, static-cache counters, VM/provider queue peaks, provider request
+    work, elapsed provider time, and backpressure events. CLI thresholds classify
+    VM subject and provider request pressure without changing rule results.
   - [x] POC: localhost provider service now supports an explicit
     `max_session_workers` / `--session-workers` bound so multiple sessions can be
     served concurrently while listener admission remains capped.
@@ -738,10 +754,11 @@ fallback path while adding shared predicate execution in front of it.
       selectivity.
   - Test that optimized evaluation requests fewer facts and performs fewer
     expression evaluations than the baseline on selective packs.
-    - [x] POC: `production_scale_validation --simulate-optimization-comparison`
-      reports 108 avoided exact-VM rule executions, 18 avoided expensive
-      provider fact opportunities, 560 avoided expression evaluations, and zero
-      result mismatches or incomplete subjects.
+    - [x] `production_scale_validation --simulate-optimization-comparison`
+      reports default optimized VM acceptance with exact-baseline comparison:
+      108 avoided exact-VM rule executions, 18 avoided expensive provider fact
+      opportunities, 560 avoided expression evaluations, and zero result
+      mismatches or incomplete subjects.
   - Test that broad-rule packs still complete correctly and do not retain
     unbounded candidate-set state.
     - [x] POC: `production_scale_validation` mixes selective shared predicates,

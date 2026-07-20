@@ -589,7 +589,7 @@ TEST_CASE("benchmark can include optimized versus baseline comparison metrics") 
     });
 
     REQUIRE(report.has_value());
-    CHECK(report->metadata.mode == "baseline_with_optimization_comparison_simulation");
+    CHECK(report->metadata.mode == "default_optimized_vm_acceptance_with_exact_baseline_comparison");
     CHECK(report->metadata.optimizer_flags ==
           std::vector<std::string> {"shared_predicate_dag", "prefiltered_evaluation", "optimizer_plan_prefilter",
                                     "lazy_provider_expansion", "optimization_comparison"});
@@ -615,6 +615,7 @@ TEST_CASE("benchmark can include optimized versus baseline comparison metrics") 
     CHECK(report->metrics.comparison_broad_workload_bounded == 1u);
 
     const auto json = rule_engine::benchmark::benchmark_report_json(*report);
+    CHECK(contains(json, R"("mode":"default_optimized_vm_acceptance_with_exact_baseline_comparison")"));
     CHECK(contains(
         json,
         R"("optimizerFlags":["shared_predicate_dag","prefiltered_evaluation","optimizer_plan_prefilter","lazy_provider_expansion","optimization_comparison"])"));
@@ -635,7 +636,7 @@ TEST_CASE("benchmark can include optimized versus baseline comparison metrics") 
     CHECK(contains(json, R"("comparisonBroadWorkloadBounded":1)"));
 
     const auto markdown = rule_engine::benchmark::benchmark_report_markdown(*report);
-    CHECK(contains(markdown, "- Mode: `baseline_with_optimization_comparison_simulation`"));
+    CHECK(contains(markdown, "- Mode: `default_optimized_vm_acceptance_with_exact_baseline_comparison`"));
     CHECK(contains(markdown, "- Optimizer flags: `shared_predicate_dag, prefiltered_evaluation, "
                              "optimizer_plan_prefilter, lazy_provider_expansion, optimization_comparison`"));
     CHECK(contains(markdown, "| Optimizer plan prefilter exact VM rule executions |"));

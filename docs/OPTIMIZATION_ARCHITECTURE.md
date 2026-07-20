@@ -75,7 +75,8 @@ is no longer POC-only.
   reproduce final VM decisions without live providers.
 - Optimized replay also snapshots provider-scope candidate results when those
   results shaped candidate sets before exact VM.
-- Localhost optimized client session replay is currently a helper-level POC:
+- Localhost optimized client session replay is a helper-level developer
+  artifact:
   `replay_optimized_client_evaluation` consumes captured evaluated subjects,
   facts, and candidate-provider results. The parity-report helper reruns that
   snapshot and counts subject, rule-result, optimizer-trace, and metric drift,
@@ -98,10 +99,26 @@ ttl = descriptor-owned
 diagnostics = structured per request
 ```
 
+Capability selection is exact across route, filter key, `subject_set` result
+kind, and a single argument type matching the request argument kind. Empty
+filter batches are rejected before dispatch, and a candidate-only capability
+does not satisfy the ordinary fact-provider capability check for the same route.
+A signature mismatch skips candidate-provider dispatch and uses ordinary fact
+evaluation.
+
+The completed default category is only `process.inventory.by_image_name`. The
+localhost provider reads subjects and `process.name` facts from one Toolhelp
+snapshot, builds one process-name index per request batch, and returns generic
+matching subject ids. Missing, unavailable, or non-string `process.name` facts,
+or abnormal Toolhelp iteration termination, make the candidate result
+unavailable instead of allowing pruning from a partial inventory. Other generic
+process-inventory filters remain future work.
+
 The server may request a provider-scope subject set when a canonical predicate
-maps to an advertised generic filter. Requests contain route, filter key,
-argument kind, and argument value. They do not contain owning rule identifiers,
-full condition branches, private strings, or exact pattern literals.
+maps to an advertised generic filter and at least one predicate owner is both
+prune-safe and reportable. Requests contain route, filter key, argument kind,
+and argument value. They do not contain owning rule identifiers, full condition
+branches, private strings, or exact pattern literals.
 
 Provider results contain the request id, subject ids, status, diagnostic text,
 and TTL. `unavailable`, `timeout`, `access_denied`, or unsupported filters
@@ -110,11 +127,12 @@ filter key plus provider diagnostic. Broad result sets are accepted as a signal
 to continue narrowing on the server, not as a failure, and reports count broad
 results that cover the whole evaluated subject set.
 
-The opt-in localhost optimizer-plan path requests advertised provider-scope
-filters before exact VM, feeds returned subject sets into the C++ optimizer, and
-then requests ordinary provider facts only for exact-VM rule/subject pairs that
-survive pruning. Final rule results still come from server-owned exact VM
-evaluation or synthesized server-owned no-match results for pruned pairs.
+The default localhost client/server evaluation path is optimized VM-backed. It
+requests advertised provider-scope filters before exact VM, feeds returned
+subject sets into the C++ optimizer, and then requests ordinary provider facts
+only for exact-VM rule/subject pairs that survive pruning. Final rule results
+still come from server-owned exact VM evaluation or synthesized server-owned
+no-match results for pruned pairs.
 
 ## Watchdog Policy
 
@@ -166,10 +184,10 @@ candidates only for static cacheable optimizer-plan provider requirements.
 Incomplete, unavailable, or wrong-typed identity observations leave the fact
 subject-scoped until the provider refreshes identity.
 
-The opt-in localhost optimizer-plan evaluator can consume explicit static fact
-cache candidates, derive them from a supplied server-owned identity fact
-snapshot, or prefetch identity facts from a configured provider route before
-provider materialization. Identity prefetch uses the normal fact-batch protocol,
+The localhost optimizer-plan evaluator can consume explicit static fact cache
+candidates, derive them from a supplied server-owned identity fact snapshot, or
+prefetch identity facts from a configured provider route before provider
+materialization. Identity prefetch uses the normal fact-batch protocol,
 capability checks, typed response validation, and provider work counters. Cache
 hits are stored in the per-subject fact cache before provider requests are sent,
 misses and invalidations continue through the ordinary provider path, and
@@ -243,8 +261,8 @@ this path.
 ## Production Data Flow
 
 1. The compiler verifies the rule pack and extracts canonical predicates.
-2. The optimizer builds an opt-in `OptimizerPlan` with predicate nodes, owners,
-   cost classes, safe ordering, exact-VM fallback continuations, and provider
+2. The optimizer builds an `OptimizerPlan` with predicate nodes, owners, cost
+   classes, safe ordering, exact-VM fallback continuations, and provider
    requirements.
 3. A client sweep starts from the subject inventory and cheap identity facts.
 4. Candidate-provider filters run when advertised and safe. Otherwise the server
@@ -261,10 +279,10 @@ this path.
 
 1. Add production-scale benchmark scenarios and differential fixture generation.
 2. Add descriptor cost classes and selectivity observation to reports and traces.
-3. Introduce `OptimizerPlan` as an opt-in compiler artifact.
-4. Add adaptive candidate-set containers and shared-DAG execution behind an
-   opt-in evaluator path.
-5. Add lazy provider expansion to the opt-in path.
+3. Introduce `OptimizerPlan` as a compiler artifact.
+4. Add adaptive candidate-set containers and shared-DAG execution to the
+   optimized evaluator path.
+5. Add lazy provider expansion to the optimized evaluator path.
 6. Add protocol-aware candidate providers and fallback equivalence tests.
 7. Add optimizer trace artifacts and replay checks.
 8. Add watchdog trace mode, then opt-in enforcement.

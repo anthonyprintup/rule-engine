@@ -170,6 +170,33 @@ rule internal_rule_name {
     CHECK_FALSE(contains(json.substr(request_section_start), "internal_rule_name"));
 }
 
+TEST_CASE("optimizer plan does not derive candidate provider requests from private-only predicates") {
+    constexpr std::string_view source = R"(
+import "process"
+
+private rule hidden {
+    condition:
+        process.name == "secret.exe"
+}
+)";
+
+    auto parsed = rule_engine::parse_source("optimizer-plan-private-only-candidate-provider.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+
+    const auto plan = rule_engine::optimizer::build_optimizer_plan(*verified);
+    const auto json = rule_engine::optimizer::optimizer_plan_json(plan);
+
+    REQUIRE(plan.predicate_nodes.size() == 1u);
+    CHECK(plan.predicate_nodes[0].literal_value == "secret.exe");
+    CHECK(plan.candidate_provider_requests.empty());
+    CHECK(contains(json, R"("candidateProviderRequestCount":0)"));
+    const auto request_section_start = json.find(R"("candidateProviderRequests")");
+    REQUIRE(request_section_start != std::string::npos);
+    CHECK_FALSE(contains(json.substr(request_section_start), "secret.exe"));
+}
+
 TEST_CASE("optimizer plan drives opt-in prefiltered exact VM execution") {
     constexpr std::string_view source = R"(
 import "process"
@@ -1571,6 +1598,85 @@ rule broad_or {
     CHECK(fallback.server_fallback_predicate_evaluations == 2u);
     REQUIRE(fallback.shared_dag.rule_candidates.size() == 2u);
     CHECK(fallback.shared_dag.rule_candidates[0].candidate_subject_ids == std::vector<std::string> {"pid:match"});
+}
+
+TEST_CASE("optimizer does not derive candidate provider requests from private predicates referenced by public rules") {
+    constexpr std::string_view source = R"(
+import "process"
+
+private rule hidden_name {
+    condition:
+        process.name == "secret.exe"
+}
+
+rule public_reference {
+    condition:
+        hidden_name
+}
+)";
+
+    auto parsed = rule_engine::parse_source("optimizer-private-candidate-provider.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+
+    const auto canonical = rule_engine::optimizer::extract_canonical_predicates(*verified);
+    const auto request_plan = rule_engine::optimizer::plan_candidate_provider_requests(canonical);
+    CHECK(request_plan.requests.empty());
+
+    const auto plan = rule_engine::optimizer::build_optimizer_plan(*verified);
+    CHECK(plan.candidate_provider_requests.empty());
+    const auto json = rule_engine::optimizer::optimizer_plan_json(plan);
+    const auto request_section_start = json.find(R"("candidateProviderRequests")");
+    REQUIRE(request_section_start != std::string::npos);
+    CHECK_FALSE(contains(json.substr(request_section_start), "secret.exe"));
+}
+
+TEST_CASE("optimizer requires one reportable prune-safe owner before deriving candidate provider requests") {
+    constexpr std::string_view source = R"(
+import "process"
+
+private rule hidden_name {
+    condition:
+        process.name == "secret.exe"
+}
+
+rule public_non_prune_safe_owner {
+    condition:
+        process.name == "secret.exe" or process.name == "visible.exe"
+}
+)";
+
+    auto parsed = rule_engine::parse_source("optimizer-mixed-owner-candidate-provider.yar", source);
+    REQUIRE(parsed.has_value());
+    auto verified = rule_engine::verify(*parsed, rule_engine::default_module_registry());
+    REQUIRE(verified.has_value());
+
+    const auto canonical = rule_engine::optimizer::extract_canonical_predicates(*verified);
+    REQUIRE(canonical.predicates.size() == 2u);
+    const auto secret = std::ranges::find_if(canonical.predicates, [](const auto &predicate) {
+        return predicate.literal_value == "secret.exe";
+    });
+    REQUIRE(secret != canonical.predicates.end());
+    REQUIRE(secret->owners.size() == 2u);
+    CHECK(std::ranges::any_of(secret->owners, [](const auto &owner) {
+        return owner.rule_identifier == "hidden_name" && owner.prune_safe && !owner.reportable;
+    }));
+    CHECK(std::ranges::any_of(secret->owners, [](const auto &owner) {
+        return owner.rule_identifier == "public_non_prune_safe_owner" && !owner.prune_safe && owner.reportable;
+    }));
+
+    const auto request_plan = rule_engine::optimizer::plan_candidate_provider_requests(canonical);
+    CHECK(request_plan.requests.empty());
+
+    const auto plan = rule_engine::optimizer::build_optimizer_plan(*verified);
+    CHECK(plan.candidate_provider_requests.empty());
+    const auto json = rule_engine::optimizer::optimizer_plan_json(plan);
+    CHECK(contains(json, R"("candidateProviderRequestCount":0)"));
+    const auto request_section_start = json.find(R"("candidateProviderRequests")");
+    REQUIRE(request_section_start != std::string::npos);
+    CHECK_FALSE(contains(json.substr(request_section_start), "secret.exe"));
+    CHECK_FALSE(contains(json.substr(request_section_start), "visible.exe"));
 }
 
 TEST_CASE("discovery gate simulation skips empty rule packs without rule decisions") {

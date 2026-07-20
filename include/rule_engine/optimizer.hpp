@@ -20,6 +20,7 @@ namespace rule_engine::optimizer {
         std::string rule_identifier;
         SourceSpan span {};
         bool prune_safe {};
+        bool reportable {};
     };
 
     struct CanonicalPredicate {

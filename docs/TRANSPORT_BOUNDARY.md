@@ -11,8 +11,12 @@ clients.
 
 - The server owns parsing, semantic validation, lowering, scheduling, cache
   policy, VM execution, and match decisions.
-- Clients enumerate subjects and return typed facts or structured diagnostics.
+- Clients enumerate subjects and return typed facts, generic provider-scope
+  subject sets, or structured diagnostics.
 - Clients must never evaluate rule predicates or decide whether a rule matches.
+- Candidate-provider requests carry generic route/filter/argument data without
+  rule identifiers, and candidate-only capabilities do not satisfy ordinary
+  fact-provider routes.
 - Provider responses are untrusted input and must keep passing descriptor-backed
   type validation before they enter or leave the fact cache.
 
@@ -23,8 +27,14 @@ clients.
   encryption.
 - Capability negotiation is advisory plus enforced by the server before and
   during evaluation, but it is not a security identity.
-- Request timeouts are bounded, but long-running provider cancellation and retry
-  semantics are still TODO items.
+- Candidate-provider dispatch requires a non-empty filter batch and an exact
+  route/filter/`subject_set`/argument-type capability match. Mismatches use the
+  ordinary fact path; clients do not resolve rule semantics.
+- Request timeouts, retries, and cancellation diagnostics are descriptor-owned
+  for localhost V1: timed-out provider facts can be retried within a bounded
+  retry budget, shutdown before provider dispatch synthesizes descriptor
+  cancellation facts locally, and context-aware localhost handlers can observe a
+  cooperative stop token for in-flight cancellation.
 - The protocol is suitable for local tests, demos, and fixture-backed provider
   development.
 
@@ -38,9 +48,10 @@ Remote clients require a separate production transport design. At minimum:
 - Authorize which subjects, scan spaces, and provider routes each client may
   access.
 - Preserve server-owned rule semantics; remote clients still return facts only.
-- Add replay protection and request identifiers if retries are introduced.
-- Define cancellation, retry, deadline, and backpressure behavior for in-flight
-  provider requests.
+- Add replay protection and stable request identifiers for any remote retry
+  model.
+- Define authenticated remote cancellation, retry, deadline, and backpressure
+  behavior for in-flight provider requests.
 - Bound payload sizes, fact counts, pattern-match counts, and diagnostic text at
   every decode boundary.
 - Decide which facts may be cached, persisted, logged, or traced.

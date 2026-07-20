@@ -4,6 +4,7 @@
 #include <rule_engine/evaluator.hpp>
 #include <rule_engine/pattern_fixture_provider.hpp>
 
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <span>
@@ -17,7 +18,18 @@ namespace rule_engine::windows {
         std::string key;
     };
 
+    struct ProcessNameInventory {
+        std::vector<Subject> subjects;
+        std::vector<Fact> facts;
+    };
+
+    namespace detail {
+        [[nodiscard]] std::expected<void, ErrorSet>
+        validate_process_snapshot_iteration_end(std::uint32_t last_error);
+    } // namespace detail
+
     [[nodiscard]] std::expected<std::vector<Subject>, ErrorSet> enumerate_process_subjects();
+    [[nodiscard]] std::expected<ProcessNameInventory, ErrorSet> read_process_name_inventory();
     [[nodiscard]] std::expected<std::vector<Fact>, ErrorSet>
     read_process_snapshot_facts(std::span<const ProcessFactKey> keys);
     [[nodiscard]] std::expected<std::vector<Fact>, ErrorSet>

@@ -364,14 +364,23 @@ namespace {
         }
 
         std::vector<ProcessEntry> out;
-        do {
+        for (;;) {
             out.push_back(ProcessEntry {
                 .pid = static_cast<std::uint32_t>(entry.th32ProcessID),
                 .parent_pid = static_cast<std::uint32_t>(entry.th32ParentProcessID),
                 .thread_count = static_cast<std::uint32_t>(entry.cntThreads),
                 .name = entry.szExeFile,
             });
-        } while (Process32NextW(snapshot.handle, &entry) != FALSE);
+            if (Process32NextW(snapshot.handle, &entry) != FALSE) {
+                continue;
+            }
+            const auto last_error = GetLastError();
+            if (auto completed = rule_engine::windows::detail::validate_process_snapshot_iteration_end(last_error);
+                !completed) {
+                return std::unexpected(std::move(completed.error()));
+            }
+            break;
+        }
 
         return out;
     }
@@ -1543,6 +1552,17 @@ namespace {
 } // namespace
 
 namespace rule_engine::windows {
+    namespace detail {
+        std::expected<void, ErrorSet>
+        validate_process_snapshot_iteration_end(const std::uint32_t last_error) {
+            if (last_error == ERROR_NO_MORE_FILES) {
+                return {};
+            }
+            return std::unexpected(
+                single_error("process", win32_diagnostic("Process32NextW", static_cast<DWORD>(last_error))));
+        }
+    } // namespace detail
+
     std::expected<std::vector<patterns::PatternScanSpace>, ErrorSet>
     read_process_readable_memory_scan_spaces(std::string subject_id,
                                              const std::span<const PatternScanPlan> scan_plans,
@@ -1672,6 +1692,37 @@ namespace rule_engine::windows {
                 .kind = "process",
                 .id = "pid:" + std::to_string(entry.pid),
             });
+        }
+
+        return out;
+    }
+
+    std::expected<ProcessNameInventory, ErrorSet> read_process_name_inventory() {
+        auto entries = enumerate_process_entries();
+        if (!entries) {
+            return std::unexpected(std::move(entries.error()));
+        }
+
+        ProcessNameInventory out;
+        out.subjects.reserve(entries->size());
+        out.facts.reserve(entries->size());
+        for (const auto &entry : *entries) {
+            const auto subject_id = "pid:" + std::to_string(entry.pid);
+            out.subjects.push_back(Subject {
+                .kind = "process",
+                .id = subject_id,
+            });
+
+            const ProcessFactKey key {
+                .subject_id = subject_id,
+                .key = "process.name",
+            };
+            const auto name = to_utf8(entry.name);
+            if (!name.has_value()) {
+                out.facts.push_back(unavailable_fact(key, "failed to encode process name as UTF-8"));
+                continue;
+            }
+            out.facts.push_back(make_fact(key.subject_id, key.key, Value::string(*name), FactStatus::available));
         }
 
         return out;
