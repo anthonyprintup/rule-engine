@@ -56,6 +56,31 @@ namespace rule_engine::python::effects {
                    left.sink_ceiling == right.sink_ceiling && left.dry_run == right.dry_run;
         }
 
+        ReceiptEligibility vm_eligibility(const EffectIntent &intent) noexcept {
+            if (intent.disposition == EffectDisposition::suppressed) {
+                return ReceiptEligibility::suppressed;
+            }
+            if (intent.disposition == EffectDisposition::dry_run || intent.policy.dry_run) {
+                return ReceiptEligibility::dry_run;
+            }
+            return ReceiptEligibility::queued;
+        }
+
+        bool same_vm_intent(const EffectIntent &left, const EffectIntent &right) noexcept {
+            return left.id == right.id && left.invocation == right.invocation && left.owner == right.owner &&
+                   left.binding == right.binding && left.sequence == right.sequence && left.kind == right.kind &&
+                   same_frozen_value(left.payload, right.payload) && left.span == right.span &&
+                   same_policy(left.policy, right.policy) && left.disposition == right.disposition &&
+                   left.idempotency_key == right.idempotency_key;
+        }
+
+        std::size_t intent_charge(const EffectIntent &intent) noexcept {
+            return frozen_value_size(intent.payload) + intent.id.value.size() + intent.invocation.value.size() +
+                   intent.owner.value.size() + intent.binding.value.size() + intent.kind.size() +
+                   intent.policy.policy_id.size() + intent.policy.policy_digest.size() + intent.idempotency_key.size() +
+                   std::to_string(intent.sequence).size();
+        }
+
     } // namespace
 
     struct EffectJournal::Implementation {
@@ -360,6 +385,16 @@ namespace rule_engine::python::effects {
             "intent-v1", {scope->owner.execution.value, scope->owner.invocation.value, draft.reach_key});
         const auto idempotency_key =
             stable_domain_key("effect-idempotency-v1", {intent_key, scope->owner.binding.value, draft.kind});
+        if (std::ranges::find(implementation_->intents, IntentId {intent_key}, &EffectIntent::id) !=
+                implementation_->intents.end() ||
+            std::ranges::find(implementation_->intents, idempotency_key, &EffectIntent::idempotency_key) !=
+                implementation_->intents.end()) {
+            return std::unexpected(EffectError {
+                .code = EffectErrorCode::duplicate_reach_mismatch,
+                .message = "the effect identity collides with an existing VM or journal reach",
+                .span = draft.span,
+            });
+        }
 
         EffectIntent intent {
             .id = IntentId {intent_key},
@@ -395,6 +430,109 @@ namespace rule_engine::python::effects {
             .source_payload_digest = draft.payload.canonical_digest,
             .source_payload_label = apply_control_label(draft.payload, draft.control_label).label,
         });
+        implementation_->charged_bytes += charge;
+        ++implementation_->next_sequence;
+        return receipt(implementation_->intents.back().id);
+    }
+
+    std::expected<EffectReceipt, EffectError> EffectJournal::append_vm_intent(const JournalScopeId scope_id,
+                                                                              const EffectIntent &supplied,
+                                                                              const DataLabel &control_label) {
+        if (implementation_->finalized) {
+            return std::unexpected(EffectError {.code = EffectErrorCode::already_finalized,
+                                                .message = "the root journal is already finalized",
+                                                .span = supplied.span});
+        }
+        const auto *scope = implementation_->find_scope(scope_id);
+        if (scope == nullptr) {
+            return std::unexpected(EffectError {.code = EffectErrorCode::unknown_scope,
+                                                .message = "the journal scope does not exist",
+                                                .span = supplied.span});
+        }
+        if (scope->disposition != JournalScopeDisposition::open &&
+            scope->disposition != JournalScopeDisposition::eligible_to_merge) {
+            return std::unexpected(EffectError {.code = EffectErrorCode::scope_not_open,
+                                                .message = "VM effects can only be appended to an open scope",
+                                                .span = supplied.span});
+        }
+        if (supplied.id.empty() || supplied.invocation.empty() || supplied.owner.empty() || supplied.binding.empty() ||
+            supplied.kind.empty() || !supplied.payload.value.valid() || supplied.payload.canonical_digest.empty() ||
+            !supplied.span.valid() || supplied.policy.policy_id.empty() || supplied.policy.policy_digest.empty() ||
+            supplied.idempotency_key.empty() || supplied.sequence == 0 ||
+            supplied.disposition == EffectDisposition::committed) {
+            return std::unexpected(EffectError {
+                .code = EffectErrorCode::invalid_argument,
+                .message = "a VM effect delta requires an uncommitted immutable identity, payload, span, and policy",
+                .span = supplied.span,
+            });
+        }
+        if (supplied.invocation != scope->owner.invocation || supplied.owner != scope->owner.executable ||
+            supplied.binding != scope->owner.binding) {
+            return std::unexpected(EffectError {
+                .code = EffectErrorCode::ownership_mismatch,
+                .message = "the VM effect identity does not belong to the selected journal scope",
+                .span = supplied.span,
+            });
+        }
+
+        auto normalized = supplied;
+        normalized.payload = apply_control_label(supplied.payload, control_label);
+        const auto eligibility = vm_eligibility(supplied);
+        normalized.policy.dry_run = eligibility == ReceiptEligibility::dry_run;
+        normalized.disposition = supplied.disposition == EffectDisposition::rolled_back ?
+                                     EffectDisposition::rolled_back :
+                                     initial_disposition(eligibility);
+        if (!may_flow_to(normalized.payload.label, normalized.policy.sink_ceiling)) {
+            return std::unexpected(
+                EffectError {.code = EffectErrorCode::label_rejected,
+                             .message = "the VM effect payload exceeds the sink classification ceiling",
+                             .span = supplied.span});
+        }
+
+        const auto existing = std::ranges::find(implementation_->intents, supplied.id, &EffectIntent::id);
+        if (existing != implementation_->intents.end()) {
+            const auto index = static_cast<std::size_t>(std::distance(implementation_->intents.begin(), existing));
+            if (implementation_->intent_scopes[index] != scope_id ||
+                implementation_->intent_eligibilities[index] != eligibility || !same_vm_intent(*existing, normalized)) {
+                return std::unexpected(EffectError {
+                    .code = EffectErrorCode::duplicate_reach_mismatch,
+                    .message = "a resumed VM intent was reused with different semantics or ownership",
+                    .span = supplied.span,
+                });
+            }
+            return receipt(existing->id);
+        }
+        if (std::ranges::find(implementation_->intents, supplied.idempotency_key, &EffectIntent::idempotency_key) !=
+            implementation_->intents.end()) {
+            return std::unexpected(EffectError {
+                .code = EffectErrorCode::duplicate_reach_mismatch,
+                .message = "a VM intent reused an idempotency key owned by a different effect",
+                .span = supplied.span,
+            });
+        }
+        if (supplied.sequence != implementation_->next_sequence) {
+            return std::unexpected(EffectError {
+                .code = EffectErrorCode::sequence_mismatch,
+                .message = "VM effect deltas must preserve the evaluation-wide journal sequence",
+                .span = supplied.span,
+            });
+        }
+        if (implementation_->intents.size() >= implementation_->limits.maximum_intents) {
+            return std::unexpected(EffectError {.code = EffectErrorCode::intent_limit_exhausted,
+                                                .message = "the evaluation effect-intent limit is exhausted",
+                                                .span = supplied.span});
+        }
+        const auto charge = intent_charge(normalized);
+        if (charge > implementation_->limits.maximum_bytes -
+                         std::min(implementation_->limits.maximum_bytes, implementation_->charged_bytes)) {
+            return std::unexpected(EffectError {.code = EffectErrorCode::byte_limit_exhausted,
+                                                .message = "the evaluation frozen-effect byte limit is exhausted",
+                                                .span = supplied.span});
+        }
+
+        implementation_->intents.push_back(std::move(normalized));
+        implementation_->intent_scopes.push_back(scope_id);
+        implementation_->intent_eligibilities.push_back(eligibility);
         implementation_->charged_bytes += charge;
         ++implementation_->next_sequence;
         return receipt(implementation_->intents.back().id);

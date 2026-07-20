@@ -1,12 +1,14 @@
 add_library(
     rule_engine_python_effects
     common.cpp
+    execution.cpp
     journal.cpp
     labels.cpp
     outbox.cpp
     recorder.cpp
     replay.cpp
     service.cpp
+    service_coordinator.cpp
 )
 add_library(rule_engine::python_effects ALIAS rule_engine_python_effects)
 target_include_directories(rule_engine_python_effects PUBLIC "${CMAKE_SOURCE_DIR}/include")

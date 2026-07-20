@@ -24,6 +24,8 @@ namespace rule_engine::python::effects {
         byte_limit_exhausted,
         label_rejected,
         duplicate_reach_mismatch,
+        ownership_mismatch,
+        sequence_mismatch,
         unknown_intent,
         replay_forbids_dispatch,
     };

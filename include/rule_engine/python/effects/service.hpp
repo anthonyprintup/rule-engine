@@ -84,6 +84,11 @@ namespace rule_engine::python::effects {
         response_label_rejected,
         malformed_response,
         cache_policy_mismatch,
+        binding_not_found,
+        duplicate_request_mismatch,
+        capture_missing,
+        capture_mismatch,
+        dispatcher_required,
     };
 
     struct ServiceError {
