@@ -1,0 +1,3 @@
+add_library(rule_engine_python_protocol INTERFACE)
+add_library(rule_engine::python_protocol ALIAS rule_engine_python_protocol)
+target_link_libraries(rule_engine_python_protocol INTERFACE rule_engine::python_contract)

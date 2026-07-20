@@ -1,0 +1,3 @@
+add_library(rule_engine_python_vm INTERFACE)
+add_library(rule_engine::python_vm ALIAS rule_engine_python_vm)
+target_link_libraries(rule_engine_python_vm INTERFACE rule_engine::python_contract)

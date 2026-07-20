@@ -1,0 +1,3 @@
+add_library(rule_engine_python_packaging INTERFACE)
+add_library(rule_engine::python_packaging ALIAS rule_engine_python_packaging)
+target_link_libraries(rule_engine_python_packaging INTERFACE rule_engine::python_contract)

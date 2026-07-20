@@ -1,0 +1,3 @@
+add_library(rule_engine_python_cluster INTERFACE)
+add_library(rule_engine::python_cluster ALIAS rule_engine_python_cluster)
+target_link_libraries(rule_engine_python_cluster INTERFACE rule_engine::python_contract)

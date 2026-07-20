@@ -231,6 +231,15 @@ add_library(rule_engine::python_contract ALIAS rule_engine_python_contract)
 target_include_directories(rule_engine_python_contract PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(rule_engine_python_contract PUBLIC rule_engine::project_options)
 
+add_subdirectory(src/python/packaging)
+add_subdirectory(src/python/compiler)
+add_subdirectory(src/python/vm)
+add_subdirectory(src/python/effects)
+add_subdirectory(src/python/events)
+add_subdirectory(src/python/protocol)
+add_subdirectory(src/python/cluster)
+add_subdirectory(src/python/optimizer)
+
 add_library(
     rule_engine_core
     src/benchmark.cpp
