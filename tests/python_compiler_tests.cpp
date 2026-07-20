@@ -1,13 +1,21 @@
 #include "rule_engine/python/compiler.hpp"
+#include "rule_engine/python/packaging/source_pack.hpp"
 #include "rule_engine/python/vm/register_vm.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#ifndef RULE_ENGINE_PACKAGING_WORKER_SCRIPT
+#define RULE_ENGINE_PACKAGING_WORKER_SCRIPT ""
+#endif
+
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <expected>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
@@ -42,6 +50,8 @@ namespace {
     }
 
     VerifiedRulePack pack(std::string source = std::string(512, ' ')) {
+        const auto source_view = std::span {source.data(), source.size()};
+        const auto source_digest = SourceDigest {"sha256:" + packaging::sha256_hex(std::as_bytes(source_view))};
         return {
             .manifest =
                 {
@@ -58,7 +68,7 @@ namespace {
                         .id = SourceId {std::string {source_name}},
                         .module = "rules.main",
                         .utf8 = std::move(source),
-                        .digest = SourceDigest {"sha256:module"},
+                        .digest = source_digest,
                     },
                 },
             .trust =
@@ -113,15 +123,79 @@ namespace {
         };
     }
 
-    packaging::PrivatePythonRuntime exact_runtime() {
-        return packaging::PrivatePythonRuntime {
-            .descriptor = packaging::official_windows_cpython_3146(),
-            .origin = packaging::RuntimeOrigin::private_bundle,
-            .runtime_root = "C:/private/python-3.14.6",
-            .worker_executable = "C:/private/rule_engine_python_worker.exe",
-            .verified_artifact_sha256 = packaging::official_windows_cpython_3146().artifact_sha256,
-            .installation_manifest_verified = true,
-        };
+    std::optional<std::string> environment_value(const char *name) {
+#ifdef _WIN32
+        char *raw_value {};
+        std::size_t length {};
+        if (_dupenv_s(&raw_value, &length, name) != 0 || raw_value == nullptr) {
+            return std::nullopt;
+        }
+        std::string value {raw_value};
+        std::free(raw_value);
+        return value;
+#else
+        const auto *raw_value = std::getenv(name);
+        return raw_value == nullptr ? std::nullopt : std::optional<std::string> {raw_value};
+#endif
+    }
+
+    struct ExactRuntimeFixture {
+        std::optional<packaging::PrivatePythonRuntime> runtime;
+        std::filesystem::path temporary_parent;
+        std::string unavailable_reason;
+        std::string staging_failure;
+
+        ExactRuntimeFixture() = default;
+        ExactRuntimeFixture(const ExactRuntimeFixture &) = delete;
+        ExactRuntimeFixture &operator=(const ExactRuntimeFixture &) = delete;
+        ExactRuntimeFixture(ExactRuntimeFixture &&) noexcept = default;
+
+        ~ExactRuntimeFixture() {
+            if (!temporary_parent.empty()) {
+                std::error_code ignored;
+                std::filesystem::remove_all(temporary_parent, ignored);
+            }
+        }
+    };
+
+    ExactRuntimeFixture exact_runtime() {
+        ExactRuntimeFixture result;
+        const auto root_text = environment_value("RULE_ENGINE_TEST_PYTHON_RUNTIME_ROOT");
+        const auto archive_text = environment_value("RULE_ENGINE_TEST_PYTHON_RUNTIME_ARCHIVE");
+        if (!root_text || !archive_text || root_text->empty() || archive_text->empty()) {
+            result.unavailable_reason = "exact CPython 3.14.6 test artifact was not configured";
+            return result;
+        }
+        std::error_code filesystem_error;
+        if (!std::filesystem::is_directory(*root_text, filesystem_error) || filesystem_error ||
+            !std::filesystem::is_regular_file(*archive_text, filesystem_error) || filesystem_error) {
+            result.unavailable_reason = "exact CPython 3.14.6 test artifact is absent";
+            return result;
+        }
+        const auto temporary_root = std::filesystem::temp_directory_path(filesystem_error);
+        if (filesystem_error) {
+            result.unavailable_reason = "cannot resolve the test temporary directory";
+            return result;
+        }
+        const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+        result.temporary_parent = temporary_root / ("rule-engine-python-compiler-" + std::to_string(nonce));
+        if (!std::filesystem::create_directory(result.temporary_parent, filesystem_error) || filesystem_error) {
+            result.unavailable_reason = "cannot create the test runtime staging directory";
+            result.temporary_parent.clear();
+            return result;
+        }
+        const auto staged = packaging::stage_exact_private_runtime(packaging::PythonRuntimeStageRequest {
+            .artifact_archive = *archive_text,
+            .extracted_distribution = *root_text,
+            .destination = result.temporary_parent / "python-3.14.6",
+            .worker_script = RULE_ENGINE_PACKAGING_WORKER_SCRIPT,
+        });
+        if (!staged) {
+            result.staging_failure = staged.error().message;
+            return result;
+        }
+        result.runtime = *staged;
+        return result;
     }
 
     struct QueueLauncher final: packaging::WorkerLauncher {
@@ -129,8 +203,8 @@ namespace {
         std::size_t calls {};
 
         std::expected<packaging::WorkerProcessResult, packaging::PackagingError>
-        launch(const packaging::PrivatePythonRuntime &, const packaging::WorkerMode, const std::span<const std::byte>,
-               const packaging::WorkerLimits &) override {
+        launch(const packaging::PrivatePythonRuntime &, const packaging::WorkerMode, const std::uint32_t,
+               const std::span<const std::byte>, const packaging::WorkerLimits &) override {
             ++calls;
             if (results.empty()) {
                 return std::unexpected(packaging::PackagingError {
@@ -248,6 +322,15 @@ namespace {
     }
 
     TEST_CASE("static pack compiler consumes the exact worker payload contract") {
+        auto runtime = exact_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
         const auto rule_pack = pack();
         const auto ast_payload = encode_ast_envelope(envelope(constant_rule_nodes(false)));
         REQUIRE(ast_payload.has_value());
@@ -262,7 +345,7 @@ namespace {
                 packaging::OpaqueWorkerPayload {
                     .schema = std::string {packaging::static_ast_schema_v1},
                     .source = SourceId {std::string {source_name}},
-                    .source_digest = rule_pack.closure_digest,
+                    .source_digest = rule_pack.sources.front().digest,
                     .bytes = *ast_payload,
                 },
         });
@@ -278,12 +361,13 @@ namespace {
             .stdout_bytes = *response_frame,
             .stderr_excerpt = {},
         });
-        packaging::WorkerClient client {.runtime = exact_runtime(), .launcher = launcher, .limits = {}};
+        packaging::WorkerClient client {.runtime = *runtime.runtime, .launcher = launcher, .limits = {}};
         WorkerAstEnvelopeProvider provider {client};
         StaticPackCompiler compiler {provider};
 
         const OperatorBindings bindings {binding("com.example.constant")};
         const auto compiled = compiler.compile(rule_pack, {}, bindings);
+        INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
         REQUIRE(compiled.has_value());
         REQUIRE(compiled->functions.size() == 1U);
         REQUIRE(compiled->functions.front().id == ExecutableId {"com.example.constant"});
