@@ -132,22 +132,51 @@ namespace rule_engine::python::compiler {
             }
         };
 
-        const std::set<std::string, std::less<>> allowed_import_roots {
+        constexpr auto allowed_import_roots = std::to_array<std::string_view>({
             "base64",  "binascii",    "collections", "dataclasses", "datetime", "enum",   "functools",
             "hashlib", "hmac",        "ipaddress",   "itertools",   "json",     "math",   "operator",
             "pathlib", "rule_engine", "statistics",  "struct",      "typing",   "urllib",
-        };
+        });
 
-        const std::set<std::string, std::less<>> forbidden_calls {
-            "__import__", "compile", "delattr", "dir",    "eval", "exec",    "getattr", "globals",
-            "help",       "id",      "input",   "locals", "open", "setattr", "vars",
-        };
+        constexpr auto forbidden_calls = std::to_array<std::string_view>({
+            "__import__",
+            "compile",
+            "delattr",
+            "dir",
+            "eval",
+            "exec",
+            "getattr",
+            "globals",
+            "help",
+            "id",
+            "input",
+            "locals",
+            "open",
+            "setattr",
+            "vars",
+        });
 
-        const std::set<std::string, std::less<>> forbidden_dunders {
-            "__bases__", "__class_getitem__", "__del__",          "__delattr__",       "__delete__",
-            "__get__",   "__getattr__",       "__getattribute__", "__init_subclass__", "__mro_entries__",
-            "__new__",   "__prepare__",       "__set__",          "__setattr__",
-        };
+        constexpr auto forbidden_dunders = std::to_array<std::string_view>({
+            "__bases__",
+            "__class_getitem__",
+            "__del__",
+            "__delattr__",
+            "__delete__",
+            "__get__",
+            "__getattr__",
+            "__getattribute__",
+            "__init_subclass__",
+            "__mro_entries__",
+            "__new__",
+            "__prepare__",
+            "__set__",
+            "__setattr__",
+        });
+
+        template<std::size_t Size> [[nodiscard]] constexpr bool
+        contains_name(const std::array<std::string_view, Size> &names, const std::string_view name) noexcept {
+            return std::ranges::find(names, name) != names.end();
+        }
 
         std::string root_name(const AstIndex &index, const AstNode &node) {
             if (node.kind == "Name") {
@@ -355,7 +384,7 @@ namespace rule_engine::python::compiler {
             if (node.kind == "Call") {
                 const auto *target = index.reference(node, "func");
                 const auto name = target ? root_name(index, *target) : std::string {};
-                if (forbidden_calls.contains(name)) {
+                if (contains_name(forbidden_calls, name)) {
                     diagnostics.push_back(make_diagnostic(
                         "PY-DYNAMIC", "ambient or reflective call '" + name + "' is rejected", node.span));
                 }
@@ -376,7 +405,7 @@ namespace rule_engine::python::compiler {
             }
             if (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef") {
                 const auto name = index.string(node, "name").value_or(std::string {});
-                if (forbidden_dunders.contains(name)) {
+                if (contains_name(forbidden_dunders, name)) {
                     diagnostics.push_back(
                         make_diagnostic("PY-DYNAMIC-DUNDER", "dynamic dunder '" + name + "' is rejected", node.span));
                 }
@@ -614,7 +643,7 @@ namespace rule_engine::python::compiler {
                 const auto root_end = name.find('.');
                 const auto root = name.substr(0, root_end);
                 const auto local_dependency = modules.contains(name) || name.starts_with("rulepack_deps.");
-                if (!local_dependency && !allowed_import_roots.contains(root)) {
+                if (!local_dependency && !contains_name(allowed_import_roots, root)) {
                     diagnostics.push_back(make_diagnostic(
                         "PY-IMPORT-AMBIENT", "ambient module '" + name + "' is not in stdlib.v1", alias->span));
                     continue;
@@ -642,7 +671,7 @@ namespace rule_engine::python::compiler {
             const auto root_end = module.find('.');
             const auto root = module.substr(0, root_end);
             const auto local_dependency = modules.contains(module) || module.starts_with("rulepack_deps.");
-            if (!local_dependency && !allowed_import_roots.contains(root)) {
+            if (!local_dependency && !contains_name(allowed_import_roots, root)) {
                 diagnostics.push_back(make_diagnostic(
                     "PY-IMPORT-AMBIENT", "ambient module '" + module + "' is not in stdlib.v1", node.span));
                 return;
@@ -1031,6 +1060,45 @@ namespace rule_engine::python::compiler {
             not_contains,
         };
 
+        constexpr auto binary_codes = std::to_array<std::pair<std::string_view, BinaryCode>>({
+            {"Add", BinaryCode::add},
+            {"BitAnd", BinaryCode::bit_and},
+            {"BitOr", BinaryCode::bit_or},
+            {"BitXor", BinaryCode::bit_xor},
+            {"Div", BinaryCode::true_divide},
+            {"FloorDiv", BinaryCode::floor_divide},
+            {"LShift", BinaryCode::left_shift},
+            {"Mod", BinaryCode::modulo},
+            {"Mult", BinaryCode::multiply},
+            {"Pow", BinaryCode::power},
+            {"RShift", BinaryCode::right_shift},
+            {"Sub", BinaryCode::subtract},
+        });
+
+        constexpr auto compare_codes = std::to_array<std::pair<std::string_view, CompareCode>>({
+            {"Eq", CompareCode::equal},
+            {"Gt", CompareCode::greater},
+            {"GtE", CompareCode::greater_equal},
+            {"In", CompareCode::contains},
+            {"Is", CompareCode::is_value},
+            {"IsNot", CompareCode::is_not},
+            {"Lt", CompareCode::less},
+            {"LtE", CompareCode::less_equal},
+            {"NotEq", CompareCode::not_equal},
+            {"NotIn", CompareCode::not_contains},
+        });
+
+        template<typename Code, std::size_t Size> [[nodiscard]] constexpr std::optional<Code>
+        operation_code(const std::array<std::pair<std::string_view, Code>, Size> &codes,
+                       const std::string_view name) noexcept {
+            for (const auto &[candidate, code] : codes) {
+                if (candidate == name) {
+                    return code;
+                }
+            }
+            return std::nullopt;
+        }
+
         struct ExpressionResult {
             std::uint32_t reg {};
             StaticType type;
@@ -1050,8 +1118,8 @@ namespace rule_engine::python::compiler {
                 case StaticTypeKind::model: return SchemaId {type.qualified_name};
                 case StaticTypeKind::callable:
                 case StaticTypeKind::unknown: return SchemaId {"any"};
+                default: std::unreachable();
             }
-            return SchemaId {"any"};
         }
 
         [[nodiscard]] std::string route_name(const FactRoute &route) { return route.provider + "." + route.fact; }
@@ -1418,22 +1486,8 @@ namespace rule_engine::python::compiler {
                     if (!left || !right) {
                         return std::nullopt;
                     }
-                    static const std::map<std::string, BinaryCode, std::less<>> codes {
-                        {"Add", BinaryCode::add},
-                        {"BitAnd", BinaryCode::bit_and},
-                        {"BitOr", BinaryCode::bit_or},
-                        {"BitXor", BinaryCode::bit_xor},
-                        {"Div", BinaryCode::true_divide},
-                        {"FloorDiv", BinaryCode::floor_divide},
-                        {"LShift", BinaryCode::left_shift},
-                        {"Mod", BinaryCode::modulo},
-                        {"Mult", BinaryCode::multiply},
-                        {"Pow", BinaryCode::power},
-                        {"RShift", BinaryCode::right_shift},
-                        {"Sub", BinaryCode::subtract},
-                    };
-                    const auto code = codes.find(operation);
-                    if (code == codes.end()) {
+                    const auto code = operation_code(binary_codes, operation);
+                    if (!code) {
                         diagnostics.push_back(make_diagnostic(
                             "PY-UNSUPPORTED", "binary operator '" + operation + "' is not supported", node.span));
                         return std::nullopt;
@@ -1465,8 +1519,8 @@ namespace rule_engine::python::compiler {
                         return std::nullopt;
                     }
                     const auto destination = allocate();
-                    emit(Opcode::binary_op, destination, left->reg, right->reg,
-                         static_cast<std::uint32_t>(code->second), node.span);
+                    emit(Opcode::binary_op, destination, left->reg, right->reg, static_cast<std::uint32_t>(*code),
+                         node.span);
                     may_fault = true;
                     return ExpressionResult {.reg = destination, .type = std::move(result_type)};
                 }
@@ -1483,13 +1537,6 @@ namespace rule_engine::python::compiler {
                     if (!left) {
                         return std::nullopt;
                     }
-                    static const std::map<std::string, CompareCode, std::less<>> codes {
-                        {"Eq", CompareCode::equal},          {"Gt", CompareCode::greater},
-                        {"GtE", CompareCode::greater_equal}, {"In", CompareCode::contains},
-                        {"Is", CompareCode::is_value},       {"IsNot", CompareCode::is_not},
-                        {"Lt", CompareCode::less},           {"LtE", CompareCode::less_equal},
-                        {"NotEq", CompareCode::not_equal},   {"NotIn", CompareCode::not_contains},
-                    };
                     const auto destination = allocate();
                     std::vector<std::size_t> exits;
                     for (std::size_t position = 0; position < comparators.size(); ++position) {
@@ -1506,15 +1553,15 @@ namespace rule_engine::python::compiler {
                         if (!right) {
                             return std::nullopt;
                         }
-                        const auto code = codes.find(operations[position]);
-                        if (code == codes.end()) {
+                        const auto code = operation_code(compare_codes, operations[position]);
+                        if (!code) {
                             diagnostics.push_back(make_diagnostic(
                                 "PY-UNSUPPORTED", "comparison operator '" + operations[position] + "' is unsupported",
                                 node.span));
                             return std::nullopt;
                         }
-                        emit(Opcode::compare, destination, left->reg, right->reg,
-                             static_cast<std::uint32_t>(code->second), node.span);
+                        emit(Opcode::compare, destination, left->reg, right->reg, static_cast<std::uint32_t>(*code),
+                             node.span);
                         left = right;
                     }
                     const auto exit = static_cast<std::uint32_t>(bytecode.instructions.size());
@@ -1662,7 +1709,7 @@ namespace rule_engine::python::compiler {
                 if (node.kind == "Call") {
                     const auto *target = index.reference(node, "func");
                     const auto name = target ? root_name(index, *target) : std::string {};
-                    if (forbidden_calls.contains(name)) {
+                    if (contains_name(forbidden_calls, name)) {
                         return std::nullopt;
                     }
                     const auto target_index = target == nullptr ? std::nullopt : function_index(*target);
@@ -2546,7 +2593,18 @@ namespace rule_engine::python::compiler {
                             normal[instruction.destination] = true;
                         }
                         break;
-                    default: break;
+                    case Opcode::jump:
+                    case Opcode::jump_if_false:
+                    case Opcode::return_value:
+                    case Opcode::raise_fault:
+                    case Opcode::enter_try:
+                    case Opcode::leave_try:
+                    case Opcode::yield_value:
+                    case Opcode::write_state:
+                    case Opcode::append_effect:
+                    case Opcode::begin_transaction:
+                    case Opcode::commit_transaction:
+                    case Opcode::rollback_transaction: break;
                 }
                 if (instruction.opcode == Opcode::jump) {
                     merge_state(instruction.immediate, normal);
@@ -2600,7 +2658,15 @@ namespace rule_engine::python::compiler {
                             require_initialized(instruction.operand_a + argument);
                         }
                         break;
-                    default: break;
+                    case Opcode::load_const:
+                    case Opcode::jump:
+                    case Opcode::enter_try:
+                    case Opcode::leave_try:
+                    case Opcode::read_state:
+                    case Opcode::write_state:
+                    case Opcode::begin_transaction:
+                    case Opcode::commit_transaction:
+                    case Opcode::rollback_transaction: break;
                 }
             }
         }
