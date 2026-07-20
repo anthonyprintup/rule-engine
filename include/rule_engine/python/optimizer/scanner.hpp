@@ -29,6 +29,7 @@ namespace rule_engine::python::optimizer {
         std::uint64_t begin {};
         std::uint64_t size {};
         std::uint32_t permissions {scan_permission_read};
+        DataLabel label;
         std::uint64_t subject_generation {};
     };
 
@@ -124,6 +125,7 @@ namespace rule_engine::python::optimizer {
         std::uint32_t maximum_matches {};
         std::uint32_t context_bytes_before {};
         std::uint32_t context_bytes_after {};
+        ScanResultMode result_mode {ScanResultMode::exact_complete};
     };
 
     // This is the complete provider-facing request. It contains an authenticated
@@ -144,8 +146,11 @@ namespace rule_engine::python::optimizer {
         std::uint64_t absolute_address {};
         std::uint64_t length {};
         std::uint32_t permissions {};
+        std::vector<std::byte> matched_bytes;
         std::vector<std::byte> context_before;
         std::vector<std::byte> context_after;
+        DataLabel label;
+        std::uint64_t subject_generation {};
     };
 
     struct MatchSet {
@@ -157,9 +162,9 @@ namespace rule_engine::python::optimizer {
     };
 
     // `source` represents bytes beginning at `source_origin`. The requested scan
-    // space must be wholly contained in that range. A successful MatchSet is
-    // always complete; exceeding maximum_matches returns an error rather than a
-    // truncated exact-looking value.
+    // space must be wholly contained in that range. Exact mode returns a complete
+    // MatchSet or an error rather than a truncated exact-looking value.
+    // Existential mode returns at most one deterministic witness.
     [[nodiscard]] std::expected<MatchSet, ScanError> execute_scan(const ExplicitScanSpace &space,
                                                                   const TypedScanPlan &plan,
                                                                   std::span<const std::byte> source,

@@ -21,6 +21,9 @@ namespace rule_engine::python::optimizer {
         std::uint32_t maximum_context_bytes {64U * 1024U};
         std::uint64_t maximum_scan_bytes {16U * 1024U * 1024U};
         std::uint32_t maximum_scan_matches {100'000U};
+        std::size_t maximum_result_payload_bytes {16U * 1024U * 1024U};
+        std::size_t maximum_label_categories {64U};
+        std::size_t maximum_label_bytes {1U * 1024U * 1024U};
         std::size_t maximum_subject_depth {32U};
         std::size_t maximum_identity_fields {64U};
         std::size_t maximum_subject_component_bytes {1U * 1024U * 1024U};
@@ -31,6 +34,7 @@ namespace rule_engine::python::optimizer {
         invalid_limits,
         invalid_request,
         invalid_subject,
+        invalid_label,
         invalid_deadline,
         invalid_space,
         unsupported_space_kind,
@@ -60,17 +64,17 @@ namespace rule_engine::python::optimizer {
     };
 
     // `ScanPlan::encoded_pattern` uses the canonical ASCII-only rsp1 framing.
-    // Identity, subject generation, contexts, and every pattern field are
-    // carried there; plan identity and budgets use their dedicated fields.
+    // The redundant identity, generation, kind, and context fields bind the
+    // encoded pattern set to its typed request fields and must agree exactly.
     [[nodiscard]] std::expected<ScanPlan, ScanWireError>
     serialize_scan_plan(const ExplicitScanSpace &space, const TypedScanPlan &plan, const ScanWireLimits &limits = {});
 
     [[nodiscard]] std::expected<DecodedScanPlan, ScanWireError>
     deserialize_scan_plan(const ScanSpace &space, const ScanPlan &plan, const ScanWireLimits &limits = {});
 
-    // The current protocol ScanMatch contains only offset and length. To keep
-    // attribution lossless, request/result adaptation supports exactly one
-    // pattern and no context. Local TypedScanPlan values remain multi-pattern.
+    // Request and result adapters preserve every typed scan field. They reject
+    // mismatched attribution, noncanonical ordering, incomplete context, and
+    // any result whose mode differs from the authenticated request.
     [[nodiscard]] std::expected<ScanRequest, ScanWireError> to_contract_scan_request(const ProviderScanRequest &request,
                                                                                      const ScanWireLimits &limits = {});
 

@@ -217,6 +217,25 @@ namespace rule_engine::python::optimizer {
             return {};
         }
 
+        [[nodiscard]] bool valid_utf8_text(const std::string_view input) {
+            std::size_t offset {};
+            while (offset < input.size()) {
+                if (!decode_utf8_code_point(input, offset, {}).has_value()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        [[nodiscard]] bool valid_label(const DataLabel &label) {
+            return label.classification <= Classification::secret &&
+                   std::ranges::all_of(
+                       label.categories,
+                       [](const std::string &category) { return !category.empty() && valid_utf8_text(category); }) &&
+                   std::ranges::is_sorted(label.categories) &&
+                   std::ranges::adjacent_find(label.categories) == label.categories.end();
+        }
+
         [[nodiscard]] std::expected<std::vector<std::byte>, ScanError>
         encode_text(const std::string_view utf8, const TextEncoding encoding, const std::string &pattern_id) {
             std::vector<std::byte> result;
@@ -332,8 +351,11 @@ namespace rule_engine::python::optimizer {
                 .absolute_address = space.begin + static_cast<std::uint64_t>(offset),
                 .length = static_cast<std::uint64_t>(length),
                 .permissions = space.permissions,
+                .matched_bytes = copy_range(input, offset, offset + length),
                 .context_before = copy_range(input, offset - before_count, offset),
                 .context_after = copy_range(input, after_start, after_start + after_count),
+                .label = space.label,
+                .subject_generation = space.subject_generation,
             });
             return {};
         }
@@ -357,6 +379,9 @@ namespace rule_engine::python::optimizer {
                 const auto appended = append_match(result, space, plan, input, pattern, offset, pattern.bytes.size());
                 if (!appended.has_value()) {
                     return appended;
+                }
+                if (plan.result_mode == ScanResultMode::existential) {
+                    return {};
                 }
             }
             return {};
@@ -398,6 +423,9 @@ namespace rule_engine::python::optimizer {
                 if (!appended.has_value()) {
                     return appended;
                 }
+                if (plan.result_mode == ScanResultMode::existential) {
+                    return {};
+                }
                 if (length == 0) {
                     if (offset == input.size()) {
                         break;
@@ -413,10 +441,12 @@ namespace rule_engine::python::optimizer {
         [[nodiscard]] std::expected<void, ScanError> validate_plan(const ExplicitScanSpace &space,
                                                                    const TypedScanPlan &plan) {
             constexpr auto known_permissions = scan_permission_read | scan_permission_write | scan_permission_execute;
-            if (space.identity.empty() || space.size == 0 || (space.permissions & scan_permission_read) == 0 ||
-                (space.permissions & ~known_permissions) != 0) {
-                return std::unexpected(error(ScanErrorCode::invalid_space,
-                                             "scan space must have identity, bounds, and known read permission"));
+            if (space.identity.empty() || space.subject_generation == 0 || space.size == 0 ||
+                (space.permissions & scan_permission_read) == 0 || (space.permissions & ~known_permissions) != 0 ||
+                !valid_label(space.label)) {
+                return std::unexpected(
+                    error(ScanErrorCode::invalid_space,
+                          "scan space must have identity, generation, bounds, label, and known read permission"));
             }
             switch (space.kind) {
                 case ScanSpaceKind::image_file:
@@ -435,6 +465,9 @@ namespace rule_engine::python::optimizer {
             }
             if (space.size > plan.maximum_bytes) {
                 return std::unexpected(error(ScanErrorCode::byte_budget_exceeded, "scan space exceeds maximum_bytes"));
+            }
+            if (plan.result_mode != ScanResultMode::exact_complete && plan.result_mode != ScanResultMode::existential) {
+                return std::unexpected(error(ScanErrorCode::invalid_plan, "scan result mode is unknown"));
             }
 
             std::vector<std::string_view> pattern_ids;
@@ -702,6 +735,9 @@ namespace rule_engine::python::optimizer {
                                      scan_fixed_pattern(result, space, plan, input, pattern);
             if (!scanned.has_value()) {
                 return std::unexpected(scanned.error());
+            }
+            if (plan.result_mode == ScanResultMode::existential && result.exists()) {
+                break;
             }
         }
         std::ranges::sort(result.matches, [](const TypedScanMatch &left, const TypedScanMatch &right) {
