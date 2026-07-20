@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rule_engine/python/effects/journal.hpp"
+#include "rule_engine/python/effects/recorder.hpp"
 
 #include <cstdint>
 #include <expected>
@@ -61,5 +62,9 @@ namespace rule_engine::python::effects {
 
     [[nodiscard]] std::vector<ParityDifference> compare_effect_journals(std::span<const EffectIntent> expected,
                                                                         std::span<const EffectIntent> actual);
+    [[nodiscard]] std::vector<ParityDifference> compare_evaluation_results(const EvaluationResult &expected,
+                                                                           const EvaluationResult &actual);
+    [[nodiscard]] std::vector<ParityDifference> compare_recorder_snapshots(const RecorderSnapshot &expected,
+                                                                           const RecorderSnapshot &actual);
 
 } // namespace rule_engine::python::effects

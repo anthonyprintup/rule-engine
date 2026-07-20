@@ -95,6 +95,126 @@ namespace {
         };
     }
 
+    EffectIntent vm_intent(const std::uint64_t sequence, const InvocationOwner &intent_owner, std::string text,
+                           const bool dry_run = false) {
+        const auto id = "vm:" + intent_owner.invocation.value + ":effect:" + std::to_string(sequence);
+        return EffectIntent {
+            .id = IntentId {id},
+            .invocation = intent_owner.invocation,
+            .owner = intent_owner.executable,
+            .binding = intent_owner.binding,
+            .sequence = sequence,
+            .kind = "post",
+            .payload = frozen(std::move(text)),
+            .span = span(static_cast<std::uint32_t>(sequence * 10U)),
+            .policy = {.policy_id = "vm.policy",
+                       .policy_digest = "vm.policy.v1",
+                       .sink_ceiling = label(Classification::secret, {"identity", "telemetry"}),
+                       .dry_run = dry_run},
+            .disposition = EffectDisposition::pending,
+            .idempotency_key = "execution-1:" + id,
+        };
+    }
+
+    VmStep vm_step(const VmStepState state, std::vector<EffectIntent> effects = {},
+                   std::vector<RecorderEvent> recorder = {}, std::optional<EvaluationResult> result = std::nullopt) {
+        return VmStep {
+            .state = state,
+            .fact_requests = {},
+            .scan_requests = {},
+            .capability_requests = {},
+            .state_requests = {},
+            .history_requests = {},
+            .journal_delta = std::move(effects),
+            .recorder_delta = std::move(recorder),
+            .yielded_value = std::nullopt,
+            .result = std::move(result),
+        };
+    }
+
+    EvaluationResult clean_result(const bool verdict, std::vector<EffectIntent> effects) {
+        for (auto &effect : effects) {
+            if (effect.disposition == EffectDisposition::pending) {
+                effect.disposition = EffectDisposition::committed;
+            }
+        }
+        return EvaluationResult {
+            .outcome = verdict ? EvaluationOutcome::match : EvaluationOutcome::no_match,
+            .verdict = verdict,
+            .committed_effects = std::move(effects),
+            .state_mutations = {},
+            .fault = std::nullopt,
+        };
+    }
+
+    ServiceBindingPolicy service_binding() {
+        return ServiceBindingPolicy {
+            .binding_key = "operator/fingerprint/v1",
+            .capability = CapabilityId {"machine-fingerprint/v1"},
+            .request_schema = SchemaId {"machine-fingerprint/request/v1"},
+            .retry = {.maximum_attempts = 2, .base_delay_ms = 100, .maximum_delay_ms = 1'000},
+            .cache = ServiceCachePolicy {.scope_key = "tenant-1/peer-1", .ttl_ms = 1'000},
+            .request_ceiling = label(Classification::internal),
+            .response_ceiling = label(Classification::sensitive, {"identity"}),
+        };
+    }
+
+    struct RecordingServiceTransport final: IServiceTransport {
+        std::vector<ServiceAttempt> attempts;
+        std::vector<ServiceAttempt> cancellations;
+        std::optional<ServiceResult> reject_next;
+
+        std::expected<void, ServiceResult> dispatch(const ServiceAttempt &attempt) override {
+            attempts.push_back(attempt);
+            if (reject_next.has_value()) {
+                auto result = std::move(*reject_next);
+                reject_next.reset();
+                return std::unexpected(std::move(result));
+            }
+            return {};
+        }
+
+        void cancel(const ServiceAttempt &attempt) noexcept override { cancellations.push_back(attempt); }
+    };
+
+    struct CountingOutboxStore final: IOutboxDeliveryStore {
+        explicit CountingOutboxStore(OutboxQueue &selected): queue {selected} {}
+
+        OutboxQueue &queue;
+        std::uint64_t claims {};
+        std::uint64_t settlements {};
+
+        std::expected<OutboxLease, OutboxError> claim(std::string worker, const std::uint64_t now_unix_ms,
+                                                      const std::uint64_t lease_duration_ms) override {
+            ++claims;
+            return queue.claim(std::move(worker), now_unix_ms, lease_duration_ms);
+        }
+
+        std::expected<ActionDeliveryRecord, OutboxError>
+        acknowledge(const OutboxLease &lease, const std::uint64_t now_unix_ms,
+                    std::optional<FrozenValue> acknowledgment) override {
+            ++settlements;
+            return queue.acknowledge(lease, now_unix_ms, std::move(acknowledgment));
+        }
+
+        std::expected<ActionDeliveryRecord, OutboxError> fail(const OutboxLease &lease, const DeliveryFailure &failure,
+                                                              const std::uint64_t now_unix_ms) override {
+            ++settlements;
+            return queue.fail(lease, failure, now_unix_ms);
+        }
+    };
+
+    struct RecordingActionTransport final: IActionTransport {
+        std::uint64_t dispatches {};
+        std::expected<ActionDispatchSuccess, ActionDispatchFailure> next = ActionDispatchSuccess {};
+
+        std::expected<ActionDispatchSuccess, ActionDispatchFailure> dispatch(const OutboxLease &lease) override {
+            (void) lease;
+            ++dispatches;
+            return next;
+        }
+    };
+
     TEST_CASE("effect journal preserves order and deduplicates one resumed reach") {
         auto created = EffectJournal::create(owner());
         REQUIRE(created.has_value());
@@ -617,6 +737,396 @@ namespace {
         queue.expire_due(1'100);
         REQUIRE(queue.find(live_finalized->intents[0].id)->state == OutboxState::expired);
         REQUIRE_FALSE(queue.claim("worker", 1'100, 100).has_value());
+    }
+
+    TEST_CASE("VM step adapter preserves suspended nested reach ownership and replay parity") {
+        const auto root_owner = owner();
+        const auto child_owner = owner("child-1", "example.child", "example.child.binding");
+        const auto root_effect = vm_intent(1, root_owner, "root-effect");
+        const auto child_effect = vm_intent(2, child_owner, "child-effect");
+        const auto transaction_effect = vm_intent(3, root_owner, "rolled-back-effect");
+        const FlightRecorderConfig recorder_config {
+            .armed = true,
+            .publish_initially = true,
+            .maximum_entries = 16,
+            .maximum_bytes = 8'192,
+            .retention_ceiling = label(Classification::secret, {"identity"}),
+        };
+
+        auto live_created = ExecutionJournalAdapter::create(ExecutionJournalConfig {
+            .root_owner = root_owner,
+            .mode = ExecutionMode::live,
+            .journal_limits = {},
+            .recorder = recorder_config,
+            .parity_expectation = std::nullopt,
+        });
+        REQUIRE(live_created.has_value());
+        auto live = std::move(*live_created);
+
+        const auto suspended = vm_step(VmStepState::waiting_for_capabilities, {root_effect}, {recorder_event(1)});
+        REQUIRE(live.observe_step(suspended, live.root_scope()).has_value());
+        // A host may re-observe an unchanged suspension snapshot. Both contract
+        // deltas are idempotent and retain their original IDs/sequences.
+        REQUIRE(live.observe_step(suspended, live.root_scope()).has_value());
+
+        const auto child = live.open_scope(live.root_scope(), JournalScopeKind::child_invocation, child_owner);
+        REQUIRE(child.has_value());
+        const auto secret_branch = live.push_control(label(Classification::sensitive, {"identity"}));
+        REQUIRE(live.observe_step(vm_step(VmStepState::yielded, {child_effect}), *child).has_value());
+        REQUIRE(live.pop_control(secret_branch).has_value());
+        REQUIRE(live.close_scope(*child, JournalExit::normal).has_value());
+
+        const auto transaction = live.open_scope(live.root_scope(), JournalScopeKind::explicit_transaction, root_owner);
+        REQUIRE(transaction.has_value());
+        REQUIRE(live.observe_step(vm_step(VmStepState::yielded, {transaction_effect}), *transaction).has_value());
+        REQUIRE(live.close_scope(*transaction, JournalExit::normal).has_value());
+
+        const auto terminal = vm_step(VmStepState::complete, {}, {recorder_event(2)},
+                                      clean_result(true, {root_effect, child_effect, transaction_effect}));
+        REQUIRE(live.observe_step(terminal, live.root_scope()).has_value());
+        const auto *live_completion = live.completion();
+        REQUIRE(live_completion != nullptr);
+        REQUIRE(live_completion->result.outcome == EvaluationOutcome::match);
+        REQUIRE(live_completion->result.committed_effects.size() == 2);
+        REQUIRE(live_completion->journal.intents.size() == 3);
+        REQUIRE(live_completion->journal.intents[1].invocation == child_owner.invocation);
+        REQUIRE(live_completion->journal.intents[1].payload.label == label(Classification::sensitive, {"identity"}));
+        REQUIRE(live_completion->journal.intents[2].disposition == EffectDisposition::rolled_back);
+        REQUIRE(live_completion->recorder.entries.size() == 2);
+
+        const ExecutionReplayExpectation expectation {
+            .result = live_completion->result,
+            .journal = live_completion->journal.intents,
+            .recorder = live_completion->recorder,
+        };
+        auto replay_created = ExecutionJournalAdapter::create(ExecutionJournalConfig {
+            .root_owner = root_owner,
+            .mode = ExecutionMode::replay,
+            .journal_limits = {},
+            .recorder = recorder_config,
+            .parity_expectation = expectation,
+        });
+        REQUIRE(replay_created.has_value());
+        auto replay = std::move(*replay_created);
+        REQUIRE(replay.observe_step(suspended, replay.root_scope()).has_value());
+        REQUIRE(replay.observe_step(suspended, replay.root_scope()).has_value());
+        const auto replay_child =
+            replay.open_scope(replay.root_scope(), JournalScopeKind::child_invocation, child_owner);
+        REQUIRE(replay_child.has_value());
+        const auto replay_secret = replay.push_control(label(Classification::sensitive, {"identity"}));
+        REQUIRE(replay.observe_step(vm_step(VmStepState::yielded, {child_effect}), *replay_child).has_value());
+        REQUIRE(replay.pop_control(replay_secret).has_value());
+        REQUIRE(replay.close_scope(*replay_child, JournalExit::normal).has_value());
+        const auto replay_transaction =
+            replay.open_scope(replay.root_scope(), JournalScopeKind::explicit_transaction, root_owner);
+        REQUIRE(replay_transaction.has_value());
+        REQUIRE(
+            replay.observe_step(vm_step(VmStepState::yielded, {transaction_effect}), *replay_transaction).has_value());
+        REQUIRE(replay.close_scope(*replay_transaction, JournalExit::normal).has_value());
+        REQUIRE(replay.observe_step(terminal, replay.root_scope()).has_value());
+        const auto *replay_completion = replay.completion();
+        REQUIRE(replay_completion != nullptr);
+        REQUIRE(replay_completion->parity_differences.empty());
+        REQUIRE_FALSE(replay_completion->journal.durable_commit_allowed());
+        REQUIRE(replay_completion->result.committed_effects.size() == 2);
+    }
+
+    TEST_CASE("VM journal imports reject foreign ownership reordered sequences and identity reuse") {
+        auto created = EffectJournal::create(owner());
+        REQUIRE(created.has_value());
+        auto journal = std::move(*created);
+
+        const auto foreign = vm_intent(1, owner("foreign", "foreign.rule", "foreign.binding"), "foreign");
+        const auto foreign_result = journal.append_vm_intent(journal.root_scope(), foreign);
+        REQUIRE_FALSE(foreign_result.has_value());
+        REQUIRE(foreign_result.error().code == EffectErrorCode::ownership_mismatch);
+
+        const auto reordered = vm_intent(2, owner(), "second-before-first");
+        const auto reordered_result = journal.append_vm_intent(journal.root_scope(), reordered);
+        REQUIRE_FALSE(reordered_result.has_value());
+        REQUIRE(reordered_result.error().code == EffectErrorCode::sequence_mismatch);
+
+        const auto first = vm_intent(1, owner(), "first");
+        REQUIRE(journal.append_vm_intent(journal.root_scope(), first).has_value());
+        auto changed = first;
+        changed.payload = frozen("changed");
+        const auto reused = journal.append_vm_intent(journal.root_scope(), changed);
+        REQUIRE_FALSE(reused.has_value());
+        REQUIRE(reused.error().code == EffectErrorCode::duplicate_reach_mismatch);
+        REQUIRE(journal.intents().size() == 1);
+    }
+
+    TEST_CASE("VM terminal faults and cancellation roll back effects and candidate state") {
+        const auto root_owner = owner();
+        const auto effect = vm_intent(1, root_owner, "candidate-effect");
+
+        const auto verify_terminal = [&](const VmStepState state, const EvaluationOutcome outcome) {
+            auto created = ExecutionJournalAdapter::create(ExecutionJournalConfig {
+                .root_owner = root_owner,
+                .mode = ExecutionMode::live,
+                .journal_limits = {},
+                .recorder = FlightRecorderConfig {},
+                .parity_expectation = std::nullopt,
+            });
+            REQUIRE(created.has_value());
+            auto adapter = std::move(*created);
+            REQUIRE(adapter.observe_step(vm_step(VmStepState::yielded, {effect}), adapter.root_scope()).has_value());
+            EvaluationResult result {
+                .outcome = outcome,
+                .verdict = std::nullopt,
+                .committed_effects = {},
+                .state_mutations = {StateMutation {.owner = root_owner.executable,
+                                                   .namespace_name = "candidate",
+                                                   .key = "discard-me",
+                                                   .expected_version = 1,
+                                                   .value = frozen("state")}},
+                .fault = FaultChain {.frames = {FaultFrame {.code = "PYVM4002",
+                                                            .message = "terminal unwind",
+                                                            .executable = root_owner.executable,
+                                                            .span = span()}},
+                                     .double_fault = false,
+                                     .triple_fault = false},
+            };
+            REQUIRE(adapter.observe_step(vm_step(state, {}, {}, std::move(result)), adapter.root_scope()).has_value());
+            const auto *completion = adapter.completion();
+            REQUIRE(completion != nullptr);
+            REQUIRE(completion->result.outcome == outcome);
+            REQUIRE(completion->result.committed_effects.empty());
+            REQUIRE(completion->result.state_mutations.empty());
+            REQUIRE(completion->journal.intents[0].disposition == EffectDisposition::rolled_back);
+            REQUIRE_FALSE(completion->journal.durable_commit_allowed());
+        };
+
+        verify_terminal(VmStepState::faulted, EvaluationOutcome::faulted);
+        verify_terminal(VmStepState::canceled, EvaluationOutcome::canceled);
+    }
+
+    TEST_CASE("service coordinator retries captures caches replays and cancels typed VM requests") {
+        auto resolver_created = StaticServiceBindingResolver::create({service_binding()});
+        REQUIRE(resolver_created.has_value());
+        auto resolver = std::move(*resolver_created);
+        RecordingServiceTransport transport;
+        auto coordinator_created =
+            ServiceCoordinator::create(ServiceCoordinatorConfig {.group_id = 100,
+                                                                 .exit_policy = TaskGroupExitPolicy::cancel_pending,
+                                                                 .deterministic_seed = 0x1234,
+                                                                 .maximum_active = 2,
+                                                                 .mode = ExecutionMode::live,
+                                                                 .replay_captures = {}},
+                                       resolver, &transport);
+        REQUIRE(coordinator_created.has_value());
+        auto coordinator = std::move(*coordinator_created);
+
+        const auto request = service_call().request;
+        const std::vector<CapabilityRequest> requests {request};
+        const auto scheduled = coordinator.schedule(requests, 1'000);
+        REQUIRE(scheduled.has_value());
+        REQUIRE(scheduled->attempts.size() == 1);
+        const auto first_attempt = scheduled->attempts[0];
+        REQUIRE(coordinator
+                    .complete(first_attempt,
+                              ServiceResult {.status = ServiceStatus::rate_limited,
+                                             .value = std::nullopt,
+                                             .retry_after_ms = 50,
+                                             .diagnostic_code = "HTTP_429"},
+                              1'100)
+                    .has_value());
+        REQUIRE(coordinator.take_responses().empty());
+        REQUIRE(coordinator.poll(1'149)->empty());
+        const auto retried = coordinator.poll(1'150);
+        REQUIRE(retried.has_value());
+        REQUIRE(retried->size() == 1);
+        REQUIRE((*retried)[0].attempt == 2);
+        REQUIRE((*retried)[0].idempotency_key == first_attempt.idempotency_key);
+        REQUIRE(coordinator
+                    .complete((*retried)[0],
+                              ServiceResult {.status = ServiceStatus::ok,
+                                             .value = frozen("fingerprint", Classification::sensitive, {"identity"}),
+                                             .retry_after_ms = std::nullopt,
+                                             .diagnostic_code = {}},
+                              1'200)
+                    .has_value());
+        const auto responses = coordinator.take_responses();
+        REQUIRE(responses.size() == 1);
+        REQUIRE(responses[0].request_id == request.request_id);
+        REQUIRE(responses[0].status == FactTerminalStatus::value);
+        REQUIRE(coordinator.captures().size() == 1);
+        REQUIRE(coordinator.captures()[0].attempts.size() == 2);
+
+        auto cached_request = service_call("fingerprint.resolve", "service-request-cached").request;
+        const std::vector<CapabilityRequest> cached_requests {cached_request};
+        const auto cached = coordinator.schedule(cached_requests, 1'300);
+        REQUIRE(cached.has_value());
+        REQUIRE(cached->cache_hits == 1);
+        REQUIRE(cached->attempts.empty());
+        REQUIRE(transport.attempts.size() == 2);
+        REQUIRE(coordinator.take_responses().size() == 1);
+        REQUIRE(coordinator.captures().size() == 2);
+        REQUIRE(coordinator.captures()[1].cache_hit);
+
+        const std::vector<ServiceCapture> replay_captures {coordinator.captures()[0]};
+        auto replay_created =
+            ServiceCoordinator::create(ServiceCoordinatorConfig {.group_id = 101,
+                                                                 .exit_policy = TaskGroupExitPolicy::cancel_pending,
+                                                                 .deterministic_seed = 0x1234,
+                                                                 .maximum_active = 2,
+                                                                 .mode = ExecutionMode::replay,
+                                                                 .replay_captures = replay_captures},
+                                       resolver);
+        REQUIRE(replay_created.has_value());
+        auto replay = std::move(*replay_created);
+        const auto replayed = replay.schedule(requests, 1'000);
+        REQUIRE(replayed.has_value());
+        REQUIRE(replay.live_dispatches() == 0);
+        REQUIRE(replay.blocked_replay_dispatches() == 2);
+        const auto replay_responses = replay.take_responses();
+        REQUIRE(replay_responses.size() == 1);
+        REQUIRE(replay_responses[0].value->canonical_digest == responses[0].value->canonical_digest);
+
+        RecordingServiceTransport cancel_transport;
+        auto cancel_created =
+            ServiceCoordinator::create(ServiceCoordinatorConfig {.group_id = 102,
+                                                                 .exit_policy = TaskGroupExitPolicy::wait_pending,
+                                                                 .deterministic_seed = 7,
+                                                                 .maximum_active = 1,
+                                                                 .mode = ExecutionMode::live,
+                                                                 .replay_captures = {}},
+                                       resolver, &cancel_transport);
+        REQUIRE(cancel_created.has_value());
+        auto cancel_coordinator = std::move(*cancel_created);
+        auto cancel_request = service_call("fingerprint.resolve", "service-request-cancel").request;
+        const std::vector<CapabilityRequest> cancel_requests {cancel_request};
+        const auto cancel_scheduled = cancel_coordinator.schedule(cancel_requests, 2'000);
+        REQUIRE(cancel_scheduled.has_value());
+        REQUIRE(cancel_scheduled->attempts.size() == 1);
+        const auto canceled = cancel_coordinator.close(2'010, true);
+        REQUIRE(canceled.has_value());
+        REQUIRE(canceled->closed);
+        REQUIRE(cancel_transport.cancellations.size() == 1);
+        REQUIRE(cancel_coordinator.take_responses()[0].status == FactTerminalStatus::canceled);
+        const auto late =
+            cancel_coordinator.complete(cancel_scheduled->attempts[0],
+                                        ServiceResult {.status = ServiceStatus::ok,
+                                                       .value = frozen("late", Classification::sensitive, {"identity"}),
+                                                       .retry_after_ms = std::nullopt,
+                                                       .diagnostic_code = {}},
+                                        2'020);
+        REQUIRE_FALSE(late.has_value());
+        REQUIRE(late.error().code == ServiceErrorCode::stale_attempt);
+
+        const std::vector<ServiceCapture> cancel_capture {cancel_coordinator.captures()[0]};
+        auto cancel_replay_created =
+            ServiceCoordinator::create(ServiceCoordinatorConfig {.group_id = 103,
+                                                                 .exit_policy = TaskGroupExitPolicy::wait_pending,
+                                                                 .deterministic_seed = 7,
+                                                                 .maximum_active = 1,
+                                                                 .mode = ExecutionMode::replay,
+                                                                 .replay_captures = cancel_capture},
+                                       resolver);
+        REQUIRE(cancel_replay_created.has_value());
+        auto cancel_replay = std::move(*cancel_replay_created);
+        REQUIRE(cancel_replay.schedule(cancel_requests, 2'000).has_value());
+        REQUIRE(cancel_replay.take_responses().empty());
+        REQUIRE(cancel_replay.close(2'010, true).has_value());
+        REQUIRE(cancel_replay.take_responses()[0].status == FactTerminalStatus::canceled);
+        REQUIRE(cancel_replay.live_dispatches() == 0);
+    }
+
+    TEST_CASE("store-neutral outbox dispatcher fences replay and terminal lease recovery") {
+        auto journal_created = EffectJournal::create(owner());
+        REQUIRE(journal_created.has_value());
+        auto journal = std::move(*journal_created);
+        REQUIRE(journal.append(journal.root_scope(), draft("dispatcher/post", "payload")).has_value());
+        const auto finalized = journal.finish_root(EvaluationOutcome::match);
+        REQUIRE(finalized.has_value());
+        const auto intent = finalized->intents[0].id;
+
+        auto queue_created = OutboxQueue::create();
+        REQUIRE(queue_created.has_value());
+        auto queue = std::move(*queue_created);
+        REQUIRE(queue.enqueue(*finalized, intent, "https://sink.example", 1'000).has_value());
+        CountingOutboxStore store {queue};
+        RecordingActionTransport transport;
+        transport.next = ActionDispatchSuccess {.completed_unix_ms = 1'001, .acknowledgment = frozen("accepted")};
+        const auto delivered = OutboxDispatcher::dispatch_one(
+            store, transport,
+            OutboxDispatcherConfig {.mode = ExecutionMode::live, .worker = "worker-a", .lease_duration_ms = 100},
+            1'000);
+        REQUIRE(delivered.has_value());
+        REQUIRE(delivered->state == OutboxState::delivered);
+        REQUIRE(store.claims == 1);
+        REQUIRE(store.settlements == 1);
+        REQUIRE(transport.dispatches == 1);
+
+        auto replay_queue_created = OutboxQueue::create();
+        REQUIRE(replay_queue_created.has_value());
+        auto replay_queue = std::move(*replay_queue_created);
+        REQUIRE(replay_queue.enqueue(*finalized, intent, "https://sink.example", 1'000).has_value());
+        CountingOutboxStore replay_store {replay_queue};
+        RecordingActionTransport replay_transport;
+        const auto replay_blocked = OutboxDispatcher::dispatch_one(
+            replay_store, replay_transport,
+            OutboxDispatcherConfig {.mode = ExecutionMode::replay, .worker = "replay", .lease_duration_ms = 100},
+            1'000);
+        REQUIRE_FALSE(replay_blocked.has_value());
+        REQUIRE(replay_blocked.error().code == OutboxErrorCode::replay_forbidden);
+        REQUIRE(replay_store.claims == 0);
+        REQUIRE(replay_transport.dispatches == 0);
+
+        auto dead_queue_created = OutboxQueue::create();
+        REQUIRE(dead_queue_created.has_value());
+        auto dead_queue = std::move(*dead_queue_created);
+        REQUIRE(dead_queue.enqueue(*finalized, intent, "https://sink.example", 1'000).has_value());
+        CountingOutboxStore dead_store {dead_queue};
+        RecordingActionTransport dead_transport;
+        dead_transport.next = std::unexpected(ActionDispatchFailure {
+            .completed_unix_ms = 1'001,
+            .failure = DeliveryFailure {.kind = DeliveryFailureKind::http_status,
+                                        .status_code = 400,
+                                        .retry_after_ms = std::nullopt,
+                                        .summary = "bad request"},
+        });
+        const auto dead = OutboxDispatcher::dispatch_one(
+            dead_store, dead_transport,
+            OutboxDispatcherConfig {.mode = ExecutionMode::live, .worker = "worker-b", .lease_duration_ms = 100},
+            1'000);
+        REQUIRE(dead.has_value());
+        REQUIRE(dead->state == OutboxState::dead_letter);
+
+        auto final_attempt_create = OutboxQueue::create();
+        REQUIRE(final_attempt_create.has_value());
+        auto final_attempt = std::move(*final_attempt_create);
+        REQUIRE(final_attempt.enqueue(*finalized, intent, "https://sink.example", 1'000).has_value());
+        auto before_final_claim = final_attempt.snapshot();
+        before_final_claim[0].attempts = 9;
+        auto restored_create = OutboxQueue::restore(std::move(before_final_claim));
+        REQUIRE(restored_create.has_value());
+        auto restored = std::move(*restored_create);
+        const auto tenth = restored.claim("worker-final", 1'000, 100);
+        REQUIRE(tenth.has_value());
+        REQUIRE(tenth->attempt == 10);
+        restored.release_expired_leases(1'100);
+        REQUIRE(restored.find(intent)->state == OutboxState::dead_letter);
+        REQUIRE_FALSE(restored.claim("worker-final", 1'100, 100).has_value());
+
+        auto expiring_create = OutboxQueue::create();
+        REQUIRE(expiring_create.has_value());
+        auto expiring = std::move(*expiring_create);
+        REQUIRE(expiring.enqueue(*finalized, intent, "https://sink.example", 1'000, 100).has_value());
+        const auto bounded_lease = expiring.claim("worker-expiry", 1'050, 10'000);
+        REQUIRE(bounded_lease.has_value());
+        REQUIRE(bounded_lease->expires_unix_ms == 1'100);
+        REQUIRE_FALSE(expiring.acknowledge(*bounded_lease, 1'100).has_value());
+        expiring.release_expired_leases(1'100);
+        REQUIRE(expiring.find(intent)->state == OutboxState::expired);
+
+        auto mismatch_create = OutboxQueue::create();
+        REQUIRE(mismatch_create.has_value());
+        auto mismatch = std::move(*mismatch_create);
+        REQUIRE(mismatch.enqueue(*finalized, intent, "https://sink.example", 1'000, 100).has_value());
+        const auto changed_lifetime = mismatch.enqueue(*finalized, intent, "https://sink.example", 1'000, 200);
+        REQUIRE_FALSE(changed_lifetime.has_value());
+        REQUIRE(changed_lifetime.error().code == OutboxErrorCode::duplicate_idempotency_mismatch);
     }
 
 } // namespace

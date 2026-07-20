@@ -57,11 +57,14 @@ namespace rule_engine::python::effects {
             entry.lease_expires_unix_ms = 0;
         }
 
-        bool same_record(const OutboxEntry &entry, const EffectIntent &intent,
-                         const std::string_view destination) noexcept {
+        bool same_record(const OutboxEntry &entry, const EffectIntent &intent, const std::string_view destination,
+                         const std::uint64_t committed_unix_ms, const std::uint64_t lifetime_ms) noexcept {
             return entry.record.intent == intent.id && entry.record.destination == destination &&
                    entry.record.idempotency_key == intent.idempotency_key &&
-                   same_frozen_value(entry.record.payload, intent.payload);
+                   same_frozen_value(entry.record.payload, intent.payload) &&
+                   entry.record.not_before_unix_ms == committed_unix_ms &&
+                   entry.committed_unix_ms == committed_unix_ms &&
+                   entry.expires_unix_ms == saturating_add(committed_unix_ms, lifetime_ms);
         }
 
         bool valid_snapshot_entry(const OutboxEntry &entry) noexcept {
@@ -72,7 +75,8 @@ namespace rule_engine::python::effects {
                 return false;
             }
             if (entry.state == OutboxState::leased) {
-                return !entry.lease_owner.empty() && entry.lease_token != 0 && entry.lease_expires_unix_ms != 0;
+                return !entry.lease_owner.empty() && entry.lease_token != 0 && entry.lease_expires_unix_ms != 0 &&
+                       entry.lease_expires_unix_ms <= entry.expires_unix_ms;
             }
             return entry.lease_owner.empty() && entry.lease_expires_unix_ms == 0;
         }
@@ -122,6 +126,13 @@ namespace rule_engine::python::effects {
                 }
             }
         }
+        for (auto &entry : entries) {
+            const auto claimable = entry.state == OutboxState::pending || entry.state == OutboxState::retry_wait;
+            if (claimable && entry.attempts >= maximum_delivery_attempts) {
+                entry.state = OutboxState::dead_letter;
+                entry.last_error = "restored delivery exhausted the permitted attempts";
+            }
+        }
         auto implementation = std::make_unique<Implementation>();
         implementation->entries = std::move(entries);
         return OutboxQueue {std::move(implementation)};
@@ -169,7 +180,7 @@ namespace rule_engine::python::effects {
             std::ranges::find(implementation_->entries, intent.idempotency_key,
                               [](const OutboxEntry &entry) { return entry.record.idempotency_key; });
         if (duplicate_key != implementation_->entries.end()) {
-            if (!same_record(*duplicate_key, intent, destination)) {
+            if (!same_record(*duplicate_key, intent, destination, committed_unix_ms, lifetime_ms)) {
                 return std::unexpected(OutboxError {
                     .code = OutboxErrorCode::duplicate_idempotency_mismatch,
                     .message = "an idempotency key was reused for a different destination, intent, or payload",
@@ -215,8 +226,12 @@ namespace rule_engine::python::effects {
         OutboxEntry *selected {};
         for (auto &entry : implementation_->entries) {
             const auto claimable_state = entry.state == OutboxState::pending || entry.state == OutboxState::retry_wait;
-            if (!claimable_state || entry.next_attempt_unix_ms > now_unix_ms || entry.expires_unix_ms <= now_unix_ms ||
-                entry.attempts >= maximum_delivery_attempts) {
+            if (claimable_state && entry.attempts >= maximum_delivery_attempts) {
+                entry.state = OutboxState::dead_letter;
+                entry.last_error = "delivery exhausted the permitted attempts before claim";
+                continue;
+            }
+            if (!claimable_state || entry.next_attempt_unix_ms > now_unix_ms || entry.expires_unix_ms <= now_unix_ms) {
                 continue;
             }
             if (selected == nullptr ||
@@ -237,7 +252,8 @@ namespace rule_engine::python::effects {
 
         selected->state = OutboxState::leased;
         selected->lease_owner = std::move(worker);
-        selected->lease_expires_unix_ms = saturating_add(now_unix_ms, lease_duration_ms);
+        selected->lease_expires_unix_ms =
+            std::min(saturating_add(now_unix_ms, lease_duration_ms), selected->expires_unix_ms);
         ++selected->lease_token;
         ++selected->attempts;
         return OutboxLease {
@@ -291,6 +307,15 @@ namespace rule_engine::python::effects {
             return std::unexpected(OutboxError {.code = OutboxErrorCode::stale_lease,
                                                 .message = "a stale or mismatched lease cannot fail delivery"});
         }
+        const auto valid_failure =
+            !failure.summary.empty() && ((failure.kind == DeliveryFailureKind::transport && failure.status_code == 0) ||
+                                         (failure.kind == DeliveryFailureKind::http_status &&
+                                          failure.status_code >= 100 && failure.status_code <= 599));
+        if (!valid_failure) {
+            return std::unexpected(
+                OutboxError {.code = OutboxErrorCode::invalid_record,
+                             .message = "a delivery failure requires a valid kind, status, and summary"});
+        }
 
         entry->last_error = failure.summary;
         clear_lease(*entry);
@@ -325,6 +350,9 @@ namespace rule_engine::python::effects {
             if (entry.expires_unix_ms <= now_unix_ms) {
                 entry.state = OutboxState::expired;
                 entry.last_error = "delivery lifetime expired while leased";
+            } else if (entry.attempts >= maximum_delivery_attempts) {
+                entry.state = OutboxState::dead_letter;
+                entry.last_error = "delivery lease expired after the final permitted attempt";
             } else {
                 entry.state = OutboxState::retry_wait;
                 entry.next_attempt_unix_ms = now_unix_ms;
@@ -358,5 +386,45 @@ namespace rule_engine::python::effects {
     }
 
     std::size_t OutboxQueue::size() const noexcept { return implementation_->entries.size(); }
+
+    std::expected<ActionDeliveryRecord, OutboxError>
+    OutboxDispatcher::dispatch_one(IOutboxDeliveryStore &store, IActionTransport &transport,
+                                   const OutboxDispatcherConfig &config, const std::uint64_t now_unix_ms) {
+        if (config.mode == ExecutionMode::replay) {
+            return std::unexpected(OutboxError {.code = OutboxErrorCode::replay_forbidden,
+                                                .message = "diagnostic replay cannot claim or dispatch outbox work"});
+        }
+        if (config.worker.empty() || config.lease_duration_ms == 0) {
+            return std::unexpected(
+                OutboxError {.code = OutboxErrorCode::invalid_record,
+                             .message = "an outbox dispatcher requires a worker and lease duration"});
+        }
+        auto lease = store.claim(config.worker, now_unix_ms, config.lease_duration_ms);
+        if (!lease.has_value()) {
+            return std::unexpected(lease.error());
+        }
+        auto delivered = transport.dispatch(*lease);
+        if (delivered.has_value()) {
+            if (delivered->completed_unix_ms < now_unix_ms) {
+                return store.fail(
+                    *lease,
+                    DeliveryFailure {.kind = DeliveryFailureKind::transport,
+                                     .status_code = 0,
+                                     .retry_after_ms = std::nullopt,
+                                     .summary = "transport returned a completion timestamp before dispatch"},
+                    now_unix_ms);
+            }
+            return store.acknowledge(*lease, delivered->completed_unix_ms, std::move(delivered->acknowledgment));
+        }
+        if (delivered.error().completed_unix_ms < now_unix_ms) {
+            return store.fail(*lease,
+                              DeliveryFailure {.kind = DeliveryFailureKind::transport,
+                                               .status_code = 0,
+                                               .retry_after_ms = std::nullopt,
+                                               .summary = "transport returned a failure timestamp before dispatch"},
+                              now_unix_ms);
+        }
+        return store.fail(*lease, delivered.error().failure, delivered.error().completed_unix_ms);
+    }
 
 } // namespace rule_engine::python::effects

@@ -89,6 +89,11 @@ namespace rule_engine::python::effects {
         [[nodiscard]] std::expected<void, EffectError> rollback_scope(JournalScopeId scope);
 
         [[nodiscard]] std::expected<EffectReceipt, EffectError> append(JournalScopeId scope, const EffectDraft &draft);
+        // Accepts the VM's immutable contract object without replacing its
+        // identity. The journal still owns eligibility and final disposition.
+        // Re-observing an identical intent after suspension is idempotent.
+        [[nodiscard]] std::expected<EffectReceipt, EffectError>
+        append_vm_intent(JournalScopeId scope, const EffectIntent &intent, const DataLabel &control_label = {});
         [[nodiscard]] std::expected<EffectReceipt, EffectError> receipt(const IntentId &intent) const;
         [[nodiscard]] std::expected<JournalScopeDisposition, EffectError> scope_disposition(JournalScopeId scope) const;
         [[nodiscard]] const std::vector<EffectIntent> &intents() const noexcept;
