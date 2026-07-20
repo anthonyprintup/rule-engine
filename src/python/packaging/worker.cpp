@@ -1,5 +1,7 @@
 #include "rule_engine/python/packaging/worker.hpp"
 
+#include "rule_engine/python/packaging/source_pack.hpp"
+
 #include <algorithm>
 #include <charconv>
 #include <limits>
@@ -149,6 +151,10 @@ namespace rule_engine::python::packaging {
                 request.runtime != official_windows_cpython_3146() || !safe_json_atom(request.request_id.value)) {
                 return std::unexpected(worker_error(PackagingErrorCode::worker_protocol_mismatch,
                                                     "worker request protocol/runtime identity is invalid"));
+            }
+            if (request.payload.source_digest.value != "sha256:" + sha256_hex(request.payload.bytes)) {
+                return std::unexpected(worker_error(PackagingErrorCode::worker_response_mismatch,
+                                                    "worker request payload digest does not match its bytes"));
             }
             const auto expected_schema =
                 request.mode == WorkerMode::static_parse ? static_source_schema_v1 : generator_request_schema_v1;
@@ -401,7 +407,7 @@ namespace rule_engine::python::packaging {
         if (!request_frame) {
             return std::unexpected(request_frame.error());
         }
-        auto process = launcher.launch(runtime, request.mode, *request_frame, limits);
+        auto process = launcher.launch(runtime, request.mode, request.hash_seed, *request_frame, limits);
         if (!process) {
             return std::unexpected(process.error());
         }
@@ -414,8 +420,11 @@ namespace rule_engine::python::packaging {
                 worker_error(PackagingErrorCode::worker_output_limit, "worker exceeded an output bound"));
         }
         if (process->crashed || process->exit_code != 0 || !process->process_tree_terminated) {
+            auto detail = "exit=" + std::to_string(process->exit_code) +
+                          ",tree_terminated=" + (process->process_tree_terminated ? std::string {"true"} : "false");
             return std::unexpected(worker_error(PackagingErrorCode::worker_crashed,
-                                                "worker failed or its process tree was not contained"));
+                                                "worker failed or its process tree was not contained",
+                                                std::move(detail)));
         }
         auto response = decode_worker_response_frame(process->stdout_bytes, limits);
         if (!response) {

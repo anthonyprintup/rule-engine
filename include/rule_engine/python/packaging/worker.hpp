@@ -5,9 +5,11 @@
 #include "rule_engine/python/packaging/error.hpp"
 #include "rule_engine/python/packaging/runtime.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <span>
 #include <string>
 #include <string_view>
@@ -54,6 +56,11 @@ namespace rule_engine::python::packaging {
         std::size_t maximum_frame_bytes {256U * mebibyte};
         std::size_t maximum_payload_bytes {64U * mebibyte};
         std::size_t maximum_stderr_bytes {64U * kibibyte};
+        std::size_t maximum_process_memory_bytes {512U * mebibyte};
+        std::size_t maximum_job_memory_bytes {512U * mebibyte};
+        std::uint32_t maximum_active_processes {1U};
+        std::chrono::milliseconds maximum_elapsed_time {std::chrono::seconds {15}};
+        std::chrono::milliseconds maximum_cpu_time {std::chrono::seconds {10}};
     };
 
     struct WorkerProcessResult {
@@ -61,7 +68,7 @@ namespace rule_engine::python::packaging {
         bool crashed {};
         bool timed_out {};
         bool output_limited {};
-        bool process_tree_terminated {true};
+        bool process_tree_terminated {};
         std::vector<std::byte> stdout_bytes;
         std::string stderr_excerpt;
     };
@@ -72,8 +79,18 @@ namespace rule_engine::python::packaging {
         // The platform implementation must bound and reap the process tree for
         // availability. These limits are not a hostile-code sandbox boundary.
         [[nodiscard]] virtual std::expected<WorkerProcessResult, PackagingError>
-        launch(const PrivatePythonRuntime &runtime, WorkerMode mode, std::span<const std::byte> framed_request,
-               const WorkerLimits &limits) = 0;
+        launch(const PrivatePythonRuntime &runtime, WorkerMode mode, std::uint32_t hash_seed,
+               std::span<const std::byte> framed_request, const WorkerLimits &limits) = 0;
+    };
+
+    struct WindowsJobWorkerLauncher final: WorkerLauncher {
+        std::filesystem::path temporary_root;
+
+        // This is availability containment for trusted source. A Job Object and
+        // reduced environment are not a hostile-code sandbox.
+        [[nodiscard]] std::expected<WorkerProcessResult, PackagingError>
+        launch(const PrivatePythonRuntime &runtime, WorkerMode mode, std::uint32_t hash_seed,
+               std::span<const std::byte> framed_request, const WorkerLimits &limits) override;
     };
 
     [[nodiscard]] std::expected<std::vector<std::byte>, PackagingError>

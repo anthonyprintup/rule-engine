@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <optional>
 #include <span>
 #include <string>
@@ -128,6 +129,16 @@ namespace rule_engine::python::packaging {
                        std::span<const std::byte> signature) const = 0;
     };
 
+    // OpenSSL is loaded only from this explicit path. The implementation never
+    // searches PATH or the current directory for a cryptographic provider.
+    struct OpenSsl3Ed25519Verifier final: SignatureVerifier {
+        std::filesystem::path crypto_library;
+
+        [[nodiscard]] std::expected<bool, PackagingError>
+        verify_ed25519(std::span<const std::byte> public_key, std::span<const std::byte> message,
+                       std::span<const std::byte> signature) const override;
+    };
+
     enum struct PackTrustKind { production_signed, development_unsigned };
 
     struct PackTrust {
@@ -156,5 +167,17 @@ namespace rule_engine::python::packaging {
     [[nodiscard]] std::expected<LoadedSourcePack, PackagingError>
     verify_and_load_source_pack(const SourcePackArchive &archive, const TrustPolicy &policy,
                                 const SignatureVerifier &signature_verifier, const SourcePackLimits &limits = {});
+    [[nodiscard]] std::expected<std::vector<std::byte>, PackagingError>
+    encode_canonical_source_pack(const SourcePackArchive &archive, const SourcePackLimits &limits = {});
+    [[nodiscard]] std::expected<SourcePackArchive, PackagingError>
+    decode_canonical_source_pack(std::span<const std::byte> bytes, const SourcePackLimits &limits = {});
+    [[nodiscard]] std::expected<void, PackagingError> write_canonical_source_pack(const std::filesystem::path &path,
+                                                                                  const SourcePackArchive &archive,
+                                                                                  const SourcePackLimits &limits = {});
+    [[nodiscard]] std::expected<SourcePackArchive, PackagingError>
+    read_canonical_source_pack(const std::filesystem::path &path, const SourcePackLimits &limits = {});
+    [[nodiscard]] std::expected<LoadedSourcePack, PackagingError>
+    read_verify_and_load_source_pack(const std::filesystem::path &path, const TrustPolicy &policy,
+                                     const SignatureVerifier &signature_verifier, const SourcePackLimits &limits = {});
 
 } // namespace rule_engine::python::packaging
