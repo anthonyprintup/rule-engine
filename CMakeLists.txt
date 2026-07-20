@@ -244,6 +244,7 @@ add_subdirectory(src/python/events)
 add_subdirectory(src/python/protocol)
 add_subdirectory(src/python/cluster)
 add_subdirectory(src/python/optimizer)
+add_subdirectory(src/python/tools)
 
 add_library(
     rule_engine_core
