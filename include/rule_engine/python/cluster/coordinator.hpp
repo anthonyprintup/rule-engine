@@ -15,28 +15,6 @@
 
 namespace rule_engine::python::cluster {
 
-    struct LeaseResource {
-        std::string scope;
-        std::string key;
-
-        auto operator<=>(const LeaseResource &) const = default;
-    };
-
-    struct FencedLease {
-        LeaseResource resource;
-        std::string owner;
-        std::uint64_t fence {};
-        std::uint64_t lease_until_unix_ms {};
-    };
-
-    struct LeaseSnapshot {
-        LeaseResource resource;
-        std::string owner;
-        std::uint64_t fence {};
-        std::uint64_t lease_until_unix_ms {};
-        bool held {};
-    };
-
     struct FencedLeaseManager {
         explicit FencedLeaseManager(AuditTrail &audit): audit_ {audit} {}
 
@@ -92,8 +70,7 @@ namespace rule_engine::python::cluster {
     };
 
     struct DeterministicWorkCoordinator {
-        DeterministicWorkCoordinator(InMemoryRuntimeStore &store, AuditTrail &audit):
-            store_ {store}, audit_ {audit}, leases_ {audit} {}
+        DeterministicWorkCoordinator(IClusterRuntimeStore &store, AuditTrail &audit): store_ {store}, audit_ {audit} {}
 
         [[nodiscard]] std::expected<bool, StoreError> enqueue(const WorkDefinition &work);
         [[nodiscard]] std::expected<std::vector<WorkLease>, StoreError>
@@ -102,18 +79,19 @@ namespace rule_engine::python::cluster {
         commit(const WorkLease &lease, RuntimeTransaction transaction, std::uint64_t now_unix_ms);
         [[nodiscard]] std::expected<void, StoreError> abandon(const WorkLease &lease, std::uint64_t now_unix_ms);
 
-        [[nodiscard]] std::optional<TransactionReceipt> recover_receipt(const EventId &input) const;
+        [[nodiscard]] std::expected<std::optional<TransactionReceipt>, StoreError>
+        recover_receipt(const EventId &input) const;
         [[nodiscard]] std::vector<WorkSnapshot> snapshot() const;
-        [[nodiscard]] std::vector<LeaseSnapshot> lease_snapshot(std::uint64_t now_unix_ms) const {
-            return leases_.snapshot(now_unix_ms);
+        [[nodiscard]] std::expected<std::vector<LeaseSnapshot>, StoreError>
+        lease_snapshot(std::uint64_t now_unix_ms) const {
+            return store_.inspect_leases(now_unix_ms);
         }
 
     private:
         [[nodiscard]] static bool definition_matches(const WorkDefinition &left, const WorkDefinition &right);
 
-        InMemoryRuntimeStore &store_;
+        IClusterRuntimeStore &store_;
         AuditTrail &audit_;
-        FencedLeaseManager leases_;
         mutable std::mutex mutex_;
         std::map<std::string, WorkSnapshot, std::less<>> work_;
     };

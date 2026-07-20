@@ -190,18 +190,17 @@ namespace rule_engine::python::cluster {
                 store_error(StoreErrorCode::constraint_violation, "input event ID is already committed"));
         }
 
-        if (!transaction.evaluation.state_mutations.empty() &&
-            state_signature(transaction.evaluation.state_mutations) != state_signature(transaction.state)) {
+        if (state_signature(transaction.evaluation.state_mutations) != state_signature(transaction.state)) {
             return std::unexpected(store_error(StoreErrorCode::constraint_violation,
                                                "evaluation and transaction state mutations disagree"));
         }
-        if (!transaction.evaluation.committed_effects.empty() &&
-            effect_signature(transaction.evaluation.committed_effects) != effect_signature(transaction.journal)) {
+        if (effect_signature(transaction.evaluation.committed_effects) != effect_signature(transaction.journal)) {
             return std::unexpected(store_error(StoreErrorCode::constraint_violation,
                                                "evaluation and transaction effect journals disagree"));
         }
         if (transaction.evaluation.outcome == EvaluationOutcome::canceled &&
-            (!transaction.state.empty() || !transaction.journal.empty() || !transaction.outbox.empty())) {
+            (!transaction.state.empty() || !transaction.emitted_events.empty() || !transaction.journal.empty() ||
+             !transaction.outbox.empty())) {
             return std::unexpected(store_error(StoreErrorCode::constraint_violation,
                                                "a canceled evaluation cannot commit user state or effects"));
         }
@@ -213,8 +212,9 @@ namespace rule_engine::python::cluster {
                 .namespace_name = mutation.namespace_name,
                 .key = mutation.key,
             };
-            if (key.owner.empty() || key.namespace_name.empty() || key.key.empty() || !state_keys.insert(key).second ||
-                (mutation.value && !valid_frozen(*mutation.value))) {
+            if (key.owner.empty() || key.namespace_name.empty() || key.key.empty() ||
+                mutation.expected_version == std::numeric_limits<std::uint64_t>::max() ||
+                !state_keys.insert(key).second || (mutation.value && !valid_frozen(*mutation.value))) {
                 return std::unexpected(
                     store_error(StoreErrorCode::constraint_violation, "state mutation is invalid or duplicated"));
             }
@@ -359,6 +359,21 @@ namespace rule_engine::python::cluster {
         return current == consumer_fences_.end() ? 0U : current->second;
     }
 
+    std::expected<std::uint64_t, StoreError>
+    InMemoryRuntimeStore::load_consumer_fence(const std::string_view consumer) const {
+        return consumer_fence(consumer);
+    }
+
+    std::expected<std::optional<TransactionReceipt>, StoreError>
+    InMemoryRuntimeStore::load_receipt(const EventId &input) const {
+        return lookup_receipt(input);
+    }
+
+    std::expected<std::optional<StoredStateCell>, StoreError>
+    InMemoryRuntimeStore::load_state(const StoredStateKey &key) const {
+        return read_state(key);
+    }
+
     std::optional<TransactionReceipt> InMemoryRuntimeStore::lookup_receipt(const EventId &input) const {
         const std::scoped_lock lock {mutex_};
         const auto receipt = receipts_.find(input.value);
@@ -375,6 +390,31 @@ namespace rule_engine::python::cluster {
             return std::nullopt;
         }
         return value->second;
+    }
+
+    std::expected<std::vector<EventEnvelope>, StoreError>
+    InMemoryRuntimeStore::read_history(const HistoryQuery &query) const {
+        if (query.tenant.empty() || query.peer.empty() || query.schema.empty() || query.limit == 0 ||
+            query.begin_ingest_unix_ms > query.end_ingest_unix_ms) {
+            return std::unexpected(store_error(StoreErrorCode::constraint_violation, "history query is invalid"));
+        }
+        const std::scoped_lock lock {mutex_};
+        std::vector<EventEnvelope> result;
+        result.reserve(std::min(query.limit, events_.size()));
+        for (const auto &[_, event] : events_) {
+            if (event.tenant != query.tenant || event.peer != query.peer || event.schema != query.schema ||
+                event.ingest_unix_ms < query.begin_ingest_unix_ms || event.ingest_unix_ms > query.end_ingest_unix_ms) {
+                continue;
+            }
+            result.push_back(event);
+        }
+        std::ranges::sort(result, [](const EventEnvelope &left, const EventEnvelope &right) {
+            return std::tie(left.ingest_unix_ms, left.id.value) < std::tie(right.ingest_unix_ms, right.id.value);
+        });
+        if (result.size() > query.limit) {
+            result.resize(query.limit);
+        }
+        return result;
     }
 
     std::expected<std::vector<OutboxLease>, StoreError>
@@ -473,6 +513,104 @@ namespace rule_engine::python::cluster {
         return {};
     }
 
+    std::expected<FencedLease, StoreError> InMemoryRuntimeStore::claim_lease(const LeaseResource &resource,
+                                                                             const std::string_view owner,
+                                                                             const std::uint64_t now_unix_ms,
+                                                                             const std::uint64_t lease_duration_ms) {
+        if (resource.scope.empty() || resource.key.empty() || owner.empty() || lease_duration_ms == 0) {
+            return std::unexpected(store_error(StoreErrorCode::constraint_violation, "lease claim is invalid"));
+        }
+        std::unique_lock lock {mutex_};
+        auto &record = leases_[resource];
+        if (record.held && record.lease_until_unix_ms >= now_unix_ms) {
+            if (record.owner == owner) {
+                return FencedLease {.resource = resource,
+                                    .owner = record.owner,
+                                    .fence = record.fence,
+                                    .lease_until_unix_ms = record.lease_until_unix_ms};
+            }
+            return std::unexpected(store_error(StoreErrorCode::conflict, "lease is held by another owner", true));
+        }
+        if (record.fence == std::numeric_limits<std::uint64_t>::max()) {
+            return std::unexpected(store_error(StoreErrorCode::unavailable, "lease fence space is exhausted"));
+        }
+        ++record.fence;
+        record.owner = std::string {owner};
+        record.lease_until_unix_ms = saturating_add(now_unix_ms, lease_duration_ms);
+        record.held = true;
+        const FencedLease lease {.resource = resource,
+                                 .owner = record.owner,
+                                 .fence = record.fence,
+                                 .lease_until_unix_ms = record.lease_until_unix_ms};
+        lock.unlock();
+        static_cast<void>(audit_.append(now_unix_ms, owner, "lease.claim", resource.scope + ":" + resource.key,
+                                        "leased", std::to_string(lease.fence)));
+        return lease;
+    }
+
+    std::expected<FencedLease, StoreError> InMemoryRuntimeStore::renew_lease(const FencedLease &lease,
+                                                                             const std::uint64_t now_unix_ms,
+                                                                             const std::uint64_t lease_duration_ms) {
+        if (lease_duration_ms == 0) {
+            return std::unexpected(store_error(StoreErrorCode::constraint_violation, "lease renewal is invalid"));
+        }
+        std::unique_lock lock {mutex_};
+        const auto current = leases_.find(lease.resource);
+        if (current == leases_.end() || !current->second.held || current->second.owner != lease.owner ||
+            current->second.fence != lease.fence || current->second.lease_until_unix_ms < now_unix_ms) {
+            return std::unexpected(store_error(StoreErrorCode::stale_fence, "lease renewal is stale"));
+        }
+        current->second.lease_until_unix_ms = saturating_add(now_unix_ms, lease_duration_ms);
+        return FencedLease {.resource = lease.resource,
+                            .owner = current->second.owner,
+                            .fence = current->second.fence,
+                            .lease_until_unix_ms = current->second.lease_until_unix_ms};
+    }
+
+    std::expected<void, StoreError> InMemoryRuntimeStore::release_lease(const FencedLease &lease,
+                                                                        const std::uint64_t now_unix_ms) {
+        std::unique_lock lock {mutex_};
+        const auto current = leases_.find(lease.resource);
+        if (current == leases_.end() || !current->second.held || current->second.owner != lease.owner ||
+            current->second.fence != lease.fence || current->second.lease_until_unix_ms < now_unix_ms) {
+            return std::unexpected(store_error(StoreErrorCode::stale_fence, "lease release is stale"));
+        }
+        current->second.held = false;
+        current->second.owner.clear();
+        current->second.lease_until_unix_ms = now_unix_ms;
+        if (current->second.fence != std::numeric_limits<std::uint64_t>::max()) {
+            ++current->second.fence;
+        }
+        lock.unlock();
+        static_cast<void>(audit_.append(now_unix_ms, lease.owner, "lease.release",
+                                        lease.resource.scope + ":" + lease.resource.key, "released",
+                                        std::to_string(lease.fence)));
+        return {};
+    }
+
+    std::expected<bool, StoreError> InMemoryRuntimeStore::lease_is_current(const FencedLease &lease,
+                                                                           const std::uint64_t now_unix_ms) const {
+        const std::scoped_lock lock {mutex_};
+        const auto current = leases_.find(lease.resource);
+        return current != leases_.end() && current->second.held && current->second.owner == lease.owner &&
+               current->second.fence == lease.fence && current->second.lease_until_unix_ms >= now_unix_ms;
+    }
+
+    std::expected<std::vector<LeaseSnapshot>, StoreError>
+    InMemoryRuntimeStore::inspect_leases(const std::uint64_t now_unix_ms) const {
+        const std::scoped_lock lock {mutex_};
+        std::vector<LeaseSnapshot> result;
+        result.reserve(leases_.size());
+        for (const auto &[resource, lease] : leases_) {
+            result.push_back(LeaseSnapshot {.resource = resource,
+                                            .owner = lease.owner,
+                                            .fence = lease.fence,
+                                            .lease_until_unix_ms = lease.lease_until_unix_ms,
+                                            .held = lease.held && lease.lease_until_unix_ms >= now_unix_ms});
+        }
+        return result;
+    }
+
     void InMemoryRuntimeStore::fail_next_commit(StoreError error) {
         const std::scoped_lock lock {mutex_};
         fail_next_commit_ = std::move(error);
@@ -496,6 +634,20 @@ namespace rule_engine::python::cluster {
         for (const auto &[_, value] : outbox_) { result.outbox.push_back(value); }
         for (const auto &[_, value] : receipts_) { result.receipts.push_back(value.receipt); }
         return result;
+    }
+
+    std::expected<RuntimeStoreSnapshot, StoreError> InMemoryRuntimeStore::inspect() const { return snapshot(); }
+
+    RuntimeStoreHealth InMemoryRuntimeStore::health() const {
+        return RuntimeStoreHealth {
+            .backend = StoreBackendKind::in_memory_reference,
+            .driver_available = true,
+            .connected = true,
+            .migrations_compatible = true,
+            .schema_version = 1,
+            .server_version = "reference-v1",
+            .detail = "single-process deterministic reference store",
+        };
     }
 
 } // namespace rule_engine::python::cluster

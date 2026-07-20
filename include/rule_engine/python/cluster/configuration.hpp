@@ -70,9 +70,9 @@ namespace rule_engine::python::cluster {
         std::string limitation;
     };
 
-    // Validates the deployment contract only. This lane intentionally does not
-    // provide libpq or SQLite drivers; implementation_available remains false
-    // for those backends until their production adapters are integrated.
+    // Validates the deployment contract and reports compile-time adapter
+    // availability. Connectivity and migration compatibility remain separate
+    // fail-closed readiness gates.
     [[nodiscard]] std::expected<StoreBackendCapabilities, ConfigurationError>
     validate_store_backend(const StoreBackendConfig &config);
 
