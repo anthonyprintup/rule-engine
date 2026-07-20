@@ -1,0 +1,15 @@
+format = 1
+
+[pack]
+id = "com.example.unsigned-process"
+version = "1.0.0"
+kind = "rules"
+engine_api = 1
+python = "3.14.6"
+entry_modules = ["unsigned_process.rules"]
+budget_profile = "balanced.v1"
+policy_profile = "development.v1"
+
+[capabilities]
+required = []
+optional = []
