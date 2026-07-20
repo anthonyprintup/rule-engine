@@ -43,13 +43,12 @@ namespace {
                     .budget_profile = "balanced.v1",
                     .entry_modules = {module_name},
                 },
-            .sources =
-                {SourceFile {
-                    .id = SourceId {module_name},
-                    .module = module_name,
-                    .utf8 = "@rule(\"com.example.constant\")\ndef constant_rule() -> bool:\n    return True\n",
-                    .digest = SourceDigest {"sha256:source"},
-                }},
+            .sources = {SourceFile {
+                .id = SourceId {module_name},
+                .module = module_name,
+                .utf8 = "@rule(\"com.example.constant\")\ndef constant_rule() -> bool:\n    return True\n",
+                .digest = SourceDigest {"sha256:source"},
+            }},
             .trust =
                 TrustResult {
                     .signer_key_id = "integration-test",
@@ -68,8 +67,7 @@ namespace {
             .nodes =
                 {
                     node(1U, "Module",
-                         {field("body", ast_sequence({ast_reference(2U)})),
-                          field("type_ignores", ast_sequence({}))}),
+                         {field("body", ast_sequence({ast_reference(2U)})), field("type_ignores", ast_sequence({}))}),
                     node(2U, "FunctionDef",
                          {field("name", ast_string("constant_rule")), field("args", ast_reference(3U)),
                           field("body", ast_sequence({ast_reference(8U)})),
@@ -97,8 +95,7 @@ namespace {
 
         std::vector<std::byte> payload;
 
-        [[nodiscard]] std::expected<std::vector<std::byte>, DiagnosticSet>
-        load(const VerifiedRulePack &) override {
+        [[nodiscard]] std::expected<std::vector<std::byte>, DiagnosticSet> load(const VerifiedRulePack &) override {
             return payload;
         }
     };
