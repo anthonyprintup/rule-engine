@@ -803,6 +803,10 @@ namespace rule_engine::python::events {
         }
         std::scoped_lock lock {mutex_};
         auto &state = groups_[group_key(group)];
+        if (state.quarantined) {
+            return std::unexpected(
+                make_error(ErrorCode::group_quarantined, "correlation group requires operator release"));
+        }
         if (state.active_token) {
             return std::unexpected(make_error(ErrorCode::group_busy, "correlation group is already claimed"));
         }
@@ -867,8 +871,24 @@ namespace rule_engine::python::events {
         if (advances) {
             ++found->second.cursor;
         }
+        if (completion == CorrelationCompletion::quarantined) {
+            found->second.quarantined = true;
+        }
         found->second.active_token.reset();
         return found->second.cursor;
+    }
+
+    std::expected<void, Error> InMemoryReferenceRuntime::clear_group_quarantine(const CorrelationGroupId &group) {
+        std::scoped_lock lock {mutex_};
+        const auto found = groups_.find(group_key(group));
+        if (found == groups_.end()) {
+            return std::unexpected(make_error(ErrorCode::not_found, "correlation group is unavailable"));
+        }
+        if (found->second.active_token) {
+            return std::unexpected(make_error(ErrorCode::group_busy, "correlation group is currently claimed"));
+        }
+        found->second.quarantined = false;
+        return {};
     }
 
     std::uint64_t InMemoryReferenceRuntime::group_cursor(const CorrelationGroupId &group) const {

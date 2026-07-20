@@ -35,6 +35,9 @@ namespace rule_engine::python::events {
         causation_depth_exceeded,
         quota_exceeded,
         not_found,
+        store_failure,
+        invalid_transition,
+        group_quarantined,
     };
 
     struct Error {
@@ -363,6 +366,7 @@ namespace rule_engine::python::events {
                                                                               std::uint64_t server_now_unix_ms);
         [[nodiscard]] std::expected<std::uint64_t, Error> complete_group(const CorrelationLease &lease,
                                                                          CorrelationCompletion completion);
+        [[nodiscard]] std::expected<void, Error> clear_group_quarantine(const CorrelationGroupId &group);
         [[nodiscard]] std::uint64_t group_cursor(const CorrelationGroupId &group) const;
 
         [[nodiscard]] std::expected<void, Error> retain(const RetentionProfile &profile, RetentionIntent intent,
@@ -387,6 +391,7 @@ namespace rule_engine::python::events {
             std::optional<std::uint64_t> active_token;
             std::uint64_t maximum_producer_timestamp {};
             std::uint64_t watermark {};
+            bool quarantined {};
         };
 
         [[nodiscard]] std::expected<void, Error> validate_event(const EventEnvelope &event) const;
