@@ -1,0 +1,3 @@
+add_library(rule_engine_python_events INTERFACE)
+add_library(rule_engine::python_events ALIAS rule_engine_python_events)
+target_link_libraries(rule_engine_python_events INTERFACE rule_engine::python_contract)

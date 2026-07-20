@@ -1,0 +1,3 @@
+add_library(rule_engine_python_optimizer INTERFACE)
+add_library(rule_engine::python_optimizer ALIAS rule_engine_python_optimizer)
+target_link_libraries(rule_engine_python_optimizer INTERFACE rule_engine::python_contract)

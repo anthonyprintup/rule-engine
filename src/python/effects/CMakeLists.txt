@@ -1,0 +1,3 @@
+add_library(rule_engine_python_effects INTERFACE)
+add_library(rule_engine::python_effects ALIAS rule_engine_python_effects)
+target_link_libraries(rule_engine_python_effects INTERFACE rule_engine::python_contract)

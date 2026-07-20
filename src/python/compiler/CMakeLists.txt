@@ -1,0 +1,3 @@
+add_library(rule_engine_python_compiler INTERFACE)
+add_library(rule_engine::python_compiler ALIAS rule_engine_python_compiler)
+target_link_libraries(rule_engine_python_compiler INTERFACE rule_engine::python_contract)
