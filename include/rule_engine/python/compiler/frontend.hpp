@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rule_engine/python/compiler/ast.hpp"
+#include "rule_engine/python/compiler/operands.hpp"
 
 #include <expected>
 #include <span>
@@ -16,6 +17,8 @@ namespace rule_engine::python::compiler {
         floating,
         string,
         bytes,
+        list,
+        dictionary,
         model,
         callable,
         unknown,
@@ -27,7 +30,16 @@ namespace rule_engine::python::compiler {
         auto operator<=>(const StaticType &) const = default;
     };
 
-    enum struct SymbolKind : std::uint8_t { module, imported, parameter, function, rule, rule_template, correlation };
+    enum struct SymbolKind : std::uint8_t {
+        module,
+        imported,
+        parameter,
+        function,
+        rule,
+        rule_template,
+        correlation,
+        model,
+    };
 
     struct BoundSymbol {
         std::string module;
@@ -46,10 +58,18 @@ namespace rule_engine::python::compiler {
         ExecutableId executable;
         std::string parameter;
         std::string attribute_path;
-        std::string route;
+        FactRoute route;
+        SchemaId expected_schema;
+        std::uint32_t operand_constant {};
         SourceSpan span;
         bool conditional {};
-        auto operator<=>(const FactRequirement &) const = default;
+
+        [[nodiscard]] bool operator==(const FactRequirement &other) const noexcept {
+            return executable == other.executable && parameter == other.parameter &&
+                   attribute_path == other.attribute_path && route.provider == other.route.provider &&
+                   route.fact == other.route.fact && expected_schema == other.expected_schema &&
+                   operand_constant == other.operand_constant && span == other.span && conditional == other.conditional;
+        }
     };
 
     struct CompilationArtifact {

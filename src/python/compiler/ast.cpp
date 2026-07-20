@@ -285,6 +285,21 @@ namespace rule_engine::python::compiler {
             return (static_cast<unsigned char>(text[offset]) & 0xc0U) != 0x80U;
         }
 
+        bool canonical_integer(const std::string_view decimal) {
+            if (decimal == "0") {
+                return true;
+            }
+            std::size_t position {};
+            if (decimal.starts_with('-')) {
+                position = 1U;
+            }
+            if (position == decimal.size() || decimal[position] < '1' || decimal[position] > '9') {
+                return false;
+            }
+            return std::ranges::all_of(decimal.substr(position + 1U),
+                                       [](const char character) { return character >= '0' && character <= '9'; });
+        }
+
         void collect_references(const AstValue &value, std::vector<AstNodeId> &references, DiagnosticSet &diagnostics,
                                 const std::uint32_t depth) {
             if (depth > maximum_ast_depth) {
@@ -293,6 +308,19 @@ namespace rule_engine::python::compiler {
             }
             if (const auto *reference = std::get_if<AstNodeReference>(&value.data)) {
                 references.push_back(reference->id);
+                return;
+            }
+            if (const auto *integer = std::get_if<IntegerValue>(&value.data)) {
+                if (integer->decimal.size() > mebibyte || !canonical_integer(integer->decimal)) {
+                    diagnostics.push_back(
+                        diagnostic("PY-AST-INTEGER", "AST integer is not a bounded canonical base-ten value"));
+                }
+                return;
+            }
+            if (const auto *unicode = std::get_if<UnicodeValue>(&value.data)) {
+                if (!valid_utf8(unicode->utf8)) {
+                    diagnostics.push_back(diagnostic("PY-AST-UNICODE", "AST Unicode value is not canonical UTF-8"));
+                }
                 return;
             }
             const auto *sequence = std::get_if<AstValue::Sequence>(&value.data);
@@ -360,6 +388,8 @@ namespace rule_engine::python::compiler {
                 }
                 if (node.kind.empty()) {
                     diagnostics.push_back(diagnostic("PY-AST-NODE", "AST node kind cannot be empty", node.span));
+                } else if (!valid_utf8(node.kind)) {
+                    diagnostics.push_back(diagnostic("PY-AST-NODE", "AST node kind is not valid UTF-8", node.span));
                 }
                 const auto source = sources.find(node.span.source.value);
                 if (!node.span.valid() || source == sources.end() ||
@@ -373,6 +403,9 @@ namespace rule_engine::python::compiler {
                     if (field.name.empty() || !fields.insert(field.name).second) {
                         diagnostics.push_back(
                             diagnostic("PY-AST-FIELD", "AST field names must be non-empty and unique", node.span));
+                    } else if (!valid_utf8(field.name)) {
+                        diagnostics.push_back(
+                            diagnostic("PY-AST-FIELD", "AST field name is not valid UTF-8", node.span));
                     }
                     collect_references(field.value, edges[node.id], diagnostics, 0);
                 }

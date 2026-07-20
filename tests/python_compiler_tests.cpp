@@ -1,10 +1,16 @@
 #include "rule_engine/python/compiler.hpp"
+#include "rule_engine/python/vm/register_vm.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <expected>
+#include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -13,6 +19,9 @@ namespace {
 
     using namespace rule_engine::python;
     using namespace rule_engine::python::compiler;
+
+    namespace packaging = rule_engine::python::packaging;
+    namespace vm = rule_engine::python::vm;
 
     constexpr std::string_view source_name = "rules.main";
 
@@ -75,6 +84,67 @@ namespace {
         };
     }
 
+    OperatorBinding binding(std::string executable) {
+        return OperatorBinding {
+            .id = BindingId {"binding"},
+            .executable = ExecutableId {std::move(executable)},
+            .capabilities = {},
+            .budget = balanced_v1,
+        };
+    }
+
+    SubjectKey subject() {
+        return SubjectKey {
+            .peer = PeerId {"peer-1"},
+            .descriptor = SchemaId {"process.v1"},
+            .identity = {IdentityField {.field_id = 1U, .value = std::uint64_t {42U}}},
+            .parent = {},
+        };
+    }
+
+    VmInvocation invocation() {
+        return VmInvocation {
+            .execution = ExecutionId {"execution"},
+            .invocation = InvocationId {"invocation"},
+            .binding = BindingId {"binding"},
+            .subject = subject(),
+            .budget = balanced_v1,
+            .deterministic_hash_seed = 7U,
+        };
+    }
+
+    packaging::PrivatePythonRuntime exact_runtime() {
+        return packaging::PrivatePythonRuntime {
+            .descriptor = packaging::official_windows_cpython_3146(),
+            .origin = packaging::RuntimeOrigin::private_bundle,
+            .runtime_root = "C:/private/python-3.14.6",
+            .worker_executable = "C:/private/rule_engine_python_worker.exe",
+            .verified_artifact_sha256 = packaging::official_windows_cpython_3146().artifact_sha256,
+            .installation_manifest_verified = true,
+        };
+    }
+
+    struct QueueLauncher final: packaging::WorkerLauncher {
+        std::deque<packaging::WorkerProcessResult> results;
+        std::size_t calls {};
+
+        std::expected<packaging::WorkerProcessResult, packaging::PackagingError>
+        launch(const packaging::PrivatePythonRuntime &, const packaging::WorkerMode, const std::span<const std::byte>,
+               const packaging::WorkerLimits &) override {
+            ++calls;
+            if (results.empty()) {
+                return std::unexpected(packaging::PackagingError {
+                    .code = packaging::PackagingErrorCode::worker_crashed,
+                    .message = "test launcher has no response",
+                    .subject = std::nullopt,
+                });
+            }
+            auto result = std::move(results.front());
+            results.pop_front();
+            return result;
+        }
+    };
+
     std::vector<std::string> diagnostic_signatures(const DiagnosticSet &diagnostics) {
         std::vector<std::string> result;
         result.reserve(diagnostics.size());
@@ -83,6 +153,12 @@ namespace {
                              (diagnostic.span ? diagnostic.span->source.value : std::string {}) + "|" +
                              std::to_string(diagnostic.span ? diagnostic.span->begin_byte : 0U));
         }
+        return result;
+    }
+
+    std::string diagnostic_text(const DiagnosticSet &diagnostics) {
+        std::string result;
+        for (const auto &diagnostic : diagnostics) { result += diagnostic.code + ":" + diagnostic.message + "\n"; }
         return result;
     }
 
@@ -171,6 +247,56 @@ namespace {
         REQUIRE(oversized.error().front().code == "PY-AST-LIMIT");
     }
 
+    TEST_CASE("static pack compiler consumes the exact worker payload contract") {
+        const auto rule_pack = pack();
+        const auto ast_payload = encode_ast_envelope(envelope(constant_rule_nodes(false)));
+        REQUIRE(ast_payload.has_value());
+        const auto response_frame = packaging::encode_worker_response_frame(packaging::WorkerResponse {
+            .protocol = packaging::python_worker_protocol_v1,
+            .request_id = RequestId {"compiler-ast:1:0"},
+            .mode = packaging::WorkerMode::static_parse,
+            .runtime_version = packaging::official_windows_cpython_3146().python_version,
+            .runtime_artifact_sha256 = packaging::official_windows_cpython_3146().artifact_sha256,
+            .status = packaging::WorkerResponseStatus::ok,
+            .payload =
+                packaging::OpaqueWorkerPayload {
+                    .schema = std::string {packaging::static_ast_schema_v1},
+                    .source = SourceId {std::string {source_name}},
+                    .source_digest = rule_pack.closure_digest,
+                    .bytes = *ast_payload,
+                },
+        });
+        REQUIRE(response_frame.has_value());
+
+        QueueLauncher launcher;
+        launcher.results.push_back(packaging::WorkerProcessResult {
+            .exit_code = 0,
+            .crashed = false,
+            .timed_out = false,
+            .output_limited = false,
+            .process_tree_terminated = true,
+            .stdout_bytes = *response_frame,
+            .stderr_excerpt = {},
+        });
+        packaging::WorkerClient client {.runtime = exact_runtime(), .launcher = launcher, .limits = {}};
+        WorkerAstEnvelopeProvider provider {client};
+        StaticPackCompiler compiler {provider};
+
+        const OperatorBindings bindings {binding("com.example.constant")};
+        const auto compiled = compiler.compile(rule_pack, {}, bindings);
+        REQUIRE(compiled.has_value());
+        REQUIRE(compiled->functions.size() == 1U);
+        REQUIRE(compiled->functions.front().id == ExecutableId {"com.example.constant"});
+        REQUIRE(launcher.calls == 1U);
+
+        auto session = vm::RegisterVmSession::create(*compiled, invocation());
+        REQUIRE(session.has_value());
+        const auto completed = (*session)->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        REQUIRE(completed.result->verdict == false);
+    }
+
     TEST_CASE("UTF-8 source spans are byte offsets and never split a code point") {
         auto source = std::string {"x=\xCF\x80\n"};
         source.resize(512, ' ');
@@ -188,6 +314,26 @@ namespace {
         REQUIRE_FALSE(invalid.has_value());
         REQUIRE(
             std::ranges::any_of(invalid.error(), [](const Diagnostic &item) { return item.code == "PY-AST-SPAN"; }));
+    }
+
+    TEST_CASE("AST scalar values require canonical bounded encodings") {
+        auto noncanonical_integer = envelope(constant_rule_nodes(false));
+        noncanonical_integer.nodes.back() = node(9, "Constant", {field("value", ast_integer("0001"))});
+        const auto integer_payload = encode_ast_envelope(noncanonical_integer);
+        REQUIRE(integer_payload.has_value());
+        const auto integer_result = decode_ast_envelope(*integer_payload, pack());
+        REQUIRE_FALSE(integer_result.has_value());
+        REQUIRE(std::ranges::any_of(integer_result.error(),
+                                    [](const Diagnostic &item) { return item.code == "PY-AST-INTEGER"; }));
+
+        auto invalid_unicode = envelope(constant_rule_nodes(false));
+        invalid_unicode.nodes.back() = node(9, "Constant", {field("value", ast_string(std::string {"\xC0\x80", 2U}))});
+        const auto unicode_payload = encode_ast_envelope(invalid_unicode);
+        REQUIRE(unicode_payload.has_value());
+        const auto unicode_result = decode_ast_envelope(*unicode_payload, pack());
+        REQUIRE_FALSE(unicode_result.has_value());
+        REQUIRE(std::ranges::any_of(unicode_result.error(),
+                                    [](const Diagnostic &item) { return item.code == "PY-AST-UNICODE"; }));
     }
 
     TEST_CASE("rule source is inert data and is never executed by the compiler") {
@@ -252,7 +398,7 @@ namespace {
             std::ranges::any_of(cycle.error(), [](const Diagnostic &item) { return item.code == "PY-IMPORT-CYCLE"; }));
     }
 
-    TEST_CASE("reportable boundaries require annotations and generators get precise NYI diagnostics") {
+    TEST_CASE("reportable boundaries require annotations and simple generators lower to yield bytecode") {
         auto missing_annotation = constant_rule_nodes(false);
         const auto returns = std::ranges::find(missing_annotation[1].fields, "returns", &AstField::name);
         REQUIRE(returns != missing_annotation[1].fields.end());
@@ -282,12 +428,11 @@ namespace {
         generator.push_back(node(10, "Constant", {field("value", ast_bool(true))}));
         const auto generator_payload = encode_ast_envelope(envelope(std::move(generator)));
         REQUIRE(generator_payload.has_value());
-        const auto generator_failure = StaticCompiler {}.compile(pack(), *generator_payload, {}, {});
-        REQUIRE_FALSE(generator_failure.has_value());
-        REQUIRE(std::ranges::any_of(generator_failure.error(),
-                                    [](const Diagnostic &item) { return item.code == "PY-NYI-GENERATOR-LOWERING"; }));
-        REQUIRE_FALSE(std::ranges::any_of(generator_failure.error(),
-                                          [](const Diagnostic &item) { return item.code == "PY-UNSUPPORTED"; }));
+        const auto generator_artifact = StaticCompiler {}.compile(pack(), *generator_payload, {}, {});
+        REQUIRE(generator_artifact.has_value());
+        REQUIRE(generator_artifact->pack.functions.front().generator);
+        REQUIRE(std::ranges::any_of(generator_artifact->pack.functions.front().instructions,
+                                    [](const Instruction &item) { return item.opcode == Opcode::yield_value; }));
     }
 
     TEST_CASE("simple typed rule lowers to verified register bytecode and fact requirements") {
@@ -308,11 +453,92 @@ namespace {
             return instruction.opcode == Opcode::jump_if_false;
         }));
         REQUIRE(artifact->fact_requirements.size() == 1);
-        REQUIRE(artifact->fact_requirements.front().route == "process.is_signed");
+        REQUIRE(artifact->fact_requirements.front().route.provider == "process");
+        REQUIRE(artifact->fact_requirements.front().route.fact == "is_signed");
+        const auto operand =
+            decode_vm_fact_operand(artifact->pack.constants[artifact->fact_requirements.front().operand_constant]);
+        REQUIRE(operand.has_value());
+        REQUIRE(operand->route.provider == "process");
+        REQUIRE(operand->route.fact == "is_signed");
+        REQUIRE(operand->expected_schema == SchemaId {"bool"});
         REQUIRE_FALSE(artifact->fact_requirements.front().conditional);
         REQUIRE(artifact->pack.optimization_certificates.front().logical_facts ==
                 std::vector<std::string> {"process.is_signed"});
         REQUIRE(verify_compiler_output(*artifact).has_value());
+    }
+
+    TEST_CASE("compiler operand constants are accepted by the real register VM") {
+        CompiledPack compiled {
+            .pack = PackId {"com.example.interop"},
+            .version = PackVersion {"1.0.0"},
+            .source_digest = SourceDigest {"sha256:interop"},
+            .compiler_abi = "python-3.14.6/static-compiler-v1",
+            .semantic_hash = "fnv1a64:interop",
+            .schemas = {},
+            .constants =
+                {
+                    make_vm_fact_operand(FactRoute {.provider = "process", .fact = "is_signed"}, SchemaId {"bool"}),
+                    make_vm_capability_operand(CapabilityId {"service.lookup"}, SchemaId {"lookup.request"}),
+                },
+            .functions = {BytecodeFunction {
+                .id = ExecutableId {"com.example.interop"},
+                .qualified_name = "rules.main.interop",
+                .register_count = 2U,
+                .parameter_count = 0U,
+                .generator = false,
+                .async = true,
+                .instructions =
+                    {
+                        Instruction {.opcode = Opcode::await_fact,
+                                     .destination = 0U,
+                                     .operand_a = 0U,
+                                     .operand_b = 0U,
+                                     .immediate = 0U,
+                                     .span = span(0U, 1U)},
+                        Instruction {.opcode = Opcode::await_capability,
+                                     .destination = 1U,
+                                     .operand_a = 0U,
+                                     .operand_b = 0U,
+                                     .immediate = 1U,
+                                     .span = span(1U, 2U)},
+                        Instruction {.opcode = Opcode::return_value,
+                                     .destination = 1U,
+                                     .operand_a = 1U,
+                                     .operand_b = 0U,
+                                     .immediate = 0U,
+                                     .span = span(2U, 3U)},
+                    },
+                .exception_regions = {},
+            }},
+            .bindings = {OperatorBinding {.id = BindingId {"binding"},
+                                          .executable = ExecutableId {"com.example.interop"},
+                                          .capabilities = {CapabilityId {"service.lookup"}},
+                                          .budget = balanced_v1}},
+            .optimization_certificates = {},
+        };
+        auto session = vm::RegisterVmSession::create(compiled, invocation());
+        REQUIRE(session.has_value());
+
+        const auto fact_wait = (*session)->step({});
+        REQUIRE(fact_wait.state == VmStepState::waiting_for_facts);
+        REQUIRE(fact_wait.fact_requests.size() == 1U);
+        REQUIRE(fact_wait.fact_requests.front().route.provider == "process");
+        REQUIRE(fact_wait.fact_requests.front().route.fact == "is_signed");
+        REQUIRE(fact_wait.fact_requests.front().expected_schema == SchemaId {"bool"});
+
+        HostResponses fact_response;
+        fact_response.facts.push_back(FactResponse {
+            .request_id = fact_wait.fact_requests.front().request_id,
+            .subject = fact_wait.fact_requests.front().subject,
+            .status = FactTerminalStatus::value,
+            .value = make_fact(true),
+            .diagnostic = std::nullopt,
+        });
+        const auto capability_wait = (*session)->step(std::move(fact_response));
+        REQUIRE(capability_wait.state == VmStepState::waiting_for_capabilities);
+        REQUIRE(capability_wait.capability_requests.size() == 1U);
+        REQUIRE(capability_wait.capability_requests.front().capability == CapabilityId {"service.lookup"});
+        REQUIRE(capability_wait.capability_requests.front().request_schema == SchemaId {"lookup.request"});
     }
 
     TEST_CASE("if branches that both return lower without an out-of-range join jump") {
@@ -333,8 +559,348 @@ namespace {
         const auto payload = encode_ast_envelope(envelope(std::move(nodes)));
         REQUIRE(payload.has_value());
         const auto artifact = StaticCompiler {}.compile(pack(), *payload, {}, {});
+        const auto artifact_diagnostics = artifact ? std::string {} : diagnostic_text(artifact.error());
+        INFO(artifact_diagnostics);
         REQUIRE(artifact.has_value());
         REQUIRE(verify_compiler_output(*artifact).has_value());
+    }
+
+    TEST_CASE("statically bound helper calls execute through real VM frames") {
+        const auto nodes = std::vector<AstNode> {
+            node(1, "Module",
+                 {field("body", ast_sequence({ast_reference(2), ast_reference(8)})),
+                  field("type_ignores", ast_sequence({}))}),
+            node(2, "FunctionDef",
+                 {field("name", ast_string("helper")), field("args", ast_reference(3)),
+                  field("body", ast_sequence({ast_reference(4)})), field("decorator_list", ast_sequence({})),
+                  field("returns", ast_reference(6))}),
+            node(3, "arguments",
+                 {field("posonlyargs", ast_sequence({})), field("args", ast_sequence({})), field("vararg", ast_none()),
+                  field("kwonlyargs", ast_sequence({})), field("kw_defaults", ast_sequence({})),
+                  field("kwarg", ast_none()), field("defaults", ast_sequence({}))}),
+            node(4, "Return", {field("value", ast_reference(5))}),
+            node(5, "Constant", {field("value", ast_bool(true))}),
+            node(6, "Name", {field("id", ast_string("bool"))}),
+            node(8, "FunctionDef",
+                 {field("name", ast_string("main")), field("args", ast_reference(9)),
+                  field("body", ast_sequence({ast_reference(14)})),
+                  field("decorator_list", ast_sequence({ast_reference(10)})), field("returns", ast_reference(13))}),
+            node(9, "arguments",
+                 {field("posonlyargs", ast_sequence({})), field("args", ast_sequence({})), field("vararg", ast_none()),
+                  field("kwonlyargs", ast_sequence({})), field("kw_defaults", ast_sequence({})),
+                  field("kwarg", ast_none()), field("defaults", ast_sequence({}))}),
+            node(10, "Call",
+                 {field("func", ast_reference(11)), field("args", ast_sequence({ast_reference(12)})),
+                  field("keywords", ast_sequence({}))}),
+            node(11, "Name", {field("id", ast_string("rule"))}),
+            node(12, "Constant", {field("value", ast_string("com.example.call"))}),
+            node(13, "Name", {field("id", ast_string("bool"))}),
+            node(14, "Return", {field("value", ast_reference(15))}),
+            node(15, "Call",
+                 {field("func", ast_reference(16)), field("args", ast_sequence({})),
+                  field("keywords", ast_sequence({}))}),
+            node(16, "Name", {field("id", ast_string("helper"))}),
+        };
+        const auto payload = encode_ast_envelope(envelope(nodes));
+        REQUIRE(payload.has_value());
+        const OperatorBindings bindings {binding("com.example.call")};
+        const auto artifact = StaticCompiler {}.compile(pack(), *payload, {}, bindings);
+        REQUIRE(artifact.has_value());
+        REQUIRE(std::ranges::any_of(artifact->pack.functions, [](const BytecodeFunction &function) {
+            return std::ranges::any_of(function.instructions,
+                                       [](const Instruction &item) { return item.opcode == Opcode::call; });
+        }));
+
+        auto session = vm::RegisterVmSession::create(artifact->pack, invocation());
+        REQUIRE(session.has_value());
+        const auto completed = (*session)->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        REQUIRE(completed.result->verdict == true);
+        REQUIRE((*session)->counters().peak_frames == 2U);
+    }
+
+    TEST_CASE("chained comparisons preserve short circuit bytecode and execute in the real VM") {
+        auto nodes = constant_rule_nodes(false);
+        nodes.back() =
+            node(9, "Compare",
+                 {field("left", ast_reference(10)), field("ops", ast_sequence({ast_string("Lt"), ast_string("Lt")})),
+                  field("comparators", ast_sequence({ast_reference(11), ast_reference(12)}))});
+        nodes.push_back(node(10, "Constant", {field("value", ast_integer("1"))}));
+        nodes.push_back(node(11, "Constant", {field("value", ast_integer("2"))}));
+        nodes.push_back(node(12, "Constant", {field("value", ast_integer("3"))}));
+        const auto payload = encode_ast_envelope(envelope(std::move(nodes)));
+        REQUIRE(payload.has_value());
+        const OperatorBindings bindings {binding("com.example.constant")};
+        const auto artifact = StaticCompiler {}.compile(pack(), *payload, {}, bindings);
+        REQUIRE(artifact.has_value());
+        const auto &instructions = artifact->pack.functions.front().instructions;
+        REQUIRE(std::ranges::count(instructions, Opcode::compare, &Instruction::opcode) == 2);
+        REQUIRE(std::ranges::count(instructions, Opcode::jump_if_false, &Instruction::opcode) == 1);
+
+        auto session = vm::RegisterVmSession::create(artifact->pack, invocation());
+        REQUIRE(session.has_value());
+        const auto completed = (*session)->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        REQUIRE(completed.result->verdict == true);
+    }
+
+    TEST_CASE("while loop assignments use stable local registers across back edges") {
+        auto nodes = constant_rule_nodes(false);
+        const auto body = std::ranges::find(nodes[1].fields, "body", &AstField::name);
+        REQUIRE(body != nodes[1].fields.end());
+        body->value = ast_sequence({ast_reference(8), ast_reference(11), ast_reference(22)});
+        nodes[7] =
+            node(8, "Assign", {field("targets", ast_sequence({ast_reference(9)})), field("value", ast_reference(10))});
+        nodes[8] = node(9, "Name", {field("id", ast_string("count"))});
+        nodes.push_back(node(10, "Constant", {field("value", ast_integer("0"))}));
+        nodes.push_back(node(11, "While",
+                             {field("test", ast_reference(12)), field("body", ast_sequence({ast_reference(16)})),
+                              field("orelse", ast_sequence({}))}));
+        nodes.push_back(node(12, "Compare",
+                             {field("left", ast_reference(13)), field("ops", ast_sequence({ast_string("Lt")})),
+                              field("comparators", ast_sequence({ast_reference(14)}))}));
+        nodes.push_back(node(13, "Name", {field("id", ast_string("count"))}));
+        nodes.push_back(node(14, "Constant", {field("value", ast_integer("3"))}));
+        nodes.push_back(node(16, "Assign",
+                             {field("targets", ast_sequence({ast_reference(17)})), field("value", ast_reference(18))}));
+        nodes.push_back(node(17, "Name", {field("id", ast_string("count"))}));
+        nodes.push_back(node(
+            18, "BinOp",
+            {field("left", ast_reference(19)), field("op", ast_string("Add")), field("right", ast_reference(20))}));
+        nodes.push_back(node(19, "Name", {field("id", ast_string("count"))}));
+        nodes.push_back(node(20, "Constant", {field("value", ast_integer("1"))}));
+        nodes.push_back(node(22, "Return", {field("value", ast_reference(23))}));
+        nodes.push_back(node(23, "Compare",
+                             {field("left", ast_reference(24)), field("ops", ast_sequence({ast_string("Eq")})),
+                              field("comparators", ast_sequence({ast_reference(25)}))}));
+        nodes.push_back(node(24, "Name", {field("id", ast_string("count"))}));
+        nodes.push_back(node(25, "Constant", {field("value", ast_integer("3"))}));
+
+        const auto payload = encode_ast_envelope(envelope(std::move(nodes)));
+        REQUIRE(payload.has_value());
+        const OperatorBindings bindings {binding("com.example.constant")};
+        const auto artifact = StaticCompiler {}.compile(pack(), *payload, {}, bindings);
+        REQUIRE(artifact.has_value());
+        REQUIRE(std::ranges::any_of(artifact->pack.functions.front().instructions,
+                                    [](const Instruction &item) { return item.opcode == Opcode::jump; }));
+
+        auto session = vm::RegisterVmSession::create(artifact->pack, invocation());
+        REQUIRE(session.has_value());
+        const auto completed = (*session)->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        REQUIRE(completed.result->verdict == true);
+        REQUIRE((*session)->counters().loop_iterations_and_yields == 3U);
+    }
+
+    TEST_CASE("literal match cases lower to ordered tests with an exhaustive wildcard") {
+        auto nodes = constant_rule_nodes(false);
+        nodes[7] = node(
+            8, "Match",
+            {field("subject", ast_reference(9)), field("cases", ast_sequence({ast_reference(10), ast_reference(15)}))});
+        nodes[8] = node(9, "Constant", {field("value", ast_integer("2"))});
+        nodes.push_back(node(10, "match_case",
+                             {field("pattern", ast_reference(11)), field("guard", ast_none()),
+                              field("body", ast_sequence({ast_reference(12)}))}));
+        nodes.push_back(node(11, "MatchValue", {field("value", ast_reference(13))}));
+        nodes.push_back(node(12, "Return", {field("value", ast_reference(14))}));
+        nodes.push_back(node(13, "Constant", {field("value", ast_integer("1"))}));
+        nodes.push_back(node(14, "Constant", {field("value", ast_bool(false))}));
+        nodes.push_back(node(15, "match_case",
+                             {field("pattern", ast_reference(16)), field("guard", ast_none()),
+                              field("body", ast_sequence({ast_reference(17)}))}));
+        nodes.push_back(node(16, "MatchAs", {field("pattern", ast_none()), field("name", ast_none())}));
+        nodes.push_back(node(17, "Return", {field("value", ast_reference(18))}));
+        nodes.push_back(node(18, "Constant", {field("value", ast_bool(true))}));
+
+        const auto payload = encode_ast_envelope(envelope(std::move(nodes)));
+        REQUIRE(payload.has_value());
+        const OperatorBindings bindings {binding("com.example.constant")};
+        const auto artifact = StaticCompiler {}.compile(pack(), *payload, {}, bindings);
+        REQUIRE(artifact.has_value());
+        REQUIRE(std::ranges::count(artifact->pack.functions.front().instructions, Opcode::compare,
+                                   &Instruction::opcode) == 1);
+
+        auto session = vm::RegisterVmSession::create(artifact->pack, invocation());
+        REQUIRE(session.has_value());
+        const auto completed = (*session)->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        REQUIRE(completed.result->verdict == true);
+    }
+
+    TEST_CASE("catch-all try regions recover explicit author faults in the real VM") {
+        auto nodes = constant_rule_nodes(false);
+        nodes[7] =
+            node(8, "Try",
+                 {field("body", ast_sequence({ast_reference(9)})), field("handlers", ast_sequence({ast_reference(11)})),
+                  field("orelse", ast_sequence({})), field("finalbody", ast_sequence({}))});
+        nodes[8] = node(9, "Raise", {field("exc", ast_reference(10)), field("cause", ast_none())});
+        nodes.push_back(node(10, "Constant", {field("value", ast_string("recoverable"))}));
+        nodes.push_back(node(
+            11, "ExceptHandler",
+            {field("type", ast_none()), field("name", ast_none()), field("body", ast_sequence({ast_reference(12)}))}));
+        nodes.push_back(node(12, "Return", {field("value", ast_reference(13))}));
+        nodes.push_back(node(13, "Constant", {field("value", ast_bool(true))}));
+
+        const auto payload = encode_ast_envelope(envelope(std::move(nodes)));
+        REQUIRE(payload.has_value());
+        const OperatorBindings bindings {binding("com.example.constant")};
+        const auto artifact = StaticCompiler {}.compile(pack(), *payload, {}, bindings);
+        REQUIRE(artifact.has_value());
+        REQUIRE(artifact->pack.functions.front().exception_regions.size() == 1U);
+        REQUIRE(verify_compiler_output(*artifact).has_value());
+
+        auto session = vm::RegisterVmSession::create(artifact->pack, invocation());
+        REQUIRE(session.has_value());
+        const auto completed = (*session)->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        REQUIRE(completed.result->verdict == true);
+    }
+
+    TEST_CASE("explicit Model declarations produce deterministic labeled schemas") {
+        auto nodes = constant_rule_nodes(false);
+        const auto module_body = std::ranges::find(nodes.front().fields, "body", &AstField::name);
+        REQUIRE(module_body != nodes.front().fields.end());
+        module_body->value = ast_sequence({ast_reference(20), ast_reference(2)});
+        nodes.push_back(node(20, "ClassDef",
+                             {field("name", ast_string("Process")), field("bases", ast_sequence({ast_reference(21)})),
+                              field("keywords", ast_sequence({})), field("body", ast_sequence({ast_reference(22)})),
+                              field("decorator_list", ast_sequence({}))}));
+        nodes.push_back(node(21, "Name", {field("id", ast_string("Model"))}));
+        nodes.push_back(node(22, "AnnAssign",
+                             {field("target", ast_reference(23)), field("annotation", ast_reference(24)),
+                              field("value", ast_none()), field("simple", ast_integer("1"))}));
+        nodes.push_back(node(23, "Name", {field("id", ast_string("is_signed"))}));
+        nodes.push_back(node(24, "Subscript", {field("value", ast_reference(25)), field("slice", ast_reference(26))}));
+        nodes.push_back(node(25, "Name", {field("id", ast_string("Sensitive"))}));
+        nodes.push_back(node(26, "Name", {field("id", ast_string("bool"))}));
+
+        const auto payload = encode_ast_envelope(envelope(nodes));
+        REQUIRE(payload.has_value());
+        const auto first = StaticCompiler {}.compile(pack(), *payload, {}, {});
+        const auto second = StaticCompiler {}.compile(pack(), *payload, {}, {});
+        REQUIRE(first.has_value());
+        REQUIRE(second.has_value());
+        const auto descriptor =
+            std::ranges::find(first->pack.schemas.descriptors, SchemaId {"rules.main.Process"}, &SchemaDescriptor::id);
+        REQUIRE(descriptor != first->pack.schemas.descriptors.end());
+        REQUIRE(descriptor->kind == SchemaKind::model);
+        REQUIRE(descriptor->fields.size() == 1U);
+        REQUIRE(descriptor->fields.front().field_id == 1U);
+        REQUIRE(descriptor->fields.front().name == "is_signed");
+        REQUIRE(descriptor->fields.front().type == SchemaId {"bool"});
+        REQUIRE(descriptor->fields.front().label.classification == Classification::sensitive);
+        REQUIRE(descriptor->canonical_hash == second->pack.schemas.descriptors.front().canonical_hash);
+        REQUIRE(first->pack.schemas.canonical_hash == second->pack.schemas.canonical_hash);
+    }
+
+    TEST_CASE("recursively constant list and dictionary displays become frozen constants") {
+        auto nodes = constant_rule_nodes(false);
+        const auto decorators = std::ranges::find(nodes[1].fields, "decorator_list", &AstField::name);
+        const auto returns = std::ranges::find(nodes[1].fields, "returns", &AstField::name);
+        REQUIRE(decorators != nodes[1].fields.end());
+        REQUIRE(returns != nodes[1].fields.end());
+        decorators->value = ast_sequence({});
+        returns->value = ast_none();
+        std::erase_if(nodes, [](const AstNode &item) { return item.id >= 4U && item.id <= 7U; });
+        const auto return_statement = std::ranges::find(nodes, AstNodeId {8U}, &AstNode::id);
+        REQUIRE(return_statement != nodes.end());
+        const auto returned_value = std::ranges::find(nodes, AstNodeId {9U}, &AstNode::id);
+        REQUIRE(returned_value != nodes.end());
+        *returned_value = node(9, "List", {field("elts", ast_sequence({ast_reference(10), ast_reference(11)}))});
+        nodes.push_back(node(10, "Constant", {field("value", ast_integer("7"))}));
+        nodes.push_back(node(
+            11, "Dict",
+            {field("keys", ast_sequence({ast_reference(12)})), field("values", ast_sequence({ast_reference(13)}))}));
+        nodes.push_back(node(12, "Constant", {field("value", ast_string("ok"))}));
+        nodes.push_back(node(13, "Constant", {field("value", ast_bool(true))}));
+
+        const auto payload = encode_ast_envelope(envelope(std::move(nodes)));
+        REQUIRE(payload.has_value());
+        const auto artifact = StaticCompiler {}.compile(pack(), *payload, {}, {});
+        const auto artifact_diagnostics = artifact ? std::string {} : diagnostic_text(artifact.error());
+        INFO(artifact_diagnostics);
+        REQUIRE(artifact.has_value());
+        REQUIRE(artifact->pack.constants.size() == 1U);
+        const auto *list = std::get_if<FactList>(&artifact->pack.constants.front().node->data);
+        REQUIRE(list != nullptr);
+        REQUIRE(list->items.size() == 2U);
+        REQUIRE(std::holds_alternative<FactMap>(list->items.back().node->data));
+    }
+
+    TEST_CASE("unsupported F0 constructs fail with precise stable diagnostics") {
+        SECTION("subscription") {
+            auto nodes = constant_rule_nodes(false);
+            nodes[8] = node(9, "Subscript", {field("value", ast_reference(10)), field("slice", ast_reference(11))});
+            nodes.push_back(node(10, "List", {field("elts", ast_sequence({}))}));
+            nodes.push_back(node(11, "Constant", {field("value", ast_integer("0"))}));
+            const auto payload = encode_ast_envelope(envelope(std::move(nodes)));
+            REQUIRE(payload.has_value());
+            const auto result = StaticCompiler {}.compile(pack(), *payload, {}, {});
+            REQUIRE_FALSE(result.has_value());
+            INFO(diagnostic_text(result.error()));
+            REQUIRE(std::ranges::any_of(
+                result.error(), [](const Diagnostic &item) { return item.code == "PY-NYI-SUBSCRIPT-LOWERING"; }));
+        }
+
+        SECTION("comprehension") {
+            auto nodes = constant_rule_nodes(false);
+            nodes[8] = node(9, "ListComp", {field("elt", ast_reference(10)), field("generators", ast_sequence({}))});
+            nodes.push_back(node(10, "Constant", {field("value", ast_integer("1"))}));
+            const auto payload = encode_ast_envelope(envelope(std::move(nodes)));
+            REQUIRE(payload.has_value());
+            const auto result = StaticCompiler {}.compile(pack(), *payload, {}, {});
+            REQUIRE_FALSE(result.has_value());
+            REQUIRE(std::ranges::any_of(
+                result.error(), [](const Diagnostic &item) { return item.code == "PY-NYI-COMPREHENSION-LOWERING"; }));
+        }
+
+        SECTION("for iteration") {
+            auto nodes = constant_rule_nodes(false);
+            const auto body = std::ranges::find(nodes[1].fields, "body", &AstField::name);
+            REQUIRE(body != nodes[1].fields.end());
+            body->value = ast_sequence({ast_reference(8), ast_reference(12)});
+            nodes[7] = node(8, "For",
+                            {field("target", ast_reference(9)), field("iter", ast_reference(10)),
+                             field("body", ast_sequence({ast_reference(11)})), field("orelse", ast_sequence({}))});
+            nodes[8] = node(9, "Name", {field("id", ast_string("item"))});
+            nodes.push_back(node(10, "List", {field("elts", ast_sequence({}))}));
+            nodes.push_back(node(11, "Pass", {}));
+            nodes.push_back(node(12, "Return", {field("value", ast_reference(13))}));
+            nodes.push_back(node(13, "Constant", {field("value", ast_bool(false))}));
+            const auto payload = encode_ast_envelope(envelope(std::move(nodes)));
+            REQUIRE(payload.has_value());
+            const auto result = StaticCompiler {}.compile(pack(), *payload, {}, {});
+            REQUIRE_FALSE(result.has_value());
+            REQUIRE(std::ranges::any_of(
+                result.error(), [](const Diagnostic &item) { return item.code == "PY-NYI-ITERATION-LOWERING"; }));
+        }
+
+        SECTION("finally unwind") {
+            auto nodes = constant_rule_nodes(false);
+            nodes[7] = node(8, "Try",
+                            {field("body", ast_sequence({ast_reference(10)})),
+                             field("handlers", ast_sequence({ast_reference(11)})), field("orelse", ast_sequence({})),
+                             field("finalbody", ast_sequence({ast_reference(13)}))});
+            std::erase_if(nodes, [](const AstNode &item) { return item.id == 9U; });
+            nodes.push_back(node(10, "Pass", {}));
+            nodes.push_back(node(11, "ExceptHandler",
+                                 {field("type", ast_none()), field("name", ast_none()),
+                                  field("body", ast_sequence({ast_reference(12)}))}));
+            nodes.push_back(node(12, "Pass", {}));
+            nodes.push_back(node(13, "Pass", {}));
+            const auto payload = encode_ast_envelope(envelope(std::move(nodes)));
+            REQUIRE(payload.has_value());
+            const auto result = StaticCompiler {}.compile(pack(), *payload, {}, {});
+            REQUIRE_FALSE(result.has_value());
+            INFO(diagnostic_text(result.error()));
+            REQUIRE(std::ranges::any_of(result.error(),
+                                        [](const Diagnostic &item) { return item.code == "PY-NYI-FINALLY-LOWERING"; }));
+        }
     }
 
     TEST_CASE("compiler artifact is deterministic across envelope ordering") {
@@ -399,6 +965,16 @@ namespace {
         REQUIRE_FALSE(invalid.has_value());
         REQUIRE(
             std::ranges::any_of(invalid.error(), [](const Diagnostic &item) { return item.code == "PYC-OPERAND"; }));
+
+        artifact = StaticCompiler {}.compile(rule_pack, *payload, {}, {});
+        REQUIRE(artifact.has_value());
+        auto &function = artifact->pack.functions.front();
+        ++function.register_count;
+        function.instructions.back().operand_a = function.register_count - 1U;
+        const auto uninitialized = verify_compiler_output(*artifact);
+        REQUIRE_FALSE(uninitialized.has_value());
+        REQUIRE(std::ranges::any_of(uninitialized.error(),
+                                    [](const Diagnostic &item) { return item.code == "PYC-UNINITIALIZED"; }));
     }
 
 } // namespace

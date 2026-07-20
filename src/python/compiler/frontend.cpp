@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <deque>
 #include <locale>
 #include <map>
 #include <optional>
@@ -182,6 +183,12 @@ namespace rule_engine::python::compiler {
             if (!annotation) {
                 return {};
             }
+            if (annotation->kind == "Constant") {
+                const auto *value = index.field(*annotation, "value");
+                if (value != nullptr && std::holds_alternative<std::monostate>(value->value.data)) {
+                    return {.kind = StaticTypeKind::none, .qualified_name = "None"};
+                }
+            }
             if (annotation->kind == "Name") {
                 const auto name = index.string(*annotation, "id").value_or(std::string {});
                 if (name == "bool") {
@@ -201,6 +208,28 @@ namespace rule_engine::python::compiler {
                 }
                 if (name == "None") {
                     return {.kind = StaticTypeKind::none, .qualified_name = "None"};
+                }
+                return {.kind = StaticTypeKind::model, .qualified_name = name};
+            }
+            if (annotation->kind == "Attribute") {
+                const auto name = attribute_path(index, *annotation).value_or(std::string {});
+                return name.empty() ? StaticType {} :
+                                      StaticType {.kind = StaticTypeKind::model, .qualified_name = name};
+            }
+            if (annotation->kind == "Subscript") {
+                const auto *base = index.reference(*annotation, "value");
+                const auto *argument = index.reference(*annotation, "slice");
+                const auto name = base == nullptr ? std::string {} : root_name(index, *base);
+                const auto nested = annotation_type(index, argument);
+                if (name == "Identity" || name == "Public" || name == "Internal" || name == "Sensitive" ||
+                    name == "Secret" || name == "Final" || name == "ClassVar") {
+                    return nested;
+                }
+                if (name == "list") {
+                    return {.kind = StaticTypeKind::list, .qualified_name = "list[" + nested.qualified_name + "]"};
+                }
+                if (name == "dict") {
+                    return {.kind = StaticTypeKind::dictionary, .qualified_name = "dict"};
                 }
                 return {.kind = StaticTypeKind::model, .qualified_name = name};
             }
@@ -387,6 +416,190 @@ namespace rule_engine::python::compiler {
             bool generator {};
         };
 
+        std::string stable_digest(std::string_view canonical);
+        SchemaId schema_for_type(const StaticType &type);
+
+        [[nodiscard]] Classification annotation_classification(const AstIndex &index, const AstNode *annotation) {
+            if (annotation == nullptr || annotation->kind != "Subscript") {
+                return Classification::internal;
+            }
+            const auto *base = index.reference(*annotation, "value");
+            const auto name = base == nullptr ? std::string {} : root_name(index, *base);
+            if (name == "Public") {
+                return Classification::public_data;
+            }
+            if (name == "Sensitive") {
+                return Classification::sensitive;
+            }
+            if (name == "Secret") {
+                return Classification::secret;
+            }
+            return Classification::internal;
+        }
+
+        [[nodiscard]] bool valid_provider_route(const std::string_view route) {
+            if (route.empty() || route.front() == '.' || route.back() == '.') {
+                return false;
+            }
+            bool segment_start {true};
+            for (const auto character : route) {
+                if (character == '.') {
+                    if (segment_start) {
+                        return false;
+                    }
+                    segment_start = true;
+                    continue;
+                }
+                const auto alpha = (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z');
+                const auto digit = character >= '0' && character <= '9';
+                if ((!alpha && character != '_' && (!digit || segment_start))) {
+                    return false;
+                }
+                segment_start = false;
+            }
+            return !segment_start;
+        }
+
+        void bind_model(const AstIndex &index, const AstNode &node, const std::string &module,
+                        std::vector<BoundSymbol> &symbols, SchemaCatalog &generated_schemas,
+                        DiagnosticSet &diagnostics) {
+            const auto name = index.string(node, "name").value_or(std::string {});
+            const auto qualified_name = module + "." + name;
+            const auto bases = index.sequence(node, "bases");
+            if (bases.size() > 1U) {
+                diagnostics.push_back(make_diagnostic(
+                    "PY-NYI-C3-MRO", "multiple inheritance is represented but C3 layout is not implemented yet",
+                    node.span));
+                return;
+            }
+            if (bases.empty() || root_name(index, *bases.front()) != "Model") {
+                const auto base = bases.empty() ? std::string {"object"} : root_name(index, *bases.front());
+                diagnostics.push_back(make_diagnostic(
+                    "PY-NYI-CLASS", "class base '" + base + "' is not implemented; explicit Model is supported",
+                    bases.empty() ? node.span : bases.front()->span));
+                return;
+            }
+            if (!index.sequence(node, "decorator_list").empty()) {
+                diagnostics.push_back(make_diagnostic(
+                    "PY-NYI-CLASS-DECORATOR", "model class decorators are represented but not lowered yet", node.span));
+                return;
+            }
+
+            SchemaDescriptor descriptor {
+                .id = SchemaId {qualified_name},
+                .kind = SchemaKind::model,
+                .qualified_name = qualified_name,
+                .canonical_hash = {},
+                .fields = {},
+            };
+            std::set<std::string, std::less<>> field_names;
+            std::vector<std::string> field_storage;
+            for (const auto *statement : index.sequence(node, "body")) {
+                if (statement->kind == "Expr") {
+                    const auto *value = index.reference(*statement, "value");
+                    if (value == nullptr || value->kind != "Constant" || !index.string(*value, "value")) {
+                        diagnostics.push_back(
+                            make_diagnostic("PY-MODEL", "model class expressions must be docstrings", statement->span));
+                    }
+                    continue;
+                }
+                if (statement->kind == "Pass") {
+                    continue;
+                }
+                if (statement->kind == "FunctionDef" || statement->kind == "AsyncFunctionDef") {
+                    diagnostics.push_back(make_diagnostic("PY-NYI-MODEL-METHOD",
+                                                          "model methods require object/method bytecode absent from F0",
+                                                          statement->span));
+                    continue;
+                }
+                if (statement->kind != "AnnAssign") {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-MODEL", "model body contains unsupported statement '" + statement->kind + "'",
+                        statement->span));
+                    continue;
+                }
+                const auto *target = index.reference(*statement, "target");
+                const auto *annotation = index.reference(*statement, "annotation");
+                if (target == nullptr || target->kind != "Name" || annotation == nullptr) {
+                    diagnostics.push_back(
+                        make_diagnostic("PY-MODEL", "model field requires a simple annotated name", statement->span));
+                    continue;
+                }
+                const auto field_name = index.string(*target, "id").value_or(std::string {});
+                const auto type = annotation_type(index, annotation);
+                if (field_name.empty() || !field_names.insert(field_name).second) {
+                    diagnostics.push_back(
+                        make_diagnostic("PY-MODEL", "model field names must be nonempty and unique", statement->span));
+                    continue;
+                }
+                if (type.kind == StaticTypeKind::unknown || type.kind == StaticTypeKind::callable) {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-TYPE", "model field '" + field_name + "' has an unsupported annotation", annotation->span));
+                    continue;
+                }
+                auto storage = std::string {"eager"};
+                if (const auto *value = index.reference(*statement, "value")) {
+                    if (value->kind != "Call") {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-NYI-MODEL-DEFAULT",
+                            "model defaults require canonical default descriptors absent from F0", value->span));
+                        continue;
+                    }
+                    const auto *provider_target = index.reference(*value, "func");
+                    if (provider_target == nullptr || root_name(index, *provider_target) != "provider_fact" ||
+                        !index.sequence(*value, "args").empty()) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-NYI-MODEL-DEFAULT", "model field call must be provider_fact(route=\"literal.route\")",
+                            value->span));
+                        continue;
+                    }
+                    const auto keywords = index.sequence(*value, "keywords");
+                    if (keywords.size() != 1U || index.string(*keywords.front(), "arg") != "route") {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-FACT-ROUTE", "provider_fact requires exactly one route keyword", value->span));
+                        continue;
+                    }
+                    const auto *route_value = index.reference(*keywords.front(), "value");
+                    const auto route = route_value == nullptr ? std::nullopt : index.string(*route_value, "value");
+                    if (!route || !valid_provider_route(*route)) {
+                        diagnostics.push_back(
+                            make_diagnostic("PY-FACT-ROUTE", "provider_fact route must be a literal dotted identifier",
+                                            route_value == nullptr ? value->span : route_value->span));
+                        continue;
+                    }
+                    storage = "lazy:" + *route;
+                }
+                descriptor.fields.push_back(SchemaField {
+                    .field_id = static_cast<std::uint32_t>(descriptor.fields.size() + 1U),
+                    .name = field_name,
+                    .type = schema_for_type(type),
+                    .optional = false,
+                    .label = {.classification = annotation_classification(index, annotation), .categories = {}},
+                });
+                field_storage.push_back(std::move(storage));
+            }
+            std::ostringstream canonical;
+            canonical.imbue(std::locale::classic());
+            canonical << qualified_name << '|';
+            for (std::size_t position = 0; position < descriptor.fields.size(); ++position) {
+                const auto &field = descriptor.fields[position];
+                canonical << field.field_id << ':' << field.name << ':' << field.type.value << ':'
+                          << static_cast<unsigned int>(field.label.classification) << ':' << field_storage[position]
+                          << '|';
+            }
+            descriptor.canonical_hash = stable_digest(std::move(canonical).str());
+            generated_schemas.descriptors.push_back(std::move(descriptor));
+            symbols.push_back(BoundSymbol {.module = module,
+                                           .name = name,
+                                           .qualified_name = qualified_name,
+                                           .kind = SymbolKind::model,
+                                           .type = {.kind = StaticTypeKind::model, .qualified_name = qualified_name},
+                                           .span = node.span,
+                                           .public_api = true,
+                                           .async = false,
+                                           .generator = false});
+        }
+
         void bind_import(const AstIndex &index, const AstNode &node, const std::set<std::string, std::less<>> &modules,
                          const std::string &current_module, std::vector<BoundSymbol> &symbols,
                          DiagnosticSet &diagnostics) {
@@ -565,7 +778,8 @@ namespace rule_engine::python::compiler {
         }
 
         std::vector<FunctionModel> bind_modules(const AstEnvelope &envelope, const AstIndex &index,
-                                                std::vector<BoundSymbol> &symbols, DiagnosticSet &diagnostics) {
+                                                std::vector<BoundSymbol> &symbols, SchemaCatalog &generated_schemas,
+                                                DiagnosticSet &diagnostics) {
             std::vector<FunctionModel> functions;
             std::set<std::string, std::less<>> modules;
             std::set<std::string, std::less<>> declared_functions;
@@ -594,6 +808,10 @@ namespace rule_engine::python::compiler {
                                 "PY-TOPLEVEL", "module-level execution is rejected; use declarations only",
                                 statement->span));
                         }
+                        continue;
+                    }
+                    if (statement->kind == "ClassDef") {
+                        bind_model(index, *statement, module.name, symbols, generated_schemas, diagnostics);
                         continue;
                     }
                     if (statement->kind != "FunctionDef" && statement->kind != "AsyncFunctionDef") {
@@ -818,21 +1036,50 @@ namespace rule_engine::python::compiler {
             StaticType type;
         };
 
+        [[nodiscard]] SchemaId schema_for_type(const StaticType &type) {
+            switch (type.kind) {
+                case StaticTypeKind::none: return SchemaId {"none"};
+                case StaticTypeKind::boolean: return SchemaId {"bool"};
+                case StaticTypeKind::integer: return SchemaId {"int"};
+                case StaticTypeKind::floating: return SchemaId {"float"};
+                case StaticTypeKind::string: return SchemaId {"text"};
+                case StaticTypeKind::bytes: return SchemaId {"bytes"};
+                case StaticTypeKind::list: return SchemaId {type.qualified_name.empty() ? "list" : type.qualified_name};
+                case StaticTypeKind::dictionary:
+                    return SchemaId {type.qualified_name.empty() ? "dict" : type.qualified_name};
+                case StaticTypeKind::model: return SchemaId {type.qualified_name};
+                case StaticTypeKind::callable:
+                case StaticTypeKind::unknown: return SchemaId {"any"};
+            }
+            return SchemaId {"any"};
+        }
+
+        [[nodiscard]] std::string route_name(const FactRoute &route) { return route.provider + "." + route.fact; }
+
         struct Lowerer {
             const AstIndex &index;
             const FunctionModel &function;
+            const std::vector<FunctionModel> &functions;
             CompiledPack &pack;
             std::vector<FactRequirement> &requirements;
             DiagnosticSet &diagnostics;
             BytecodeFunction bytecode;
             std::map<std::string, ExpressionResult, std::less<>> locals;
+            struct LoopFrame {
+                std::uint32_t continue_target {};
+                std::vector<std::size_t> break_jumps;
+            };
+            std::vector<LoopFrame> loops;
             std::uint32_t conditional_depth {};
+            std::uint32_t direct_await_depth {};
             bool may_fault {};
 
-            Lowerer(const AstIndex &index_value, const FunctionModel &function_value, CompiledPack &pack_value,
+            Lowerer(const AstIndex &index_value, const FunctionModel &function_value,
+                    const std::vector<FunctionModel> &functions_value, CompiledPack &pack_value,
                     std::vector<FactRequirement> &requirements_value, DiagnosticSet &diagnostics_value):
                 index {index_value},
                 function {function_value},
+                functions {functions_value},
                 pack {pack_value},
                 requirements {requirements_value},
                 diagnostics {diagnostics_value},
@@ -852,6 +1099,49 @@ namespace rule_engine::python::compiler {
             }
 
             std::uint32_t allocate() { return bytecode.register_count++; }
+
+            [[nodiscard]] std::optional<std::size_t> function_index(const AstNode &target) const {
+                const auto name = attribute_path(index, target).value_or(std::string {});
+                if (name.empty()) {
+                    return std::nullopt;
+                }
+                const auto local_name = function.module + "." + name;
+                auto found = std::ranges::find(functions, local_name, &FunctionModel::qualified_name);
+                if (found == functions.end()) {
+                    found = std::ranges::find(functions, name, &FunctionModel::qualified_name);
+                }
+                return found == functions.end() ?
+                           std::nullopt :
+                           std::optional<std::size_t> {static_cast<std::size_t>(found - functions.begin())};
+            }
+
+            [[nodiscard]] static bool assignable(const StaticType &actual, const StaticType &expected) {
+                return expected.kind == StaticTypeKind::unknown || actual.kind == StaticTypeKind::unknown ||
+                       actual.kind == expected.kind ||
+                       (actual.kind == StaticTypeKind::boolean && expected.kind == StaticTypeKind::integer);
+            }
+
+            [[nodiscard]] static bool numeric(const StaticTypeKind kind) noexcept {
+                return kind == StaticTypeKind::boolean || kind == StaticTypeKind::integer ||
+                       kind == StaticTypeKind::floating;
+            }
+
+            [[nodiscard]] static bool integral(const StaticTypeKind kind) noexcept {
+                return kind == StaticTypeKind::boolean || kind == StaticTypeKind::integer;
+            }
+
+            [[nodiscard]] static StaticType unify(StaticType left, const StaticType &right) {
+                if (left.kind == right.kind && left.qualified_name == right.qualified_name) {
+                    return left;
+                }
+                if (numeric(left.kind) && numeric(right.kind)) {
+                    if (left.kind == StaticTypeKind::floating || right.kind == StaticTypeKind::floating) {
+                        return {.kind = StaticTypeKind::floating, .qualified_name = "float"};
+                    }
+                    return {.kind = StaticTypeKind::integer, .qualified_name = "int"};
+                }
+                return {.kind = StaticTypeKind::unknown, .qualified_name = "Any"};
+            }
 
             void emit(const Opcode opcode, const std::uint32_t destination, const std::uint32_t operand_a,
                       const std::uint32_t operand_b, const std::uint32_t immediate, const SourceSpan &span) {
@@ -903,9 +1193,111 @@ namespace rule_engine::python::compiler {
                 return ExpressionResult {.reg = destination, .type = std::move(type)};
             }
 
+            std::optional<FactValue> literal_fact(const AstNode &node) {
+                if (node.kind == "Constant") {
+                    const auto *value = index.field(node, "value");
+                    if (value == nullptr) {
+                        return std::nullopt;
+                    }
+                    if (std::holds_alternative<std::monostate>(value->value.data)) {
+                        return make_fact(std::monostate {});
+                    }
+                    if (const auto *boolean = std::get_if<bool>(&value->value.data)) {
+                        return make_fact(*boolean);
+                    }
+                    if (const auto *integer = std::get_if<IntegerValue>(&value->value.data)) {
+                        return make_fact(*integer);
+                    }
+                    if (const auto *floating = std::get_if<AstFloatBits>(&value->value.data)) {
+                        return make_fact(std::bit_cast<double>(floating->bits));
+                    }
+                    if (const auto *unicode = std::get_if<UnicodeValue>(&value->value.data)) {
+                        return make_fact(*unicode);
+                    }
+                    if (const auto *bytes = std::get_if<BytesValue>(&value->value.data)) {
+                        return make_fact(*bytes);
+                    }
+                    return std::nullopt;
+                }
+                if (node.kind == "List") {
+                    FactList list;
+                    for (const auto *element : index.sequence(node, "elts")) {
+                        const auto value = literal_fact(*element);
+                        if (!value) {
+                            return std::nullopt;
+                        }
+                        list.items.push_back(*value);
+                    }
+                    return make_fact(std::move(list));
+                }
+                if (node.kind == "Dict") {
+                    const auto keys = index.sequence(node, "keys");
+                    const auto values = index.sequence(node, "values");
+                    if (keys.size() != values.size()) {
+                        return std::nullopt;
+                    }
+                    FactMap map;
+                    for (std::size_t position = 0; position < keys.size(); ++position) {
+                        const auto key = literal_fact(*keys[position]);
+                        const auto value = literal_fact(*values[position]);
+                        if (!key || !value) {
+                            return std::nullopt;
+                        }
+                        map.entries.push_back(FactMapEntry {.key = *key, .value = *value});
+                    }
+                    return make_fact(std::move(map));
+                }
+                return std::nullopt;
+            }
+
+            std::optional<ExpressionResult> literal_collection(const AstNode &node) {
+                const auto value = literal_fact(node);
+                if (!value) {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-NYI-COLLECTION-LOWERING",
+                        "only recursively constant list and dictionary displays are lowered by the F0 bytecode",
+                        node.span));
+                    return std::nullopt;
+                }
+                const auto constant_index = static_cast<std::uint32_t>(pack.constants.size());
+                pack.constants.push_back(*value);
+                const auto destination = allocate();
+                emit(Opcode::load_const, destination, 0U, 0U, constant_index, node.span);
+                return ExpressionResult {
+                    .reg = destination,
+                    .type = {.kind = node.kind == "List" ? StaticTypeKind::list : StaticTypeKind::dictionary,
+                             .qualified_name = node.kind == "List" ? "list[Any]" : "dict[Any,Any]"},
+                };
+            }
+
             std::optional<ExpressionResult> expression(const AstNode &node) {
                 if (node.kind == "Constant") {
                     return constant(node);
+                }
+                if (node.kind == "List" || node.kind == "Dict") {
+                    return literal_collection(node);
+                }
+                if (node.kind == "Tuple" || node.kind == "Set") {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-NYI-COLLECTION-LOWERING",
+                        node.kind + " requires a distinct runtime value kind absent from the F0 FactValue constants",
+                        node.span));
+                    return std::nullopt;
+                }
+                if (node.kind == "Subscript") {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-NYI-SUBSCRIPT-LOWERING",
+                        "subscription requires a container access opcode absent from the F0 bytecode contract",
+                        node.span));
+                    return std::nullopt;
+                }
+                if (node.kind == "ListComp" || node.kind == "SetComp" || node.kind == "DictComp" ||
+                    node.kind == "GeneratorExp") {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-NYI-COMPREHENSION-LOWERING",
+                        "comprehensions require iterator/container opcodes absent from the F0 bytecode contract",
+                        node.span));
+                    return std::nullopt;
                 }
                 if (node.kind == "Name") {
                     const auto name = index.string(node, "id").value_or(std::string {});
@@ -932,21 +1324,26 @@ namespace rule_engine::python::compiler {
                         return std::nullopt;
                     }
                     const auto destination = allocate();
-                    const auto fact_index = static_cast<std::uint32_t>(requirements.size());
-                    requirements.push_back(FactRequirement {
-                        .executable = function.executable,
-                        .parameter = parameter,
-                        .attribute_path = *path,
-                        .route = *path,
-                        .span = node.span,
-                        .conditional = conditional_depth != 0,
-                    });
-                    emit(Opcode::await_fact, destination, locals.at(parameter).reg, 0, fact_index, node.span);
-                    may_fault = true;
                     const auto last = path->substr(path->find_last_of('.') + 1);
                     const auto type = last.starts_with("is_") || last.starts_with("has_") ?
                                           StaticType {.kind = StaticTypeKind::boolean, .qualified_name = "bool"} :
                                           StaticType {.kind = StaticTypeKind::unknown, .qualified_name = "Any"};
+                    const auto route = FactRoute {.provider = parameter, .fact = path->substr(separator + 1U)};
+                    const auto expected_schema = schema_for_type(type);
+                    const auto operand_constant = static_cast<std::uint32_t>(pack.constants.size());
+                    pack.constants.push_back(make_vm_fact_operand(route, expected_schema));
+                    requirements.push_back(FactRequirement {
+                        .executable = function.executable,
+                        .parameter = parameter,
+                        .attribute_path = *path,
+                        .route = route,
+                        .expected_schema = expected_schema,
+                        .operand_constant = operand_constant,
+                        .span = node.span,
+                        .conditional = conditional_depth != 0,
+                    });
+                    emit(Opcode::await_fact, destination, locals.at(parameter).reg, 0, operand_constant, node.span);
+                    may_fault = true;
                     return ExpressionResult {.reg = destination, .type = type};
                 }
                 if (node.kind == "UnaryOp") {
@@ -968,11 +1365,33 @@ namespace rule_engine::python::compiler {
                         code = UnaryCode::logical_not;
                         result_type = {.kind = StaticTypeKind::boolean, .qualified_name = "bool"};
                     } else if (operation == "UAdd") {
+                        if (!numeric(operand->type.kind) && operand->type.kind != StaticTypeKind::unknown) {
+                            diagnostics.push_back(
+                                make_diagnostic("PY-TYPE", "unary '+' requires a numeric operand", node.span));
+                            return std::nullopt;
+                        }
                         code = UnaryCode::positive;
+                        if (operand->type.kind == StaticTypeKind::boolean) {
+                            result_type = {.kind = StaticTypeKind::integer, .qualified_name = "int"};
+                        }
                     } else if (operation == "USub") {
+                        if (!numeric(operand->type.kind) && operand->type.kind != StaticTypeKind::unknown) {
+                            diagnostics.push_back(
+                                make_diagnostic("PY-TYPE", "unary '-' requires a numeric operand", node.span));
+                            return std::nullopt;
+                        }
                         code = UnaryCode::negative;
+                        if (operand->type.kind == StaticTypeKind::boolean) {
+                            result_type = {.kind = StaticTypeKind::integer, .qualified_name = "int"};
+                        }
                     } else if (operation == "Invert") {
+                        if (!integral(operand->type.kind) && operand->type.kind != StaticTypeKind::unknown) {
+                            diagnostics.push_back(
+                                make_diagnostic("PY-TYPE", "unary '~' requires an integer operand", node.span));
+                            return std::nullopt;
+                        }
                         code = UnaryCode::invert;
+                        result_type = {.kind = StaticTypeKind::integer, .qualified_name = "int"};
                     } else {
                         diagnostics.push_back(make_diagnostic(
                             "PY-UNSUPPORTED", "unary operator '" + operation + "' is not supported", node.span));
@@ -1019,13 +1438,30 @@ namespace rule_engine::python::compiler {
                             "PY-UNSUPPORTED", "binary operator '" + operation + "' is not supported", node.span));
                         return std::nullopt;
                     }
-                    StaticType result_type = left->type;
-                    if (operation == "Div" || left->type.kind == StaticTypeKind::floating ||
-                        right->type.kind == StaticTypeKind::floating) {
-                        result_type = {.kind = StaticTypeKind::floating, .qualified_name = "float"};
-                    } else if (left->type.kind != right->type.kind) {
-                        diagnostics.push_back(
-                            make_diagnostic("PY-TYPE", "binary operands have incompatible static types", node.span));
+                    StaticType result_type;
+                    const auto arithmetic = operation == "Add" || operation == "Sub" || operation == "Mult" ||
+                                            operation == "Div" || operation == "FloorDiv" || operation == "Mod" ||
+                                            operation == "Pow";
+                    const auto bitwise = operation == "LShift" || operation == "RShift" || operation == "BitOr" ||
+                                         operation == "BitXor" || operation == "BitAnd";
+                    if (arithmetic && numeric(left->type.kind) && numeric(right->type.kind)) {
+                        result_type = operation == "Div" || left->type.kind == StaticTypeKind::floating ||
+                                              right->type.kind == StaticTypeKind::floating ?
+                                          StaticType {.kind = StaticTypeKind::floating, .qualified_name = "float"} :
+                                          StaticType {.kind = StaticTypeKind::integer, .qualified_name = "int"};
+                    } else if (bitwise && integral(left->type.kind) && integral(right->type.kind)) {
+                        result_type = {.kind = StaticTypeKind::integer, .qualified_name = "int"};
+                    } else if (operation == "Add" && left->type.kind == right->type.kind &&
+                               (left->type.kind == StaticTypeKind::string || left->type.kind == StaticTypeKind::bytes ||
+                                left->type.kind == StaticTypeKind::list)) {
+                        result_type = left->type;
+                    } else if (left->type.kind == StaticTypeKind::unknown ||
+                               right->type.kind == StaticTypeKind::unknown) {
+                        result_type = {.kind = StaticTypeKind::unknown, .qualified_name = "Any"};
+                    } else {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-TYPE", "binary operator '" + operation + "' is invalid for the operand types",
+                            node.span));
                         return std::nullopt;
                     }
                     const auto destination = allocate();
@@ -1038,14 +1474,13 @@ namespace rule_engine::python::compiler {
                     const auto *left_node = index.reference(node, "left");
                     const auto comparators = index.sequence(node, "comparators");
                     const auto operations = index.string_sequence(node, "ops");
-                    if (!left_node || comparators.size() != 1 || operations.size() != 1) {
-                        diagnostics.push_back(make_diagnostic(
-                            "PY-NYI-COMPARE", "chained comparisons are represented but not lowered yet", node.span));
+                    if (!left_node || comparators.empty() || comparators.size() != operations.size()) {
+                        diagnostics.push_back(
+                            make_diagnostic("PY-AST-FIELD", "Compare operands and operators do not match", node.span));
                         return std::nullopt;
                     }
-                    const auto left = expression(*left_node);
-                    const auto right = expression(*comparators.front());
-                    if (!left || !right) {
+                    auto left = expression(*left_node);
+                    if (!left) {
                         return std::nullopt;
                     }
                     static const std::map<std::string, CompareCode, std::less<>> codes {
@@ -1055,15 +1490,35 @@ namespace rule_engine::python::compiler {
                         {"Lt", CompareCode::less},           {"LtE", CompareCode::less_equal},
                         {"NotEq", CompareCode::not_equal},   {"NotIn", CompareCode::not_contains},
                     };
-                    const auto code = codes.find(operations.front());
-                    if (code == codes.end()) {
-                        diagnostics.push_back(
-                            make_diagnostic("PY-UNSUPPORTED", "comparison operator is unsupported", node.span));
-                        return std::nullopt;
-                    }
                     const auto destination = allocate();
-                    emit(Opcode::compare, destination, left->reg, right->reg, static_cast<std::uint32_t>(code->second),
-                         node.span);
+                    std::vector<std::size_t> exits;
+                    for (std::size_t position = 0; position < comparators.size(); ++position) {
+                        if (position != 0U) {
+                            exits.push_back(bytecode.instructions.size());
+                            emit(Opcode::jump_if_false, destination, destination, 0U, 0U,
+                                 comparators[position - 1U]->span);
+                            ++conditional_depth;
+                        }
+                        const auto right = expression(*comparators[position]);
+                        if (position != 0U) {
+                            --conditional_depth;
+                        }
+                        if (!right) {
+                            return std::nullopt;
+                        }
+                        const auto code = codes.find(operations[position]);
+                        if (code == codes.end()) {
+                            diagnostics.push_back(make_diagnostic(
+                                "PY-UNSUPPORTED", "comparison operator '" + operations[position] + "' is unsupported",
+                                node.span));
+                            return std::nullopt;
+                        }
+                        emit(Opcode::compare, destination, left->reg, right->reg,
+                             static_cast<std::uint32_t>(code->second), node.span);
+                        left = right;
+                    }
+                    const auto exit = static_cast<std::uint32_t>(bytecode.instructions.size());
+                    for (const auto instruction : exits) { bytecode.instructions[instruction].immediate = exit; }
                     may_fault = true;
                     return ExpressionResult {
                         .reg = destination,
@@ -1085,6 +1540,7 @@ namespace rule_engine::python::compiler {
                         return std::nullopt;
                     }
                     const auto result = allocate();
+                    auto result_type = first->type;
                     emit(Opcode::move, result, first->reg, 0, 0, values.front()->span);
                     std::vector<std::size_t> exits;
                     for (std::size_t position = 1; position < values.size(); ++position) {
@@ -1102,19 +1558,99 @@ namespace rule_engine::python::compiler {
                         if (!next) {
                             return std::nullopt;
                         }
+                        result_type = unify(std::move(result_type), next->type);
                         emit(Opcode::move, result, next->reg, 0, 0, values[position]->span);
                     }
                     const auto exit = static_cast<std::uint32_t>(bytecode.instructions.size());
                     for (const auto instruction : exits) { bytecode.instructions[instruction].immediate = exit; }
                     return ExpressionResult {
                         .reg = result,
-                        .type = {.kind = StaticTypeKind::boolean, .qualified_name = "bool"},
+                        .type = std::move(result_type),
                     };
                 }
+                if (node.kind == "IfExp") {
+                    const auto *test = index.reference(node, "test");
+                    const auto *body = index.reference(node, "body");
+                    const auto *otherwise = index.reference(node, "orelse");
+                    if (test == nullptr || body == nullptr || otherwise == nullptr) {
+                        diagnostics.push_back(
+                            make_diagnostic("PY-AST-FIELD", "conditional expression is incomplete", node.span));
+                        return std::nullopt;
+                    }
+                    const auto condition = expression(*test);
+                    if (!condition) {
+                        return std::nullopt;
+                    }
+                    const auto result = allocate();
+                    const auto false_jump = bytecode.instructions.size();
+                    emit(Opcode::jump_if_false, condition->reg, condition->reg, 0U, 0U, test->span);
+                    ++conditional_depth;
+                    const auto when_true = expression(*body);
+                    --conditional_depth;
+                    if (!when_true) {
+                        return std::nullopt;
+                    }
+                    emit(Opcode::move, result, when_true->reg, 0U, 0U, body->span);
+                    const auto end_jump = bytecode.instructions.size();
+                    emit(Opcode::jump, 0U, 0U, 0U, 0U, node.span);
+                    bytecode.instructions[false_jump].immediate =
+                        static_cast<std::uint32_t>(bytecode.instructions.size());
+                    ++conditional_depth;
+                    const auto when_false = expression(*otherwise);
+                    --conditional_depth;
+                    if (!when_false) {
+                        return std::nullopt;
+                    }
+                    emit(Opcode::move, result, when_false->reg, 0U, 0U, otherwise->span);
+                    bytecode.instructions[end_jump].immediate =
+                        static_cast<std::uint32_t>(bytecode.instructions.size());
+                    return ExpressionResult {.reg = result, .type = unify(when_true->type, when_false->type)};
+                }
+                if (node.kind == "NamedExpr") {
+                    const auto *target = index.reference(node, "target");
+                    const auto *value = index.reference(node, "value");
+                    if (target == nullptr || target->kind != "Name" || value == nullptr) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-AST-FIELD", "named expression requires a local-name target", node.span));
+                        return std::nullopt;
+                    }
+                    const auto result = expression(*value);
+                    if (!result) {
+                        return std::nullopt;
+                    }
+                    const auto name = index.string(*target, "id").value_or(std::string {});
+                    const auto existing = locals.find(name);
+                    if (existing == locals.end()) {
+                        locals[name] = *result;
+                        return result;
+                    }
+                    emit(Opcode::move, existing->second.reg, result->reg, 0U, 0U, node.span);
+                    existing->second.type = unify(existing->second.type, result->type);
+                    return existing->second;
+                }
                 if (node.kind == "Await") {
+                    const auto *value = index.reference(node, "value");
+                    if (!function.async || value == nullptr) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-TYPE-AWAIT", "await requires an expression inside an async function", node.span));
+                        return std::nullopt;
+                    }
+                    if (value->kind == "Attribute") {
+                        return expression(*value);
+                    }
+                    if (value->kind == "Call") {
+                        const auto *target = index.reference(*value, "func");
+                        const auto target_index = target == nullptr ? std::nullopt : function_index(*target);
+                        if (target_index && functions[*target_index].async) {
+                            ++direct_await_depth;
+                            auto result = expression(*value);
+                            --direct_await_depth;
+                            return result;
+                        }
+                    }
                     diagnostics.push_back(make_diagnostic(
                         "PY-NYI-ASYNC-LOWERING",
-                        "async declaration is supported, but this await expression is not lowered yet", node.span));
+                        "await target is represented but has no F0 capability/coroutine operand encoding", node.span));
                     return std::nullopt;
                 }
                 if (node.kind == "Yield" || node.kind == "YieldFrom") {
@@ -1129,9 +1665,61 @@ namespace rule_engine::python::compiler {
                     if (forbidden_calls.contains(name)) {
                         return std::nullopt;
                     }
-                    diagnostics.push_back(make_diagnostic(
-                        "PY-NYI-CALL-LOWERING", "statically bound call '" + name + "' is not lowered yet", node.span));
-                    return std::nullopt;
+                    const auto target_index = target == nullptr ? std::nullopt : function_index(*target);
+                    if (!target_index) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-UNSUPPORTED-CALL", "call target '" + name + "' is not a statically bound pack function",
+                            node.span));
+                        return std::nullopt;
+                    }
+                    if (!index.sequence(node, "keywords").empty()) {
+                        diagnostics.push_back(make_diagnostic("PY-NYI-CALL-KEYWORDS",
+                                                              "keyword arguments are represented but not lowered yet",
+                                                              node.span));
+                        return std::nullopt;
+                    }
+                    const auto arguments = index.sequence(node, "args");
+                    const auto &callee = functions[*target_index];
+                    if (callee.async && direct_await_depth == 0U) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-TYPE-COROUTINE",
+                            "async function calls must be directly awaited until cold coroutine values are encoded",
+                            node.span));
+                        return std::nullopt;
+                    }
+                    if (arguments.size() != callee.parameters.size()) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-TYPE-CALL", "call to '" + callee.qualified_name + "' has the wrong argument count",
+                            node.span));
+                        return std::nullopt;
+                    }
+                    std::vector<ExpressionResult> values;
+                    values.reserve(arguments.size());
+                    for (std::size_t position = 0; position < arguments.size(); ++position) {
+                        const auto value = expression(*arguments[position]);
+                        if (!value) {
+                            return std::nullopt;
+                        }
+                        if (!assignable(value->type, callee.parameters[position].second)) {
+                            diagnostics.push_back(make_diagnostic("PY-TYPE-CALL",
+                                                                  "argument " + std::to_string(position + 1U) +
+                                                                      " to '" + callee.qualified_name +
+                                                                      "' has incompatible type",
+                                                                  arguments[position]->span));
+                            return std::nullopt;
+                        }
+                        values.push_back(*value);
+                    }
+                    const auto first_argument = bytecode.register_count;
+                    for (const auto &value : values) {
+                        const auto argument = allocate();
+                        emit(Opcode::move, argument, value.reg, 0U, 0U, node.span);
+                    }
+                    const auto destination = allocate();
+                    emit(Opcode::call, destination, first_argument, static_cast<std::uint32_t>(values.size()),
+                         static_cast<std::uint32_t>(*target_index), node.span);
+                    may_fault = true;
+                    return ExpressionResult {.reg = destination, .type = callee.return_type};
                 }
                 diagnostics.push_back(make_diagnostic(
                     "PY-NYI-LOWERING", "AST expression '" + node.kind + "' is represented but not lowered yet",
@@ -1153,6 +1741,23 @@ namespace rule_engine::python::compiler {
                         if (value && value->kind == "Constant" && index.string(*value, "value")) {
                             continue;
                         }
+                        if (value && value->kind == "Yield") {
+                            const auto *yielded = index.reference(*value, "value");
+                            std::optional<ExpressionResult> result;
+                            if (yielded != nullptr) {
+                                result = expression(*yielded);
+                            } else {
+                                AstNode synthetic {.id = 0U,
+                                                   .kind = "Constant",
+                                                   .span = value->span,
+                                                   .fields = {AstField {.name = "value", .value = ast_none()}}};
+                                result = constant(synthetic);
+                            }
+                            if (result) {
+                                emit(Opcode::yield_value, result->reg, result->reg, 0U, 0U, value->span);
+                            }
+                            continue;
+                        }
                         if (value) {
                             static_cast<void>(expression(*value));
                         }
@@ -1168,7 +1773,48 @@ namespace rule_engine::python::compiler {
                         }
                         const auto result = expression(*value);
                         if (result) {
-                            locals[index.string(*targets.front(), "id").value_or(std::string {})] = *result;
+                            const auto name = index.string(*targets.front(), "id").value_or(std::string {});
+                            const auto existing = locals.find(name);
+                            if (existing == locals.end()) {
+                                locals[name] = *result;
+                            } else {
+                                emit(Opcode::move, existing->second.reg, result->reg, 0U, 0U, statement->span);
+                                existing->second.type = unify(existing->second.type, result->type);
+                            }
+                        }
+                        continue;
+                    }
+                    if (statement->kind == "AnnAssign") {
+                        const auto *target = index.reference(*statement, "target");
+                        const auto *annotation = index.reference(*statement, "annotation");
+                        const auto *value = index.reference(*statement, "value");
+                        if (target == nullptr || target->kind != "Name" || annotation == nullptr) {
+                            diagnostics.push_back(make_diagnostic("PY-NYI-ASSIGNMENT",
+                                                                  "annotated assignment requires a local-name target",
+                                                                  statement->span));
+                            continue;
+                        }
+                        if (value == nullptr) {
+                            continue;
+                        }
+                        const auto declared = annotation_type(index, annotation);
+                        const auto result = expression(*value);
+                        if (!result) {
+                            continue;
+                        }
+                        if (!assignable(result->type, declared)) {
+                            diagnostics.push_back(make_diagnostic("PY-TYPE-ASSIGN",
+                                                                  "assigned value is incompatible with its annotation",
+                                                                  statement->span));
+                            continue;
+                        }
+                        const auto name = index.string(*target, "id").value_or(std::string {});
+                        const auto existing = locals.find(name);
+                        if (existing == locals.end()) {
+                            locals[name] = ExpressionResult {.reg = result->reg, .type = declared};
+                        } else {
+                            emit(Opcode::move, existing->second.reg, result->reg, 0U, 0U, statement->span);
+                            existing->second.type = declared;
                         }
                         continue;
                     }
@@ -1189,10 +1835,13 @@ namespace rule_engine::python::compiler {
                         if (!result) {
                             continue;
                         }
-                        if (function.public_api && result->type.kind != StaticTypeKind::boolean) {
-                            diagnostics.push_back(make_diagnostic("PY-TYPE-RETURN",
-                                                                  "reportable function must return bool on every path",
-                                                                  statement->span));
+                        if (function.return_type.kind != StaticTypeKind::unknown &&
+                            !assignable(result->type, function.return_type)) {
+                            diagnostics.push_back(make_diagnostic(
+                                "PY-TYPE-RETURN",
+                                function.public_api ? "reportable function must return bool on every path" :
+                                                      "return value is incompatible with the function annotation",
+                                statement->span));
                         }
                         emit(Opcode::return_value, result->reg, result->reg, 0, 0, statement->span);
                         terminated = true;
@@ -1229,6 +1878,222 @@ namespace rule_engine::python::compiler {
                                 static_cast<std::uint32_t>(bytecode.instructions.size());
                         }
                         terminated = body_terminated && else_terminated;
+                        continue;
+                    }
+                    if (statement->kind == "Match") {
+                        const auto *subject = index.reference(*statement, "subject");
+                        if (subject == nullptr) {
+                            diagnostics.push_back(
+                                make_diagnostic("PY-AST-FIELD", "match statement has no subject", statement->span));
+                            continue;
+                        }
+                        const auto subject_value = expression(*subject);
+                        if (!subject_value) {
+                            continue;
+                        }
+                        std::vector<std::size_t> end_jumps;
+                        bool exhaustive {};
+                        bool all_cases_terminate {true};
+                        for (const auto *match_case : index.sequence(*statement, "cases")) {
+                            const auto *pattern = index.reference(*match_case, "pattern");
+                            if (pattern == nullptr) {
+                                diagnostics.push_back(
+                                    make_diagnostic("PY-AST-FIELD", "match case has no pattern", match_case->span));
+                                continue;
+                            }
+                            std::vector<std::size_t> next_case_jumps;
+                            if (pattern->kind == "MatchValue" || pattern->kind == "MatchSingleton") {
+                                const AstNode *literal_node = index.reference(*pattern, "value");
+                                AstNode singleton;
+                                if (pattern->kind == "MatchSingleton") {
+                                    const auto *literal = AstIndex::field(*pattern, "value");
+                                    if (literal != nullptr) {
+                                        singleton = AstNode {
+                                            .id = 0U,
+                                            .kind = "Constant",
+                                            .span = pattern->span,
+                                            .fields = {AstField {.name = "value", .value = literal->value}},
+                                        };
+                                        literal_node = &singleton;
+                                    }
+                                }
+                                const auto literal = literal_node == nullptr ? std::nullopt : expression(*literal_node);
+                                if (!literal) {
+                                    diagnostics.push_back(make_diagnostic(
+                                        "PY-NYI-MATCH-PATTERN",
+                                        "match value pattern must be a statically supported literal", pattern->span));
+                                    continue;
+                                }
+                                const auto matched = allocate();
+                                emit(Opcode::compare, matched, subject_value->reg, literal->reg,
+                                     static_cast<std::uint32_t>(CompareCode::equal), pattern->span);
+                                next_case_jumps.push_back(bytecode.instructions.size());
+                                emit(Opcode::jump_if_false, matched, matched, 0U, 0U, pattern->span);
+                            } else if (pattern->kind == "MatchAs" && index.reference(*pattern, "pattern") == nullptr &&
+                                       !index.string(*pattern, "name").has_value()) {
+                                exhaustive = true;
+                            } else {
+                                diagnostics.push_back(make_diagnostic(
+                                    "PY-NYI-MATCH-PATTERN",
+                                    "pattern '" + pattern->kind +
+                                        "' requires binding/rollback or container opcodes absent from F0",
+                                    pattern->span));
+                                continue;
+                            }
+                            if (const auto *guard = index.reference(*match_case, "guard")) {
+                                ++conditional_depth;
+                                const auto guard_value = expression(*guard);
+                                --conditional_depth;
+                                if (!guard_value) {
+                                    continue;
+                                }
+                                next_case_jumps.push_back(bytecode.instructions.size());
+                                emit(Opcode::jump_if_false, guard_value->reg, guard_value->reg, 0U, 0U, guard->span);
+                            }
+                            ++conditional_depth;
+                            const auto case_terminated = statements(index.sequence(*match_case, "body"));
+                            --conditional_depth;
+                            all_cases_terminate = all_cases_terminate && case_terminated;
+                            if (!case_terminated) {
+                                end_jumps.push_back(bytecode.instructions.size());
+                                emit(Opcode::jump, 0U, 0U, 0U, 0U, match_case->span);
+                            }
+                            const auto next_case = static_cast<std::uint32_t>(bytecode.instructions.size());
+                            for (const auto jump : next_case_jumps) {
+                                bytecode.instructions[jump].immediate = next_case;
+                            }
+                        }
+                        const auto end = static_cast<std::uint32_t>(bytecode.instructions.size());
+                        for (const auto jump : end_jumps) { bytecode.instructions[jump].immediate = end; }
+                        terminated = exhaustive && all_cases_terminate;
+                        continue;
+                    }
+                    if (statement->kind == "While") {
+                        const auto loop_start = static_cast<std::uint32_t>(bytecode.instructions.size());
+                        const auto *test = index.reference(*statement, "test");
+                        if (test == nullptr) {
+                            diagnostics.push_back(
+                                make_diagnostic("PY-AST-FIELD", "While is missing test", statement->span));
+                            continue;
+                        }
+                        const auto condition = expression(*test);
+                        if (!condition) {
+                            continue;
+                        }
+                        const auto false_jump = bytecode.instructions.size();
+                        emit(Opcode::jump_if_false, condition->reg, condition->reg, 0U, 0U, test->span);
+                        loops.push_back(LoopFrame {.continue_target = loop_start, .break_jumps = {}});
+                        ++conditional_depth;
+                        const auto body_terminated = statements(index.sequence(*statement, "body"));
+                        --conditional_depth;
+                        if (!body_terminated) {
+                            emit(Opcode::jump, 0U, 0U, 0U, loop_start, statement->span);
+                        }
+                        auto loop = std::move(loops.back());
+                        loops.pop_back();
+                        bytecode.instructions[false_jump].immediate =
+                            static_cast<std::uint32_t>(bytecode.instructions.size());
+                        ++conditional_depth;
+                        static_cast<void>(statements(index.sequence(*statement, "orelse")));
+                        --conditional_depth;
+                        const auto loop_exit = static_cast<std::uint32_t>(bytecode.instructions.size());
+                        for (const auto jump : loop.break_jumps) { bytecode.instructions[jump].immediate = loop_exit; }
+                        terminated = false;
+                        continue;
+                    }
+                    if (statement->kind == "Break" || statement->kind == "Continue") {
+                        if (loops.empty()) {
+                            diagnostics.push_back(make_diagnostic(
+                                "PY-SCOPE", statement->kind + " appears outside a loop", statement->span));
+                            continue;
+                        }
+                        if (statement->kind == "Break") {
+                            loops.back().break_jumps.push_back(bytecode.instructions.size());
+                            emit(Opcode::jump, 0U, 0U, 0U, 0U, statement->span);
+                        } else {
+                            emit(Opcode::jump, 0U, 0U, 0U, loops.back().continue_target, statement->span);
+                        }
+                        terminated = true;
+                        continue;
+                    }
+                    if (statement->kind == "Raise") {
+                        const auto *value = index.reference(*statement, "exc");
+                        if (value == nullptr) {
+                            diagnostics.push_back(make_diagnostic(
+                                "PY-NYI-BARE-RAISE", "bare raise requires active-exception metadata absent from F0",
+                                statement->span));
+                            continue;
+                        }
+                        const auto result = expression(*value);
+                        if (result) {
+                            emit(Opcode::raise_fault, result->reg, result->reg, 0U, 0U, statement->span);
+                            terminated = true;
+                        }
+                        continue;
+                    }
+                    if (statement->kind == "For") {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-NYI-ITERATION-LOWERING",
+                            "for loops require iterator opcodes that are absent from the F0 bytecode contract",
+                            statement->span));
+                        continue;
+                    }
+                    if (statement->kind == "TryStar") {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-NYI-EXCEPTION-GROUP-LOWERING",
+                            "except* requires exception-group splitting absent from the F0 bytecode contract",
+                            statement->span));
+                        continue;
+                    }
+                    if (statement->kind == "Try") {
+                        if (!index.sequence(*statement, "finalbody").empty()) {
+                            diagnostics.push_back(make_diagnostic(
+                                "PY-NYI-FINALLY-LOWERING",
+                                "finally requires unwind-reason metadata absent from the F0 bytecode contract",
+                                statement->span));
+                            continue;
+                        }
+                        const auto handlers = index.sequence(*statement, "handlers");
+                        if (handlers.size() != 1U || index.reference(*handlers.front(), "type") != nullptr ||
+                            index.string(*handlers.front(), "name").has_value()) {
+                            diagnostics.push_back(make_diagnostic(
+                                "PY-NYI-EXCEPTION-FILTER", "F0 lowers exactly one unbound catch-all except handler",
+                                statement->span));
+                            continue;
+                        }
+                        const auto region_begin = static_cast<std::uint32_t>(bytecode.instructions.size());
+                        emit(Opcode::enter_try, 0U, 0U, 0U, 0U, statement->span);
+                        ++conditional_depth;
+                        const auto body_terminated = statements(index.sequence(*statement, "body"));
+                        --conditional_depth;
+                        const auto region_end = static_cast<std::uint32_t>(bytecode.instructions.size());
+                        auto normal_terminated = body_terminated;
+                        if (!body_terminated) {
+                            emit(Opcode::leave_try, 0U, 0U, 0U, 0U, statement->span);
+                            ++conditional_depth;
+                            normal_terminated = statements(index.sequence(*statement, "orelse"));
+                            --conditional_depth;
+                        }
+                        std::optional<std::size_t> end_jump;
+                        if (!normal_terminated) {
+                            end_jump = bytecode.instructions.size();
+                            emit(Opcode::jump, 0U, 0U, 0U, 0U, statement->span);
+                        }
+                        const auto handler_begin = static_cast<std::uint32_t>(bytecode.instructions.size());
+                        ++conditional_depth;
+                        const auto handler_terminated = statements(index.sequence(*handlers.front(), "body"));
+                        --conditional_depth;
+                        const auto end = static_cast<std::uint32_t>(bytecode.instructions.size());
+                        if (end_jump) {
+                            bytecode.instructions[*end_jump].immediate = end;
+                        }
+                        bytecode.exception_regions.push_back(ExceptionRegion {
+                            .begin_instruction = region_begin,
+                            .end_instruction = region_end,
+                            .handler_instruction = handler_begin,
+                            .cleanup_instruction = handler_begin,
+                        });
+                        terminated = normal_terminated && handler_terminated;
                         continue;
                     }
                     diagnostics.push_back(make_diagnostic(
@@ -1307,10 +2172,15 @@ namespace rule_engine::python::compiler {
                            << ':' << instruction.span.source.value << ':' << instruction.span.begin_byte << ':'
                            << instruction.span.end_byte << '\n';
                 }
+                for (const auto &region : function.exception_regions) {
+                    output << "exception:" << region.begin_instruction << ':' << region.end_instruction << ':'
+                           << region.handler_instruction << ':' << region.cleanup_instruction << '\n';
+                }
             }
             for (const auto &requirement : requirements) {
                 output << "fact|" << requirement.executable.value << '|' << requirement.attribute_path << '|'
-                       << requirement.route << '|' << requirement.conditional << '\n';
+                       << route_name(requirement.route) << '|' << requirement.expected_schema.value << '|'
+                       << requirement.operand_constant << '|' << requirement.conditional << '\n';
             }
             for (const auto &binding : pack.bindings) {
                 output << "binding|";
@@ -1328,19 +2198,78 @@ namespace rule_engine::python::compiler {
     std::expected<CompilationArtifact, DiagnosticSet>
     StaticCompiler::compile(const VerifiedRulePack &pack, const std::span<const std::byte> ast_payload,
                             const SchemaCatalog &schemas, const OperatorBindings &bindings) const {
+        DiagnosticSet diagnostics;
+        if (pack.manifest.compiler_abi != "python-3.14.6/static-compiler-v1") {
+            diagnostics.push_back(make_diagnostic(
+                "PY-COMPILER-ABI", "verified pack compiler ABI does not select the exact static compiler"));
+        }
+        if (pack.manifest.budget_profile != balanced_v1.name) {
+            diagnostics.push_back(make_diagnostic(
+                "PY-BUDGET-PROFILE", "verified pack must select the immutable balanced.v1 budget profile"));
+        }
+        if (!diagnostics.empty()) {
+            sort_diagnostics(diagnostics);
+            return std::unexpected(std::move(diagnostics));
+        }
         auto decoded = decode_ast_envelope(ast_payload, pack);
         if (!decoded) {
             return std::unexpected(std::move(decoded.error()));
         }
 
         const AstIndex index {*decoded};
-        DiagnosticSet diagnostics;
         std::vector<BoundSymbol> symbols;
-        const auto functions = bind_modules(*decoded, index, symbols, diagnostics);
+        SchemaCatalog generated_schemas;
+        const auto functions = bind_modules(*decoded, index, symbols, generated_schemas, diagnostics);
+        std::set<std::string, std::less<>> reportable_executables;
+        for (const auto &function : functions) {
+            if (function.public_api) {
+                reportable_executables.insert(function.executable.value);
+            }
+        }
+        std::set<std::string, std::less<>> binding_ids;
+        for (const auto &binding : bindings) {
+            if (binding.id.empty() || !binding_ids.insert(binding.id.value).second) {
+                diagnostics.push_back(
+                    make_diagnostic("PY-BINDING", "operator binding IDs must be nonempty and unique"));
+            }
+            if (!reportable_executables.contains(binding.executable.value)) {
+                diagnostics.push_back(
+                    make_diagnostic("PY-BINDING", "operator binding references an unknown reportable executable '" +
+                                                      binding.executable.value + "'"));
+            }
+            if (binding.budget.name != balanced_v1.name) {
+                diagnostics.push_back(make_diagnostic(
+                    "PY-BINDING-BUDGET", "operator binding must use the immutable balanced.v1 budget profile"));
+            }
+        }
         if (!diagnostics.empty()) {
             sort_diagnostics(diagnostics);
             return std::unexpected(std::move(diagnostics));
         }
+
+        auto merged_schemas = schemas;
+        for (auto &descriptor : generated_schemas.descriptors) {
+            if (std::ranges::find(merged_schemas.descriptors, descriptor.id, &SchemaDescriptor::id) !=
+                merged_schemas.descriptors.end()) {
+                diagnostics.push_back(make_diagnostic(
+                    "PY-SCHEMA-DUPLICATE", "generated model schema '" + descriptor.id.value + "' already exists"));
+                continue;
+            }
+            merged_schemas.descriptors.push_back(std::move(descriptor));
+        }
+        if (!diagnostics.empty()) {
+            sort_diagnostics(diagnostics);
+            return std::unexpected(std::move(diagnostics));
+        }
+        merged_schemas = normalize_schemas(std::move(merged_schemas));
+        std::string schema_identity = merged_schemas.canonical_hash;
+        for (const auto &descriptor : merged_schemas.descriptors) {
+            schema_identity += '|';
+            schema_identity += descriptor.id.value;
+            schema_identity += '|';
+            schema_identity += descriptor.canonical_hash;
+        }
+        merged_schemas.canonical_hash = stable_digest(schema_identity);
 
         CompiledPack compiled {
             .pack = pack.manifest.pack,
@@ -1348,7 +2277,7 @@ namespace rule_engine::python::compiler {
             .source_digest = pack.closure_digest,
             .compiler_abi = "python-3.14.6/static-compiler-v1",
             .semantic_hash = {},
-            .schemas = normalize_schemas(schemas),
+            .schemas = std::move(merged_schemas),
             .constants = {},
             .functions = {},
             .bindings = normalize_bindings(bindings),
@@ -1356,12 +2285,12 @@ namespace rule_engine::python::compiler {
         };
         std::vector<FactRequirement> requirements;
         for (const auto &function : functions) {
-            Lowerer lowerer {index, function, compiled, requirements, diagnostics};
+            Lowerer lowerer {index, function, functions, compiled, requirements, diagnostics};
             auto bytecode = lowerer.lower();
             std::vector<std::string> logical_facts;
             for (const auto &requirement : requirements) {
                 if (requirement.executable == function.executable) {
-                    logical_facts.push_back(requirement.route);
+                    logical_facts.push_back(route_name(requirement.route));
                 }
             }
             std::ranges::sort(logical_facts);
@@ -1385,6 +2314,40 @@ namespace rule_engine::python::compiler {
                 .pure_false_prefix_exits = {},
                 .semantic_hash = {},
             });
+        }
+        for (std::size_t iteration = 0; iteration < compiled.functions.size(); ++iteration) {
+            bool changed {};
+            for (std::size_t caller_index = 0; caller_index < compiled.functions.size(); ++caller_index) {
+                auto &caller = compiled.optimization_certificates[caller_index];
+                for (const auto &instruction : compiled.functions[caller_index].instructions) {
+                    if (instruction.opcode != Opcode::call || instruction.immediate >= compiled.functions.size()) {
+                        continue;
+                    }
+                    const auto callee = compiled.optimization_certificates[instruction.immediate];
+                    const auto before = std::make_tuple(
+                        caller.transitively_pure, caller.recorder_observable, caller.may_fault, caller.reads_state,
+                        caller.reads_history, caller.calls_services, caller.emits_effects, caller.logical_facts);
+                    caller.transitively_pure = caller.transitively_pure && callee.transitively_pure;
+                    caller.recorder_observable = caller.recorder_observable || callee.recorder_observable;
+                    caller.may_fault = caller.may_fault || callee.may_fault;
+                    caller.reads_state = caller.reads_state || callee.reads_state;
+                    caller.reads_history = caller.reads_history || callee.reads_history;
+                    caller.calls_services = caller.calls_services || callee.calls_services;
+                    caller.emits_effects = caller.emits_effects || callee.emits_effects;
+                    caller.logical_facts.insert(caller.logical_facts.end(), callee.logical_facts.begin(),
+                                                callee.logical_facts.end());
+                    std::ranges::sort(caller.logical_facts);
+                    caller.logical_facts.erase(std::ranges::unique(caller.logical_facts).begin(),
+                                               caller.logical_facts.end());
+                    const auto after = std::make_tuple(
+                        caller.transitively_pure, caller.recorder_observable, caller.may_fault, caller.reads_state,
+                        caller.reads_history, caller.calls_services, caller.emits_effects, caller.logical_facts);
+                    changed = changed || before != after;
+                }
+            }
+            if (!changed) {
+                break;
+            }
         }
         if (!diagnostics.empty()) {
             sort_diagnostics(diagnostics);
@@ -1465,7 +2428,9 @@ namespace rule_engine::python::compiler {
                         make_diagnostic("PYC-CONSTANT", "load_const index is out of range", instruction.span));
                 }
                 if ((instruction.opcode == Opcode::move || instruction.opcode == Opcode::unary_op ||
-                     instruction.opcode == Opcode::jump_if_false || instruction.opcode == Opcode::return_value) &&
+                     instruction.opcode == Opcode::jump_if_false || instruction.opcode == Opcode::return_value ||
+                     instruction.opcode == Opcode::raise_fault || instruction.opcode == Opcode::yield_value ||
+                     instruction.opcode == Opcode::await_fact) &&
                     !in_register_range(instruction.operand_a)) {
                     diagnostics.push_back(make_diagnostic("PYC-OPERAND", "bytecode operand_a register is out of range",
                                                           instruction.span));
@@ -1475,13 +2440,176 @@ namespace rule_engine::python::compiler {
                     diagnostics.push_back(
                         make_diagnostic("PYC-OPERAND", "bytecode operand register is out of range", instruction.span));
                 }
+                if (instruction.opcode == Opcode::unary_op &&
+                    instruction.immediate > static_cast<std::uint32_t>(UnaryCode::invert)) {
+                    diagnostics.push_back(
+                        make_diagnostic("PYC-OPERATOR", "unary operation selector is out of range", instruction.span));
+                }
+                if (instruction.opcode == Opcode::binary_op &&
+                    instruction.immediate > static_cast<std::uint32_t>(BinaryCode::bit_and)) {
+                    diagnostics.push_back(
+                        make_diagnostic("PYC-OPERATOR", "binary operation selector is out of range", instruction.span));
+                }
+                if (instruction.opcode == Opcode::compare &&
+                    instruction.immediate > static_cast<std::uint32_t>(CompareCode::not_contains)) {
+                    diagnostics.push_back(make_diagnostic(
+                        "PYC-OPERATOR", "comparison operation selector is out of range", instruction.span));
+                }
+                if (instruction.opcode == Opcode::call) {
+                    if (instruction.immediate >= artifact.pack.functions.size() ||
+                        instruction.operand_a > function.register_count ||
+                        instruction.operand_b > function.register_count - instruction.operand_a) {
+                        diagnostics.push_back(
+                            make_diagnostic("PYC-CALL", "static call operand is out of range", instruction.span));
+                    } else if (instruction.operand_b !=
+                               artifact.pack.functions[instruction.immediate].parameter_count) {
+                        diagnostics.push_back(
+                            make_diagnostic("PYC-CALL", "static call argument count is invalid", instruction.span));
+                    }
+                }
+                if (instruction.opcode == Opcode::yield_value && !function.generator && !function.async) {
+                    diagnostics.push_back(make_diagnostic(
+                        "PYC-YIELD", "yield opcode is outside a generator or async function", instruction.span));
+                }
+                if (instruction.opcode == Opcode::await_fact) {
+                    if (instruction.immediate >= artifact.pack.constants.size()) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PYC-FACT-OPERAND", "await_fact constant index is out of range", instruction.span));
+                        continue;
+                    }
+                    const auto operand = decode_vm_fact_operand(artifact.pack.constants[instruction.immediate]);
+                    if (!operand) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PYC-FACT-OPERAND", "await_fact does not reference a canonical fact operand record",
+                            instruction.span));
+                        continue;
+                    }
+                    const auto requirement =
+                        std::ranges::find_if(artifact.fact_requirements, [&](const FactRequirement &candidate) {
+                            return candidate.executable == function.id &&
+                                   candidate.operand_constant == instruction.immediate;
+                        });
+                    if (requirement == artifact.fact_requirements.end() ||
+                        requirement->route.provider != operand->route.provider ||
+                        requirement->route.fact != operand->route.fact ||
+                        requirement->expected_schema != operand->expected_schema) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PYC-FACT-OPERAND", "await_fact operand does not match its compiler requirement",
+                            instruction.span));
+                    }
+                }
+            }
+
+            using RegisterState = std::vector<bool>;
+            std::vector<std::optional<RegisterState>> states(function.instructions.size());
+            std::deque<std::size_t> worklist;
+            if (!function.instructions.empty()) {
+                RegisterState entry(function.register_count, false);
+                for (std::uint32_t parameter = 0U; parameter < function.parameter_count; ++parameter) {
+                    entry[parameter] = true;
+                }
+                states.front() = std::move(entry);
+                worklist.push_back(0U);
+            }
+            const auto merge_state = [&](const std::size_t successor, const RegisterState &candidate) {
+                if (successor >= states.size()) {
+                    return;
+                }
+                if (!states[successor]) {
+                    states[successor] = candidate;
+                    worklist.push_back(successor);
+                    return;
+                }
+                auto merged = *states[successor];
+                for (std::size_t reg = 0; reg < merged.size(); ++reg) { merged[reg] = merged[reg] && candidate[reg]; }
+                if (merged != *states[successor]) {
+                    states[successor] = std::move(merged);
+                    worklist.push_back(successor);
+                }
+            };
+            while (!worklist.empty()) {
+                const auto pc = worklist.front();
+                worklist.pop_front();
+                const auto &instruction = function.instructions[pc];
+                auto normal = *states[pc];
+                switch (instruction.opcode) {
+                    case Opcode::load_const:
+                    case Opcode::move:
+                    case Opcode::unary_op:
+                    case Opcode::binary_op:
+                    case Opcode::compare:
+                    case Opcode::call:
+                    case Opcode::await_fact:
+                    case Opcode::await_capability:
+                    case Opcode::read_state:
+                        if (instruction.destination < normal.size()) {
+                            normal[instruction.destination] = true;
+                        }
+                        break;
+                    default: break;
+                }
+                if (instruction.opcode == Opcode::jump) {
+                    merge_state(instruction.immediate, normal);
+                } else if (instruction.opcode == Opcode::jump_if_false) {
+                    merge_state(instruction.immediate, normal);
+                    merge_state(pc + 1U, normal);
+                } else if (instruction.opcode != Opcode::return_value && instruction.opcode != Opcode::raise_fault) {
+                    merge_state(pc + 1U, normal);
+                }
+                for (const auto &region : function.exception_regions) {
+                    if (pc < region.begin_instruction || pc >= region.end_instruction) {
+                        continue;
+                    }
+                    auto exceptional = *states[pc];
+                    if (instruction.destination < exceptional.size()) {
+                        exceptional[instruction.destination] = true;
+                    }
+                    merge_state(region.handler_instruction, exceptional);
+                }
+            }
+            for (std::size_t pc = 0; pc < states.size(); ++pc) {
+                if (!states[pc]) {
+                    continue;
+                }
+                const auto &instruction = function.instructions[pc];
+                const auto require_initialized = [&](const std::uint32_t reg) {
+                    if (reg < states[pc]->size() && !(*states[pc])[reg]) {
+                        diagnostics.push_back(make_diagnostic("PYC-UNINITIALIZED",
+                                                              "bytecode reads register " + std::to_string(reg) +
+                                                                  " before initialization on every path",
+                                                              instruction.span));
+                    }
+                };
+                switch (instruction.opcode) {
+                    case Opcode::move:
+                    case Opcode::unary_op:
+                    case Opcode::jump_if_false:
+                    case Opcode::return_value:
+                    case Opcode::raise_fault:
+                    case Opcode::yield_value:
+                    case Opcode::await_fact:
+                    case Opcode::await_capability:
+                    case Opcode::append_effect: require_initialized(instruction.operand_a); break;
+                    case Opcode::binary_op:
+                    case Opcode::compare:
+                        require_initialized(instruction.operand_a);
+                        require_initialized(instruction.operand_b);
+                        break;
+                    case Opcode::call:
+                        for (std::uint32_t argument = 0U; argument < instruction.operand_b; ++argument) {
+                            require_initialized(instruction.operand_a + argument);
+                        }
+                        break;
+                    default: break;
+                }
             }
         }
         for (const auto &requirement : artifact.fact_requirements) {
             const auto certificate = std::ranges::find(artifact.pack.optimization_certificates, requirement.executable,
                                                        &OptimizationCertificate::executable);
             if (certificate == artifact.pack.optimization_certificates.end() ||
-                std::ranges::find(certificate->logical_facts, requirement.route) == certificate->logical_facts.end()) {
+                std::ranges::find(certificate->logical_facts, route_name(requirement.route)) ==
+                    certificate->logical_facts.end()) {
                 diagnostics.push_back(make_diagnostic("PYC-FACT-CERTIFICATE",
                                                       "fact requirement is absent from its optimizer certificate",
                                                       requirement.span));
