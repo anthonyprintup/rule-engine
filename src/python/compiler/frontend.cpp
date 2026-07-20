@@ -2605,6 +2605,7 @@ namespace rule_engine::python::compiler {
                     case Opcode::begin_transaction:
                     case Opcode::commit_transaction:
                     case Opcode::rollback_transaction: break;
+                    default: std::unreachable();
                 }
                 if (instruction.opcode == Opcode::jump) {
                     merge_state(instruction.immediate, normal);
@@ -2667,6 +2668,7 @@ namespace rule_engine::python::compiler {
                     case Opcode::begin_transaction:
                     case Opcode::commit_transaction:
                     case Opcode::rollback_transaction: break;
+                    default: std::unreachable();
                 }
             }
         }
