@@ -188,7 +188,17 @@ namespace rule_engine::python::cluster {
         }
         std::vector<WorkSnapshot *> candidates;
         candidates.reserve(domain_heads.size());
-        for (const auto &[_, item] : domain_heads) { candidates.push_back(item); }
+        for (const auto &[_, item] : domain_heads) {
+            const auto receipt = store_.load_receipt(item->work.event);
+            if (!receipt) {
+                return std::unexpected(receipt.error());
+            }
+            if (*receipt) {
+                item->phase = WorkPhase::completed;
+                continue;
+            }
+            candidates.push_back(item);
+        }
         std::ranges::sort(candidates, [](const WorkSnapshot *left, const WorkSnapshot *right) {
             if (left->work.priority != right->work.priority) {
                 return left->work.priority > right->work.priority;
@@ -207,8 +217,8 @@ namespace rule_engine::python::cluster {
                 continue;
             }
 
-            const auto lease = leases_.claim(LeaseResource {.scope = "work", .key = item->work.serial_domain}, node_id,
-                                             now_unix_ms, lease_duration_ms);
+            const auto lease = store_.claim_lease(LeaseResource {.scope = "work", .key = item->work.serial_domain},
+                                                  node_id, now_unix_ms, lease_duration_ms);
             if (!lease) {
                 if (lease.error().code == StoreErrorCode::conflict) {
                     continue;
@@ -216,7 +226,7 @@ namespace rule_engine::python::cluster {
                 return std::unexpected(lease.error());
             }
             if (auto installed = store_.install_consumer_fence(item->work.serial_domain, lease->fence); !installed) {
-                static_cast<void>(leases_.release(*lease, now_unix_ms));
+                static_cast<void>(store_.release_lease(*lease, now_unix_ms));
                 return std::unexpected(installed.error());
             }
 
@@ -244,15 +254,20 @@ namespace rule_engine::python::cluster {
         if (current == work_.end() || current->second.phase != WorkPhase::leased ||
             !definition_matches(current->second.work, lease.work) || current->second.node_id != lease.node_id ||
             current->second.attempt != lease.attempt || current->second.fence != lease.fence ||
-            current->second.lease_until_unix_ms < now_unix_ms ||
-            !leases_.is_current(
-                FencedLease {
-                    .resource = {.scope = "work", .key = lease.work.serial_domain},
-                    .owner = lease.node_id,
-                    .fence = lease.fence,
-                    .lease_until_unix_ms = lease.lease_until_unix_ms,
-                },
-                now_unix_ms)) {
+            current->second.lease_until_unix_ms < now_unix_ms) {
+            return std::unexpected(coordinator_error(StoreErrorCode::stale_fence, "work completion is stale"));
+        }
+        const FencedLease domain_lease {
+            .resource = {.scope = "work", .key = lease.work.serial_domain},
+            .owner = lease.node_id,
+            .fence = lease.fence,
+            .lease_until_unix_ms = lease.lease_until_unix_ms,
+        };
+        const auto current_lease = store_.lease_is_current(domain_lease, now_unix_ms);
+        if (!current_lease) {
+            return std::unexpected(current_lease.error());
+        }
+        if (!*current_lease) {
             return std::unexpected(coordinator_error(StoreErrorCode::stale_fence, "work completion is stale"));
         }
         if (transaction.input.id != lease.work.event) {
@@ -268,13 +283,7 @@ namespace rule_engine::python::cluster {
         }
 
         current->second.phase = WorkPhase::completed;
-        const FencedLease domain_lease {
-            .resource = {.scope = "work", .key = lease.work.serial_domain},
-            .owner = lease.node_id,
-            .fence = lease.fence,
-            .lease_until_unix_ms = lease.lease_until_unix_ms,
-        };
-        static_cast<void>(leases_.release(domain_lease, now_unix_ms));
+        static_cast<void>(store_.release_lease(domain_lease, now_unix_ms));
         lock.unlock();
         static_cast<void>(audit_.append(now_unix_ms, lease.node_id, "work.commit", lease.work.work_id, "committed",
                                         lease.work.serial_domain));
@@ -296,7 +305,7 @@ namespace rule_engine::python::cluster {
             .fence = lease.fence,
             .lease_until_unix_ms = lease.lease_until_unix_ms,
         };
-        if (auto released = leases_.release(domain_lease, now_unix_ms); !released) {
+        if (auto released = store_.release_lease(domain_lease, now_unix_ms); !released) {
             return std::unexpected(released.error());
         }
         current->second.phase = WorkPhase::ready;
@@ -308,8 +317,9 @@ namespace rule_engine::python::cluster {
         return {};
     }
 
-    std::optional<TransactionReceipt> DeterministicWorkCoordinator::recover_receipt(const EventId &input) const {
-        return store_.lookup_receipt(input);
+    std::expected<std::optional<TransactionReceipt>, StoreError>
+    DeterministicWorkCoordinator::recover_receipt(const EventId &input) const {
+        return store_.load_receipt(input);
     }
 
     std::vector<WorkSnapshot> DeterministicWorkCoordinator::snapshot() const {

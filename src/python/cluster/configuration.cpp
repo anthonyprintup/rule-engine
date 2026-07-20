@@ -38,7 +38,11 @@ namespace rule_engine::python::cluster {
 
             return StoreBackendCapabilities {
                 .kind = StoreBackendKind::postgresql17,
+#if defined(RULE_ENGINE_HAS_POSTGRESQL)
+                .implementation_available = true,
+#else
                 .implementation_available = false,
+#endif
                 .production_allowed = true,
                 .active_active = true,
                 .multi_process = true,
@@ -46,8 +50,12 @@ namespace rule_engine::python::cluster {
                 .row_fences = true,
                 .outbox_leases = true,
                 .database_time_leases = true,
-                .required_driver = "libpq/PostgreSQL 17+ adapter (not linked in this lane)",
-                .limitation = "This is a validated production capability contract, not an implemented SQL driver.",
+                .required_driver = "libpq/PostgreSQL 17+",
+#if defined(RULE_ENGINE_HAS_POSTGRESQL)
+                .limitation = "Driver is compiled; readiness still requires PostgreSQL 17 connectivity and migrations.",
+#else
+                .limitation = "libpq was not discovered; production readiness is impossible in this build.",
+#endif
             };
         }
 
@@ -68,17 +76,22 @@ namespace rule_engine::python::cluster {
 
             return StoreBackendCapabilities {
                 .kind = StoreBackendKind::sqlite_dev,
+#if defined(RULE_ENGINE_HAS_SQLITE)
+                .implementation_available = true,
+#else
                 .implementation_available = false,
+#endif
                 .production_allowed = false,
                 .active_active = false,
                 .multi_process = false,
                 .atomic_event_transaction = true,
                 .row_fences = true,
                 .outbox_leases = true,
-                .database_time_leases = true,
-                .required_driver = "SQLite development adapter (not linked in this lane)",
+                .database_time_leases = false,
+                .required_driver = "SQLite3 or Windows SDK winsqlite3",
                 .limitation =
-                    "The future adapter must pass the semantic conformance suite but cannot qualify clustering.",
+                    "Implemented for one development process with a deterministic caller clock; it cannot qualify "
+                    "clustering or database-time leases.",
             };
         }
 

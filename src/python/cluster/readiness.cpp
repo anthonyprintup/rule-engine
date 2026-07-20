@@ -26,4 +26,17 @@ namespace rule_engine::python::cluster {
         return result;
     }
 
+    ReadinessSnapshot evaluate_readiness(const ReadinessInput &input, const RuntimeStoreHealth &store_health) {
+        auto selected = input;
+        selected.database_reachable = store_health.connected;
+        selected.backend_driver_ready = store_health.driver_available;
+        selected.migrations_compatible = store_health.migrations_compatible;
+        auto result = evaluate_readiness(selected);
+        if (store_health.backend != input.backend.kind) {
+            result.blockers.push_back("runtime-store health does not match the selected backend");
+            result.ready = false;
+        }
+        return result;
+    }
+
 } // namespace rule_engine::python::cluster

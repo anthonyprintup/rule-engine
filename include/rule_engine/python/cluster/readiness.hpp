@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rule_engine/python/cluster/configuration.hpp"
+#include "rule_engine/python/cluster/store.hpp"
 
 #include <string>
 #include <vector>
@@ -28,5 +29,7 @@ namespace rule_engine::python::cluster {
     };
 
     [[nodiscard]] ReadinessSnapshot evaluate_readiness(const ReadinessInput &input);
+    [[nodiscard]] ReadinessSnapshot evaluate_readiness(const ReadinessInput &input,
+                                                       const RuntimeStoreHealth &store_health);
 
 } // namespace rule_engine::python::cluster

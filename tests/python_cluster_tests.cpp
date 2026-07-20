@@ -3,9 +3,20 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <functional>
+#include <memory>
 #include <string>
+#include <system_error>
 #include <vector>
+
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -13,6 +24,55 @@ namespace {
     using namespace rule_engine::python::cluster;
 
     constexpr std::uint64_t minute_ms = 60'000;
+
+    std::uint64_t current_process_id() {
+#if defined(_WIN32)
+        return static_cast<std::uint64_t>(_getpid());
+#else
+        return static_cast<std::uint64_t>(getpid());
+#endif
+    }
+
+    struct TemporaryDatabase {
+        std::filesystem::path path;
+
+        TemporaryDatabase() {
+            static std::atomic_uint64_t sequence {};
+            std::error_code error;
+            auto directory = std::filesystem::temp_directory_path(error);
+            if (error) {
+                directory = std::filesystem::current_path(error);
+            }
+            path = directory / ("rule-engine-python-cluster-" + std::to_string(current_process_id()) + "-" +
+                                std::to_string(++sequence) + ".sqlite3");
+        }
+
+        ~TemporaryDatabase() {
+            std::error_code error;
+            std::filesystem::remove(path, error);
+            std::filesystem::remove(path.string() + "-wal", error);
+            std::filesystem::remove(path.string() + "-shm", error);
+        }
+
+        TemporaryDatabase(const TemporaryDatabase &) = delete;
+        TemporaryDatabase &operator=(const TemporaryDatabase &) = delete;
+    };
+
+    std::expected<std::unique_ptr<SqliteRuntimeStore>, StoreError> open_sqlite(const TemporaryDatabase &database,
+                                                                               AuditTrail &audit) {
+        return SqliteRuntimeStore::open(
+            SqliteDevConfig {
+                .database_path = database.path.string(),
+                .server_processes = 1,
+                .busy_timeout = std::chrono::seconds {2},
+                .wal = true,
+                .foreign_keys = true,
+                .remote_cluster = false,
+                .high_availability = false,
+                .deployment_mode = DeploymentMode::single_node_dev,
+            },
+            audit);
+    }
 
     FrozenValue frozen(const std::string &digest, const std::string &text = "value") {
         return FrozenValue {
@@ -183,6 +243,74 @@ namespace {
         REQUIRE(finalized->phase == GenerationPhase::ready);
     }
 
+    void verify_runtime_store_contract(IClusterRuntimeStore &store) {
+        REQUIRE(store.health().driver_available);
+        REQUIRE(store.health().connected);
+        REQUIRE(store.health().migrations_compatible);
+        REQUIRE(store.install_consumer_fence("contract:peer", 7).has_value());
+
+        const auto proposed = transaction("contract-event", "contract:peer", 0, 7, 0, true, true);
+        const auto receipt = store.transact_event(proposed);
+        REQUIRE(receipt.has_value());
+        REQUIRE(receipt->committed_cursor == 1);
+        REQUIRE(store.transact_event(proposed)->committed_cursor == 1);
+
+        const auto state = store.load_state(
+            StoredStateKey {.owner = ExecutableId {"executable-1"}, .namespace_name = "pack-state", .key = "counter"});
+        REQUIRE(state.has_value());
+        REQUIRE(state->has_value());
+        REQUIRE((*state)->version == 1);
+        REQUIRE((*state)->value->canonical_digest == "sha256:state-contract-event");
+
+        const auto history = store.read_history(HistoryQuery {
+            .tenant = TenantId {"tenant-a"},
+            .peer = PeerId {"peer-a"},
+            .schema = SchemaId {"event/process/v1"},
+            .begin_ingest_unix_ms = 0,
+            .end_ingest_unix_ms = 10,
+            .limit = 10,
+        });
+        REQUIRE(history.has_value());
+        REQUIRE(history->size() == 2);
+        REQUIRE(history->front().id == EventId {"contract-event"});
+
+        const auto snapshot = store.inspect();
+        REQUIRE(snapshot.has_value());
+        REQUIRE(snapshot->events.size() == 2);
+        REQUIRE(snapshot->state.size() == 1);
+        REQUIRE(snapshot->journal.size() == 1);
+        REQUIRE(snapshot->outbox.size() == 1);
+        REQUIRE(snapshot->receipts.size() == 1);
+
+        const auto conflict = store.transact_event(transaction("contract-conflict", "contract:peer", 1, 7, 0, true));
+        REQUIRE_FALSE(conflict.has_value());
+        REQUIRE(conflict.error().code == StoreErrorCode::conflict);
+        const auto after_conflict = store.inspect();
+        REQUIRE(after_conflict.has_value());
+        REQUIRE(after_conflict->events.size() == snapshot->events.size());
+        REQUIRE(after_conflict->journal.size() == snapshot->journal.size());
+        REQUIRE(after_conflict->outbox.size() == snapshot->outbox.size());
+
+        const auto first = store.claim_outbox("contract-worker-a", 100, 10, 1);
+        REQUIRE(first.has_value());
+        REQUIRE(first->size() == 1);
+        REQUIRE(store.claim_outbox("contract-worker-b", 110, 10, 1)->empty());
+        const auto takeover = store.claim_outbox("contract-worker-b", 111, 10, 1);
+        REQUIRE(takeover->size() == 1);
+        REQUIRE(takeover->front().fence > first->front().fence);
+        REQUIRE(store
+                    .settle_outbox(OutboxSettlement {
+                        .intent = takeover->front().record.intent,
+                        .owner = takeover->front().owner,
+                        .fence = takeover->front().fence,
+                        .now_unix_ms = 111,
+                        .kind = OutboxSettlementKind::delivered,
+                        .retry_not_before_unix_ms = 0,
+                        .detail = "contract delivered",
+                    })
+                    .has_value());
+    }
+
     TEST_CASE("backend contracts distinguish production intent from implemented adapters") {
         const auto postgres = validate_store_backend(PostgreSql17Config {
             .connection_reference = "secret://runtime/postgres",
@@ -198,7 +326,18 @@ namespace {
         REQUIRE(postgres->kind == StoreBackendKind::postgresql17);
         REQUIRE(postgres->production_allowed);
         REQUIRE(postgres->active_active);
+        REQUIRE(postgres->database_time_leases);
+#if defined(RULE_ENGINE_HAS_POSTGRESQL)
+        REQUIRE(postgres->implementation_available);
+#else
         REQUIRE_FALSE(postgres->implementation_available);
+#endif
+
+        const auto sqlite = validate_store_backend(SqliteDevConfig {.database_path = "dev.db"});
+        REQUIRE(sqlite.has_value());
+        REQUIRE(sqlite->implementation_available);
+        REQUIRE_FALSE(sqlite->production_allowed);
+        REQUIRE_FALSE(sqlite->database_time_leases);
 
         const auto clustered_sqlite = validate_store_backend(SqliteDevConfig {
             .database_path = "dev.db",
@@ -211,6 +350,100 @@ namespace {
         REQUIRE(reference.has_value());
         REQUIRE(reference->implementation_available);
         REQUIRE_FALSE(reference->production_allowed);
+    }
+
+    TEST_CASE("runtime store contract is parameterized across reference and SQLite adapters") {
+        SECTION("in-memory reference") {
+            AuditTrail audit;
+            InMemoryRuntimeStore store {audit};
+            verify_runtime_store_contract(store);
+        }
+        SECTION("SQLite durable adapter") {
+            TemporaryDatabase database;
+            AuditTrail audit;
+            const auto store = open_sqlite(database, audit);
+            REQUIRE(store.has_value());
+            verify_runtime_store_contract(**store);
+        }
+    }
+
+    TEST_CASE("SQLite reopens committed receipts state history outbox and migrations") {
+        TemporaryDatabase database;
+        AuditTrail first_audit;
+        {
+            const auto store = open_sqlite(database, first_audit);
+            REQUIRE(store.has_value());
+            REQUIRE((*store)->install_consumer_fence("durable:peer", 3).has_value());
+            REQUIRE((*store)
+                        ->transact_event(transaction("durable-event", "durable:peer", 0, 3, 0, true, true))
+                        .has_value());
+            REQUIRE((*store)->health().schema_version == runtime_store_schema_version);
+        }
+
+        AuditTrail reopened_audit;
+        const auto reopened = open_sqlite(database, reopened_audit);
+        REQUIRE(reopened.has_value());
+        const auto receipt = (*reopened)->load_receipt(EventId {"durable-event"});
+        REQUIRE(receipt.has_value());
+        REQUIRE(receipt->has_value());
+        REQUIRE((*receipt)->committed_cursor == 1);
+        const auto state = (*reopened)->load_state(
+            StoredStateKey {.owner = ExecutableId {"executable-1"}, .namespace_name = "pack-state", .key = "counter"});
+        REQUIRE(state.has_value());
+        REQUIRE(state->has_value());
+        REQUIRE((*state)->value->canonical_digest == "sha256:state-durable-event");
+        REQUIRE((*reopened)
+                    ->read_history(HistoryQuery {
+                        .tenant = TenantId {"tenant-a"},
+                        .peer = PeerId {"peer-a"},
+                        .schema = SchemaId {"event/process/v1"},
+                        .begin_ingest_unix_ms = 0,
+                        .end_ingest_unix_ms = 10,
+                        .limit = 10,
+                    })
+                    ->size() == 2);
+        REQUIRE((*reopened)->inspect()->outbox.size() == 1);
+    }
+
+    TEST_CASE("SQLite shared leases fence a crashed coordinator and recover its receipt") {
+        TemporaryDatabase database;
+        AuditTrail audit_a;
+        AuditTrail audit_b;
+        const auto store_a = open_sqlite(database, audit_a);
+        const auto store_b = open_sqlite(database, audit_b);
+        REQUIRE(store_a.has_value());
+        REQUIRE(store_b.has_value());
+        DeterministicWorkCoordinator node_a {**store_a, audit_a};
+        DeterministicWorkCoordinator node_b {**store_b, audit_b};
+        const WorkDefinition work {.work_id = "durable-work",
+                                   .pack = PackId {"pack-a"},
+                                   .generation = 1,
+                                   .serial_domain = "durable:domain",
+                                   .event = EventId {"durable-work-event"},
+                                   .priority = 1,
+                                   .ingest_position = 1};
+        REQUIRE(node_a.enqueue(work).value());
+        REQUIRE(node_b.enqueue(work).value());
+
+        const auto first = node_a.claim("node-a", 0, 10, 1);
+        REQUIRE(first->size() == 1);
+        REQUIRE(node_b.claim("node-b", 10, 10, 1)->empty());
+        const auto takeover = node_b.claim("node-b", 11, 10, 1);
+        REQUIRE(takeover->size() == 1);
+        REQUIRE(takeover->front().fence > first->front().fence);
+        const auto stale = node_a.commit(first->front(), transaction("durable-work-event", "ignored", 0, 0, 0), 11);
+        REQUIRE_FALSE(stale.has_value());
+        REQUIRE(stale.error().code == StoreErrorCode::stale_fence);
+        REQUIRE(
+            node_b.commit(takeover->front(), transaction("durable-work-event", "ignored", 0, 0, 0), 11).has_value());
+
+        AuditTrail audit_c;
+        const auto store_c = open_sqlite(database, audit_c);
+        REQUIRE(store_c.has_value());
+        DeterministicWorkCoordinator recovered {**store_c, audit_c};
+        REQUIRE(recovered.enqueue(work).value());
+        REQUIRE(recovered.claim("node-c", 12, 10, 1)->empty());
+        REQUIRE(recovered.snapshot().front().phase == WorkPhase::completed);
     }
 
     TEST_CASE("runtime store atomically commits event cursor state result journal and outbox") {
@@ -661,6 +894,43 @@ namespace {
         REQUIRE(records.size() == 2);
         REQUIRE(records.front().sequence == 1);
         REQUIRE(records.back().sequence == 2);
+
+        const auto postgres_backend = validate_store_backend(PostgreSql17Config {
+            .connection_reference = "secret://runtime/postgres",
+            .server_major = 17,
+            .server_processes = 2,
+            .pool_size = 16,
+            .statement_timeout = std::chrono::seconds {5},
+            .verify_tls_peer = true,
+            .external_ha_configured = true,
+            .deployment_mode = DeploymentMode::production_cluster,
+        });
+        REQUIRE(postgres_backend.has_value());
+        auto postgres_input = ready_input;
+        postgres_input.backend = *postgres_backend;
+        const RuntimeStoreHealth disconnected_postgres {
+            .backend = StoreBackendKind::postgresql17,
+            .driver_available = postgres_backend->implementation_available,
+            .connected = false,
+            .migrations_compatible = false,
+            .schema_version = 0,
+            .server_version = {},
+            .detail = "qualification database is absent",
+        };
+        const auto postgres_readiness = evaluate_readiness(postgres_input, disconnected_postgres);
+        REQUIRE_FALSE(postgres_readiness.ready);
+        REQUIRE(std::ranges::contains(postgres_readiness.blockers, "runtime store is unreachable"));
+        REQUIRE(std::ranges::contains(postgres_readiness.blockers, "store migrations are incompatible"));
+#if !defined(RULE_ENGINE_HAS_POSTGRESQL)
+        REQUIRE(std::ranges::contains(postgres_readiness.blockers, "selected runtime-store driver is not ready"));
+        const auto unavailable = PostgreSqlRuntimeStore::open(
+            PostgreSql17Config {
+                .connection_reference = "secret://runtime/postgres",
+            },
+            audit);
+        REQUIRE_FALSE(unavailable.has_value());
+        REQUIRE(unavailable.error().code == StoreErrorCode::unavailable);
+#endif
     }
 
 } // namespace
