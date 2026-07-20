@@ -25,6 +25,7 @@ namespace rule_engine::python::protocol_v2 {
         std::size_t maximum_identity_fields {64};
         std::size_t maximum_fact_requests {512};
         std::size_t maximum_scan_requests {128};
+        std::size_t maximum_scan_patterns {4'096};
         std::size_t maximum_scan_matches {100'000};
         std::size_t maximum_label_categories {64};
         std::size_t maximum_snapshot_items {100'000};

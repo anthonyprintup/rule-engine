@@ -75,7 +75,8 @@ namespace {
                               .maximum_matches = 16,
                               .context_bytes_before = 2,
                               .context_bytes_after = 2,
-                              .result_mode = ScanResultMode::exact_complete},
+                              .result_mode = ScanResultMode::exact_complete,
+                              .pattern_ids = {"pattern-1", "pattern-2"}},
             .deadline_unix_ms = 5'000,
         };
     }
@@ -144,7 +145,7 @@ namespace {
                              .subject_generation = 9},
                             {.offset = 32,
                              .length = 3,
-                             .pattern_id = "pattern-1",
+                             .pattern_id = "pattern-2",
                              .scan_space_id = "memory:allocation-2000",
                              .absolute_address = 0x2020,
                              .permission_snapshot = 5,
@@ -228,6 +229,8 @@ namespace {
         REQUIRE(lease.route == "windows.memory");
         REQUIRE(canonical_subject_key(lease.facts.front().subject) == canonical_subject_key(region_subject()));
         REQUIRE(lease.scans.front().plan.encoded_pattern == "48 8b ??");
+        REQUIRE(lease.scans.front().plan.pattern_ids ==
+                std::vector {std::string {"pattern-1"}, std::string {"pattern-2"}});
 
         const auto result_frame = encode_frame(envelope(work_result(), 1));
         REQUIRE(result_frame.has_value());
@@ -238,6 +241,7 @@ namespace {
         REQUIRE(result.scans.front().matches.size() == 2);
         REQUIRE(result.scans.front().mode == ScanResultMode::exact_complete);
         REQUIRE(result.scans.front().matches.front().pattern_id == "pattern-1");
+        REQUIRE(result.scans.front().matches.back().pattern_id == "pattern-2");
         REQUIRE(result.scans.front().matches.front().scan_space_id == "memory:allocation-2000");
         REQUIRE(result.scans.front().matches.front().absolute_address == 0x2008);
         REQUIRE(result.scans.front().matches.front().permission_snapshot == 5);
@@ -299,6 +303,45 @@ namespace {
         auto truncated_exact = work_result();
         truncated_exact.scans.front().truncated = true;
         REQUIRE_FALSE(encode_frame(envelope(truncated_exact, 1)).has_value());
+
+        auto missing_pattern_ids = work_lease();
+        missing_pattern_ids.scans.front().plan.pattern_ids.clear();
+        const auto missing_pattern_ids_result = encode_frame(envelope(missing_pattern_ids));
+        REQUIRE_FALSE(missing_pattern_ids_result.has_value());
+        REQUIRE(missing_pattern_ids_result.error().code == ProtocolErrorCode::malformed);
+
+        auto empty_pattern_id = work_lease();
+        empty_pattern_id.scans.front().plan.pattern_ids = {""};
+        const auto empty_pattern_id_result = encode_frame(envelope(empty_pattern_id));
+        REQUIRE_FALSE(empty_pattern_id_result.has_value());
+        REQUIRE(empty_pattern_id_result.error().code == ProtocolErrorCode::malformed);
+
+        auto duplicate_pattern_ids = work_lease();
+        duplicate_pattern_ids.scans.front().plan.pattern_ids = {"pattern-1", "pattern-1"};
+        const auto duplicate_pattern_ids_result = encode_frame(envelope(duplicate_pattern_ids));
+        REQUIRE_FALSE(duplicate_pattern_ids_result.has_value());
+        REQUIRE(duplicate_pattern_ids_result.error().code == ProtocolErrorCode::duplicate_item);
+
+        ProtocolLimits one_pattern;
+        one_pattern.maximum_scan_patterns = 1;
+        const auto too_many_pattern_ids = encode_frame(envelope(work_lease()), one_pattern);
+        REQUIRE_FALSE(too_many_pattern_ids.has_value());
+        REQUIRE(too_many_pattern_ids.error().code == ProtocolErrorCode::limit_exceeded);
+
+        auto zero_length = work_result();
+        zero_length.scans.front().matches.front().length = 0;
+        zero_length.scans.front().matches.front().matched_bytes.clear();
+        const auto zero_length_frame = encode_frame(envelope(zero_length, 1));
+        REQUIRE(zero_length_frame.has_value());
+        const auto zero_length_round_trip = decode_frame(*zero_length_frame);
+        REQUIRE(zero_length_round_trip.has_value());
+        const auto &zero_length_result = std::get<WorkResultMessage>(zero_length_round_trip->envelope.body);
+        REQUIRE(zero_length_result.scans.front().matches.front().length == 0);
+        REQUIRE(zero_length_result.scans.front().matches.front().matched_bytes.empty());
+
+        auto inconsistent_match_length = work_result();
+        inconsistent_match_length.scans.front().matches.front().length = 2;
+        REQUIRE_FALSE(encode_frame(envelope(inconsistent_match_length, 1)).has_value());
     }
 
     TEST_CASE("transport authentication requires TLS 1.3 mutual identity and operator mapping") {
@@ -528,9 +571,12 @@ namespace {
     }
 
     struct FakeProvider final: IWindowsAgentProvider {
+        enum struct ScanBehavior : std::uint8_t { normal, unknown_pattern, zero_length, out_of_bounds };
+
         std::vector<FactRequest> facts;
         std::vector<ScanRequest> scans;
         std::vector<RequestId> canceled;
+        ScanBehavior scan_behavior {ScanBehavior::normal};
 
         [[nodiscard]] std::expected<std::vector<FactResponse>, ProviderDispatchError>
         resolve_facts(const std::span<const FactRequest> requests) noexcept override {
@@ -551,21 +597,43 @@ namespace {
             scans.assign(requests.begin(), requests.end());
             std::vector<ScanResponse> result;
             for (const auto &request : requests) {
+                std::vector<ScanMatch> matches;
+                matches.reserve(request.plan.pattern_ids.size());
+                for (std::size_t index = 0; index < request.plan.pattern_ids.size(); ++index) {
+                    matches.push_back(ScanMatch {
+                        .offset = 16 + index * 16,
+                        .length = 3,
+                        .pattern_id = request.plan.pattern_ids[index],
+                        .scan_space_id = request.space.identity,
+                        .absolute_address = request.space.begin + 16 + index * 16,
+                        .permission_snapshot = request.space.permissions,
+                        .matched_bytes = {std::byte {0x48}, std::byte {0x8b}, std::byte {0x30}},
+                        .before_bytes = {std::byte {0x90}},
+                        .after_bytes = {std::byte {0x90}},
+                        .label = request.space.label,
+                        .subject_generation = request.space.subject_generation,
+                    });
+                }
+                if (scan_behavior == ScanBehavior::unknown_pattern) {
+                    matches.front().pattern_id = "pattern-unknown";
+                } else if (scan_behavior == ScanBehavior::zero_length) {
+                    matches.front().offset = request.space.size;
+                    matches.front().length = 0;
+                    matches.front().absolute_address = request.space.begin + request.space.size;
+                    matches.front().matched_bytes.clear();
+                    matches.front().after_bytes.clear();
+                } else if (scan_behavior == ScanBehavior::out_of_bounds) {
+                    matches.front().offset = request.space.size;
+                    matches.front().length = 1;
+                    matches.front().absolute_address = request.space.begin + request.space.size;
+                    matches.front().matched_bytes = {std::byte {0x48}};
+                    matches.front().after_bytes.clear();
+                }
                 result.push_back(ScanResponse {
                     .request_id = request.request_id,
                     .subject = request.subject,
                     .status = FactTerminalStatus::value,
-                    .matches = {{.offset = 16,
-                                 .length = 3,
-                                 .pattern_id = request.plan.plan_id,
-                                 .scan_space_id = request.space.identity,
-                                 .absolute_address = request.space.begin + 16,
-                                 .permission_snapshot = request.space.permissions,
-                                 .matched_bytes = {std::byte {0x48}, std::byte {0x8b}, std::byte {0x30}},
-                                 .before_bytes = {std::byte {0x90}},
-                                 .after_bytes = {std::byte {0x90}},
-                                 .label = request.space.label,
-                                 .subject_generation = request.space.subject_generation}},
+                    .matches = std::move(matches),
                     .truncated = false,
                     .diagnostic = std::nullopt,
                     .mode = request.plan.result_mode,
@@ -590,8 +658,41 @@ namespace {
         REQUIRE(provider.facts.size() == 1);
         REQUIRE(provider.scans.size() == 1);
         REQUIRE(result->facts.front().request_id.value == "fact-1");
+        REQUIRE(result->scans.front().matches.size() == 2);
         REQUIRE(result->scans.front().matches.front().offset == 16);
+        REQUIRE(result->scans.front().matches.front().pattern_id == "pattern-1");
+        REQUIRE(result->scans.front().matches.back().pattern_id == "pattern-2");
         REQUIRE(result->work_id == "work-1");
+
+        auto missing_pattern_ids = work_lease();
+        missing_pattern_ids.scans.front().plan.pattern_ids.clear();
+        const auto missing_pattern_ids_result = router.dispatch(missing_pattern_ids);
+        REQUIRE_FALSE(missing_pattern_ids_result.has_value());
+        REQUIRE(missing_pattern_ids_result.error().code == ProviderDispatchErrorCode::invalid_request);
+
+        auto duplicate_pattern_ids = work_lease();
+        duplicate_pattern_ids.scans.front().plan.pattern_ids = {"pattern-1", "pattern-1"};
+        const auto duplicate_pattern_ids_result = router.dispatch(duplicate_pattern_ids);
+        REQUIRE_FALSE(duplicate_pattern_ids_result.has_value());
+        REQUIRE(duplicate_pattern_ids_result.error().code == ProviderDispatchErrorCode::invalid_request);
+
+        provider.scan_behavior = FakeProvider::ScanBehavior::unknown_pattern;
+        const auto unknown_pattern = router.dispatch(work_lease());
+        REQUIRE_FALSE(unknown_pattern.has_value());
+        REQUIRE(unknown_pattern.error().code == ProviderDispatchErrorCode::provider_violation);
+
+        provider.scan_behavior = FakeProvider::ScanBehavior::zero_length;
+        const auto zero_length = router.dispatch(work_lease());
+        REQUIRE(zero_length.has_value());
+        REQUIRE(zero_length->scans.front().matches.back().length == 0);
+        REQUIRE(zero_length->scans.front().matches.back().matched_bytes.empty());
+
+        provider.scan_behavior = FakeProvider::ScanBehavior::out_of_bounds;
+        const auto out_of_bounds = router.dispatch(work_lease());
+        REQUIRE_FALSE(out_of_bounds.has_value());
+        REQUIRE(out_of_bounds.error().code == ProviderDispatchErrorCode::provider_violation);
+
+        provider.scan_behavior = FakeProvider::ScanBehavior::normal;
 
         auto insufficient_context = work_lease();
         insufficient_context.scans.front().plan.context_bytes_before = 0;
