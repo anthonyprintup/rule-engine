@@ -43,6 +43,129 @@ namespace rule_engine::python::packaging {
             output.insert(output.end(), value.begin(), value.end());
         }
 
+        bool safe_json_atom(const std::string_view value) noexcept {
+            return !value.empty() && std::ranges::all_of(value, [](const char character) {
+                return character >= 0x21 && character <= 0x7e && character != '"' && character != '\\';
+            });
+        }
+
+        std::string base64_encode(const std::span<const std::byte> bytes) {
+            constexpr std::string_view alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::string output;
+            output.reserve((bytes.size() + 2U) / 3U * 4U);
+            for (std::size_t index = 0U; index < bytes.size(); index += 3U) {
+                const auto remaining = bytes.size() - index;
+                const auto first = std::to_integer<std::uint32_t>(bytes[index]);
+                const auto second = remaining > 1U ? std::to_integer<std::uint32_t>(bytes[index + 1U]) : 0U;
+                const auto third = remaining > 2U ? std::to_integer<std::uint32_t>(bytes[index + 2U]) : 0U;
+                const auto value = (first << 16U) | (second << 8U) | third;
+                output.push_back(alphabet[(value >> 18U) & 0x3fU]);
+                output.push_back(alphabet[(value >> 12U) & 0x3fU]);
+                output.push_back(remaining > 1U ? alphabet[(value >> 6U) & 0x3fU] : '=');
+                output.push_back(remaining > 2U ? alphabet[value & 0x3fU] : '=');
+            }
+            return output;
+        }
+
+        std::expected<std::vector<std::byte>, PackagingError> base64_decode(const std::string_view text) {
+            if (text.size() % 4U != 0U) {
+                return std::unexpected(generator_error(PackagingErrorCode::worker_frame_malformed,
+                                                       "generated binding base64 length is invalid"));
+            }
+            auto value_of = [](const char character) noexcept {
+                if (character >= 'A' && character <= 'Z') {
+                    return static_cast<int>(character - 'A');
+                }
+                if (character >= 'a' && character <= 'z') {
+                    return static_cast<int>(character - 'a' + 26);
+                }
+                if (character >= '0' && character <= '9') {
+                    return static_cast<int>(character - '0' + 52);
+                }
+                if (character == '+') {
+                    return 62;
+                }
+                if (character == '/') {
+                    return 63;
+                }
+                return -1;
+            };
+            std::vector<std::byte> bytes;
+            bytes.reserve(text.size() / 4U * 3U);
+            for (std::size_t index = 0U; index < text.size(); index += 4U) {
+                const bool third_padding = text[index + 2U] == '=';
+                const bool fourth_padding = text[index + 3U] == '=';
+                if ((third_padding && !fourth_padding) ||
+                    ((third_padding || fourth_padding) && index + 4U != text.size())) {
+                    return std::unexpected(generator_error(PackagingErrorCode::worker_frame_malformed,
+                                                           "generated binding base64 padding is invalid"));
+                }
+                const auto first = value_of(text[index]);
+                const auto second = value_of(text[index + 1U]);
+                const auto third = third_padding ? 0 : value_of(text[index + 2U]);
+                const auto fourth = fourth_padding ? 0 : value_of(text[index + 3U]);
+                if (first < 0 || second < 0 || third < 0 || fourth < 0) {
+                    return std::unexpected(generator_error(PackagingErrorCode::worker_frame_malformed,
+                                                           "generated binding base64 data is invalid"));
+                }
+                const auto value = (static_cast<std::uint32_t>(first) << 18U) |
+                                   (static_cast<std::uint32_t>(second) << 12U) |
+                                   (static_cast<std::uint32_t>(third) << 6U) | static_cast<std::uint32_t>(fourth);
+                bytes.push_back(static_cast<std::byte>((value >> 16U) & 0xffU));
+                if (!third_padding) {
+                    bytes.push_back(static_cast<std::byte>((value >> 8U) & 0xffU));
+                }
+                if (!fourth_padding) {
+                    bytes.push_back(static_cast<std::byte>(value & 0xffU));
+                }
+                if ((third_padding && (value & 0xffffU) != 0U) ||
+                    (fourth_padding && !third_padding && (value & 0xffU) != 0U)) {
+                    return std::unexpected(generator_error(PackagingErrorCode::worker_frame_malformed,
+                                                           "generated binding base64 padding bits are not zero"));
+                }
+            }
+            return bytes;
+        }
+
+        std::string_view input_format_name(const GeneratorInputFormat format) noexcept {
+            switch (format) {
+                case GeneratorInputFormat::json: return "json";
+                case GeneratorInputFormat::utf8: return "utf8";
+                case GeneratorInputFormat::bytes: return "bytes";
+                default: return {};
+            }
+        }
+
+        struct JsonCursor {
+            std::string_view text;
+            std::size_t offset {};
+
+            bool consume(const std::string_view expected) noexcept {
+                if (!text.substr(offset).starts_with(expected)) {
+                    return false;
+                }
+                offset += expected.size();
+                return true;
+            }
+
+            std::expected<std::string, PackagingError> quoted(const std::string_view field) {
+                const auto end = text.find('"', offset);
+                if (end == std::string_view::npos) {
+                    return std::unexpected(generator_error(PackagingErrorCode::worker_frame_malformed,
+                                                           "generated binding JSON string is truncated",
+                                                           std::string {field}));
+                }
+                const auto value = text.substr(offset, end - offset);
+                if (!safe_json_atom(value)) {
+                    return std::unexpected(generator_error(PackagingErrorCode::worker_frame_malformed,
+                                                           "generated binding JSON string is not canonical",
+                                                           std::string {field}));
+                }
+                offset = end;
+                return std::string {value};
+            }
+        };
+
     } // namespace
 
     std::expected<CanonicalGeneratorOutput, PackagingError>
@@ -157,6 +280,157 @@ namespace rule_engine::python::packaging {
                                                    "second generator run did not attest the requested hash seed"));
         }
         return compare_generator_runs(*first, *second, limits);
+    }
+
+    std::expected<std::vector<std::byte>, PackagingError>
+    encode_trusted_generator_worker_payload(const TrustedGeneratorWorkerPayload &payload, const WorkerLimits &limits) {
+        if (!safe_json_atom(payload.callable) || payload.module_source.size() > limits.maximum_payload_bytes) {
+            return std::unexpected(
+                generator_error(PackagingErrorCode::generator_limit, "generator callable or source bytes are invalid"));
+        }
+        auto inputs = payload.inputs;
+        auto templates = payload.templates;
+        std::ranges::sort(inputs, {}, &WorkerGeneratorInput::name);
+        std::ranges::sort(templates, {}, &WorkerGeneratorTemplate::factory);
+        std::size_t input_bytes {};
+        std::string previous;
+        for (const auto &input : inputs) {
+            if (!safe_json_atom(input.name) || input.name == previous || input_format_name(input.format).empty() ||
+                input.bytes.size() > limits.maximum_payload_bytes ||
+                input_bytes > limits.maximum_payload_bytes - input.bytes.size()) {
+                return std::unexpected(generator_error(PackagingErrorCode::generator_limit,
+                                                       "generator input identity or aggregate bytes are invalid",
+                                                       input.name));
+            }
+            previous = input.name;
+            input_bytes += input.bytes.size();
+        }
+        previous.clear();
+        for (const auto &item : templates) {
+            if (!safe_json_atom(item.factory) || !safe_json_atom(item.template_id.value) || item.factory == previous) {
+                return std::unexpected(generator_error(PackagingErrorCode::invalid_binding,
+                                                       "generator template descriptor is invalid", item.factory));
+            }
+            previous = item.factory;
+        }
+
+        std::string json = "{\"callable\":\"" + payload.callable + "\",\"inputs\":[";
+        for (std::size_t index = 0U; index < inputs.size(); ++index) {
+            if (index != 0U) {
+                json.push_back(',');
+            }
+            const auto &input = inputs[index];
+            json += "{\"data_b64\":\"" + base64_encode(input.bytes) + "\",\"format\":\"" +
+                    std::string {input_format_name(input.format)} + "\",\"name\":\"" + input.name + "\"}";
+        }
+        json += "],\"module_source_b64\":\"" + base64_encode(payload.module_source) + "\",\"templates\":[";
+        for (std::size_t index = 0U; index < templates.size(); ++index) {
+            if (index != 0U) {
+                json.push_back(',');
+            }
+            const auto &item = templates[index];
+            json += "{\"factory\":\"" + item.factory + "\",\"template_id\":\"" + item.template_id.value + "\"}";
+        }
+        json += "]}";
+        if (json.size() > limits.maximum_payload_bytes) {
+            return std::unexpected(generator_error(PackagingErrorCode::generator_limit,
+                                                   "canonical generator request exceeds the worker payload bound"));
+        }
+        return std::vector<std::byte> {reinterpret_cast<const std::byte *>(json.data()),
+                                       reinterpret_cast<const std::byte *>(json.data() + json.size())};
+    }
+
+    std::expected<std::vector<GeneratedBinding>, PackagingError>
+    decode_generated_bindings_worker_payload(const std::span<const std::byte> payload, const GeneratorLimits &limits) {
+        const std::string_view json {reinterpret_cast<const char *>(payload.data()), payload.size()};
+        JsonCursor cursor {.text = json};
+        if (!cursor.consume("{\"bindings\":[")) {
+            return std::unexpected(generator_error(PackagingErrorCode::worker_frame_malformed,
+                                                   "generated binding payload does not begin canonically"));
+        }
+        std::vector<GeneratedBinding> bindings;
+        if (!cursor.consume("]")) {
+            while (true) {
+                if (bindings.size() >= limits.maximum_bindings || !cursor.consume("{\"arguments_b64\":\"")) {
+                    return std::unexpected(generator_error(PackagingErrorCode::generator_limit,
+                                                           "generated binding payload count or shape is invalid"));
+                }
+                auto arguments_text = cursor.quoted("arguments_b64");
+                if (!arguments_text || !cursor.consume("\",\"id\":\"")) {
+                    return std::unexpected(arguments_text ? generator_error(PackagingErrorCode::worker_frame_malformed,
+                                                                            "generated binding ID field is missing") :
+                                                            arguments_text.error());
+                }
+                auto id = cursor.quoted("id");
+                if (!id || !cursor.consume("\",\"template_id\":\"")) {
+                    return std::unexpected(id ? generator_error(PackagingErrorCode::worker_frame_malformed,
+                                                                "generated binding template field is missing") :
+                                                id.error());
+                }
+                auto template_id = cursor.quoted("template_id");
+                if (!template_id || !cursor.consume("\"}")) {
+                    return std::unexpected(template_id ? generator_error(PackagingErrorCode::worker_frame_malformed,
+                                                                         "generated binding object is malformed") :
+                                                         template_id.error());
+                }
+                auto arguments = base64_decode(*arguments_text);
+                if (!arguments) {
+                    return std::unexpected(arguments.error());
+                }
+                bindings.push_back(GeneratedBinding {
+                    .id = BindingId {std::move(*id)},
+                    .template_id = ExecutableId {std::move(*template_id)},
+                    .canonical_arguments = std::move(*arguments),
+                });
+                if (cursor.consume("]")) {
+                    break;
+                }
+                if (!cursor.consume(",")) {
+                    return std::unexpected(generator_error(PackagingErrorCode::worker_frame_malformed,
+                                                           "generated binding list separator is malformed"));
+                }
+            }
+        }
+        if (!cursor.consume(",\"format\":1,\"schema\":\"rule-engine.bindings/1\"}") || cursor.offset != json.size()) {
+            return std::unexpected(generator_error(PackagingErrorCode::worker_frame_malformed,
+                                                   "generated binding payload trailer is invalid"));
+        }
+        auto canonical = canonicalize_generator_output(bindings, limits);
+        if (!canonical) {
+            return std::unexpected(canonical.error());
+        }
+        return std::move(canonical->bindings);
+    }
+
+    std::expected<GeneratorRun, PackagingError> PythonWorkerGeneratorExecutor::run(const std::uint32_t hash_seed) {
+        if (client == nullptr) {
+            return std::unexpected(
+                generator_error(PackagingErrorCode::worker_crashed, "generator executor has no worker client"));
+        }
+        WorkerRequest request {
+            .protocol = python_worker_protocol_v1,
+            .request_id = RequestId {request_id_prefix.value + "-" + std::to_string(hash_seed)},
+            .mode = WorkerMode::trusted_generator,
+            .runtime = client->runtime.descriptor,
+            .payload =
+                OpaqueWorkerPayload {
+                    .schema = std::string {generator_request_schema_v1},
+                    .source = source,
+                    .source_digest = SourceDigest {"sha256:" + sha256_hex(canonical_payload)},
+                    .bytes = canonical_payload,
+                },
+            .hash_seed = hash_seed,
+            .generator_execution_authorized = generator_execution_authorized,
+        };
+        auto response = client->invoke(request);
+        if (!response) {
+            return std::unexpected(response.error());
+        }
+        auto bindings = decode_generated_bindings_worker_payload(response->payload.bytes, limits);
+        if (!bindings) {
+            return std::unexpected(bindings.error());
+        }
+        return GeneratorRun {.hash_seed = hash_seed, .bindings = std::move(*bindings)};
     }
 
 } // namespace rule_engine::python::packaging
