@@ -1,5 +1,8 @@
 #include "rule_engine/python/protocol/provider_router.hpp"
 
+#include "rule_engine/python/protocol/snapshot.hpp"
+#include "rule_engine/python/protocol/spool.hpp"
+
 #include <algorithm>
 #include <limits>
 #include <string_view>
@@ -20,7 +23,9 @@ namespace rule_engine::python::protocol_v2 {
         }
 
         [[nodiscard]] bool scan_status_valid(const ScanResponse &response) {
-            if (response.truncated) {
+            if (response.truncated ||
+                (response.mode != ScanResultMode::exact_complete && response.mode != ScanResultMode::existential) ||
+                (response.mode == ScanResultMode::existential && response.matches.size() > 1)) {
                 return false;
             }
             if (response.status == FactTerminalStatus::value) {
@@ -83,8 +88,14 @@ namespace rule_engine::python::protocol_v2 {
         for (const auto &request : work.scans) {
             if (request.request_id.empty() || !request_ids.insert(request.request_id.value).second ||
                 !request.subject.valid() || request.subject.peer != work.peer || request.space.kind.empty() ||
-                request.plan.plan_id.empty() || request.plan.maximum_bytes > limits.maximum_blob_bytes ||
+                request.space.identity.empty() || request.space.subject_generation == 0 ||
+                request.plan.plan_id.empty() || request.plan.maximum_bytes == 0 ||
+                request.plan.maximum_bytes > limits.maximum_blob_bytes || request.plan.maximum_matches == 0 ||
                 request.plan.maximum_matches > limits.maximum_scan_matches ||
+                request.plan.context_bytes_before > limits.maximum_blob_bytes ||
+                request.plan.context_bytes_after > limits.maximum_blob_bytes ||
+                (request.plan.result_mode != ScanResultMode::exact_complete &&
+                 request.plan.result_mode != ScanResultMode::existential) ||
                 request.space.size > std::numeric_limits<std::uint64_t>::max() - request.space.begin) {
                 return std::unexpected(provider_error(ProviderDispatchErrorCode::invalid_request,
                                                       "scan request is outside its typed bounds"));
@@ -157,19 +168,37 @@ namespace rule_engine::python::protocol_v2 {
         for (const auto &request : work.scans) {
             auto found = scans_by_id.find(request.request_id.value);
             if (found == scans_by_id.end() || !same_subject(found->second.subject, request.subject) ||
+                found->second.mode != request.plan.result_mode ||
                 found->second.matches.size() > request.plan.maximum_matches) {
                 return std::unexpected(provider_error(ProviderDispatchErrorCode::provider_violation,
                                                       "scan result request, subject, or count does not match"));
             }
             for (const auto &match : found->second.matches) {
-                if (match.offset > request.space.size || match.length > request.space.size - match.offset) {
+                if (match.pattern_id != request.plan.plan_id || match.scan_space_id != request.space.identity ||
+                    match.permission_snapshot != request.space.permissions || match.label != request.space.label ||
+                    match.subject_generation != request.space.subject_generation || match.length == 0 ||
+                    match.offset > request.space.size || match.length > request.space.size - match.offset ||
+                    match.offset > std::numeric_limits<std::uint64_t>::max() - request.space.begin ||
+                    match.absolute_address != request.space.begin + match.offset ||
+                    match.matched_bytes.size() != match.length ||
+                    match.before_bytes.size() > request.plan.context_bytes_before ||
+                    match.after_bytes.size() > request.plan.context_bytes_after ||
+                    match.before_bytes.size() > match.offset ||
+                    match.after_bytes.size() > request.space.size - match.offset - match.length ||
+                    match.matched_bytes.size() > limits.maximum_blob_bytes ||
+                    match.before_bytes.size() > limits.maximum_blob_bytes - match.matched_bytes.size() ||
+                    match.after_bytes.size() >
+                        limits.maximum_blob_bytes - match.matched_bytes.size() - match.before_bytes.size()) {
                     return std::unexpected(provider_error(ProviderDispatchErrorCode::provider_violation,
-                                                          "scan result is outside the requested space"));
+                                                          "scan result metadata is outside the authenticated request"));
                 }
             }
             std::ranges::sort(found->second.matches, [](const ScanMatch &left, const ScanMatch &right) {
                 if (left.offset != right.offset) {
                     return left.offset < right.offset;
+                }
+                if (left.pattern_id != right.pattern_id) {
+                    return left.pattern_id < right.pattern_id;
                 }
                 return left.length < right.length;
             });
@@ -192,6 +221,134 @@ namespace rule_engine::python::protocol_v2 {
         }
         provider->cancel(message.requests);
         return {};
+    }
+
+    WindowsProviderSpoolAdapter::WindowsProviderSpoolAdapter(const WindowsAgentProviderRouter &router,
+                                                             SqliteAgentSpool &spool) noexcept:
+        router_ {&router}, spool_ {&spool} {}
+
+    std::expected<std::uint64_t, ProviderDispatchError>
+    WindowsProviderSpoolAdapter::dispatch_and_spool(const WorkLeaseMessage &work, const ProtocolLimits &limits) const {
+        if (router_ == nullptr || spool_ == nullptr) {
+            return std::unexpected(
+                provider_error(ProviderDispatchErrorCode::provider_failure, "provider spool adapter is not bound"));
+        }
+        auto result = router_->dispatch(work, limits);
+        if (!result) {
+            return std::unexpected(std::move(result.error()));
+        }
+        auto sequence = spool_->enqueue(DurableAgentBody {std::move(*result)});
+        if (!sequence) {
+            return std::unexpected(provider_error(sequence.error().code == ProtocolErrorCode::backpressured ?
+                                                      ProviderDispatchErrorCode::provider_failure :
+                                                      ProviderDispatchErrorCode::provider_violation,
+                                                  "typed provider result could not enter the durable spool"));
+        }
+        return *sequence;
+    }
+
+    std::expected<SpoolPublication, ProviderDispatchError>
+    WindowsProviderSpoolAdapter::enumerate_and_spool(const SnapshotEnumerationRequest &request,
+                                                     IWindowsSubjectEnumerator &enumerator,
+                                                     const ProtocolLimits &limits) const {
+        if (spool_ == nullptr || request.session.empty() || request.peer.empty() || request.session_fence == 0 ||
+            request.snapshot_id.empty() || request.subject_schema.empty() || request.generation == 0 ||
+            request.chunk_items == 0 || request.chunk_items > limits.maximum_snapshot_items) {
+            return std::unexpected(
+                provider_error(ProviderDispatchErrorCode::invalid_request, "snapshot enumeration request is invalid"));
+        }
+        auto subjects = enumerator.enumerate(request);
+        if (!subjects) {
+            return std::unexpected(std::move(subjects.error()));
+        }
+        if (subjects->size() > limits.maximum_snapshot_items) {
+            return std::unexpected(provider_error(ProviderDispatchErrorCode::provider_violation,
+                                                  "snapshot enumeration exceeds the item limit"));
+        }
+
+        std::vector<std::pair<std::string, SubjectKey>> canonical;
+        canonical.reserve(subjects->size());
+        std::unordered_set<std::string> identities;
+        std::size_t canonical_bytes {};
+        const auto expected_parent =
+            request.parent.has_value() ? canonical_subject_key(*request.parent) : std::string {};
+        for (auto &subject : *subjects) {
+            const auto identity = canonical_subject_key(subject);
+            const auto parent = subject.parent == nullptr ? std::string {} : canonical_subject_key(*subject.parent);
+            if (identity.empty() || subject.peer != request.peer || subject.descriptor != request.subject_schema ||
+                parent != expected_parent || !identities.insert(identity).second ||
+                identity.size() > limits.maximum_snapshot_bytes - canonical_bytes) {
+                return std::unexpected(provider_error(ProviderDispatchErrorCode::provider_violation,
+                                                      "snapshot enumerator returned invalid or duplicate subjects"));
+            }
+            canonical_bytes += identity.size();
+            canonical.emplace_back(identity, std::move(subject));
+        }
+        std::ranges::sort(canonical, {}, &std::pair<std::string, SubjectKey>::first);
+        subjects->clear();
+        subjects->reserve(canonical.size());
+        for (auto &item : canonical) { subjects->push_back(std::move(item.second)); }
+        auto digest = authoritative_snapshot_digest(*subjects, limits);
+        if (!digest) {
+            return std::unexpected(provider_error(ProviderDispatchErrorCode::provider_violation,
+                                                  "snapshot enumeration cannot be canonicalized"));
+        }
+
+        SpoolPublication publication;
+        const auto append = [this, &publication](DurableAgentBody body) -> std::expected<void, ProviderDispatchError> {
+            auto sequence = spool_->enqueue(body);
+            if (!sequence) {
+                return std::unexpected(provider_error(ProviderDispatchErrorCode::provider_failure,
+                                                      "snapshot message could not enter the durable spool"));
+            }
+            publication.sequences.push_back(*sequence);
+            return {};
+        };
+        if (auto queued = append(AuthoritativeSnapshotBegin {
+                .session = request.session,
+                .peer = request.peer,
+                .session_fence = request.session_fence,
+                .snapshot_id = request.snapshot_id,
+                .parent = request.parent,
+                .subject_schema = request.subject_schema,
+                .generation = request.generation,
+                .expected_count = subjects->size(),
+                .expected_digest = *digest,
+            });
+            !queued) {
+            return std::unexpected(std::move(queued.error()));
+        }
+        std::uint32_t chunk_index {};
+        for (std::size_t offset = 0; offset < subjects->size(); offset += request.chunk_items) {
+            const auto count = std::min(request.chunk_items, subjects->size() - offset);
+            std::vector<SubjectKey> chunk(subjects->begin() + static_cast<std::ptrdiff_t>(offset),
+                                          subjects->begin() + static_cast<std::ptrdiff_t>(offset + count));
+            if (auto queued = append(AuthoritativeSnapshotChunk {
+                    .session = request.session,
+                    .peer = request.peer,
+                    .session_fence = request.session_fence,
+                    .snapshot_id = request.snapshot_id,
+                    .generation = request.generation,
+                    .chunk_index = chunk_index++,
+                    .subjects = std::move(chunk),
+                });
+                !queued) {
+                return std::unexpected(std::move(queued.error()));
+            }
+        }
+        if (auto queued = append(AuthoritativeSnapshotCommit {
+                .session = request.session,
+                .peer = request.peer,
+                .session_fence = request.session_fence,
+                .snapshot_id = request.snapshot_id,
+                .generation = request.generation,
+                .item_count = subjects->size(),
+                .canonical_digest = *digest,
+            });
+            !queued) {
+            return std::unexpected(std::move(queued.error()));
+        }
+        return publication;
     }
 
 } // namespace rule_engine::python::protocol_v2

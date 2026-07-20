@@ -1182,6 +1182,84 @@ namespace rule_engine::python::protocol_v2 {
             return status >= FactTerminalStatus::value && status <= FactTerminalStatus::canceled;
         }
 
+        [[nodiscard]] std::expected<void, ProtocolError> validate_label(const DataLabel &label,
+                                                                        const ProtocolLimits &limits) {
+            if (label.classification > Classification::secret ||
+                label.categories.size() > limits.maximum_label_categories ||
+                !std::ranges::is_sorted(label.categories)) {
+                return std::unexpected(
+                    codec_error(ProtocolErrorCode::invalid_value, "scan data label is not canonical"));
+            }
+            std::string_view previous;
+            for (const auto &category : label.categories) {
+                if (category.empty() || category.size() > limits.maximum_string_bytes || !valid_utf8(category) ||
+                    (!previous.empty() && previous == category)) {
+                    return std::unexpected(
+                        codec_error(ProtocolErrorCode::invalid_value, "scan data label category is invalid"));
+                }
+                previous = category;
+            }
+            return {};
+        }
+
+        void encode_label(Writer &writer, const DataLabel &label) {
+            writer.unsigned_field(1, static_cast<std::uint8_t>(label.classification));
+            for (const auto &category : label.categories) { writer.string_field(2, category); }
+        }
+
+        [[nodiscard]] std::expected<DataLabel, ProtocolError> decode_label(Reader &reader) {
+            DataLabel result;
+            bool classification_seen {};
+            while (!reader.eof()) {
+                auto tag = reader.next_tag();
+                if (!tag) {
+                    return std::unexpected(std::move(tag.error()));
+                }
+                if (tag->field > 2) {
+                    if (auto skipped = reader.skip(*tag); !skipped) {
+                        return std::unexpected(std::move(skipped.error()));
+                    }
+                    continue;
+                }
+                if (tag->field == 1) {
+                    if (classification_seen) {
+                        return std::unexpected(codec_error(ProtocolErrorCode::duplicate_field,
+                                                           "duplicate scan label classification", reader.offset));
+                    }
+                    auto classification = reader.read_unsigned(*tag);
+                    if (!classification || *classification > static_cast<std::uint8_t>(Classification::secret)) {
+                        return std::unexpected(classification ?
+                                                   codec_error(ProtocolErrorCode::invalid_value,
+                                                               "scan label classification is invalid", reader.offset) :
+                                                   std::move(classification.error()));
+                    }
+                    classification_seen = true;
+                    result.classification = static_cast<Classification>(*classification);
+                    continue;
+                }
+                if (auto counted = count_collection(reader); !counted) {
+                    return std::unexpected(std::move(counted.error()));
+                }
+                if (result.categories.size() >= reader.limits->maximum_label_categories) {
+                    return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
+                                                       "scan label category count exceeds the limit", reader.offset));
+                }
+                auto category = read_string(reader, *tag);
+                if (!category) {
+                    return std::unexpected(std::move(category.error()));
+                }
+                result.categories.push_back(std::move(*category));
+            }
+            if (!classification_seen) {
+                return std::unexpected(
+                    codec_error(ProtocolErrorCode::invalid_value, "scan label classification is missing"));
+            }
+            if (auto valid = validate_label(result, *reader.limits); !valid) {
+                return std::unexpected(std::move(valid.error()));
+            }
+            return result;
+        }
+
         [[nodiscard]] std::expected<void, ProtocolError> encode_fact_request(Writer &writer, const FactRequest &request,
                                                                              const ProtocolLimits &) {
             if (request.request_id.empty() || !request.subject.valid() || request.route.provider.empty() ||
@@ -1260,13 +1338,22 @@ namespace rule_engine::python::protocol_v2 {
         [[nodiscard]] std::expected<void, ProtocolError> encode_scan_request(Writer &writer, const ScanRequest &request,
                                                                              const ProtocolLimits &limits) {
             if (request.request_id.empty() || !request.subject.valid() || request.space.kind.empty() ||
+                request.space.identity.empty() || request.space.subject_generation == 0 ||
                 request.space.size > std::numeric_limits<std::uint64_t>::max() - request.space.begin ||
                 request.plan.plan_id.empty() || request.plan.encoded_pattern.empty() ||
-                request.plan.encoded_pattern.size() > limits.maximum_string_bytes ||
-                request.plan.maximum_bytes > limits.maximum_blob_bytes ||
-                request.plan.maximum_matches > limits.maximum_scan_matches || request.deadline_unix_ms == 0) {
+                request.plan.encoded_pattern.size() > limits.maximum_string_bytes || request.plan.maximum_bytes == 0 ||
+                request.plan.maximum_bytes > limits.maximum_blob_bytes || request.plan.maximum_matches == 0 ||
+                request.plan.maximum_matches > limits.maximum_scan_matches ||
+                request.plan.context_bytes_before > limits.maximum_blob_bytes ||
+                request.plan.context_bytes_after > limits.maximum_blob_bytes ||
+                (request.plan.result_mode != ScanResultMode::exact_complete &&
+                 request.plan.result_mode != ScanResultMode::existential) ||
+                request.deadline_unix_ms == 0) {
                 return std::unexpected(
                     codec_error(ProtocolErrorCode::malformed, "scan request identity or bounds are invalid"));
+            }
+            if (auto valid = validate_label(request.space.label, limits); !valid) {
+                return valid;
             }
             writer.string_field(1, request.request_id.value);
             Writer subject;
@@ -1281,18 +1368,28 @@ namespace rule_engine::python::protocol_v2 {
             writer.unsigned_field(9, request.plan.maximum_bytes);
             writer.unsigned_field(10, request.plan.maximum_matches);
             writer.unsigned_field(11, request.deadline_unix_ms);
+            writer.string_field(12, request.space.identity);
+            writer.unsigned_field(13, request.space.subject_generation);
+            Writer label;
+            encode_label(label, request.space.label);
+            writer.message_field(14, label);
+            writer.unsigned_field(15, request.plan.context_bytes_before);
+            writer.unsigned_field(16, request.plan.context_bytes_after);
+            writer.unsigned_field(17, static_cast<std::uint8_t>(request.plan.result_mode));
             return {};
         }
 
         [[nodiscard]] std::expected<ScanRequest, ProtocolError> decode_scan_request(Reader &reader) {
             ScanRequest result;
             SeenFields seen;
+            bool label_seen {};
+            bool mode_seen {};
             while (!reader.eof()) {
                 auto tag = reader.next_tag();
                 if (!tag) {
                     return std::unexpected(std::move(tag.error()));
                 }
-                if (tag->field > 11) {
+                if (tag->field > 17) {
                     if (auto skipped = reader.skip(*tag); !skipped) {
                         return std::unexpected(std::move(skipped.error()));
                     }
@@ -1301,19 +1398,30 @@ namespace rule_engine::python::protocol_v2 {
                 if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
                     return std::unexpected(std::move(marked.error()));
                 }
-                if (tag->field == 2) {
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_subject_depth);
+                if (tag->field == 2 || tag->field == 14) {
+                    auto nested = child_reader(reader, *tag,
+                                               tag->field == 2 ? reader.limits->maximum_subject_depth :
+                                                                 reader.limits->maximum_value_depth);
                     if (!nested) {
                         return std::unexpected(std::move(nested.error()));
                     }
-                    auto subject = decode_subject(*nested);
-                    if (!subject) {
-                        return std::unexpected(std::move(subject.error()));
+                    if (tag->field == 2) {
+                        auto subject = decode_subject(*nested);
+                        if (!subject) {
+                            return std::unexpected(std::move(subject.error()));
+                        }
+                        result.subject = std::move(*subject);
+                    } else {
+                        auto label = decode_label(*nested);
+                        if (!label) {
+                            return std::unexpected(std::move(label.error()));
+                        }
+                        result.space.label = std::move(*label);
+                        label_seen = true;
                     }
-                    result.subject = std::move(*subject);
                     continue;
                 }
-                if (tag->field == 1 || tag->field == 3 || tag->field == 7 || tag->field == 8) {
+                if (tag->field == 1 || tag->field == 3 || tag->field == 7 || tag->field == 8 || tag->field == 12) {
                     auto text = read_string(reader, *tag);
                     if (!text) {
                         return std::unexpected(std::move(text.error()));
@@ -1324,8 +1432,10 @@ namespace rule_engine::python::protocol_v2 {
                         result.space.kind = std::move(*text);
                     } else if (tag->field == 7) {
                         result.plan.plan_id = std::move(*text);
-                    } else {
+                    } else if (tag->field == 8) {
                         result.plan.encoded_pattern = std::move(*text);
+                    } else {
+                        result.space.identity = std::move(*text);
                     }
                     continue;
                 }
@@ -1352,14 +1462,39 @@ namespace rule_engine::python::protocol_v2 {
                         result.plan.maximum_matches = static_cast<std::uint32_t>(*number);
                         break;
                     case 11: result.deadline_unix_ms = *number; break;
+                    case 13: result.space.subject_generation = *number; break;
+                    case 15:
+                    case 16:
+                        if (*number > std::numeric_limits<std::uint32_t>::max()) {
+                            return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
+                                                               "scan context bound exceeds uint32", reader.offset));
+                        }
+                        if (tag->field == 15) {
+                            result.plan.context_bytes_before = static_cast<std::uint32_t>(*number);
+                        } else {
+                            result.plan.context_bytes_after = static_cast<std::uint32_t>(*number);
+                        }
+                        break;
+                    case 17:
+                        if (*number < static_cast<std::uint8_t>(ScanResultMode::exact_complete) ||
+                            *number > static_cast<std::uint8_t>(ScanResultMode::existential)) {
+                            return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
+                                                               "scan result mode is invalid", reader.offset));
+                        }
+                        result.plan.result_mode = static_cast<ScanResultMode>(*number);
+                        mode_seen = true;
+                        break;
                     default: break;
                 }
             }
-            if (result.request_id.empty() || !result.subject.valid() || result.space.kind.empty() ||
+            if (!label_seen || !mode_seen || result.request_id.empty() || !result.subject.valid() ||
+                result.space.kind.empty() || result.space.identity.empty() || result.space.subject_generation == 0 ||
                 result.space.size > std::numeric_limits<std::uint64_t>::max() - result.space.begin ||
-                result.plan.plan_id.empty() || result.plan.encoded_pattern.empty() ||
-                result.plan.maximum_bytes > reader.limits->maximum_blob_bytes ||
-                result.plan.maximum_matches > reader.limits->maximum_scan_matches || result.deadline_unix_ms == 0) {
+                result.plan.plan_id.empty() || result.plan.encoded_pattern.empty() || result.plan.maximum_bytes == 0 ||
+                result.plan.maximum_bytes > reader.limits->maximum_blob_bytes || result.plan.maximum_matches == 0 ||
+                result.plan.maximum_matches > reader.limits->maximum_scan_matches ||
+                result.plan.context_bytes_before > reader.limits->maximum_blob_bytes ||
+                result.plan.context_bytes_after > reader.limits->maximum_blob_bytes || result.deadline_unix_ms == 0) {
                 return std::unexpected(
                     codec_error(ProtocolErrorCode::malformed, "decoded scan request is invalid", reader.offset));
             }
@@ -1470,20 +1605,53 @@ namespace rule_engine::python::protocol_v2 {
             return result;
         }
 
-        void encode_scan_match(Writer &writer, const ScanMatch &match) {
+        [[nodiscard]] std::expected<void, ProtocolError> validate_scan_match(const ScanMatch &match,
+                                                                             const ProtocolLimits &limits) {
+            if (match.length == 0 || match.pattern_id.empty() || match.scan_space_id.empty() ||
+                match.pattern_id.size() > limits.maximum_string_bytes ||
+                match.scan_space_id.size() > limits.maximum_string_bytes || !valid_utf8(match.pattern_id) ||
+                !valid_utf8(match.scan_space_id) || match.subject_generation == 0 ||
+                match.matched_bytes.size() != match.length || match.matched_bytes.size() > limits.maximum_blob_bytes ||
+                match.before_bytes.size() > limits.maximum_blob_bytes - match.matched_bytes.size() ||
+                match.after_bytes.size() >
+                    limits.maximum_blob_bytes - match.matched_bytes.size() - match.before_bytes.size()) {
+                return std::unexpected(
+                    codec_error(ProtocolErrorCode::invalid_value, "scan match metadata or context is invalid"));
+            }
+            return validate_label(match.label, limits);
+        }
+
+        [[nodiscard]] std::expected<void, ProtocolError> encode_scan_match(Writer &writer, const ScanMatch &match,
+                                                                           const ProtocolLimits &limits) {
+            if (auto valid = validate_scan_match(match, limits); !valid) {
+                return valid;
+            }
             writer.unsigned_field(1, match.offset);
             writer.unsigned_field(2, match.length);
+            writer.string_field(3, match.pattern_id);
+            writer.string_field(4, match.scan_space_id);
+            writer.unsigned_field(5, match.absolute_address);
+            writer.unsigned_field(6, match.permission_snapshot);
+            writer.raw_length_field(7, match.matched_bytes);
+            writer.raw_length_field(8, match.before_bytes);
+            writer.raw_length_field(9, match.after_bytes);
+            Writer label;
+            encode_label(label, match.label);
+            writer.message_field(10, label);
+            writer.unsigned_field(11, match.subject_generation);
+            return {};
         }
 
         [[nodiscard]] std::expected<ScanMatch, ProtocolError> decode_scan_match(Reader &reader) {
             ScanMatch result;
             SeenFields seen;
+            std::array<bool, 11> required {};
             while (!reader.eof()) {
                 auto tag = reader.next_tag();
                 if (!tag) {
                     return std::unexpected(std::move(tag.error()));
                 }
-                if (tag->field != 1 && tag->field != 2) {
+                if (tag->field > 11) {
                     if (auto skipped = reader.skip(*tag); !skipped) {
                         return std::unexpected(std::move(skipped.error()));
                     }
@@ -1492,15 +1660,72 @@ namespace rule_engine::python::protocol_v2 {
                 if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
                     return std::unexpected(std::move(marked.error()));
                 }
+                required[tag->field - 1] = true;
+                if (tag->field == 3 || tag->field == 4) {
+                    auto text = read_string(reader, *tag);
+                    if (!text) {
+                        return std::unexpected(std::move(text.error()));
+                    }
+                    if (tag->field == 3) {
+                        result.pattern_id = std::move(*text);
+                    } else {
+                        result.scan_space_id = std::move(*text);
+                    }
+                    continue;
+                }
+                if (tag->field >= 7 && tag->field <= 9) {
+                    auto bytes = reader.read_bytes(*tag, reader.limits->maximum_blob_bytes);
+                    if (!bytes) {
+                        return std::unexpected(std::move(bytes.error()));
+                    }
+                    std::vector<std::byte> value(bytes->begin(), bytes->end());
+                    if (tag->field == 7) {
+                        result.matched_bytes = std::move(value);
+                    } else if (tag->field == 8) {
+                        result.before_bytes = std::move(value);
+                    } else {
+                        result.after_bytes = std::move(value);
+                    }
+                    continue;
+                }
+                if (tag->field == 10) {
+                    auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
+                    if (!nested) {
+                        return std::unexpected(std::move(nested.error()));
+                    }
+                    auto label = decode_label(*nested);
+                    if (!label) {
+                        return std::unexpected(std::move(label.error()));
+                    }
+                    result.label = std::move(*label);
+                    continue;
+                }
                 auto number = reader.read_unsigned(*tag);
                 if (!number) {
                     return std::unexpected(std::move(number.error()));
                 }
-                if (tag->field == 1) {
-                    result.offset = *number;
-                } else {
-                    result.length = *number;
+                switch (tag->field) {
+                    case 1: result.offset = *number; break;
+                    case 2: result.length = *number; break;
+                    case 5: result.absolute_address = *number; break;
+                    case 6:
+                        if (*number > std::numeric_limits<std::uint32_t>::max()) {
+                            return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
+                                                               "scan permission snapshot exceeds uint32",
+                                                               reader.offset));
+                        }
+                        result.permission_snapshot = static_cast<std::uint32_t>(*number);
+                        break;
+                    case 11: result.subject_generation = *number; break;
+                    default: break;
                 }
+            }
+            if (!std::ranges::all_of(required, std::identity {})) {
+                return std::unexpected(
+                    codec_error(ProtocolErrorCode::invalid_value, "scan match metadata is incomplete", reader.offset));
+            }
+            if (auto valid = validate_scan_match(result, *reader.limits); !valid) {
+                return std::unexpected(std::move(valid.error()));
             }
             return result;
         }
@@ -1509,6 +1734,8 @@ namespace rule_engine::python::protocol_v2 {
         encode_scan_response(Writer &writer, const ScanResponse &response, const ProtocolLimits &limits) {
             if (response.request_id.empty() || !response.subject.valid() || !terminal_status_valid(response.status) ||
                 response.truncated || response.matches.size() > limits.maximum_scan_matches ||
+                (response.mode != ScanResultMode::exact_complete && response.mode != ScanResultMode::existential) ||
+                (response.mode == ScanResultMode::existential && response.matches.size() > 1) ||
                 (response.status != FactTerminalStatus::value && !response.matches.empty())) {
                 return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
                                                    "scan response is truncated, oversized, or status-invalid"));
@@ -1520,7 +1747,9 @@ namespace rule_engine::python::protocol_v2 {
             writer.unsigned_field(3, static_cast<std::uint8_t>(response.status));
             for (const auto &match : response.matches) {
                 Writer nested;
-                encode_scan_match(nested, match);
+                if (auto encoded = encode_scan_match(nested, match, limits); !encoded) {
+                    return encoded;
+                }
                 writer.message_field(4, nested);
             }
             writer.boolean_field(5, false);
@@ -1532,6 +1761,7 @@ namespace rule_engine::python::protocol_v2 {
                 encode_diagnostic(diagnostic, *response.diagnostic);
                 writer.message_field(6, diagnostic);
             }
+            writer.unsigned_field(7, static_cast<std::uint8_t>(response.mode));
             return {};
         }
 
@@ -1539,6 +1769,7 @@ namespace rule_engine::python::protocol_v2 {
             ScanResponse result;
             SeenFields seen;
             bool status_seen {};
+            bool mode_seen {};
             while (!reader.eof()) {
                 auto tag = reader.next_tag();
                 if (!tag) {
@@ -1563,7 +1794,7 @@ namespace rule_engine::python::protocol_v2 {
                     result.matches.push_back(*match);
                     continue;
                 }
-                if (tag->field > 6) {
+                if (tag->field > 7) {
                     if (auto skipped = reader.skip(*tag); !skipped) {
                         return std::unexpected(std::move(skipped.error()));
                     }
@@ -1603,7 +1834,7 @@ namespace rule_engine::python::protocol_v2 {
                         return std::unexpected(std::move(truncated.error()));
                     }
                     result.truncated = *truncated;
-                } else {
+                } else if (tag->field == 6) {
                     auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
                     if (!nested) {
                         return std::unexpected(std::move(nested.error()));
@@ -1613,9 +1844,20 @@ namespace rule_engine::python::protocol_v2 {
                         return std::unexpected(std::move(diagnostic.error()));
                     }
                     result.diagnostic = std::move(*diagnostic);
+                } else {
+                    auto mode = reader.read_unsigned(*tag);
+                    if (!mode || *mode < static_cast<std::uint8_t>(ScanResultMode::exact_complete) ||
+                        *mode > static_cast<std::uint8_t>(ScanResultMode::existential)) {
+                        return std::unexpected(mode ? codec_error(ProtocolErrorCode::invalid_value,
+                                                                  "scan result mode is invalid", reader.offset) :
+                                                      std::move(mode.error()));
+                    }
+                    result.mode = static_cast<ScanResultMode>(*mode);
+                    mode_seen = true;
                 }
             }
-            if (!status_seen || result.request_id.empty() || !result.subject.valid() || result.truncated ||
+            if (!status_seen || !mode_seen || result.request_id.empty() || !result.subject.valid() ||
+                result.truncated || (result.mode == ScanResultMode::existential && result.matches.size() > 1) ||
                 (result.status != FactTerminalStatus::value && !result.matches.empty())) {
                 return std::unexpected(
                     codec_error(ProtocolErrorCode::invalid_value, "decoded scan response is invalid", reader.offset));
@@ -2697,7 +2939,7 @@ namespace rule_engine::python::protocol_v2 {
                     if (tag->field == 2) {
                         result.sequence = *number;
                     } else if (tag->field == 3) {
-                        if (*number > static_cast<std::uint8_t>(ProtocolErrorCode::unauthenticated)) {
+                        if (*number > static_cast<std::uint8_t>(ProtocolErrorCode::persistence_error)) {
                             return std::unexpected(
                                 codec_error(ProtocolErrorCode::malformed, "NACK reason is invalid", reader.offset));
                         }
@@ -3090,6 +3332,105 @@ namespace rule_engine::python::protocol_v2 {
         frame.push_back(static_cast<std::byte>(size & 0xffU));
         frame.insert(frame.end(), payload->begin(), payload->end());
         return frame;
+    }
+
+    std::expected<std::vector<std::byte>, ProtocolError> encode_durable_body(const DurableAgentBody &body,
+                                                                             const ProtocolLimits &limits) {
+        const auto message = std::visit([](const auto &value) -> MessageBody { return value; }, body);
+        const auto kind = message_kind(message);
+        if (!durable_agent_message(kind)) {
+            return std::unexpected(
+                codec_error(ProtocolErrorCode::unexpected_message, "spool body is not durable agent data"));
+        }
+
+        Writer body_writer;
+        if (auto encoded = encode_body(body_writer, message, limits); !encoded) {
+            return std::unexpected(std::move(encoded.error()));
+        }
+        Writer writer;
+        writer.unsigned_field(1, static_cast<std::uint8_t>(kind));
+        writer.message_field(2, body_writer);
+        if (writer.bytes.empty() || writer.bytes.size() > limits.maximum_frame_bytes) {
+            return std::unexpected(
+                codec_error(ProtocolErrorCode::limit_exceeded, "durable spool body exceeds the frame limit"));
+        }
+        auto validated = decode_durable_body(writer.bytes, limits);
+        if (!validated) {
+            return std::unexpected(std::move(validated.error()));
+        }
+        return writer.bytes;
+    }
+
+    std::expected<DurableAgentBody, ProtocolError> decode_durable_body(const std::span<const std::byte> bytes,
+                                                                       const ProtocolLimits &limits) {
+        if (bytes.empty() || bytes.size() > limits.maximum_frame_bytes) {
+            return std::unexpected(
+                codec_error(bytes.empty() ? ProtocolErrorCode::truncated : ProtocolErrorCode::limit_exceeded,
+                            "durable spool body is empty or oversized"));
+        }
+        DecodeBudget budget;
+        Reader reader {.bytes = bytes, .limits = &limits, .budget = &budget, .depth = 0, .offset = 0};
+        SeenFields seen;
+        std::optional<MessageKind> kind;
+        std::optional<std::span<const std::byte>> body_bytes;
+        while (!reader.eof()) {
+            auto tag = reader.next_tag();
+            if (!tag) {
+                return std::unexpected(std::move(tag.error()));
+            }
+            if (tag->field > 2) {
+                if (auto skipped = reader.skip(*tag); !skipped) {
+                    return std::unexpected(std::move(skipped.error()));
+                }
+                continue;
+            }
+            if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
+                return std::unexpected(std::move(marked.error()));
+            }
+            if (tag->field == 1) {
+                auto number = reader.read_unsigned(*tag);
+                if (!number || *number > static_cast<std::uint8_t>(MessageKind::credit_update)) {
+                    return std::unexpected(number ? codec_error(ProtocolErrorCode::unexpected_message,
+                                                                "durable spool message kind is unknown") :
+                                                    std::move(number.error()));
+                }
+                kind = static_cast<MessageKind>(*number);
+                continue;
+            }
+            auto encoded = reader.read_bytes(*tag, limits.maximum_frame_bytes);
+            if (!encoded) {
+                return std::unexpected(std::move(encoded.error()));
+            }
+            body_bytes = *encoded;
+        }
+        if (!kind.has_value() || !body_bytes.has_value() || !durable_agent_message(*kind)) {
+            return std::unexpected(
+                codec_error(ProtocolErrorCode::unexpected_message, "durable spool body kind is missing or invalid"));
+        }
+        Reader body_reader {.bytes = *body_bytes, .limits = &limits, .budget = &budget, .depth = 1, .offset = 0};
+        auto decoded = decode_body(*kind, body_reader);
+        if (!decoded) {
+            return std::unexpected(std::move(decoded.error()));
+        }
+        switch (*kind) {
+            case MessageKind::work_result: return DurableAgentBody {std::get<WorkResultMessage>(std::move(*decoded))};
+            case MessageKind::snapshot_begin:
+                return DurableAgentBody {std::get<AuthoritativeSnapshotBegin>(std::move(*decoded))};
+            case MessageKind::snapshot_chunk:
+                return DurableAgentBody {std::get<AuthoritativeSnapshotChunk>(std::move(*decoded))};
+            case MessageKind::snapshot_commit:
+                return DurableAgentBody {std::get<AuthoritativeSnapshotCommit>(std::move(*decoded))};
+            case MessageKind::agent_hello:
+            case MessageKind::server_hello:
+            case MessageKind::work_lease:
+            case MessageKind::cancel_work:
+            case MessageKind::ack:
+            case MessageKind::nack:
+            case MessageKind::credit_update: break;
+            default: break;
+        }
+        return std::unexpected(
+            codec_error(ProtocolErrorCode::unexpected_message, "durable spool body kind is not supported"));
     }
 
     std::expected<DecodedFrame, ProtocolError> decode_frame(const std::span<const std::byte> bytes,

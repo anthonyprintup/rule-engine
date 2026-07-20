@@ -26,6 +26,7 @@ namespace rule_engine::python::protocol_v2 {
         std::size_t maximum_fact_requests {512};
         std::size_t maximum_scan_requests {128};
         std::size_t maximum_scan_matches {100'000};
+        std::size_t maximum_label_categories {64};
         std::size_t maximum_snapshot_items {100'000};
         std::size_t maximum_snapshot_bytes {16 * mebibyte};
         std::size_t maximum_sequence_gap {4'096};
@@ -54,6 +55,9 @@ namespace rule_engine::python::protocol_v2 {
         provider_violation,
         canceled,
         unauthenticated,
+        dependency_unavailable,
+        transport_error,
+        persistence_error,
     };
 
     struct ProtocolError {
@@ -196,6 +200,9 @@ namespace rule_engine::python::protocol_v2 {
     using MessageBody = std::variant<AgentHelloMessage, ServerHelloMessage, WorkLeaseMessage, WorkResultMessage,
                                      CancelWorkMessage, AuthoritativeSnapshotBegin, AuthoritativeSnapshotChunk,
                                      AuthoritativeSnapshotCommit, AckMessage, NackMessage, CreditUpdateMessage>;
+
+    using DurableAgentBody = std::variant<WorkResultMessage, AuthoritativeSnapshotBegin, AuthoritativeSnapshotChunk,
+                                          AuthoritativeSnapshotCommit>;
 
     enum struct MessageKind : std::uint8_t {
         agent_hello = 1,

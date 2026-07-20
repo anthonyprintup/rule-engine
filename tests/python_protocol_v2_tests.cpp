@@ -61,11 +61,21 @@ namespace {
         return ScanRequest {
             .request_id = RequestId {std::string {id}},
             .subject = region_subject(),
-            .space = ScanSpace {.kind = "memory", .begin = 0x2000, .size = 0x1000, .permissions = 5},
+            .space =
+                ScanSpace {.kind = "memory",
+                           .begin = 0x2000,
+                           .size = 0x1000,
+                           .permissions = 5,
+                           .identity = "memory:allocation-2000",
+                           .label = {.classification = Classification::sensitive, .categories = {"process-memory"}},
+                           .subject_generation = 9},
             .plan = ScanPlan {.plan_id = "pattern-1",
                               .encoded_pattern = "48 8b ??",
                               .maximum_bytes = 0x1000,
-                              .maximum_matches = 16},
+                              .maximum_matches = 16,
+                              .context_bytes_before = 2,
+                              .context_bytes_after = 2,
+                              .result_mode = ScanResultMode::exact_complete},
             .deadline_unix_ms = 5'000,
         };
     }
@@ -121,9 +131,31 @@ namespace {
                 .request_id = RequestId {"scan-1"},
                 .subject = region_subject(),
                 .status = FactTerminalStatus::value,
-                .matches = {{.offset = 8, .length = 3}, {.offset = 32, .length = 3}},
+                .matches = {{.offset = 8,
+                             .length = 3,
+                             .pattern_id = "pattern-1",
+                             .scan_space_id = "memory:allocation-2000",
+                             .absolute_address = 0x2008,
+                             .permission_snapshot = 5,
+                             .matched_bytes = {std::byte {0x48}, std::byte {0x8b}, std::byte {0x10}},
+                             .before_bytes = {std::byte {0x90}, std::byte {0x90}},
+                             .after_bytes = {std::byte {0x90}},
+                             .label = {.classification = Classification::sensitive, .categories = {"process-memory"}},
+                             .subject_generation = 9},
+                            {.offset = 32,
+                             .length = 3,
+                             .pattern_id = "pattern-1",
+                             .scan_space_id = "memory:allocation-2000",
+                             .absolute_address = 0x2020,
+                             .permission_snapshot = 5,
+                             .matched_bytes = {std::byte {0x48}, std::byte {0x8b}, std::byte {0x20}},
+                             .before_bytes = {std::byte {0x90}},
+                             .after_bytes = {std::byte {0x90}, std::byte {0x90}},
+                             .label = {.classification = Classification::sensitive, .categories = {"process-memory"}},
+                             .subject_generation = 9}},
                 .truncated = false,
                 .diagnostic = std::nullopt,
+                .mode = ScanResultMode::exact_complete,
             }},
         };
     }
@@ -204,6 +236,17 @@ namespace {
         const auto &result = std::get<WorkResultMessage>(decoded_result->envelope.body);
         REQUIRE(result.facts.size() == 1);
         REQUIRE(result.scans.front().matches.size() == 2);
+        REQUIRE(result.scans.front().mode == ScanResultMode::exact_complete);
+        REQUIRE(result.scans.front().matches.front().pattern_id == "pattern-1");
+        REQUIRE(result.scans.front().matches.front().scan_space_id == "memory:allocation-2000");
+        REQUIRE(result.scans.front().matches.front().absolute_address == 0x2008);
+        REQUIRE(result.scans.front().matches.front().permission_snapshot == 5);
+        REQUIRE(result.scans.front().matches.front().matched_bytes ==
+                std::vector {std::byte {0x48}, std::byte {0x8b}, std::byte {0x10}});
+        REQUIRE(result.scans.front().matches.front().before_bytes.size() == 2);
+        REQUIRE(result.scans.front().matches.front().after_bytes.size() == 1);
+        REQUIRE(result.scans.front().matches.front().label.classification == Classification::sensitive);
+        REQUIRE(result.scans.front().matches.front().subject_generation == 9);
         REQUIRE(std::holds_alternative<FactRecord>(result.facts.front().value->node->data));
         REQUIRE(decoded_result->bytes_consumed == result_frame->size());
     }
@@ -252,6 +295,10 @@ namespace {
         ProtocolLimits one_fact;
         one_fact.maximum_fact_requests = 1;
         REQUIRE_FALSE(encode_frame(envelope(too_many), one_fact).has_value());
+
+        auto truncated_exact = work_result();
+        truncated_exact.scans.front().truncated = true;
+        REQUIRE_FALSE(encode_frame(envelope(truncated_exact, 1)).has_value());
     }
 
     TEST_CASE("transport authentication requires TLS 1.3 mutual identity and operator mapping") {
@@ -504,12 +551,25 @@ namespace {
             scans.assign(requests.begin(), requests.end());
             std::vector<ScanResponse> result;
             for (const auto &request : requests) {
-                result.push_back(ScanResponse {.request_id = request.request_id,
-                                               .subject = request.subject,
-                                               .status = FactTerminalStatus::value,
-                                               .matches = {{.offset = 16, .length = 3}},
-                                               .truncated = false,
-                                               .diagnostic = std::nullopt});
+                result.push_back(ScanResponse {
+                    .request_id = request.request_id,
+                    .subject = request.subject,
+                    .status = FactTerminalStatus::value,
+                    .matches = {{.offset = 16,
+                                 .length = 3,
+                                 .pattern_id = request.plan.plan_id,
+                                 .scan_space_id = request.space.identity,
+                                 .absolute_address = request.space.begin + 16,
+                                 .permission_snapshot = request.space.permissions,
+                                 .matched_bytes = {std::byte {0x48}, std::byte {0x8b}, std::byte {0x30}},
+                                 .before_bytes = {std::byte {0x90}},
+                                 .after_bytes = {std::byte {0x90}},
+                                 .label = request.space.label,
+                                 .subject_generation = request.space.subject_generation}},
+                    .truncated = false,
+                    .diagnostic = std::nullopt,
+                    .mode = request.plan.result_mode,
+                });
             }
             return result;
         }
@@ -532,6 +592,10 @@ namespace {
         REQUIRE(result->facts.front().request_id.value == "fact-1");
         REQUIRE(result->scans.front().matches.front().offset == 16);
         REQUIRE(result->work_id == "work-1");
+
+        auto insufficient_context = work_lease();
+        insufficient_context.scans.front().plan.context_bytes_before = 0;
+        REQUIRE_FALSE(router.dispatch(insufficient_context).has_value());
 
         CancelWorkMessage cancel {.session = SessionId {"session-1"},
                                   .peer = PeerId {"peer-1"},

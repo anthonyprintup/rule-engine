@@ -10,6 +10,8 @@
 
 namespace rule_engine::python::protocol_v2 {
 
+    struct SqliteAgentSpool;
+
     enum struct ProviderDispatchErrorCode : std::uint8_t {
         unknown_route,
         duplicate_route,
@@ -51,6 +53,42 @@ namespace rule_engine::python::protocol_v2 {
         [[nodiscard]] IWindowsAgentProvider *find(std::string_view route) const noexcept;
 
         std::vector<Binding> bindings_;
+    };
+
+    struct SnapshotEnumerationRequest {
+        SessionId session;
+        PeerId peer;
+        std::uint64_t session_fence {};
+        std::string snapshot_id;
+        std::optional<SubjectKey> parent;
+        SchemaId subject_schema;
+        std::uint64_t generation {};
+        std::size_t chunk_items {1'024};
+    };
+
+    struct IWindowsSubjectEnumerator {
+        virtual ~IWindowsSubjectEnumerator() = default;
+        [[nodiscard]] virtual std::expected<std::vector<SubjectKey>, ProviderDispatchError>
+        enumerate(const SnapshotEnumerationRequest &request) noexcept = 0;
+    };
+
+    struct SpoolPublication {
+        std::vector<std::uint64_t> sequences;
+    };
+
+    struct WindowsProviderSpoolAdapter {
+        WindowsProviderSpoolAdapter(const WindowsAgentProviderRouter &router, SqliteAgentSpool &spool) noexcept;
+
+        [[nodiscard]] std::expected<std::uint64_t, ProviderDispatchError>
+        dispatch_and_spool(const WorkLeaseMessage &work, const ProtocolLimits &limits = {}) const;
+
+        [[nodiscard]] std::expected<SpoolPublication, ProviderDispatchError>
+        enumerate_and_spool(const SnapshotEnumerationRequest &request, IWindowsSubjectEnumerator &enumerator,
+                            const ProtocolLimits &limits = {}) const;
+
+    private:
+        const WindowsAgentProviderRouter *router_ {};
+        SqliteAgentSpool *spool_ {};
     };
 
 } // namespace rule_engine::python::protocol_v2
