@@ -39,6 +39,18 @@ namespace rule_engine::python::protocol_v2 {
             return !left_key.empty() && left_key == canonical_subject_key(right);
         }
 
+        [[nodiscard]] bool scan_pattern_ids_valid(const ScanPlan &plan, const ProtocolLimits &limits) {
+            if (plan.pattern_ids.empty() || plan.pattern_ids.size() > limits.maximum_scan_patterns) {
+                return false;
+            }
+            std::unordered_set<std::string_view> unique_ids;
+            unique_ids.reserve(plan.pattern_ids.size());
+            return std::ranges::all_of(plan.pattern_ids, [&](const std::string &pattern_id) {
+                return !pattern_id.empty() && pattern_id.size() <= limits.maximum_string_bytes &&
+                       unique_ids.insert(pattern_id).second;
+            });
+        }
+
     } // namespace
 
     std::expected<void, ProviderDispatchError> WindowsAgentProviderRouter::bind(std::string route,
@@ -89,9 +101,9 @@ namespace rule_engine::python::protocol_v2 {
             if (request.request_id.empty() || !request_ids.insert(request.request_id.value).second ||
                 !request.subject.valid() || request.subject.peer != work.peer || request.space.kind.empty() ||
                 request.space.identity.empty() || request.space.subject_generation == 0 ||
-                request.plan.plan_id.empty() || request.plan.maximum_bytes == 0 ||
-                request.plan.maximum_bytes > limits.maximum_blob_bytes || request.plan.maximum_matches == 0 ||
-                request.plan.maximum_matches > limits.maximum_scan_matches ||
+                request.plan.plan_id.empty() || !scan_pattern_ids_valid(request.plan, limits) ||
+                request.plan.maximum_bytes == 0 || request.plan.maximum_bytes > limits.maximum_blob_bytes ||
+                request.plan.maximum_matches == 0 || request.plan.maximum_matches > limits.maximum_scan_matches ||
                 request.plan.context_bytes_before > limits.maximum_blob_bytes ||
                 request.plan.context_bytes_after > limits.maximum_blob_bytes ||
                 (request.plan.result_mode != ScanResultMode::exact_complete &&
@@ -173,11 +185,14 @@ namespace rule_engine::python::protocol_v2 {
                 return std::unexpected(provider_error(ProviderDispatchErrorCode::provider_violation,
                                                       "scan result request, subject, or count does not match"));
             }
+            std::unordered_set<std::string_view> allowed_pattern_ids;
+            allowed_pattern_ids.reserve(request.plan.pattern_ids.size());
+            for (const auto &pattern_id : request.plan.pattern_ids) { allowed_pattern_ids.insert(pattern_id); }
             for (const auto &match : found->second.matches) {
-                if (match.pattern_id != request.plan.plan_id || match.scan_space_id != request.space.identity ||
+                if (!allowed_pattern_ids.contains(match.pattern_id) || match.scan_space_id != request.space.identity ||
                     match.permission_snapshot != request.space.permissions || match.label != request.space.label ||
-                    match.subject_generation != request.space.subject_generation || match.length == 0 ||
-                    match.offset > request.space.size || match.length > request.space.size - match.offset ||
+                    match.subject_generation != request.space.subject_generation || match.offset > request.space.size ||
+                    match.length > request.space.size - match.offset ||
                     match.offset > std::numeric_limits<std::uint64_t>::max() - request.space.begin ||
                     match.absolute_address != request.space.begin + match.offset ||
                     match.matched_bytes.size() != match.length ||

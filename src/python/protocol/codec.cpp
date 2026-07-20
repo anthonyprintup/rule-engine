@@ -271,6 +271,40 @@ namespace rule_engine::python::protocol_v2 {
             return true;
         }
 
+        [[nodiscard]] std::expected<void, ProtocolError>
+        validate_scan_pattern_ids(const std::span<const std::string> pattern_ids, const ProtocolLimits &limits) {
+            if (pattern_ids.empty()) {
+                return std::unexpected(
+                    codec_error(ProtocolErrorCode::malformed, "scan plan must declare at least one pattern ID"));
+            }
+            if (pattern_ids.size() > limits.maximum_scan_patterns) {
+                return std::unexpected(
+                    codec_error(ProtocolErrorCode::limit_exceeded, "scan pattern ID count exceeds the limit"));
+            }
+
+            std::unordered_set<std::string_view> unique_ids;
+            unique_ids.reserve(pattern_ids.size());
+            for (const auto &pattern_id : pattern_ids) {
+                if (pattern_id.empty()) {
+                    return std::unexpected(
+                        codec_error(ProtocolErrorCode::malformed, "scan pattern ID must not be empty"));
+                }
+                if (pattern_id.size() > limits.maximum_string_bytes) {
+                    return std::unexpected(
+                        codec_error(ProtocolErrorCode::limit_exceeded, "scan pattern ID exceeds the string limit"));
+                }
+                if (!valid_utf8(pattern_id)) {
+                    return std::unexpected(
+                        codec_error(ProtocolErrorCode::invalid_utf8, "scan pattern ID is not canonical UTF-8"));
+                }
+                if (!unique_ids.insert(pattern_id).second) {
+                    return std::unexpected(
+                        codec_error(ProtocolErrorCode::duplicate_item, "scan pattern IDs must be unique"));
+                }
+            }
+            return {};
+        }
+
         [[nodiscard]] bool canonical_integer(const std::string_view decimal) noexcept {
             if (decimal.empty()) {
                 return false;
@@ -1355,6 +1389,9 @@ namespace rule_engine::python::protocol_v2 {
             if (auto valid = validate_label(request.space.label, limits); !valid) {
                 return valid;
             }
+            if (auto valid = validate_scan_pattern_ids(request.plan.pattern_ids, limits); !valid) {
+                return valid;
+            }
             writer.string_field(1, request.request_id.value);
             Writer subject;
             encode_subject(subject, request.subject);
@@ -1376,6 +1413,7 @@ namespace rule_engine::python::protocol_v2 {
             writer.unsigned_field(15, request.plan.context_bytes_before);
             writer.unsigned_field(16, request.plan.context_bytes_after);
             writer.unsigned_field(17, static_cast<std::uint8_t>(request.plan.result_mode));
+            for (const auto &pattern_id : request.plan.pattern_ids) { writer.string_field(18, pattern_id); }
             return {};
         }
 
@@ -1389,7 +1427,22 @@ namespace rule_engine::python::protocol_v2 {
                 if (!tag) {
                     return std::unexpected(std::move(tag.error()));
                 }
-                if (tag->field > 17) {
+                if (tag->field == 18) {
+                    if (auto counted = count_collection(reader); !counted) {
+                        return std::unexpected(std::move(counted.error()));
+                    }
+                    if (result.plan.pattern_ids.size() >= reader.limits->maximum_scan_patterns) {
+                        return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
+                                                           "scan pattern ID count exceeds the limit", reader.offset));
+                    }
+                    auto pattern_id = read_string(reader, *tag);
+                    if (!pattern_id) {
+                        return std::unexpected(std::move(pattern_id.error()));
+                    }
+                    result.plan.pattern_ids.push_back(std::move(*pattern_id));
+                    continue;
+                }
+                if (tag->field > 18) {
                     if (auto skipped = reader.skip(*tag); !skipped) {
                         return std::unexpected(std::move(skipped.error()));
                     }
@@ -1497,6 +1550,9 @@ namespace rule_engine::python::protocol_v2 {
                 result.plan.context_bytes_after > reader.limits->maximum_blob_bytes || result.deadline_unix_ms == 0) {
                 return std::unexpected(
                     codec_error(ProtocolErrorCode::malformed, "decoded scan request is invalid", reader.offset));
+            }
+            if (auto valid = validate_scan_pattern_ids(result.plan.pattern_ids, *reader.limits); !valid) {
+                return std::unexpected(std::move(valid.error()));
             }
             return result;
         }
@@ -1607,7 +1663,7 @@ namespace rule_engine::python::protocol_v2 {
 
         [[nodiscard]] std::expected<void, ProtocolError> validate_scan_match(const ScanMatch &match,
                                                                              const ProtocolLimits &limits) {
-            if (match.length == 0 || match.pattern_id.empty() || match.scan_space_id.empty() ||
+            if (match.pattern_id.empty() || match.scan_space_id.empty() ||
                 match.pattern_id.size() > limits.maximum_string_bytes ||
                 match.scan_space_id.size() > limits.maximum_string_bytes || !valid_utf8(match.pattern_id) ||
                 !valid_utf8(match.scan_space_id) || match.subject_generation == 0 ||

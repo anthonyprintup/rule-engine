@@ -71,6 +71,7 @@ namespace rule_engine::python {
         std::uint32_t context_bytes_before {};
         std::uint32_t context_bytes_after {};
         ScanResultMode result_mode {ScanResultMode::exact_complete};
+        std::vector<std::string> pattern_ids;
     };
 
     struct ScanRequest {
