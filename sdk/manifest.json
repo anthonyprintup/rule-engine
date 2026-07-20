@@ -1,0 +1,59 @@
+{
+  "author_package": "rule_engine",
+  "content_sha256": "sha256:a1917fbe67b4fe7b21667726390620d58b0dab09472b1b18e68c29121337cc0d",
+  "engine_api": 1,
+  "files": [
+    {
+      "path": "rule_engine/__init__.py",
+      "sha256": "d9dceb020b4923955ce53641421188e5ed68cf0b0ee8589e8e07ee6b1ce033da",
+      "size": 5647
+    },
+    {
+      "path": "rule_engine/__init__.pyi",
+      "sha256": "51f65092dbae2cd63f869af0f2235bea15d19b59d6b249e3c695d4a6962194a5",
+      "size": 12828
+    },
+    {
+      "path": "rule_engine/py.typed",
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+      "size": 1
+    },
+    {
+      "path": "rule_engine_generator/__init__.py",
+      "sha256": "9c2fff8d090cb2c78442c9d27b81d4d4f6d0d2e4eaae62e9eb825837799f61ae",
+      "size": 1202
+    },
+    {
+      "path": "rule_engine_generator/__init__.pyi",
+      "sha256": "1162e755647e7fd142fcd3546b365bf3ad47701bac1f8377d919c77f2c871f0f",
+      "size": 2337
+    },
+    {
+      "path": "rule_engine_generator/_runtime.py",
+      "sha256": "d6adff7df377cfe7fcc5dded4547b3527fffb10d6be165394f0fa5ce134e6e82",
+      "size": 20705
+    },
+    {
+      "path": "rule_engine_generator/bindings.py",
+      "sha256": "5a1705803ba434ab625b04ea01ac6afde74d1fc24fe609d85f86983e5b50d42f",
+      "size": 258
+    },
+    {
+      "path": "rule_engine_generator/bindings.pyi",
+      "sha256": "5c0f6a69953c253d9372b4b2627c9db132cfe90dd2d67bda6619560ac033ad9b",
+      "size": 201
+    },
+    {
+      "path": "rule_engine_generator/py.typed",
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+      "size": 1
+    }
+  ],
+  "format": 1,
+  "generator_package": "rule_engine_generator",
+  "generator_protocol": 1,
+  "python": "3.14.6",
+  "sdk_id": "rule-engine-python-author-sdk",
+  "sdk_version": "1.0.0",
+  "stub_format": "pep561"
+}
