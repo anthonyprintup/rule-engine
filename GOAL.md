@@ -1,21 +1,27 @@
 # Rule Engine Goal
 
-Build a Windows-only C++23 rule engine that can parse YARA rules through YARA-X, verify them against C++-owned module descriptors, lower them to a debug-stable symbolic IR, and evaluate them against live process subjects while facts arrive asynchronously from client-side handlers.
+Build a C++23 rule engine whose authoring language is a statically checked, resource-bounded Python 3.14 subset. C++ owns type checking, lowering, rule semantics, scheduling, optimization, effects, state, correlation, and match decisions. Windows agents only enumerate typed subjects and return requested facts, scans, observations, or diagnostics.
 
-The server owns rule semantics. Clients are data providers only: they enumerate subjects and return typed facts or structured diagnostics. A client must never decide whether a rule matches.
+## Product invariants
 
-## V1 Scope
+- Python rule modules are parsed as data by a short-lived, exact CPython 3.14.6 worker; they are never imported or evaluated by CPython.
+- Trusted signed generators may execute only in the short-lived worker with declared inputs and deterministic double-run validation. Process limits contain failures and resource abuse, but are not represented as a hostile-code sandbox.
+- Rule evaluation runs only in the verified, resumable C++ VM under the immutable `balanced.v1` budget profile.
+- Mutable VM values are deep-frozen, schema-checked, labeled, canonical, and acyclic before crossing provider, service, event, effect, or persistence boundaries.
+- Reached effects remain ordered and transactional. External actions are dispatched only from a committed durable outbox.
+- Protocol v2 uses typed recursive subject identities and never sends a predicate or delegates a rule decision to an agent.
+- Production activation is atomic across healthy leased nodes and compares platform-independent semantic hashes before the active generation changes.
 
-- Parse YARA syntax with a Rust `yara-x-parser` bridge.
-- Keep semantic validation, lowering, scheduling, caching, and execution in C++.
-- Support provider-backed facts for process fields, PE image fields, and pattern matches.
-- Use a synchronous VM step function that either completes or returns missing fact batches grouped by provider route.
-- Use plain localhost TCP framing for v1 server/client demos.
-- Record machine-readable and readable diagnostics, schedules, and opt-in traces.
+## Supported deployment
 
-## Non-Goals
+- Windows 10/Server 2019 or newer, x64: server and agent.
+- glibc 2.35 or newer, x86-64: server only.
+- PostgreSQL 17 or newer: production runtime store.
+- SQLite: explicit single-node development and test store only.
 
-- Do not implement a complete native pattern scanner in v1. Pattern facts are fixture/provider supplied.
-- Do not let clients evaluate conditions or whole predicates.
-- Do not make the debug IR or trace format a permanent public API yet.
-- Do not support non-Windows live process providers in v1.
+## Non-goals
+
+- Compatibility with YARA syntax, YARA artifacts, protocol v1, or the former Rust parser bridge.
+- Treating signed pack authors as hostile. Signer authorization is the production source trust boundary.
+- Executing arbitrary Python, dynamic imports, reflection, `eval`, `exec`, ambient filesystem/network/process APIs, or unbounded computation.
+- Letting clients evaluate conditions, optimize predicates, or return match decisions.
