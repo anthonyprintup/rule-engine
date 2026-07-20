@@ -32,6 +32,36 @@ namespace rule_engine::python::protocol_v2 {
         virtual ~ITrustPolicy() = default;
         [[nodiscard]] virtual std::expected<AuthenticatedPeer, ProtocolError>
         authenticate(const TlsPeerIdentity &identity) const noexcept = 0;
+        [[nodiscard]] virtual std::expected<void, ProtocolError>
+        authorize_capabilities(const AuthenticatedPeer &peer,
+                               std::span<const CapabilityAdvertisement> capabilities) const noexcept;
+    };
+
+    struct CapabilityPermission {
+        CapabilityId capability;
+        std::uint32_t maximum_version {};
+        SchemaId request_schema;
+        SchemaId response_schema;
+    };
+
+    struct PeerEnrollment {
+        std::string canonical_uri_san;
+        std::string certificate_sha256;
+        AuthenticatedPeer identity;
+        bool disabled {};
+        std::vector<CapabilityPermission> capabilities;
+    };
+
+    struct OperatorTrustPolicy final: ITrustPolicy {
+        [[nodiscard]] std::expected<void, ProtocolError> enroll(PeerEnrollment enrollment);
+        [[nodiscard]] std::expected<AuthenticatedPeer, ProtocolError>
+        authenticate(const TlsPeerIdentity &identity) const noexcept override;
+        [[nodiscard]] std::expected<void, ProtocolError>
+        authorize_capabilities(const AuthenticatedPeer &peer,
+                               std::span<const CapabilityAdvertisement> capabilities) const noexcept override;
+
+    private:
+        std::vector<PeerEnrollment> enrollments_;
     };
 
     // Validates transport facts supplied by the TLS implementation, then delegates
@@ -39,6 +69,10 @@ namespace rule_engine::python::protocol_v2 {
     // claims to establish TLS or peer identity.
     [[nodiscard]] std::expected<AuthenticatedPeer, ProtocolError>
     authenticate_transport(const TlsPeerIdentity &identity, const ITrustPolicy &policy) noexcept;
+
+    [[nodiscard]] std::expected<AuthenticatedPeer, ProtocolError>
+    authenticate_and_authorize(const TlsPeerIdentity &identity, const ITrustPolicy &policy,
+                               std::span<const CapabilityAdvertisement> capabilities) noexcept;
 
     enum struct SequenceDisposition : std::uint8_t { accepted, accepted_out_of_order, duplicate };
 
@@ -64,9 +98,6 @@ namespace rule_engine::python::protocol_v2 {
         std::size_t high_water_bytes {48 * mebibyte};
         std::size_t low_water_bytes {32 * mebibyte};
     };
-
-    using DurableAgentBody = std::variant<WorkResultMessage, AuthoritativeSnapshotBegin, AuthoritativeSnapshotChunk,
-                                          AuthoritativeSnapshotCommit>;
 
     struct OutboundRecord {
         std::uint64_t sequence {};

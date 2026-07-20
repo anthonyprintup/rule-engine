@@ -56,13 +56,21 @@ namespace rule_engine::python {
         std::uint64_t begin {};
         std::uint64_t size {};
         std::uint32_t permissions {};
+        std::string identity;
+        DataLabel label;
+        std::uint64_t subject_generation {};
     };
+
+    enum struct ScanResultMode : std::uint8_t { exact_complete = 1, existential = 2 };
 
     struct ScanPlan {
         std::string plan_id;
         std::string encoded_pattern;
         std::uint64_t maximum_bytes {};
         std::uint32_t maximum_matches {};
+        std::uint32_t context_bytes_before {};
+        std::uint32_t context_bytes_after {};
+        ScanResultMode result_mode {ScanResultMode::exact_complete};
     };
 
     struct ScanRequest {
@@ -84,6 +92,15 @@ namespace rule_engine::python {
     struct ScanMatch {
         std::uint64_t offset {};
         std::uint64_t length {};
+        std::string pattern_id;
+        std::string scan_space_id;
+        std::uint64_t absolute_address {};
+        std::uint32_t permission_snapshot {};
+        std::vector<std::byte> matched_bytes;
+        std::vector<std::byte> before_bytes;
+        std::vector<std::byte> after_bytes;
+        DataLabel label;
+        std::uint64_t subject_generation {};
     };
 
     struct ScanResponse {
@@ -93,6 +110,7 @@ namespace rule_engine::python {
         std::vector<ScanMatch> matches;
         bool truncated {};
         std::optional<Diagnostic> diagnostic;
+        ScanResultMode mode {ScanResultMode::exact_complete};
     };
 
     struct SnapshotBegin {

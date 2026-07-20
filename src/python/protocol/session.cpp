@@ -41,6 +41,87 @@ namespace rule_engine::python::protocol_v2 {
 
     } // namespace
 
+    std::expected<void, ProtocolError>
+    ITrustPolicy::authorize_capabilities(const AuthenticatedPeer &,
+                                         const std::span<const CapabilityAdvertisement> capabilities) const noexcept {
+        if (!capabilities.empty()) {
+            return std::unexpected(
+                session_error(ProtocolErrorCode::capability_mismatch, "peer capabilities are not authorized"));
+        }
+        return {};
+    }
+
+    std::expected<void, ProtocolError> OperatorTrustPolicy::enroll(PeerEnrollment enrollment) {
+        if (enrollment.canonical_uri_san.empty() || enrollment.identity.tenant.empty() ||
+            enrollment.identity.peer.empty()) {
+            return std::unexpected(
+                session_error(ProtocolErrorCode::malformed, "peer enrollment identity is incomplete"));
+        }
+        const auto duplicate_uri = std::ranges::any_of(enrollments_, [&enrollment](const PeerEnrollment &existing) {
+            return existing.canonical_uri_san == enrollment.canonical_uri_san;
+        });
+        const auto duplicate_peer = std::ranges::any_of(enrollments_, [&enrollment](const PeerEnrollment &existing) {
+            return existing.identity.tenant == enrollment.identity.tenant &&
+                   existing.identity.peer == enrollment.identity.peer;
+        });
+        if (duplicate_uri || duplicate_peer) {
+            return std::unexpected(
+                session_error(ProtocolErrorCode::malformed, "peer enrollment identity is duplicated"));
+        }
+        std::unordered_set<std::string> capabilities;
+        for (const auto &permission : enrollment.capabilities) {
+            if (permission.capability.empty() || permission.maximum_version == 0 || permission.request_schema.empty() ||
+                permission.response_schema.empty() || !capabilities.insert(permission.capability.value).second) {
+                return std::unexpected(
+                    session_error(ProtocolErrorCode::malformed, "peer capability enrollment is invalid"));
+            }
+        }
+        enrollments_.push_back(std::move(enrollment));
+        return {};
+    }
+
+    std::expected<AuthenticatedPeer, ProtocolError>
+    OperatorTrustPolicy::authenticate(const TlsPeerIdentity &identity) const noexcept {
+        const auto found = std::ranges::find_if(enrollments_, [&identity](const PeerEnrollment &enrollment) {
+            return enrollment.canonical_uri_san == identity.canonical_uri_san;
+        });
+        if (found == enrollments_.end() || found->disabled ||
+            (!found->certificate_sha256.empty() && found->certificate_sha256 != identity.certificate_sha256)) {
+            return std::unexpected(
+                session_error(ProtocolErrorCode::unauthenticated, "peer certificate is not enrolled"));
+        }
+        return found->identity;
+    }
+
+    std::expected<void, ProtocolError> OperatorTrustPolicy::authorize_capabilities(
+        const AuthenticatedPeer &peer, const std::span<const CapabilityAdvertisement> capabilities) const noexcept {
+        const auto enrollment = std::ranges::find_if(enrollments_, [&peer](const PeerEnrollment &candidate) {
+            return candidate.identity.tenant == peer.tenant && candidate.identity.peer == peer.peer;
+        });
+        if (enrollment == enrollments_.end() || enrollment->disabled) {
+            return std::unexpected(session_error(ProtocolErrorCode::unauthenticated, "peer enrollment is disabled"));
+        }
+        std::unordered_set<std::string> seen;
+        for (const auto &advertised : capabilities) {
+            if (advertised.capability.empty() || !seen.insert(advertised.capability.value).second) {
+                return std::unexpected(
+                    session_error(ProtocolErrorCode::capability_mismatch, "peer advertised duplicate capabilities"));
+            }
+            const auto permission =
+                std::ranges::find_if(enrollment->capabilities, [&advertised](const CapabilityPermission &candidate) {
+                    return candidate.capability == advertised.capability;
+                });
+            if (permission == enrollment->capabilities.end() || advertised.version == 0 ||
+                advertised.version > permission->maximum_version ||
+                advertised.request_schema != permission->request_schema ||
+                advertised.response_schema != permission->response_schema) {
+                return std::unexpected(
+                    session_error(ProtocolErrorCode::capability_mismatch, "peer capability exceeds its enrollment"));
+            }
+        }
+        return {};
+    }
+
     std::expected<AuthenticatedPeer, ProtocolError> authenticate_transport(const TlsPeerIdentity &identity,
                                                                            const ITrustPolicy &policy) noexcept {
         // The fields use human protocol notation: TLS 1.3 is {1, 3}.
@@ -67,6 +148,19 @@ namespace rule_engine::python::protocol_v2 {
         if (peer->tenant.empty() || peer->peer.empty()) {
             return std::unexpected(
                 session_error(ProtocolErrorCode::unauthenticated, "the trust policy returned an empty peer"));
+        }
+        return peer;
+    }
+
+    std::expected<AuthenticatedPeer, ProtocolError>
+    authenticate_and_authorize(const TlsPeerIdentity &identity, const ITrustPolicy &policy,
+                               const std::span<const CapabilityAdvertisement> capabilities) noexcept {
+        auto peer = authenticate_transport(identity, policy);
+        if (!peer) {
+            return std::unexpected(std::move(peer.error()));
+        }
+        if (auto authorized = policy.authorize_capabilities(*peer, capabilities); !authorized) {
+            return std::unexpected(std::move(authorized.error()));
         }
         return peer;
     }
