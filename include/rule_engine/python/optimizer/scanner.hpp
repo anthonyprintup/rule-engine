@@ -64,7 +64,7 @@ namespace rule_engine::python::optimizer {
         RegexEncoding encoding {RegexEncoding::utf8};
         bool case_sensitive {true};
         bool dot_matches_newline {};
-        bool one_line {};
+        bool multiline {};
     };
 
     struct StaticScanPattern {
@@ -73,6 +73,7 @@ namespace rule_engine::python::optimizer {
         PatternOrigin origin {PatternOrigin::compile_time};
         std::vector<std::byte> bytes;
         std::vector<std::byte> mask;
+        TextEncoding text_encoding {TextEncoding::utf8};
         bool ascii_case_insensitive {};
         std::string regex_source;
         RegexOptions regex_options;
@@ -85,8 +86,8 @@ namespace rule_engine::python::optimizer {
         invalid_utf8,
         invalid_masked_pattern,
         duplicate_pattern_id,
-        regex_engine_unavailable,
         regex_syntax,
+        regex_resource_exhausted,
         space_out_of_bounds,
         byte_budget_exceeded,
         match_budget_exceeded,
@@ -115,8 +116,6 @@ namespace rule_engine::python::optimizer {
     [[nodiscard]] std::expected<StaticScanPattern, ScanError>
     make_re2_pattern(std::string pattern_id, std::string_view expression, RegexOptions options = {},
                      PatternOrigin origin = PatternOrigin::compile_time);
-
-    [[nodiscard]] bool re2_engine_available() noexcept;
 
     struct TypedScanPlan {
         std::string plan_id;

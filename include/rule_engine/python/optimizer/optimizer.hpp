@@ -3,6 +3,7 @@
 #include "rule_engine/python/contract/compiler.hpp"
 #include "rule_engine/python/contract/runtime.hpp"
 
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -89,14 +90,36 @@ namespace rule_engine::python::optimizer {
         std::string value_digest;
     };
 
+    struct SemanticResourceCounters {
+        std::uint64_t instructions {};
+        std::uint64_t peak_frames {};
+        std::uint64_t peak_heap_bytes {};
+        std::uint64_t loop_iterations_and_yields {};
+        std::uint64_t allocation_work {};
+        std::uint64_t logical_facts {};
+        std::uint64_t provider_rounds {};
+        std::uint64_t fact_bytes {};
+        std::uint64_t service_calls {};
+        std::uint64_t peak_active_service_calls {};
+        std::uint64_t service_response_bytes {};
+        std::uint64_t history_queries {};
+        std::uint64_t history_rows {};
+        std::uint64_t history_bytes {};
+        std::uint64_t state_keys {};
+        std::uint64_t state_bytes {};
+        std::uint64_t effect_intents {};
+        std::uint64_t effect_bytes {};
+        std::uint64_t recorder_events {};
+        std::uint64_t recorder_bytes {};
+
+        auto operator<=>(const SemanticResourceCounters &) const = default;
+    };
+
     struct ShadowExecutionSnapshot {
-        EvaluationOutcome outcome {EvaluationOutcome::faulted};
-        std::optional<bool> verdict;
+        EvaluationResult evaluation;
         std::vector<LogicalReadObservation> logical_reads;
-        std::vector<EffectIntent> ordered_effects;
-        std::vector<StateMutation> ordered_state;
         std::vector<RecorderEvent> recorder;
-        std::optional<FaultChain> fault;
+        SemanticResourceCounters resources;
     };
 
     enum struct ShadowParityDimension : std::uint8_t {
@@ -107,6 +130,7 @@ namespace rule_engine::python::optimizer {
         state,
         recorder,
         fault,
+        semantic_resources,
     };
 
     // This deliberately contains no compared values. Counts and an optional
@@ -119,7 +143,7 @@ namespace rule_engine::python::optimizer {
         std::optional<std::size_t> first_difference_index;
     };
 
-    inline constexpr std::size_t maximum_shadow_mismatch_records = 7;
+    inline constexpr std::size_t maximum_shadow_mismatch_records = 8;
 
     struct ShadowParityLimits {
         std::size_t maximum_mismatch_records {maximum_shadow_mismatch_records};
