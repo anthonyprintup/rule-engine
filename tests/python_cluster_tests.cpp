@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -297,6 +298,90 @@ namespace {
         return pack_version + 4;
     }
 
+    struct CountingControlStore final: IActivationControlStore {
+        mutable std::size_t load_calls {};
+        mutable std::size_t find_operation_calls {};
+        mutable std::size_t find_idempotency_calls {};
+        mutable std::size_t inspect_calls {};
+        std::size_t commit_calls {};
+        DurableControlState state;
+        std::optional<AdminOperationRecord> operation;
+
+        [[nodiscard]] std::expected<DurableControlState, StoreError> load_state() const override {
+            ++load_calls;
+            return state;
+        }
+
+        [[nodiscard]] std::expected<std::optional<AdminOperationRecord>, StoreError>
+        find_operation(const std::string_view) const override {
+            ++find_operation_calls;
+            return operation;
+        }
+
+        [[nodiscard]] std::expected<std::optional<AdminOperationRecord>, StoreError>
+        find_operation_by_idempotency(const std::string_view) const override {
+            ++find_idempotency_calls;
+            return operation;
+        }
+
+        [[nodiscard]] std::expected<void, StoreError> commit(const ControlPlaneCommit &) override {
+            ++commit_calls;
+            return {};
+        }
+
+        [[nodiscard]] std::expected<ControlPlaneInspection, StoreError> inspect() const override {
+            ++inspect_calls;
+            return ControlPlaneInspection {.state = state, .operations = {}, .audit = {}};
+        }
+
+        [[nodiscard]] RuntimeStoreHealth health() const override { return {}; }
+
+        [[nodiscard]] std::size_t total_calls() const {
+            return load_calls + find_operation_calls + find_idempotency_calls + inspect_calls + commit_calls;
+        }
+    };
+
+    struct RecordingSecurityAudit final: IAdminSecurityAuditSink {
+        std::vector<AdminSecurityAuditEvent> events;
+
+        void record(const AdminSecurityAuditEvent &event) noexcept override { events.push_back(event); }
+    };
+
+    struct TestAdminAuthorizer final: IAdminAuthorizer {
+        bool allow_all {};
+        bool unavailable {};
+        TenantId allowed_tenant;
+        PackId allowed_pack;
+        std::set<AdminControlOperation> allowed_operations;
+        mutable std::vector<AdminAuthorizationRequest> requests;
+
+        [[nodiscard]] std::expected<AdminAuthorizationDecision, AdminAuthorizerFailure>
+        authorize(const AuthenticatedAdminPrincipal &principal,
+                  const AdminAuthorizationRequest &request) const override {
+            requests.push_back(request);
+            if (unavailable) {
+                return std::unexpected(
+                    AdminAuthorizerFailure {.message = "policy service unavailable", .retryable = true});
+            }
+            const auto allowed =
+                allow_all || (principal.home_tenant == allowed_tenant && request.resource.tenant == allowed_tenant &&
+                              request.resource.pack == allowed_pack && allowed_operations.contains(request.operation));
+            return AdminAuthorizationDecision {.outcome = allowed ? AdminAuthorizationOutcome::allowed :
+                                                                    AdminAuthorizationOutcome::denied,
+                                               .decision_id = "decision-" + std::to_string(requests.size()),
+                                               .detail = allowed ? "test policy allowed" : "test policy denied"};
+        }
+    };
+
+    AdminCallContext admin_context(const TenantId &tenant, const std::string &principal = "admin-a",
+                                   const AdminPrincipalKind kind = AdminPrincipalKind::administrator) {
+        return AdminCallContext {.principal = AuthenticatedAdminPrincipal {.principal_id = principal,
+                                                                           .home_tenant = tenant,
+                                                                           .kind = kind,
+                                                                           .authentication_id = "upstream-session-a"},
+                                 .at_unix_ms = 1};
+    }
+
     void stage_ready(ActivationController &activation, const GenerationRequest &request,
                      const std::vector<ClusterNode> &targets, const std::string &semantic, const std::string &binding,
                      const std::uint64_t now) {
@@ -421,6 +506,129 @@ namespace {
         REQUIRE(reference.has_value());
         REQUIRE(reference->implementation_available);
         REQUIRE_FALSE(reference->production_allowed);
+    }
+
+    TEST_CASE("authorized admin facade fails closed before touching persistence") {
+        CountingControlStore store;
+        DurableActivationAdmin durable {store};
+        TestAdminAuthorizer allow_all;
+        allow_all.allow_all = true;
+        RecordingSecurityAudit security_audit;
+        AuthorizedActivationAdmin authorized {durable, &allow_all, &security_audit};
+        const auto staged = ready_generation(1, "sha256:auth-source");
+        const auto request = mutation_request("auth-required", 0, 10);
+        const TenantId tenant {"tenant-a"};
+
+        const auto unauthenticated = authorized.preview_stage(AdminCallContext {}, tenant, request, staged);
+        REQUIRE_FALSE(unauthenticated.has_value());
+        REQUIRE(unauthenticated.error().code == AuthorizedAdminErrorCode::unauthenticated);
+        REQUIRE(allow_all.requests.empty());
+        REQUIRE(store.total_calls() == 0);
+
+        auto malformed = admin_context(tenant);
+        malformed.principal->authentication_id.clear();
+        const auto malformed_identity = authorized.pack_snapshot(malformed, tenant, staged.request.pack);
+        REQUIRE_FALSE(malformed_identity.has_value());
+        REQUIRE(malformed_identity.error().code == AuthorizedAdminErrorCode::unauthenticated);
+        REQUIRE(store.total_calls() == 0);
+
+        const auto invalid_resource = authorized.pack_snapshot(admin_context(tenant), TenantId {}, staged.request.pack);
+        REQUIRE_FALSE(invalid_resource.has_value());
+        REQUIRE(invalid_resource.error().code == AuthorizedAdminErrorCode::invalid_resource);
+        REQUIRE(allow_all.requests.empty());
+        REQUIRE(store.total_calls() == 0);
+
+        AuthorizedActivationAdmin missing_authorizer {durable, nullptr, &security_audit};
+        const auto missing = missing_authorizer.preview_stage(admin_context(tenant), tenant, request, staged);
+        REQUIRE_FALSE(missing.has_value());
+        REQUIRE(missing.error().code == AuthorizedAdminErrorCode::authorizer_unavailable);
+        REQUIRE(store.total_calls() == 0);
+
+        TestAdminAuthorizer unavailable;
+        unavailable.unavailable = true;
+        AuthorizedActivationAdmin failed_authorizer {durable, &unavailable, &security_audit};
+        const auto failed = failed_authorizer.inspect_pack(admin_context(tenant), tenant, staged.request.pack);
+        REQUIRE_FALSE(failed.has_value());
+        REQUIRE(failed.error().code == AuthorizedAdminErrorCode::authorizer_unavailable);
+        REQUIRE(failed.error().retryable);
+        REQUIRE(store.total_calls() == 0);
+
+        REQUIRE(security_audit.events.size() == 5);
+        REQUIRE(security_audit.events[0].outcome == AdminSecurityAuditOutcome::unauthenticated);
+        REQUIRE(security_audit.events[1].outcome == AdminSecurityAuditOutcome::unauthenticated);
+        REQUIRE(security_audit.events[2].outcome == AdminSecurityAuditOutcome::invalid_resource);
+        REQUIRE(security_audit.events[3].outcome == AdminSecurityAuditOutcome::authorizer_unavailable);
+        REQUIRE(security_audit.events[4].outcome == AdminSecurityAuditOutcome::authorizer_unavailable);
+    }
+
+    TEST_CASE("admin authorization scopes tenant resource and operation before store access") {
+        CountingControlStore store;
+        DurableActivationAdmin durable {store};
+        const TenantId tenant_a {"tenant-a"};
+        const TenantId tenant_b {"tenant-b"};
+        TestAdminAuthorizer policy;
+        policy.allowed_tenant = tenant_a;
+        policy.allowed_pack = PackId {"pack-a"};
+        policy.allowed_operations = {AdminControlOperation::stage_preview};
+        RecordingSecurityAudit security_audit;
+        AuthorizedActivationAdmin authorized {durable, &policy, &security_audit};
+        const auto context = admin_context(tenant_a);
+        const auto pack_a = ready_generation(1, "sha256:pack-a");
+        auto pack_b = ready_generation(1, "sha256:pack-b");
+        pack_b.request.pack = PackId {"pack-b"};
+
+        const auto cross_tenant =
+            authorized.preview_stage(context, tenant_b, mutation_request("cross-tenant", 0, 10), pack_a);
+        REQUIRE_FALSE(cross_tenant.has_value());
+        REQUIRE(cross_tenant.error().code == AuthorizedAdminErrorCode::unauthorized);
+
+        const auto cross_resource =
+            authorized.preview_stage(context, tenant_a, mutation_request("cross-resource", 0, 11), pack_b);
+        REQUIRE_FALSE(cross_resource.has_value());
+        REQUIRE(cross_resource.error().code == AuthorizedAdminErrorCode::unauthorized);
+
+        const auto wrong_operation = authorized.preview_activation(
+            context, tenant_a, mutation_request("wrong-operation", 0, 12), pack_a.request.pack, 1);
+        REQUIRE_FALSE(wrong_operation.has_value());
+        REQUIRE(wrong_operation.error().code == AuthorizedAdminErrorCode::unauthorized);
+
+        const auto denied_read = authorized.pack_snapshot(context, tenant_a, pack_a.request.pack);
+        REQUIRE_FALSE(denied_read.has_value());
+        REQUIRE(denied_read.error().code == AuthorizedAdminErrorCode::unauthorized);
+
+        const auto foreign_principal = authorized.preview_stage(admin_context(tenant_b, "foreign-admin"), tenant_a,
+                                                                mutation_request("foreign-principal", 0, 13), pack_a);
+        REQUIRE_FALSE(foreign_principal.has_value());
+        REQUIRE(foreign_principal.error().code == AuthorizedAdminErrorCode::unauthorized);
+
+        REQUIRE(policy.requests.size() == 5);
+        REQUIRE(security_audit.events.size() == 5);
+        REQUIRE(std::ranges::all_of(security_audit.events, [](const AdminSecurityAuditEvent &event) {
+            return event.outcome == AdminSecurityAuditOutcome::denied;
+        }));
+        REQUIRE(store.total_calls() == 0);
+    }
+
+    TEST_CASE("pack signer authentication never grants administrative authority") {
+        CountingControlStore store;
+        DurableActivationAdmin durable {store};
+        TestAdminAuthorizer allow_all;
+        allow_all.allow_all = true;
+        RecordingSecurityAudit security_audit;
+        AuthorizedActivationAdmin authorized {durable, &allow_all, &security_audit};
+        const TenantId tenant {"tenant-a"};
+        const auto staged = ready_generation(1, "sha256:signed-source");
+        auto request = mutation_request("signer-cannot-stage", 0, 10);
+        request.actor = "signer-a";
+
+        const auto denied = authorized.preview_stage(admin_context(tenant, "signer-a", AdminPrincipalKind::pack_signer),
+                                                     tenant, request, staged);
+        REQUIRE_FALSE(denied.has_value());
+        REQUIRE(denied.error().code == AuthorizedAdminErrorCode::unauthorized);
+        REQUIRE(allow_all.requests.empty());
+        REQUIRE(store.total_calls() == 0);
+        REQUIRE(security_audit.events.size() == 1);
+        REQUIRE(security_audit.events.front().outcome == AdminSecurityAuditOutcome::non_admin_identity_rejected);
     }
 
     TEST_CASE("runtime store contract is parameterized across reference and SQLite adapters") {
@@ -622,6 +830,135 @@ namespace {
             REQUIRE(std::ranges::all_of(inspection->audit,
                                         [](const AuditRecord &record) { return record.actor == "operator-a"; }));
         }
+    }
+
+    TEST_CASE("authorized facade gates and attributes every durable admin operation") {
+        TemporaryDatabase database;
+        const auto store = open_control(database);
+        REQUIRE(store.has_value());
+        DurableActivationAdmin durable {**store};
+        TestAdminAuthorizer allow_all;
+        allow_all.allow_all = true;
+        RecordingSecurityAudit security_audit;
+        AuthorizedActivationAdmin admin {durable, &allow_all, &security_audit};
+        const TenantId tenant {"tenant-a"};
+        const auto context = admin_context(tenant, "authenticated-admin");
+        const auto first_generation = ready_generation(1, "sha256:source-one");
+        const auto second_generation = ready_generation(2, "sha256:source-two");
+
+        auto first_stage_request = mutation_request("authorized-first-stage", 0, 10);
+        first_stage_request.actor = "untrusted-request-actor";
+        const auto first_stage = admin.preview_stage(context, tenant, first_stage_request, first_generation);
+        REQUIRE(first_stage.has_value());
+        REQUIRE(first_stage->actor == "authenticated-admin");
+        REQUIRE(admin.apply_stage(context, tenant, apply_request(*first_stage, 0, 11), first_generation).has_value());
+        const auto first_activation = admin.preview_activation(
+            context, tenant, mutation_request("authorized-first-activation", 1, 12), first_generation.request.pack, 1);
+        REQUIRE(first_activation.has_value());
+        REQUIRE(admin
+                    .begin_drain(context, tenant, first_generation.request.pack,
+                                 apply_request(*first_activation, 1, 13), 100)
+                    .has_value());
+        REQUIRE(admin
+                    .fence_stragglers(context, tenant, first_generation.request.pack,
+                                      apply_request(*first_activation, 2, 14), {})
+                    .has_value());
+        REQUIRE(admin.flip(context, tenant, first_generation.request.pack, apply_request(*first_activation, 3, 15))
+                    .has_value());
+
+        const auto second_stage =
+            admin.preview_stage(context, tenant, mutation_request("authorized-second-stage", 4, 20), second_generation);
+        REQUIRE(second_stage.has_value());
+        REQUIRE(admin.apply_stage(context, tenant, apply_request(*second_stage, 4, 21), second_generation).has_value());
+        const auto second_activation =
+            admin.preview_activation(context, tenant, mutation_request("authorized-second-activation", 5, 22),
+                                     second_generation.request.pack, 2);
+        REQUIRE(second_activation.has_value());
+        REQUIRE(admin
+                    .begin_drain(context, tenant, second_generation.request.pack,
+                                 apply_request(*second_activation, 5, 23), 200)
+                    .has_value());
+        REQUIRE(admin
+                    .fence_stragglers(context, tenant, second_generation.request.pack,
+                                      apply_request(*second_activation, 6, 24), {"work-two"})
+                    .has_value());
+        REQUIRE(admin.flip(context, tenant, second_generation.request.pack, apply_request(*second_activation, 7, 25))
+                    .has_value());
+
+        const StateTransitionPlan rollback_transition {.mode = StateTransitionMode::carry,
+                                                       .source_namespace = {},
+                                                       .target_namespace = {},
+                                                       .migration_id = {},
+                                                       .reset_authorized = false,
+                                                       .accept_state_gap = false};
+        const auto rollback = admin.preview_rollback(context, tenant, mutation_request("authorized-rollback", 8, 30),
+                                                     first_generation.request.pack, 1, 3, rollback_transition);
+        REQUIRE(rollback.has_value());
+        REQUIRE(rollback->actor == "authenticated-admin");
+        auto rollback_generation = first_generation;
+        rollback_generation.request.generation = 3;
+        rollback_generation.request.rollback_from = 1;
+        rollback_generation.request.state_transition = rollback->state_transition;
+        REQUIRE(admin.apply_rollback_stage(context, tenant, apply_request(*rollback, 8, 31), rollback_generation)
+                    .has_value());
+
+        const auto snapshot = admin.pack_snapshot(context, tenant, first_generation.request.pack);
+        REQUIRE(snapshot.has_value());
+        REQUIRE(snapshot->control.has_value());
+        REQUIRE(snapshot->control->resource_version == 9);
+        REQUIRE(snapshot->control->active_generation == 2);
+        REQUIRE(snapshot->generations.size() == 3);
+
+        const auto operation =
+            admin.operation_snapshot(context, tenant, first_generation.request.pack, rollback->operation_id);
+        REQUIRE(operation.has_value());
+        REQUIRE(operation->has_value());
+        REQUIRE((*operation)->kind == AdminOperationKind::rollback);
+
+        const auto inspection = admin.inspect_pack(context, tenant, first_generation.request.pack);
+        REQUIRE(inspection.has_value());
+        REQUIRE(inspection->operations.size() == 5);
+        REQUIRE(inspection->audit.size() == 14);
+        REQUIRE(std::ranges::all_of(inspection->audit,
+                                    [](const AuditRecord &record) { return record.actor == "authenticated-admin"; }));
+
+        const auto wrong_resource =
+            admin.operation_snapshot(context, tenant, PackId {"pack-b"}, rollback->operation_id);
+        REQUIRE(wrong_resource.has_value());
+        REQUIRE_FALSE(wrong_resource->has_value());
+        const auto unchanged = durable.inspect();
+        REQUIRE(unchanged.has_value());
+        REQUIRE(unchanged->state.storage_revision == 14);
+        REQUIRE(unchanged->audit.size() == 14);
+
+        std::set<AdminControlOperation> observed_operations;
+        for (const auto &request : allow_all.requests) { observed_operations.insert(request.operation); }
+        REQUIRE(observed_operations ==
+                std::set<AdminControlOperation> {
+                    AdminControlOperation::stage_preview, AdminControlOperation::stage_apply,
+                    AdminControlOperation::activation_preview, AdminControlOperation::activation_drain,
+                    AdminControlOperation::activation_fence, AdminControlOperation::activation_flip,
+                    AdminControlOperation::rollback_preview, AdminControlOperation::rollback_stage_apply,
+                    AdminControlOperation::pack_read, AdminControlOperation::operation_read,
+                    AdminControlOperation::pack_inspect});
+        REQUIRE(security_audit.events.size() == allow_all.requests.size());
+        REQUIRE(std::ranges::all_of(security_audit.events, [](const AdminSecurityAuditEvent &event) {
+            return event.outcome == AdminSecurityAuditOutcome::allowed && !event.decision_id.empty();
+        }));
+
+        allow_all.allow_all = false;
+        const auto denied_after_state =
+            admin.preview_stage(context, tenant, mutation_request("denied-after-state", 9, 40),
+                                ready_generation(4, "sha256:denied-source"));
+        REQUIRE_FALSE(denied_after_state.has_value());
+        REQUIRE(denied_after_state.error().code == AuthorizedAdminErrorCode::unauthorized);
+        const auto after_denial = durable.inspect();
+        REQUIRE(after_denial.has_value());
+        REQUIRE(after_denial->state.storage_revision == unchanged->state.storage_revision);
+        REQUIRE(after_denial->state.generations.size() == unchanged->state.generations.size());
+        REQUIRE(after_denial->operations.size() == unchanged->operations.size());
+        REQUIRE(after_denial->audit.size() == unchanged->audit.size());
+        REQUIRE(security_audit.events.back().outcome == AdminSecurityAuditOutcome::denied);
     }
 
     TEST_CASE("control-plane apply rejects stale previews without partially staging a generation") {

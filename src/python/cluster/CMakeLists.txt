@@ -1,5 +1,6 @@
 add_library(
     rule_engine_python_cluster
+    admin_authorization.cpp
     activation.cpp
     audit.cpp
     breaker.cpp
@@ -46,18 +47,19 @@ if(PostgreSQL_FOUND)
     target_compile_definitions(rule_engine_python_cluster PUBLIC RULE_ENGINE_HAS_POSTGRESQL=1)
 endif()
 
-add_executable(rule_engine_python_cluster_tests ../../../tests/python_cluster_tests.cpp)
-target_link_libraries(
-    rule_engine_python_cluster_tests
-    PRIVATE
-        rule_engine::python_cluster
-        Catch2::Catch2WithMain
-)
-target_compile_options(
-    rule_engine_python_cluster_tests
-    PRIVATE
-        $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:/clang:-Wno-c2y-extensions>
-        $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:GNU>>:-Wno-c2y-extensions>
-)
-enable_testing()
-add_test(NAME python_cluster_tests COMMAND $<TARGET_FILE:rule_engine_python_cluster_tests>)
+if(BUILD_TESTING)
+    add_executable(rule_engine_python_cluster_tests ../../../tests/python_cluster_tests.cpp)
+    target_link_libraries(
+        rule_engine_python_cluster_tests
+        PRIVATE
+            rule_engine::python_cluster
+            Catch2::Catch2WithMain
+    )
+    target_compile_options(
+        rule_engine_python_cluster_tests
+        PRIVATE
+            $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:/clang:-Wno-c2y-extensions>
+            $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:GNU>>:-Wno-c2y-extensions>
+    )
+    add_test(NAME python_cluster_tests COMMAND $<TARGET_FILE:rule_engine_python_cluster_tests>)
+endif()
