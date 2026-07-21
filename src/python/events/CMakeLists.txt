@@ -9,22 +9,23 @@ target_link_libraries(
         rule_engine::project_options
 )
 
-add_executable(
-    rule_engine_python_events_tests
-    "${PROJECT_SOURCE_DIR}/tests/python_events_adapter_tests.cpp"
-    "${PROJECT_SOURCE_DIR}/tests/python_events_tests.cpp"
-)
-target_link_libraries(
-    rule_engine_python_events_tests
-    PRIVATE
-        rule_engine::python_events
-        Catch2::Catch2WithMain
-)
-target_compile_options(
-    rule_engine_python_events_tests
-    PRIVATE
-        $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:/clang:-Wno-c2y-extensions>
-        $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:GNU>>:-Wno-c2y-extensions>
-)
-enable_testing()
-add_test(NAME rule_engine_python_events_tests COMMAND $<TARGET_FILE:rule_engine_python_events_tests>)
+if(BUILD_TESTING)
+    add_executable(
+        rule_engine_python_events_tests
+        "${PROJECT_SOURCE_DIR}/tests/python_events_adapter_tests.cpp"
+        "${PROJECT_SOURCE_DIR}/tests/python_events_tests.cpp"
+    )
+    target_link_libraries(
+        rule_engine_python_events_tests
+        PRIVATE
+            rule_engine::python_events
+            Catch2::Catch2WithMain
+    )
+    target_compile_options(
+        rule_engine_python_events_tests
+        PRIVATE
+            $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:/clang:-Wno-c2y-extensions>
+            $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:GNU>>:-Wno-c2y-extensions>
+    )
+    add_test(NAME rule_engine_python_events_tests COMMAND $<TARGET_FILE:rule_engine_python_events_tests>)
+endif()
