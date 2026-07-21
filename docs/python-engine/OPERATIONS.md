@@ -1,0 +1,247 @@
+# Python Engine Operations
+
+This runbook covers the shipped Python-only command surfaces. It is subordinate
+to the trust model, contracts, and limitations in this directory: a command
+being present does not widen the supported Python subset or make a trusted
+generator safe to run as hostile code.
+
+## 1. Install and inventory
+
+Production packages should bundle the already staged, manifest-validated
+CPython 3.14.6 runtime. The staging root is not a system Python installation and
+must contain `rule-engine-python-runtime.manifest` and the pinned worker.
+
+```powershell
+cmake -S . -B build/release -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DBUILD_TESTING=OFF `
+  -DRULE_ENGINE_PROTOCOL_REQUIRE_SECURE_RUNTIME=ON `
+  -DRULE_ENGINE_INSTALL_PRIVATE_PYTHON=ON `
+  -DRULE_ENGINE_PRIVATE_PYTHON_RUNTIME_ROOT=C:/cache/python-3.14.6
+cmake --build build/release
+cmake --install build/release --prefix C:/rule-engine
+```
+
+Verify the six public executables from the installed prefix:
+
+```powershell
+$bin = 'C:/rule-engine/bin'
+foreach ($name in @(
+  'rule_engine_pack', 'rule_engine_check', 'rule_engine_admin',
+  'rule_engine_server', 'rule_engine_agent', 'rule_engine_benchmark'
+)) {
+  & "$bin/$name.exe" --version
+}
+```
+
+The package deliberately contains no Cargo, Rust, YARA, protocol-v1, private
+key, cache, bytecode, or build-tree artifact. See
+[`../../cmake/INSTALL_PACKAGE.md`](../../cmake/INSTALL_PACKAGE.md) for the full
+layout and relocation contract.
+
+## 2. Author, check, and build a pack
+
+Static rule modules are parsed as data and are never imported or evaluated by
+CPython. `rule_engine_check` uses the private worker only to obtain a bounded
+syntax envelope; C++ performs binding, type checking, lowering, verification,
+optimization, and execution semantics.
+
+```powershell
+$runtime = 'C:/rule-engine/libexec/rule_engine/python/runtime/3.14.6'
+$sdk = 'C:/rule-engine/share/rule_engine/python-sdk/1.0.0'
+
+rule_engine_pack stubs C:/rules/example `
+  --output C:/rules/.typing `
+  --sdk-root $sdk
+
+rule_engine_pack build C:/rules/example `
+  --output C:/packs/example.unsigned.rpack `
+  --trust-mode development
+
+rule_engine_check --pack C:/packs/example.unsigned.rpack `
+  --runtime-root $runtime `
+  --trust-mode development `
+  --format sarif `
+  --explain-facts `
+  --explain-plan
+```
+
+Development trust is explicit. It does not authorize a generator unless the
+pack trust decision independently grants generator execution. Unsupported
+Python constructs fail with stable, source-spanned diagnostics.
+
+## 3. Sign and verify offline
+
+The built-in signer accepts an absolute `file:` reference to exactly one raw
+32-byte Ed25519 seed. On Windows the file must be local, non-reparse, owned by
+the caller, have no alternate streams, and have an allow-only protected ACL for
+the caller, SYSTEM, and Administrators. The tool refuses to overwrite output
+and never prints or embeds the seed or its path.
+
+```powershell
+rule_engine_pack sign C:/packs/example.unsigned.rpack `
+  --output C:/packs/example.rpack `
+  --signer file:C:/offline-keys/example.seed `
+  --runtime-root C:/rule-engine/libexec/rule_engine/python/runtime/3.14.6
+
+rule_engine_pack verify C:/packs/example.rpack `
+  --trust-mode production `
+  --trust-config C:/rule-engine/config/pack-trust.conf `
+  --format json
+```
+
+The canonical trust configuration is:
+
+```text
+format=1
+mode=production
+crypto_library=C:/rule-engine/bin/libcrypto-4-x64.dll
+signer=sha256:PUBLIC_KEY_DIGEST|64_HEX_PUBLIC_KEY|sorted.pack.prefixes|active
+```
+
+The local-file key provider is an offline operational adapter, not a substitute
+for an HSM/KMS/PKCS#11 integration. Keep key generation, backup, rotation, and
+operator ceremony outside the online server.
+
+## 4. Configure the resident server
+
+The server accepts only one explicit configuration path. Validate syntax,
+cross-field policy, path types, runtime pins, trust snapshots, and required
+backends before starting listeners:
+
+```powershell
+rule_engine_server --config C:/rule-engine/config/server.conf --validate-config
+rule_engine_server --config C:/rule-engine/config/server.conf
+```
+
+A single-node development configuration uses `deployment.mode =
+"single_node_dev"`, `store.backend = "sqlite_dev"`, exactly one server process,
+numeric loopback listener endpoints, and explicit development authorization.
+Production uses `deployment.mode = "production_cluster"`, PostgreSQL 17,
+mutual TLS, CRL policy, signer/revocation/peer-enrollment snapshots, and every
+named policy profile. Inline database secrets are rejected; the supported
+reference form is `env:VARIABLE_NAME`, resolved once and then wiped from the
+server-owned buffer.
+
+Both modes require these common keys:
+
+```text
+schema.version
+deployment.mode
+node.id
+node.platform_abi
+node.lease_duration_ms
+node.lease_renew_interval_ms
+store.backend
+store.server_processes
+listener.agent_endpoint
+listener.admin_endpoint
+listener.accept_timeout_ms
+listener.handshake_timeout_ms
+listener.read_timeout_ms
+listener.write_timeout_ms
+listener.backlog
+listener.maximum_consecutive_failures
+network.require_hard_resolver_bounds
+runtime.root
+pack.registry_path
+bindings.operator_path
+schemas.catalog_path
+profiles.budget_path
+profiles.retention_path
+observability.prometheus_endpoint
+observability.json_log_path
+observability.audit_path
+```
+
+Run `rule_engine_server --help` from the same installed version for the
+production-only keys. Unknown and duplicate keys fail closed. Listener hosts
+are numeric literals so startup does not introduce an unbounded resolver path.
+
+## 5. Configure the Windows agent
+
+The agent is outbound-only and accepts numeric failover endpoints. It never
+receives a predicate, bytecode, or verdict; it enumerates typed subjects and
+returns requested facts, scans, inventory observations, or diagnostics.
+
+```text
+schema_version = 1
+spool_path = C:\ProgramData\RuleEngine\agent\spool.sqlite3
+certificate_path = C:\ProgramData\RuleEngine\agent\client.pem
+private_key_path = C:\ProgramData\RuleEngine\agent\client-key.pem
+ca_path = C:\ProgramData\RuleEngine\agent\ca.pem
+server_endpoint = 192.0.2.10:7443
+server_endpoint = [2001:db8::10]:7443
+server_name = coordinator.example
+server_uri = urn:rule-engine:server
+server_fingerprint_sha256 = 64_LOWERCASE_HEX_DIGITS
+peer_id = peer:example-host
+active_generation = 1
+```
+
+All filesystem paths are absolute. The TLS chain, DNS name, exact URI SAN, and
+SHA-256 leaf fingerprint must agree. Validate before running:
+
+```powershell
+rule_engine_agent --config C:/ProgramData/RuleEngine/agent/agent.conf --validate-config
+rule_engine_agent --config C:/ProgramData/RuleEngine/agent/agent.conf
+```
+
+Accepted results and complete authoritative inventory snapshots are written to
+the SQLite spool before first transmission. Reconnect replays unacknowledged
+records; cumulative ACK is the deletion boundary. Sequence, generation,
+session, request, and fence mismatches are rejected rather than guessed.
+
+## 6. Administration and observability
+
+`rule_engine_admin` requires an authenticated configuration and an injected
+transport backend. There is no implicit local administrator or unauthenticated
+fallback:
+
+```text
+format=1
+endpoint=https://control.example/v1
+client_certificate=client.pem
+client_key=client.key
+trust_bundle=trust.pem
+actor=operator-identity
+```
+
+Mutating commands require an idempotent request identity and audited reason;
+destructive operations default to preview unless `--apply` is explicit. The
+server authorizes the authenticated principal against the exact operation and
+tenant/pack resource before any store access or audit mutation.
+
+Use the configured JSON log, security audit, readiness, and Prometheus outputs
+for operations. Logs and diagnostics record identities, hashes, limits, and
+failure classes, not rule payloads, private keys, connection secrets, or
+Sensitive/Secret values.
+
+## 7. Benchmark interpretation
+
+```powershell
+rule_engine_benchmark --peers 10000 --format json
+```
+
+This validates exact/optimized observable parity and a bounded in-memory
+resident coordinator/spool model. The output states whether sockets and
+PostgreSQL were exercised. The default 10,000-peer run is not a claim of 10,000
+concurrent TLS connections or a live database load test.
+
+## 8. Stop and recovery rules
+
+- Stop admission first, cancel bounded work, then join owned workers; no
+  detached task may outlive its owner.
+- Never delete an agent spool to fix a reconnect. Restore connectivity and let
+  cumulative ACK retire durable records.
+- Treat stale fences, semantic-hash disagreement, schema mismatch, runtime-pin
+  mismatch, migration failure, or incomplete activation as fail-closed
+  readiness failures.
+- Replay is diagnostic and dispatch-free. External actions are redriven only
+  through a separately authorized outbox operation.
+- Do not weaken signer, TLS, schema, or private-runtime validation to recover a
+  pack. Repair the artifact or policy and stage a new generation.
+
+The complete known-limit record and its revisit conditions are in
+[`LIMITATIONS.md`](LIMITATIONS.md). Current implementation and qualification
+evidence is in [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md).
