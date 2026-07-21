@@ -16,8 +16,8 @@ target_link_libraries(
     PUBLIC
         rule_engine::python_contract
         rule_engine::python_optimizer
-        rule_engine::project_options
     PRIVATE
+        rule_engine::project_options
         advapi32
         bcrypt
         crypt32
@@ -32,6 +32,7 @@ target_link_libraries(
     PUBLIC
         rule_engine::python_windows
         rule_engine::python_protocol
+    PRIVATE
         rule_engine::project_options
 )
 
@@ -43,8 +44,8 @@ target_link_libraries(
     PUBLIC
         rule_engine::python_windows_runtime
         rule_engine::python_protocol
-        rule_engine::project_options
     PRIVATE
+        rule_engine::project_options
         ws2_32
 )
 
@@ -66,6 +67,7 @@ if(BUILD_TESTING)
         rule_engine_python_windows_provider_tests
         PRIVATE
             rule_engine::python_windows_runtime
+            rule_engine_test_options
             Catch2::Catch2WithMain
     )
     target_compile_options(
@@ -91,6 +93,7 @@ if(BUILD_TESTING)
         rule_engine_python_windows_agent_tests
         PRIVATE
             rule_engine::python_windows_agent
+            rule_engine_test_options
             Catch2::Catch2WithMain
     )
     target_compile_options(

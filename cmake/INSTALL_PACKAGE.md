@@ -23,11 +23,11 @@ share/rule_engine/package/                 package notes and runtime pin manifes
 The install rules select explicit source directories. They do not copy a source
 or build tree wholesale, and therefore do not package private keys, Git data,
 Cargo/Rust artifacts, caches, `__pycache__`, bytecode, or unrelated build output.
-The current CLI target names are `rule_engine_python_pack_cli`,
-`rule_engine_python_check_cli`, and `rule_engine_python_admin_cli`; their public
-installed names come from `OUTPUT_NAME`. The module also recognizes the
-Python-owned server, agent, and benchmark targets when those integration lanes
-are present. It never selects similarly named legacy targets.
+The executable targets are `rule_engine_python_pack_cli`,
+`rule_engine_python_check_cli`, `rule_engine_python_admin_cli`,
+`rule_engine_python_server`, `rule_engine_python_agent`, and
+`rule_engine_python_benchmark`; their public installed names come from
+`OUTPUT_NAME`. The module never selects similarly named legacy targets.
 
 Executables and shared libraries contribute to a CMake runtime-dependency set.
 The install step recursively copies their non-system runtime libraries beside
@@ -144,5 +144,6 @@ probe, packaging, and downstream-consumer paths run without Cargo or Rust.
   without `re2Config.cmake` fails instead of silently using a build-tree copy.
 - Per-template generator binding modules are produced by pack compilation; the
   installed SDK contains the versioned base package and empty binding seam.
-- Executables are installed only after their Python-engine targets exist. The
-  module intentionally never falls back to similarly named legacy executables.
+- The six Python-engine executables are part of the complete root graph. A
+  deliberately partial embedding exports only the targets it creates, and the
+  module never falls back to similarly named legacy executables.

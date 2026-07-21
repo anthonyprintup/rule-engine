@@ -6,11 +6,18 @@ add_library(
 )
 add_library(rule_engine::python_vm ALIAS rule_engine_python_vm)
 target_include_directories(rule_engine_python_vm PUBLIC "${CMAKE_SOURCE_DIR}/include")
-target_link_libraries(rule_engine_python_vm PUBLIC rule_engine::python_contract rule_engine::project_options)
+target_link_libraries(
+    rule_engine_python_vm
+    PUBLIC rule_engine::python_contract
+    PRIVATE rule_engine::project_options
+)
 
 if(BUILD_TESTING)
     add_executable(rule_engine_python_vm_tests "${CMAKE_SOURCE_DIR}/tests/python_vm_tests.cpp")
-    target_link_libraries(rule_engine_python_vm_tests PRIVATE rule_engine::python_vm Catch2::Catch2WithMain)
+    target_link_libraries(
+        rule_engine_python_vm_tests
+        PRIVATE rule_engine::python_vm rule_engine_test_options Catch2::Catch2WithMain
+    )
     target_compile_options(
         rule_engine_python_vm_tests
         PRIVATE

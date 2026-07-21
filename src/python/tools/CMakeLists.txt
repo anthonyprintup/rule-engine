@@ -18,6 +18,7 @@ target_link_libraries(
         rule_engine::python_compiler
         rule_engine::python_optimizer
         rule_engine::python_packaging
+    PRIVATE
         rule_engine::project_options
 )
 
@@ -45,7 +46,10 @@ target_link_libraries(
 
 add_executable(rule_engine_python_pack_cli bin/rule_engine_pack_main.cpp)
 set_target_properties(rule_engine_python_pack_cli PROPERTIES OUTPUT_NAME rule_engine_pack)
-target_link_libraries(rule_engine_python_pack_cli PRIVATE rule_engine::python_tools)
+target_link_libraries(
+    rule_engine_python_pack_cli
+    PRIVATE rule_engine::python_tools rule_engine::project_options
+)
 target_compile_definitions(
     rule_engine_python_pack_cli
     PRIVATE RULE_ENGINE_TRACKED_SDK_ROOT="${PROJECT_SOURCE_DIR}/sdk"
@@ -53,19 +57,31 @@ target_compile_definitions(
 
 add_executable(rule_engine_python_check_cli bin/rule_engine_check_main.cpp)
 set_target_properties(rule_engine_python_check_cli PROPERTIES OUTPUT_NAME rule_engine_check)
-target_link_libraries(rule_engine_python_check_cli PRIVATE rule_engine::python_tools)
+target_link_libraries(
+    rule_engine_python_check_cli
+    PRIVATE rule_engine::python_tools rule_engine::project_options
+)
 
 add_executable(rule_engine_python_admin_cli bin/rule_engine_admin_main.cpp)
 set_target_properties(rule_engine_python_admin_cli PROPERTIES OUTPUT_NAME rule_engine_admin)
-target_link_libraries(rule_engine_python_admin_cli PRIVATE rule_engine::python_tools)
+target_link_libraries(
+    rule_engine_python_admin_cli
+    PRIVATE rule_engine::python_tools rule_engine::project_options
+)
 
 add_executable(rule_engine_python_server server_main.cpp)
 set_target_properties(rule_engine_python_server PROPERTIES OUTPUT_NAME rule_engine_server)
-target_link_libraries(rule_engine_python_server PRIVATE rule_engine::python_executable_support)
+target_link_libraries(
+    rule_engine_python_server
+    PRIVATE rule_engine::python_executable_support rule_engine::project_options
+)
 
 add_executable(rule_engine_python_benchmark benchmark_main.cpp)
 set_target_properties(rule_engine_python_benchmark PROPERTIES OUTPUT_NAME rule_engine_benchmark)
-target_link_libraries(rule_engine_python_benchmark PRIVATE rule_engine::python_executable_support)
+target_link_libraries(
+    rule_engine_python_benchmark
+    PRIVATE rule_engine::python_executable_support rule_engine::project_options
+)
 
 if(BUILD_TESTING)
     if(NOT TARGET rule_engine_stage_python_runtime)
@@ -89,6 +105,7 @@ if(BUILD_TESTING)
         rule_engine_python_tools_tests
         PRIVATE
             rule_engine::python_tools
+            rule_engine_test_options
             Catch2::Catch2WithMain
     )
     target_compile_options(
@@ -113,6 +130,7 @@ if(BUILD_TESTING)
         rule_engine_python_executable_surface_tests
         PRIVATE
             Catch2::Catch2WithMain
+            rule_engine_test_options
             rule_engine::python_executable_support
     )
     add_dependencies(

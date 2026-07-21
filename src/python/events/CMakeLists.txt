@@ -6,6 +6,7 @@ target_link_libraries(
     PUBLIC
         rule_engine::python_contract
         rule_engine::python_effects
+    PRIVATE
         rule_engine::project_options
 )
 
@@ -19,6 +20,7 @@ if(BUILD_TESTING)
         rule_engine_python_events_tests
         PRIVATE
             rule_engine::python_events
+            rule_engine_test_options
             Catch2::Catch2WithMain
     )
     target_compile_options(

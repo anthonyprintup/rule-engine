@@ -10,6 +10,22 @@ set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "Propagate the project C++ standard thr
 if(WIN32)
     set(ABSL_MSVC_STATIC_RUNTIME ON CACHE BOOL "Keep RE2 and Abseil behind the static-CRT bridge" FORCE)
 endif()
+
+set(rule_engine_restore_optimizer_flags OFF)
+if(MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    set(rule_engine_restore_optimizer_flags ON)
+    foreach(
+        flag_var
+        CMAKE_CXX_FLAGS
+        CMAKE_CXX_FLAGS_DEBUG
+        CMAKE_CXX_FLAGS_RELEASE
+        CMAKE_CXX_FLAGS_RELWITHDEBINFO
+        CMAKE_CXX_FLAGS_MINSIZEREL
+    )
+        set("rule_engine_optimizer_${flag_var}" "${${flag_var}}")
+        set("${flag_var}" "${RULE_ENGINE_DEPENDENCY_${flag_var}}")
+    endforeach()
+endif()
 if(NOT TARGET absl::base)
     FetchContent_Declare(
         rule_engine_abseil
@@ -27,6 +43,18 @@ if(NOT TARGET re2::re2)
         GIT_TAG 927f5d53caf8111721e734cf24724686bb745f55
     )
     FetchContent_MakeAvailable(rule_engine_re2)
+endif()
+if(rule_engine_restore_optimizer_flags)
+    foreach(
+        flag_var
+        CMAKE_CXX_FLAGS
+        CMAKE_CXX_FLAGS_DEBUG
+        CMAKE_CXX_FLAGS_RELEASE
+        CMAKE_CXX_FLAGS_RELWITHDEBINFO
+        CMAKE_CXX_FLAGS_MINSIZEREL
+    )
+        set("${flag_var}" "${rule_engine_optimizer_${flag_var}}")
+    endforeach()
 endif()
 
 # Protobuf's Abseil dependency is built with the static CRT on Windows, while
@@ -69,8 +97,8 @@ target_link_libraries(
     rule_engine_python_optimizer
     PUBLIC
         rule_engine::python_contract
-        rule_engine::project_options
     PRIVATE
+        rule_engine::project_options
         rule_engine_python_re2_bridge
 )
 
@@ -94,6 +122,7 @@ if(BUILD_TESTING)
         PRIVATE
             rule_engine::python_optimizer
             rule_engine::python_protocol
+            rule_engine_test_options
             Catch2::Catch2WithMain
     )
     target_compile_options(
