@@ -8,7 +8,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <cstdlib>
 #include <expected>
 #include <filesystem>
 #include <fstream>
@@ -28,25 +27,9 @@ namespace {
 #define RULE_ENGINE_TOOLING_SDK_ROOT ""
 #endif
 
-#ifndef RULE_ENGINE_TOOLING_WORKER_SCRIPT
-#define RULE_ENGINE_TOOLING_WORKER_SCRIPT ""
+#ifndef RULE_ENGINE_TOOLING_STAGED_RUNTIME_ROOT
+#define RULE_ENGINE_TOOLING_STAGED_RUNTIME_ROOT ""
 #endif
-
-    std::optional<std::string> environment_value(const char *name) {
-#ifdef _WIN32
-        char *raw_value {};
-        std::size_t length {};
-        if (_dupenv_s(&raw_value, &length, name) != 0 || raw_value == nullptr) {
-            return std::nullopt;
-        }
-        std::string value {raw_value};
-        std::free(raw_value);
-        return value;
-#else
-        const auto *raw_value = std::getenv(name);
-        return raw_value == nullptr ? std::nullopt : std::optional<std::string> {raw_value};
-#endif
-    }
 
     struct TemporaryDirectory {
         std::filesystem::path path;
@@ -365,13 +348,15 @@ namespace {
         CHECK(backend.command->explain_plan);
     }
 
-    TEST_CASE("pack command models expose deterministic build verify inspect and stubs operations") {
+    TEST_CASE("pack command models expose deterministic build sign verify inspect and stubs operations") {
         FakePackagingBackend backend;
 
         SECTION("build allows only a manifest-authorized generator") {
             const std::array arguments {
-                std::string_view {"build"},     std::string_view {"rules"},    std::string_view {"--output"},
-                std::string_view {"out.rpack"}, std::string_view {"--signer"}, std::string_view {"vault:key-one"},
+                std::string_view {"build"},    std::string_view {"rules"},
+                std::string_view {"--output"}, std::string_view {"out.rpack"},
+                std::string_view {"--signer"}, std::string_view {"vault:key-one"},
+                std::string_view {"--key-id"}, std::string_view {"sha256:expected"},
             };
             const auto output = run_rule_engine_pack(arguments, backend);
             CHECK(output.exit_code == ExitCode::success);
@@ -379,11 +364,13 @@ namespace {
             CHECK(backend.command->action == PackAction::build);
             CHECK(backend.command->generator_policy == GeneratorPolicy::manifest_authorized_only);
             CHECK(backend.command->signer_reference == "vault:key-one");
+            CHECK(backend.command->requested_key_id == "sha256:expected");
             CHECK(output.standard_output.find("vault:key-one") == std::string::npos);
         }
 
         SECTION("non-build operations cannot request generator execution") {
             constexpr std::array actions {
+                std::pair {std::string_view {"sign"}, PackAction::sign},
                 std::pair {std::string_view {"verify"}, PackAction::verify},
                 std::pair {std::string_view {"inspect"}, PackAction::inspect},
                 std::pair {std::string_view {"stubs"}, PackAction::stubs},
@@ -430,6 +417,25 @@ namespace {
         REQUIRE(built.has_value());
         CHECK(built->success);
         CHECK(std::filesystem::is_regular_file(archive));
+
+        PackCommand clobber_sign;
+        clobber_sign.action = PackAction::sign;
+        clobber_sign.input_path = archive.string();
+        clobber_sign.output_path = archive.string();
+        clobber_sign.signer_reference = "file:C:/must-not-be-opened.seed";
+        const auto clobber_rejected = backend.execute(clobber_sign);
+        REQUIRE_FALSE(clobber_rejected.has_value());
+        CHECK(clobber_rejected.error().code == "PACK-OUTPUT");
+        CHECK(packaging::read_canonical_source_pack(archive).has_value());
+
+        PackCommand missing_signer;
+        missing_signer.action = PackAction::sign;
+        missing_signer.input_path = archive.string();
+        missing_signer.output_path = (temporary.path / "signed.rpack").string();
+        const auto signer_rejected = backend.execute(missing_signer);
+        REQUIRE_FALSE(signer_rejected.has_value());
+        CHECK(signer_rejected.error().code == "PACK-SIGNER");
+        CHECK_FALSE(std::filesystem::exists(missing_signer.output_path));
 
         FilesystemCompilerBackend compiler_backend;
         CheckCommand check_without_runtime;
@@ -519,32 +525,15 @@ namespace {
     }
 
     TEST_CASE("real exact-runtime pack to check smoke preserves the shared compiler ABI") {
-        const auto runtime_root = environment_value("RULE_ENGINE_TEST_PYTHON_RUNTIME_ROOT");
-        const auto runtime_archive = environment_value("RULE_ENGINE_TEST_PYTHON_RUNTIME_ARCHIVE");
-        if (!runtime_root.has_value() && !runtime_archive.has_value()) {
-            WARN("SKIPPED: exact CPython 3.14.6 test artifacts were not configured");
-            return;
-        }
-        REQUIRE(runtime_root.has_value());
-        REQUIRE(runtime_archive.has_value());
-        std::error_code filesystem_error;
-        REQUIRE(std::filesystem::is_directory(*runtime_root, filesystem_error));
-        REQUIRE_FALSE(filesystem_error);
-        REQUIRE(std::filesystem::is_regular_file(*runtime_archive, filesystem_error));
-        REQUIRE_FALSE(filesystem_error);
-
         TemporaryDirectory temporary;
         REQUIRE(temporary.created);
-        const auto staged = packaging::stage_exact_private_runtime(packaging::PythonRuntimeStageRequest {
-            .artifact_archive = *runtime_archive,
-            .extracted_distribution = *runtime_root,
-            .destination = temporary.path / "python-3.14.6",
-            .worker_script = RULE_ENGINE_TOOLING_WORKER_SCRIPT,
-        });
-        if (!staged.has_value()) {
-            INFO(staged.error().message);
+        const auto runtime =
+            packaging::load_exact_private_runtime(std::filesystem::path {RULE_ENGINE_TOOLING_STAGED_RUNTIME_ROOT});
+        if (!runtime.has_value()) {
+            INFO(runtime.error().message);
         }
-        REQUIRE(staged.has_value());
+        REQUIRE(runtime.has_value());
+        std::error_code filesystem_error;
         const auto worker_temporary_root = temporary.path / "workers";
         REQUIRE(std::filesystem::create_directory(worker_temporary_root, filesystem_error));
         REQUIRE_FALSE(filesystem_error);
@@ -569,7 +558,7 @@ namespace {
         REQUIRE(std::filesystem::is_regular_file(archive));
 
         FilesystemCompilerBackend compiler_backend;
-        const std::string staged_root_text = staged->runtime_root.string();
+        const std::string staged_root_text = runtime->runtime_root.string();
         const std::string temporary_root_text = worker_temporary_root.string();
         const std::array check_arguments {
             std::string_view {"--pack"},           std::string_view {archive_text},

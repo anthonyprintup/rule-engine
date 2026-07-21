@@ -2,8 +2,9 @@
 
 This component owns the local author and operator entrypoints:
 
-- `rule_engine_pack` canonicalizes source-only packs, verifies trust, inspects
-  redacted metadata, and copies the pinned PEP 561 SDK;
+- `rule_engine_pack` canonicalizes source-only packs, signs them through the
+  offline file-key adapter, verifies trust, inspects redacted metadata, and
+  copies the pinned PEP 561 SDK;
 - `rule_engine_check` runs the exact private CPython parser worker and the same
   C++ static compiler and optimizer contracts used by the server; and
 - `rule_engine_admin` validates an authenticated endpoint configuration before
@@ -33,6 +34,16 @@ crypto_library=relative/or/absolute/path
 signer=sha256:PUBLIC_KEY_DIGEST|64_HEX_PUBLIC_KEY|sorted.pack.prefixes|active
 ```
 
+`rule_engine_pack sign` requires `--runtime-root` and an explicit absolute
+`file:` signer reference. The referenced file contains exactly one raw 32-byte
+Ed25519 seed. On Windows it must be a regular local file owned by the caller,
+have a protected DACL, and grant access only to the caller, SYSTEM, and
+Administrators. The command loads OpenSSL 3 only from the validated exact
+private runtime, never copies the key into the archive, never prints the key
+reference, refuses to overwrite its output, and reports only the derived key
+ID and signature status. `--key-id` can pin the expected derived identity.
+`build --signer ...` uses the same adapter after canonical validation.
+
 `rule_engine_pack stubs` verifies the tracked SDK manifest and every declared
 file digest, then copies those bytes directly. It does not start Python, import
 the SDK, or consult ambient packages.
@@ -60,8 +71,11 @@ none is linked.
 
 - The worker's process and resource limits contain ordinary failure and abuse;
   they are not a hostile-code sandbox for a trusted generator.
-- External signing and the authenticated admin transport are integration
-  adapters and are not linked by this component.
+- The authenticated admin transport is an integration adapter and is not
+  linked by this component. The offline file signer is currently implemented
+  only on Windows; HSM/KMS/PKCS#11 providers remain deployment integrations.
+- Archive publication uses a same-directory hard link to provide atomic
+  no-clobber behavior. Filesystems without hard-link support fail closed.
 - `--watch` coordinates cancellation and publication generations, but a
   platform filesystem event source is not yet linked into the standalone
   executable, and cancellation is observed between compile phases rather than

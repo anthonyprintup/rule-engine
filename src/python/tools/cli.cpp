@@ -41,6 +41,7 @@ Static rule modules are never imported or executed.
 
 Commands:
   build                Canonicalize, validate, optionally run an authorized generator twice, and build
+  sign                 Sign a canonical unsigned archive with an offline Ed25519 seed
   verify               Verify archive, digest closure, runtime pins, and signature policy
   inspect              Emit a redacted canonical summary
   stubs                Emit PEP 561 and typed binding stubs
@@ -48,7 +49,8 @@ Commands:
 Options:
   --source PATH        Source directory (equivalent to positional PATH)
   --output PATH        Output archive or stub directory
-  --signer REF         External signer/key-provider reference (never printed)
+  --signer REF         Absolute file: reference to a private ACL-protected 32-byte seed (never printed)
+  --key-id ID          Optional expected sha256: signer key ID
   --runtime-root PATH  Staged exact private CPython 3.14.6 runtime
   --sdk-root PATH      Tracked, manifest-verified author SDK
   --trust-config PATH  Production signer policy and explicit OpenSSL path
@@ -254,6 +256,9 @@ Options:
             if (value == "build") {
                 return PackAction::build;
             }
+            if (value == "sign") {
+                return PackAction::sign;
+            }
             if (value == "verify") {
                 return PackAction::verify;
             }
@@ -401,9 +406,10 @@ Options:
 
             for (std::size_t index = 1; index < arguments.size(); ++index) {
                 const auto argument = arguments[index];
-                if (argument == "--output" || argument == "--signer" || argument == "--format" ||
-                    argument == "--source" || argument == "--runtime-root" || argument == "--sdk-root" ||
-                    argument == "--trust-config" || argument == "--trust-mode" || argument == "--temporary-root") {
+                if (argument == "--output" || argument == "--signer" || argument == "--key-id" ||
+                    argument == "--format" || argument == "--source" || argument == "--runtime-root" ||
+                    argument == "--sdk-root" || argument == "--trust-config" || argument == "--trust-mode" ||
+                    argument == "--temporary-root") {
                     const auto value = required_option_value(arguments, index, argument);
                     if (!value.has_value()) {
                         return std::unexpected(value.error());
@@ -412,6 +418,8 @@ Options:
                         command.output_path = *value;
                     } else if (argument == "--signer") {
                         command.signer_reference = *value;
+                    } else if (argument == "--key-id") {
+                        command.requested_key_id = *value;
                     } else if (argument == "--source") {
                         command.input_path = *value;
                     } else if (argument == "--runtime-root") {
@@ -446,6 +454,10 @@ Options:
                 }
                 if (const auto value = inline_option_value(argument, "--signer"); value.has_value()) {
                     command.signer_reference = *value;
+                    continue;
+                }
+                if (const auto value = inline_option_value(argument, "--key-id"); value.has_value()) {
+                    command.requested_key_id = *value;
                     continue;
                 }
                 if (const auto value = inline_option_value(argument, "--source"); value.has_value()) {

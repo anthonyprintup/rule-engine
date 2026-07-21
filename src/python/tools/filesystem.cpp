@@ -275,6 +275,31 @@ namespace rule_engine::python::tools {
             return std::move(*runtime);
         }
 
+        [[nodiscard]] std::expected<SourcePackArchive, ToolFailure> sign_archive(const SourcePackArchive &archive,
+                                                                                 const PackCommand &command) {
+            if (command.signer_reference.empty()) {
+                return std::unexpected(failure(ToolFailureKind::operation, "PACK-SIGNER",
+                                               "signing requires --signer with an explicit file: reference"));
+            }
+            auto runtime = load_runtime(command.runtime_root);
+            if (!runtime.has_value()) {
+                return std::unexpected(runtime.error());
+            }
+            packaging::OpenSsl3FileEd25519KeyProvider provider;
+            provider.crypto_library = runtime->crypto_library;
+            const packaging::SourcePackSigningRequest request {
+                .signer_reference = command.signer_reference,
+                .requested_key_id = command.requested_key_id.empty() ?
+                                        std::nullopt :
+                                        std::optional<std::string> {command.requested_key_id},
+            };
+            auto signed_archive = packaging::sign_canonical_source_pack(archive, request, provider);
+            if (!signed_archive.has_value()) {
+                return std::unexpected(packaging_failure(signed_archive.error()));
+            }
+            return std::move(*signed_archive);
+        }
+
         [[nodiscard]] std::expected<std::filesystem::path, ToolFailure>
         temporary_root(const std::string_view configured) {
             if (!configured.empty()) {
@@ -298,6 +323,19 @@ namespace rule_engine::python::tools {
         [[nodiscard]] const ArchiveEntry *find_entry(const SourcePackArchive &archive, const std::string_view path) {
             const auto found = std::ranges::find(archive.entries, path, &ArchiveEntry::path);
             return found == archive.entries.end() ? nullptr : &*found;
+        }
+
+        [[nodiscard]] std::expected<std::string, ToolFailure> signer_key_id(const SourcePackArchive &archive) {
+            const auto *signature = find_entry(archive, "META-INF/signature.json");
+            if (signature == nullptr) {
+                return std::unexpected(failure(ToolFailureKind::internal_invariant, "PACK-SIGNATURE",
+                                               "signer returned an archive without a signature envelope"));
+            }
+            auto envelope = packaging::parse_canonical_signature_envelope(text(signature->bytes));
+            if (!envelope.has_value()) {
+                return std::unexpected(packaging_failure(envelope.error()));
+            }
+            return std::move(envelope->key_id);
         }
 
         [[nodiscard]] std::string module_path(const std::string_view module) {
@@ -492,6 +530,8 @@ namespace rule_engine::python::tools {
                 case duplicate_certificate: return "duplicate certificate";
                 case certificate_semantic_hash_mismatch: return "certificate semantic hash mismatch";
                 case contradictory_certificate: return "certificate is contradictory";
+                case certificate_noncanonical: return "certificate is not canonical";
+                case certificate_prefix_out_of_bounds: return "certificate prefix is outside the executable";
                 case certificate_not_transitively_pure: return "executable is not transitively pure";
                 case certificate_may_fault: return "executable may fault";
                 case certificate_recorder_observable: return "execution is recorder-observable";
@@ -501,6 +541,7 @@ namespace rule_engine::python::tools {
                 case certificate_calls_services: return "executable calls services";
                 case certificate_emits_effects: return "executable emits effects";
                 case certificate_has_logical_reads: return "executable has logical fact reads";
+                case certificate_has_no_pure_prefix: return "certificate has no pure prefix";
                 case no_transform_requested: return "no transform requested";
                 case no_applicable_transform: return "no applicable transform";
                 default: return "unknown conservative fallback";
@@ -539,6 +580,46 @@ namespace rule_engine::python::tools {
             if (!output.good()) {
                 return std::unexpected(
                     failure(ToolFailureKind::operation, "TOOL-WRITE", "cannot write complete output file"));
+            }
+            return {};
+        }
+
+        [[nodiscard]] std::expected<void, ToolFailure> require_new_output(const std::filesystem::path &path,
+                                                                          const std::string_view operation) {
+            std::error_code filesystem_error;
+            if (std::filesystem::exists(path, filesystem_error) || filesystem_error) {
+                return std::unexpected(
+                    failure(ToolFailureKind::operation, "PACK-OUTPUT",
+                            std::string {operation} + " output already exists; refusing to overwrite it"));
+            }
+            return {};
+        }
+
+        [[nodiscard]] std::expected<void, ToolFailure> publish_new_archive(const std::filesystem::path &path,
+                                                                           const SourcePackArchive &archive) {
+            auto staging = path;
+            staging += ".rule-engine-publish";
+            auto staging_absent = require_new_output(staging, "archive staging");
+            if (!staging_absent.has_value()) {
+                return std::unexpected(staging_absent.error());
+            }
+            const auto written = packaging::write_canonical_source_pack(staging, archive);
+            if (!written.has_value()) {
+                return std::unexpected(packaging_failure(written.error()));
+            }
+
+            std::error_code publish_error;
+            std::filesystem::create_hard_link(staging, path, publish_error);
+            if (publish_error) {
+                std::error_code ignored;
+                std::filesystem::remove(staging, ignored);
+                return std::unexpected(failure(ToolFailureKind::operation, "PACK-OUTPUT",
+                                               "cannot atomically publish a new archive without overwriting"));
+            }
+            std::filesystem::remove(staging, publish_error);
+            if (publish_error) {
+                return std::unexpected(failure(ToolFailureKind::internal_invariant, "PACK-OUTPUT-CLEANUP",
+                                               "archive was published but its staging link could not be removed"));
             }
             return {};
         }
@@ -891,19 +972,18 @@ namespace rule_engine::python::tools {
     std::expected<PackToolResult, ToolFailure> FilesystemPackagingBackend::execute(const PackCommand &command) {
         const auto input = std::filesystem::path {command.input_path};
         if (command.action == PackAction::build) {
-            if (!command.signer_reference.empty()) {
-                return std::unexpected(failure(ToolFailureKind::unavailable_dependency, "PACK-SIGNER",
-                                               "external signing adapter is not linked into this executable"));
-            }
             if (command.output_path.empty()) {
                 return std::unexpected(
                     failure(ToolFailureKind::operation, "PACK-OUTPUT", "build requires --output PATH"));
             }
+            if (command.signer_reference.empty() && !command.requested_key_id.empty()) {
+                return std::unexpected(failure(ToolFailureKind::operation, "PACK-SIGNER",
+                                               "--key-id requires an explicit --signer reference"));
+            }
             const auto output = std::filesystem::path {command.output_path};
-            std::error_code filesystem_error;
-            if (std::filesystem::exists(output, filesystem_error) || filesystem_error) {
-                return std::unexpected(failure(ToolFailureKind::operation, "PACK-OUTPUT",
-                                               "build output already exists; refusing to overwrite it"));
+            auto output_absent = require_new_output(output, "build");
+            if (!output_absent.has_value()) {
+                return std::unexpected(output_absent.error());
             }
             auto archive = archive_source_tree(input);
             if (!archive.has_value()) {
@@ -944,9 +1024,22 @@ namespace rule_engine::python::tools {
                 }
                 generated = std::move(compiled->generated);
             }
-            const auto written = packaging::write_canonical_source_pack(output, *archive);
+            std::optional<std::string> signing_key_id;
+            if (!command.signer_reference.empty()) {
+                auto signed_archive = sign_archive(*archive, command);
+                if (!signed_archive.has_value()) {
+                    return std::unexpected(signed_archive.error());
+                }
+                auto key_id = signer_key_id(*signed_archive);
+                if (!key_id.has_value()) {
+                    return std::unexpected(key_id.error());
+                }
+                signing_key_id = std::move(*key_id);
+                *archive = std::move(*signed_archive);
+            }
+            const auto written = publish_new_archive(output, *archive);
             if (!written.has_value()) {
-                return std::unexpected(packaging_failure(written.error()));
+                return std::unexpected(written.error());
             }
             PackToolResult result {
                 .success = true,
@@ -957,16 +1050,75 @@ namespace rule_engine::python::tools {
                         display_field("pack_id", loaded->manifest.pack.value),
                         display_field("version", loaded->manifest.version.value),
                         display_field("source_digest", loaded->source_digest.value),
-                        display_field("trust", "development-unsigned"),
+                        display_field("trust",
+                                      signing_key_id.has_value() ? "signed-unverified" : "development-unsigned"),
                     },
                 .generated_paths = {output.string()},
             };
+            if (signing_key_id.has_value()) {
+                result.fields.push_back(display_field("signer_key_id", *signing_key_id));
+                result.fields.push_back(display_field("signature_status", "created"));
+            }
             if (generated.has_value()) {
                 result.fields.push_back(
                     display_field("generated_binding_count", std::to_string(generated->bindings.size())));
                 result.fields.push_back(display_field("generated_binding_digest", generated->digest.value));
             }
             return result;
+        }
+
+        if (command.action == PackAction::sign) {
+            if (command.output_path.empty()) {
+                return std::unexpected(
+                    failure(ToolFailureKind::operation, "PACK-OUTPUT", "sign requires --output PATH"));
+            }
+            const auto output = std::filesystem::path {command.output_path};
+            auto output_absent = require_new_output(output, "sign");
+            if (!output_absent.has_value()) {
+                return std::unexpected(output_absent.error());
+            }
+            auto archive = packaging::read_canonical_source_pack(input);
+            if (!archive.has_value()) {
+                return std::unexpected(packaging_failure(archive.error()));
+            }
+            const RejectingSignatureVerifier verifier;
+            const packaging::TrustPolicy construction_policy {
+                .mode = TrustMode::development,
+                .allow_unsigned_packs = true,
+                .allow_unsigned_generators = false,
+                .signers = {},
+            };
+            auto loaded = packaging::verify_and_load_source_pack(*archive, construction_policy, verifier);
+            if (!loaded.has_value()) {
+                return std::unexpected(packaging_failure(loaded.error()));
+            }
+            auto signed_archive = sign_archive(*archive, command);
+            if (!signed_archive.has_value()) {
+                return std::unexpected(signed_archive.error());
+            }
+            auto key_id = signer_key_id(*signed_archive);
+            if (!key_id.has_value()) {
+                return std::unexpected(key_id.error());
+            }
+            const auto written = publish_new_archive(output, *signed_archive);
+            if (!written.has_value()) {
+                return std::unexpected(written.error());
+            }
+            return PackToolResult {
+                .success = true,
+                .diagnostics = {},
+                .sources = source_documents(*loaded),
+                .fields =
+                    {
+                        display_field("pack_id", loaded->manifest.pack.value),
+                        display_field("version", loaded->manifest.version.value),
+                        display_field("source_digest", loaded->source_digest.value),
+                        display_field("signer_key_id", *key_id),
+                        display_field("signature_status", "created"),
+                        display_field("trust", "signed-unverified"),
+                    },
+                .generated_paths = {output.string()},
+            };
         }
 
         if (command.action == PackAction::stubs) {
@@ -1028,6 +1180,10 @@ namespace rule_engine::python::tools {
             };
         }
 
+        if (!command.signer_reference.empty() || !command.requested_key_id.empty()) {
+            return std::unexpected(
+                failure(ToolFailureKind::operation, "PACK-OPTION", "signer options are valid only for build and sign"));
+        }
         auto archive = packaging::read_canonical_source_pack(input);
         if (!archive.has_value()) {
             return std::unexpected(packaging_failure(archive.error()));
