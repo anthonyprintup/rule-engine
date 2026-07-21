@@ -35,6 +35,7 @@ These contracts are frozen by the F0 commit. Lanes may depend on them but must n
 
 - `VmSession` owns frames, registers, heap, hash seed, logical-read ledger, task groups, state/effect journal, flight recorder, and captured replay inputs.
 - `VmSession::step(HostResponses) -> VmStep` returns one of: yielded, waiting for facts, waiting for capabilities, complete, faulted, quarantined, or canceled.
+- `VmSession::resource_usage() -> VmResourceUsage` is mandatory. The resident validates it before commit and uses checked cumulative normal-executor totals to derive every transparent retry's remaining profile; live heap, frames, and concurrent services remain per-attempt peaks.
 - A suspended session resumes at its instruction; it never restarts the entrypoint.
 - `EvaluationResult` distinguishes MATCH, NO_MATCH, FAULTED, QUARANTINED, and CANCELED.
 

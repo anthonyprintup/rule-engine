@@ -362,6 +362,9 @@ namespace rule_engine::python::vm {
         bool forced_cleanup_active {};
         std::size_t forced_cleanup_heap_start {};
         std::uint32_t active_service_calls {};
+        std::size_t retired_normal_logical_heap_allocation_bytes {};
+        std::size_t normal_peak_live_heap_bytes {};
+        bool current_heap_normal_accounted {};
         std::chrono::steady_clock::time_point started {std::chrono::steady_clock::now()};
         std::chrono::steady_clock::time_point phase_started {started};
         std::chrono::steady_clock::time_point active_step_started {};
@@ -383,6 +386,79 @@ namespace rule_engine::python::vm {
 
         [[nodiscard]] const BytecodeFunction &function(const Frame &frame) const {
             return pack.functions[frame.function_index];
+        }
+
+        [[nodiscard]] static bool normal_phase(const ExecutorPhase value) noexcept {
+            return value == ExecutorPhase::normal || value == ExecutorPhase::recovery_retry;
+        }
+
+        [[nodiscard]] static std::size_t saturating_add(const std::size_t left, const std::size_t right) noexcept {
+            if (right > std::numeric_limits<std::size_t>::max() - left) {
+                return std::numeric_limits<std::size_t>::max();
+            }
+            return left + right;
+        }
+
+        [[nodiscard]] static std::chrono::nanoseconds charged_time(const std::chrono::nanoseconds measured,
+                                                                   const std::chrono::milliseconds limit) noexcept {
+            if (limit <= std::chrono::milliseconds::zero()) {
+                return std::chrono::nanoseconds::zero();
+            }
+            constexpr auto nanoseconds_per_millisecond = std::chrono::nanoseconds {std::chrono::milliseconds {1}};
+            const auto maximum_milliseconds =
+                std::chrono::nanoseconds::max().count() / nanoseconds_per_millisecond.count();
+            if (limit.count() > maximum_milliseconds) {
+                return measured;
+            }
+            return std::min(measured, std::chrono::duration_cast<std::chrono::nanoseconds>(limit));
+        }
+
+        void retire_normal_heap_usage() noexcept {
+            if (current_heap_normal_accounted || !normal_phase(phase)) {
+                return;
+            }
+            const auto stats = heap.stats();
+            retired_normal_logical_heap_allocation_bytes =
+                saturating_add(retired_normal_logical_heap_allocation_bytes, stats.logical_allocated_bytes);
+            normal_peak_live_heap_bytes = std::max(normal_peak_live_heap_bytes, stats.peak_live_bytes);
+            current_heap_normal_accounted = true;
+        }
+
+        [[nodiscard]] VmResourceUsage normal_resource_usage() const noexcept {
+            auto logical_heap_allocation = retired_normal_logical_heap_allocation_bytes;
+            auto peak_live_heap = normal_peak_live_heap_bytes;
+            if (!current_heap_normal_accounted && normal_phase(phase)) {
+                const auto stats = heap.stats();
+                logical_heap_allocation = saturating_add(logical_heap_allocation, stats.logical_allocated_bytes);
+                peak_live_heap = std::max(peak_live_heap, stats.peak_live_bytes);
+            }
+            const auto now = std::chrono::steady_clock::now();
+            const auto elapsed = now >= started ? now - started : std::chrono::steady_clock::duration::zero();
+            return VmResourceUsage {
+                .elapsed = charged_time(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed),
+                                        invocation.budget.normal.elapsed),
+                .active_cpu = charged_time(counters.active_time, invocation.budget.normal.active_cpu),
+                .instructions = counters.instructions,
+                .peak_frames = counters.peak_frames,
+                .peak_live_heap_bytes = peak_live_heap,
+                .logical_heap_allocation_bytes = logical_heap_allocation,
+                .loop_iterations_and_yields = counters.loop_iterations_and_yields,
+                .logical_facts = counters.logical_facts,
+                .provider_rounds = counters.provider_rounds,
+                .fact_bytes = counters.fact_bytes,
+                .service_calls = counters.service_calls,
+                .peak_active_service_calls = counters.peak_active_service_calls,
+                .service_response_bytes = counters.service_response_bytes,
+                .history_queries = counters.history_queries,
+                .history_rows = counters.history_rows,
+                .history_bytes = counters.history_bytes,
+                .state_keys = counters.state_keys,
+                .state_bytes = counters.state_bytes,
+                .effect_intents = counters.effect_intents,
+                .effect_bytes = counters.effect_bytes,
+                .recorder_events = counters.recorder_events,
+                .recorder_bytes = counters.recorder_bytes,
+            };
         }
 
         [[nodiscard]] std::vector<PyValue> roots() const {
@@ -524,7 +600,9 @@ namespace rule_engine::python::vm {
                                 .message = "balanced.v1 elapsed deadline exhausted",
                                 .span = std::nullopt};
             }
-            if (active_limit != std::chrono::milliseconds::zero() && current_active_time() >= active_limit) {
+            const auto active_limit_enabled =
+                recovery_limit == nullptr || active_limit != std::chrono::milliseconds::zero();
+            if (active_limit_enabled && current_active_time() >= active_limit) {
                 return VmError {.code = VmErrorCode::elapsed_budget_exhausted,
                                 .message = "balanced.v1 active VM time exhausted",
                                 .span = std::nullopt};
@@ -600,10 +678,15 @@ namespace rule_engine::python::vm {
             target.peak_active_service_calls =
                 std::max(target.peak_active_service_calls, source.peak_active_service_calls);
             target.service_response_bytes += source.service_response_bytes;
+            target.history_queries += source.history_queries;
+            target.history_rows += source.history_rows;
+            target.history_bytes += source.history_bytes;
             target.state_keys += source.state_keys;
             target.state_bytes += source.state_bytes;
             target.effect_intents += source.effect_intents;
             target.effect_bytes += source.effect_bytes;
+            target.recorder_events += source.recorder_events;
+            target.recorder_bytes += source.recorder_bytes;
             target.active_time += source.active_time;
         }
 
@@ -636,12 +719,14 @@ namespace rule_engine::python::vm {
 
         [[nodiscard]] std::optional<VmError>
         start_executor(const std::size_t function_index, const ExecutorPhase next_phase, const std::size_t heap_limit) {
+            retire_normal_heap_usage();
             finish_tier_counters();
             phase = next_phase;
             tier_counters_finalized = false;
             phase_started = std::chrono::steady_clock::now();
             rebind_active_measurement();
             heap = ValueHeap {heap_limit};
+            current_heap_normal_accounted = !normal_phase(next_phase);
             frames.clear();
             pending.reset();
             journal.clear();
@@ -1829,6 +1914,9 @@ namespace rule_engine::python::vm {
 
         void set_forced_cleanup(const bool active) {
             settle_active_measurement();
+            if (active) {
+                retire_normal_heap_usage();
+            }
             forced_cleanup_active = active;
             if (active) {
                 forced_cleanup_heap_start = heap.stats().logical_allocated_bytes;
@@ -2703,6 +2791,8 @@ namespace rule_engine::python::vm {
     }
 
     VmCounters RegisterVmSession::counters() const noexcept { return impl_->counters; }
+
+    VmResourceUsage RegisterVmSession::resource_usage() const noexcept { return impl_->normal_resource_usage(); }
 
     RecoveryCounters RegisterVmSession::recovery_counters() const noexcept { return impl_->recovery; }
 

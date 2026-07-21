@@ -75,10 +75,15 @@ namespace rule_engine::python::vm {
         std::uint32_t service_calls {};
         std::uint32_t peak_active_service_calls {};
         std::size_t service_response_bytes {};
+        std::uint32_t history_queries {};
+        std::uint32_t history_rows {};
+        std::size_t history_bytes {};
         std::uint32_t state_keys {};
         std::size_t state_bytes {};
         std::uint32_t effect_intents {};
         std::size_t effect_bytes {};
+        std::uint32_t recorder_events {};
+        std::size_t recorder_bytes {};
         std::chrono::nanoseconds active_time {};
     };
 
@@ -138,6 +143,7 @@ namespace rule_engine::python::vm {
         ~RegisterVmSession() override;
 
         [[nodiscard]] VmStep step(HostResponses responses) override;
+        [[nodiscard]] VmResourceUsage resource_usage() const noexcept override;
         [[nodiscard]] VmStep send_generator(std::optional<PyValue> value = std::nullopt);
         [[nodiscard]] VmStep throw_generator(PyValue exception);
         [[nodiscard]] VmStep close_generator();

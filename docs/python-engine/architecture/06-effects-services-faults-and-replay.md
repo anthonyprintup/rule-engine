@@ -467,7 +467,9 @@ The first state CAS conflict discards the entire candidate journal and state ove
 
 Repeated canonical external requests use their first captured response. The external-input transcript is sealed after the original attempt. If refreshed state takes a new branch and requests an input not present in that transcript, the retry ends as `FAULTED(StateConflictReplayDiverged)` without contacting a provider, service, history store, cache, or clock. This prevents one logical evaluation from mixing observation epochs; a later ordinary event may evaluate again with fresh inputs.
 
-The original elapsed deadline and aggregate normal-evaluation budgets continue across attempts. No discarded outbox row, event, retention selection, trace publication, or state write reaches storage.
+The original elapsed deadline and aggregate normal-evaluation budgets continue across attempts. The coordinator's monotonic evaluation clock includes VM, host-wait, control, and conflict-commit time and is never lower than the summed VM-reported elapsed charge. At each terminal attempt the mandatory VM usage snapshot is checked against the profile that attempt received and then added with checked arithmetic. The next session receives the remaining elapsed/active CPU, instruction, loop/yield, fact/provider, service, history, state, effect, and recorder limits. An exact zero is still an enforced limit. Frame depth, live heap, concurrent service calls, and the single-call deadline remain original per-attempt caps; separately budgeted finalizer/fault/cleanup tiers are copied unchanged. No discarded outbox row, event, retention selection, trace publication, or state write reaches storage.
+
+Logical heap allocation is included in the cumulative snapshot and audit. `balanced.v1` currently names only the 16 MiB live-heap peak, so the resident does not reinterpret that field as an allocation-work ceiling; L-029 records the remaining named-profile gap.
 
 ### 11.3 Diagnostic and parity replay
 

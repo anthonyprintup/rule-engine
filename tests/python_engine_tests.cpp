@@ -59,6 +59,8 @@ namespace {
     struct ScriptedSession final: VmSession {
         std::uint32_t calls {};
 
+        [[nodiscard]] VmResourceUsage resource_usage() const noexcept override { return {}; }
+
         VmStep step(HostResponses) override {
             if (calls++ < 2) {
                 return VmStep {

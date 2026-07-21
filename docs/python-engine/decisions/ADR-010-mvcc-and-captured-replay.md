@@ -78,6 +78,10 @@ An evaluation has at most three executions: the original plus two transparent re
 
 Only separately specified finalizer/fault/cleanup executors receive fresh dedicated caps. Attempts are individually visible in the flight recorder and audit. Only a committed attempt's ordinary state/effects/events survive. Fault policy can diagnose the exhausted conflict but cannot turn an uncommitted stale journal into committed state.
 
+Every `VmSession` must expose a terminal normal-executor `VmResourceUsage` snapshot through the resident driver. The coordinator rejects a missing, negative, internally inconsistent, per-attempt-over-limit, or arithmetically overflowing snapshot before commit. It retains the original monotonic elapsed-time basis across VM, host, and conflict-commit work, never below the summed VM-reported elapsed charge, and sums active CPU time, instructions, loop/yield work, fact/provider count and bytes, service count and response bytes, history, state, effects, recorder work, and logical heap-allocation work. The next fresh session receives a copy of the original profile with those cumulative dimensions reduced to their exact remaining values; zero remains an exhausted limit rather than disabling it.
+
+Frame depth, live heap, and concurrently active service calls are peaks, not cumulative work. Each retry therefore retains the original per-attempt peak caps and the maximum single-service deadline. Finalizer/fault, double-fault, and forced-cleanup profiles are also copied unchanged because they are separate recovery tiers, not normal-budget refunds.
+
 ### 5. Correlation faults advance deterministically
 
 Correlation group leases serialize normal work by canonical group identity, so MVCC conflicts should chiefly arise from explicitly shared state, lease turnover races, or administrative work.
@@ -203,6 +207,7 @@ Rejected because clients are fact providers only and must never own rule semanti
 5. Migration fixtures cannot prove that every historic production value will migrate successfully; bad keys can quarantine affected work after activation.
 6. Rolling back an incompatible state schema does not reverse-migrate new-generation writes.
 7. Shared mutable state can reduce active-active parallelism and should remain an explicit capability rather than the default.
+8. `balanced.v1` specifies a 16 MiB live-heap peak but no separate cumulative logical-allocation byte ceiling. The VM and resident now report and overflow-safely aggregate logical allocation across attempts, but a hard cross-retry allocation-work limit requires a new named profile rather than reinterpreting the immutable live-heap field.
 
 ## Evidence and validation
 

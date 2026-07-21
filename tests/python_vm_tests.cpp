@@ -1563,6 +1563,20 @@ TEST_CASE("instruction frame loop and elapsed limits are hard pre-operation faul
         CHECK(session->step({}).state == VmStepState::faulted);
         CHECK(session->counters().instructions == 0U);
     }
+
+    SECTION("exactly exhausted normal active CPU") {
+        auto pack = pack_with({make_fact(true)}, {function("rule.main", 1U,
+                                                           {
+                                                               instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                                                               instruction(Opcode::return_value, 0U, 0U),
+                                                           })});
+        auto budget = balanced_v1;
+        budget.normal.active_cpu = std::chrono::milliseconds {0};
+        auto session = start(pack, invocation(budget));
+        CHECK(session->step({}).state == VmStepState::faulted);
+        CHECK(session->counters().instructions == 0U);
+        CHECK(session->resource_usage().active_cpu == std::chrono::nanoseconds {0});
+    }
 }
 
 TEST_CASE("generator yield preserves its frame and resumes at the successor instruction") {

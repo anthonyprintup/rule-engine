@@ -209,3 +209,11 @@ Every entry records impact, rationale, mitigation, observability, and revisit co
 - **Mitigation:** Stable source-spanned diagnostics reject the unsupported surface. Exact CPython-worker-to-compiler-to-VM tests cover ordered typed matching, catch-all behavior, nested handlers, `else`, `finally`, re-raise, loop/return cleanup, and implicit value/type/arithmetic faults. Instruction-budget exhaustion, deployment cancellation, and VM integrity faults bypass source handlers and are tested separately from forced cleanup.
 - **Observability:** Count `PY-NYI-EXCEPTION-FILTER`, `PY-NYI-EXCEPTION-BINDING`, `PY-NYI-EXCEPTION-GROUP`, `PY-NYI-RAISE-EXPRESSION`, `PY-NYI-RAISE-CAUSE`, and `PY-NYI-BARE-RAISE` by pack and source span. Verifier failures retain the existing `PYC0112` handler-filter-cycle and `PYC0114` cleanup-bypass diagnostics.
 - **Revisit:** Expand only after versioning typed exception descriptors, cause/context/traceback representation, handler-scope unwind metadata, a catchable missing-active-exception value, exception-group splitting/merge semantics, and their verifier and budget rules.
+
+## L-029 — Logical allocation has no distinct `balanced.v1` ceiling
+
+- **Impact:** State-conflict retries cannot exceed the 16 MiB live heap in any attempt and cannot multiply the cumulative instruction or other semantic budgets, but allocation churn is not independently bounded by one cross-attempt byte total.
+- **Rationale:** The immutable `balanced.v1` contract defines `heap_bytes` as a live-heap peak and does not assign a separate numeric ceiling to cumulative logical allocation work. Reusing that field would silently change the profile and reduce a retry's allowed live heap.
+- **Mitigation:** `RegisterVmSession` reports logical allocation work; the resident aggregates it with overflow-safe arithmetic and exposes it in the evaluation receipt. The three-attempt bound, cumulative instructions/CPU/time, and per-attempt live-heap peak still bound abuse.
+- **Observability:** Record per-attempt and cumulative logical allocation bytes alongside peak live heap and the remaining normal profile.
+- **Revisit:** Add an independently named logical-allocation limit only in a new budget-profile version with boundary, retry, and representative-workload evidence.

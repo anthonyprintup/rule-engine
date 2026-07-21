@@ -3,6 +3,7 @@
 #include "rule_engine/python/contract/subject.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <map>
 #include <ranges>
@@ -23,6 +24,149 @@ namespace rule_engine::python::runtime {
                 .store = std::nullopt,
                 .diagnostics = {},
             };
+        }
+
+        template<typename Value> [[nodiscard]] bool checked_add(Value &total, const Value amount) noexcept {
+            if (amount > std::numeric_limits<Value>::max() - total) {
+                return false;
+            }
+            total += amount;
+            return true;
+        }
+
+        [[nodiscard]] bool within(const std::chrono::nanoseconds usage,
+                                  const std::chrono::milliseconds limit) noexcept {
+            if (usage.count() < 0 || limit.count() < 0) {
+                return false;
+            }
+            return std::chrono::ceil<std::chrono::milliseconds>(usage) <= limit;
+        }
+
+        template<typename Value> [[nodiscard]] bool within(const Value usage, const Value limit) noexcept {
+            return usage <= limit;
+        }
+
+        [[nodiscard]] std::expected<void, ResidentRuntimeError> validate_usage(const VmResourceUsage &usage,
+                                                                               const BudgetProfile &budget) {
+            const auto &limit = budget.normal;
+            if (!within(usage.elapsed, limit.elapsed) || !within(usage.active_cpu, limit.active_cpu) ||
+                !within(usage.instructions, limit.instructions) || !within(usage.peak_frames, limit.frames) ||
+                !within(usage.peak_live_heap_bytes, limit.heap_bytes) ||
+                usage.logical_heap_allocation_bytes < usage.peak_live_heap_bytes ||
+                !within(usage.loop_iterations_and_yields, limit.loop_iterations_and_yields) ||
+                !within(usage.logical_facts, limit.logical_facts) ||
+                !within(usage.provider_rounds, limit.provider_rounds) || !within(usage.fact_bytes, limit.fact_bytes) ||
+                !within(usage.service_calls, limit.service_calls) ||
+                !within(usage.peak_active_service_calls, limit.active_service_calls) ||
+                !within(usage.service_response_bytes, limit.service_response_bytes) ||
+                !within(usage.history_queries, limit.history_queries) ||
+                !within(usage.history_rows, limit.history_rows) || !within(usage.history_bytes, limit.history_bytes) ||
+                !within(usage.state_keys, limit.state_keys) || !within(usage.state_bytes, limit.state_bytes) ||
+                !within(usage.effect_intents, limit.effect_intents) ||
+                !within(usage.effect_bytes, limit.effect_bytes) ||
+                !within(usage.recorder_events, limit.recorder_events) ||
+                !within(usage.recorder_bytes, limit.recorder_bytes)) {
+                return std::unexpected(
+                    runtime_error(ResidentRuntimeErrorCode::invalid_resource_usage,
+                                  "resident VM reported negative, inconsistent, or over-budget normal resource usage"));
+            }
+            return {};
+        }
+
+        [[nodiscard]] std::expected<void, ResidentRuntimeError>
+        accumulate_usage(VmResourceUsage &total, std::chrono::nanoseconds &reported_elapsed,
+                         const VmResourceUsage &attempt, const BudgetProfile &attempt_budget) {
+            if (auto valid = validate_usage(attempt, attempt_budget); !valid) {
+                return valid;
+            }
+            auto elapsed = reported_elapsed.count();
+            auto active_cpu = total.active_cpu.count();
+            if (!checked_add(elapsed, attempt.elapsed.count()) ||
+                !checked_add(active_cpu, attempt.active_cpu.count()) ||
+                !checked_add(total.instructions, attempt.instructions) ||
+                !checked_add(total.logical_heap_allocation_bytes, attempt.logical_heap_allocation_bytes) ||
+                !checked_add(total.loop_iterations_and_yields, attempt.loop_iterations_and_yields) ||
+                !checked_add(total.logical_facts, attempt.logical_facts) ||
+                !checked_add(total.provider_rounds, attempt.provider_rounds) ||
+                !checked_add(total.fact_bytes, attempt.fact_bytes) ||
+                !checked_add(total.service_calls, attempt.service_calls) ||
+                !checked_add(total.service_response_bytes, attempt.service_response_bytes) ||
+                !checked_add(total.history_queries, attempt.history_queries) ||
+                !checked_add(total.history_rows, attempt.history_rows) ||
+                !checked_add(total.history_bytes, attempt.history_bytes) ||
+                !checked_add(total.state_keys, attempt.state_keys) ||
+                !checked_add(total.state_bytes, attempt.state_bytes) ||
+                !checked_add(total.effect_intents, attempt.effect_intents) ||
+                !checked_add(total.effect_bytes, attempt.effect_bytes) ||
+                !checked_add(total.recorder_events, attempt.recorder_events) ||
+                !checked_add(total.recorder_bytes, attempt.recorder_bytes)) {
+                return std::unexpected(runtime_error(ResidentRuntimeErrorCode::invalid_resource_usage,
+                                                     "resident VM resource usage overflowed cumulative accounting"));
+            }
+            reported_elapsed = std::chrono::nanoseconds {elapsed};
+            total.active_cpu = std::chrono::nanoseconds {active_cpu};
+            total.peak_frames = std::max(total.peak_frames, attempt.peak_frames);
+            total.peak_live_heap_bytes = std::max(total.peak_live_heap_bytes, attempt.peak_live_heap_bytes);
+            total.peak_active_service_calls =
+                std::max(total.peak_active_service_calls, attempt.peak_active_service_calls);
+            return {};
+        }
+
+        template<typename Value> [[nodiscard]] Value remaining(const Value limit, const Value used) noexcept {
+            return used >= limit ? Value {} : limit - used;
+        }
+
+        [[nodiscard]] std::chrono::milliseconds remaining(const std::chrono::milliseconds limit,
+                                                          const std::chrono::nanoseconds used) noexcept {
+            if (limit.count() <= 0 || used.count() < 0) {
+                return std::chrono::milliseconds::zero();
+            }
+            const auto charged = std::chrono::ceil<std::chrono::milliseconds>(used);
+            return charged >= limit ? std::chrono::milliseconds::zero() : limit - charged;
+        }
+
+        [[nodiscard]] BudgetProfile remaining_budget(const BudgetProfile &original,
+                                                     const VmResourceUsage &usage) noexcept {
+            auto result = original;
+            auto &normal = result.normal;
+            normal.elapsed = remaining(original.normal.elapsed, usage.elapsed);
+            normal.active_cpu = remaining(original.normal.active_cpu, usage.active_cpu);
+            normal.instructions = remaining(original.normal.instructions, usage.instructions);
+            // Frames, live heap, and concurrent services are per-attempt peaks.
+            normal.loop_iterations_and_yields =
+                remaining(original.normal.loop_iterations_and_yields, usage.loop_iterations_and_yields);
+            normal.logical_facts = remaining(original.normal.logical_facts, usage.logical_facts);
+            normal.provider_rounds = remaining(original.normal.provider_rounds, usage.provider_rounds);
+            normal.fact_bytes = remaining(original.normal.fact_bytes, usage.fact_bytes);
+            normal.service_calls = remaining(original.normal.service_calls, usage.service_calls);
+            normal.service_response_bytes =
+                remaining(original.normal.service_response_bytes, usage.service_response_bytes);
+            normal.history_queries = remaining(original.normal.history_queries, usage.history_queries);
+            normal.history_rows = remaining(original.normal.history_rows, usage.history_rows);
+            normal.history_bytes = remaining(original.normal.history_bytes, usage.history_bytes);
+            normal.state_keys = remaining(original.normal.state_keys, usage.state_keys);
+            normal.state_bytes = remaining(original.normal.state_bytes, usage.state_bytes);
+            normal.effect_intents = remaining(original.normal.effect_intents, usage.effect_intents);
+            normal.effect_bytes = remaining(original.normal.effect_bytes, usage.effect_bytes);
+            normal.recorder_events = remaining(original.normal.recorder_events, usage.recorder_events);
+            normal.recorder_bytes = remaining(original.normal.recorder_bytes, usage.recorder_bytes);
+            return result;
+        }
+
+        [[nodiscard]] std::chrono::nanoseconds evaluation_elapsed(const std::chrono::steady_clock::time_point started,
+                                                                  const std::chrono::milliseconds limit) noexcept {
+            if (limit <= std::chrono::milliseconds::zero()) {
+                return std::chrono::nanoseconds::zero();
+            }
+            const auto measured =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started);
+            constexpr auto nanoseconds_per_millisecond = std::chrono::nanoseconds {std::chrono::milliseconds {1}};
+            const auto maximum_milliseconds =
+                std::chrono::nanoseconds::max().count() / nanoseconds_per_millisecond.count();
+            if (limit.count() > maximum_milliseconds) {
+                return measured;
+            }
+            return std::min(measured, std::chrono::duration_cast<std::chrono::nanoseconds>(limit));
         }
 
         [[nodiscard]] ResidentRuntimeError port_error(PortError error, const std::string_view operation) {
@@ -192,11 +336,14 @@ namespace rule_engine::python::runtime {
         [[nodiscard]] std::expected<void, ResidentRuntimeError>
         validate_request(const ResidentEvaluationRequest &request) {
             const auto &work = request.work;
+            const auto &normal_budget = request.invocation.budget.normal;
             if (work.work_id.empty() || work.node_id.empty() || work.serial_domain.empty() || work.pack.empty() ||
                 work.generation == 0U || work.attempt == 0U || work.fence == 0U ||
                 request.invocation.execution.empty() || request.invocation.invocation.empty() ||
-                request.invocation.binding.empty() || !request.invocation.subject.valid() || request.input.id.empty() ||
-                request.input.tenant.empty() || request.input.peer.empty() ||
+                request.invocation.binding.empty() || !request.invocation.subject.valid() ||
+                request.invocation.budget.name.empty() || normal_budget.elapsed.count() < 0 ||
+                normal_budget.active_cpu.count() < 0 || normal_budget.maximum_service_deadline.count() < 0 ||
+                request.input.id.empty() || request.input.tenant.empty() || request.input.peer.empty() ||
                 request.input.peer != request.invocation.subject.peer ||
                 request.cursor.consumer != work.serial_domain ||
                 request.cursor.expected_position == std::numeric_limits<std::uint64_t>::max() ||
@@ -622,6 +769,14 @@ namespace rule_engine::python::runtime {
         return step;
     }
 
+    std::expected<VmResourceUsage, ResidentVmDriverError>
+    DispatchFreeRuntimeEngineDriver::resource_usage(const EvaluationHandle &evaluation) const noexcept {
+        if (!evaluation.session) {
+            return std::unexpected(ResidentVmDriverError {.message = "evaluation has no VM session"});
+        }
+        return evaluation.session->resource_usage();
+    }
+
     std::expected<TransactionReceipt, StoreError>
     RuntimeStoreTransactionPort::commit(const ResidentWorkIdentity &work,
                                         const RuntimeTransaction &transaction) noexcept {
@@ -641,6 +796,7 @@ namespace rule_engine::python::runtime {
 
     std::expected<ResidentEvaluationReceipt, ResidentRuntimeError>
     ResidentRuntime::evaluate(ResidentEvaluationRequest request) {
+        const auto evaluation_started = std::chrono::steady_clock::now();
         if (auto valid = validate_request(request); !valid) {
             return std::unexpected(valid.error());
         }
@@ -654,6 +810,12 @@ namespace rule_engine::python::runtime {
         }
 
         std::uint64_t host_turns {};
+        VmResourceUsage resource_usage;
+        std::chrono::nanoseconds reported_elapsed;
+        const auto refresh_elapsed = [&] {
+            resource_usage.elapsed = std::max(
+                reported_elapsed, evaluation_elapsed(evaluation_started, request.invocation.budget.normal.elapsed));
+        };
         const auto replay = request.mode == effects::ExecutionMode::replay;
         const auto attempt_limit = replay ? 1U : maximum_mvcc_attempts;
         for (std::uint32_t attempt = 1U; attempt <= attempt_limit; ++attempt) {
@@ -667,9 +829,11 @@ namespace rule_engine::python::runtime {
                         runtime_error(ResidentRuntimeErrorCode::stale_fence, "resident work fence is stale"));
                 }
                 if (*control == WorkControlState::canceled) {
+                    refresh_elapsed();
                     return ResidentEvaluationReceipt {
                         .attempts = attempt,
                         .host_turns = host_turns,
+                        .resource_usage = resource_usage,
                         .mode = request.mode,
                         .evaluation =
                             EvaluationResult {
@@ -686,7 +850,10 @@ namespace rule_engine::python::runtime {
                 }
             }
 
-            auto evaluation = vm_.start(request.invocation);
+            refresh_elapsed();
+            auto attempt_invocation = request.invocation;
+            attempt_invocation.budget = remaining_budget(request.invocation.budget, resource_usage);
+            auto evaluation = vm_.start(attempt_invocation);
             if (!evaluation) {
                 return std::unexpected(ResidentRuntimeError {
                     .code = ResidentRuntimeErrorCode::start_failed,
@@ -700,6 +867,19 @@ namespace rule_engine::python::runtime {
                 return std::unexpected(runtime_error(ResidentRuntimeErrorCode::invalid_work,
                                                      "active VM pack does not match the resident work identity"));
             }
+
+            const auto account_attempt = [&]() -> std::expected<void, ResidentRuntimeError> {
+                auto reported = vm_.resource_usage(*evaluation);
+                if (!reported) {
+                    return std::unexpected(runtime_error(ResidentRuntimeErrorCode::invalid_resource_usage,
+                                                         "resident VM did not provide a valid resource snapshot: " +
+                                                             reported.error().message));
+                }
+                auto accumulated =
+                    accumulate_usage(resource_usage, reported_elapsed, *reported, attempt_invocation.budget);
+                refresh_elapsed();
+                return accumulated;
+            };
 
             HostResponses responses;
             VmStep last_step;
@@ -740,9 +920,13 @@ namespace rule_engine::python::runtime {
                             return std::unexpected(runtime_error(ResidentRuntimeErrorCode::stale_fence,
                                                                  "resident work fence became stale"));
                         }
+                        if (auto accounted = account_attempt(); !accounted) {
+                            return std::unexpected(accounted.error());
+                        }
                         return ResidentEvaluationReceipt {
                             .attempts = attempt,
                             .host_turns = host_turns,
+                            .resource_usage = resource_usage,
                             .mode = request.mode,
                             .evaluation = std::move(*canceled),
                             .candidate = std::nullopt,
@@ -760,6 +944,10 @@ namespace rule_engine::python::runtime {
                 responses = std::move(*resolved);
             }
 
+            if (auto accounted = account_attempt(); !accounted) {
+                return std::unexpected(accounted.error());
+            }
+
             auto transaction = make_transaction(request, *terminal);
             if (!transaction) {
                 return std::unexpected(transaction.error());
@@ -768,6 +956,7 @@ namespace rule_engine::python::runtime {
                 return ResidentEvaluationReceipt {
                     .attempts = attempt,
                     .host_turns = host_turns,
+                    .resource_usage = resource_usage,
                     .mode = request.mode,
                     .evaluation = std::move(*terminal),
                     .candidate = std::move(*transaction),
@@ -779,6 +968,7 @@ namespace rule_engine::python::runtime {
                 return ResidentEvaluationReceipt {
                     .attempts = attempt,
                     .host_turns = host_turns,
+                    .resource_usage = resource_usage,
                     .mode = request.mode,
                     .evaluation = std::move(*terminal),
                     .candidate = std::move(*transaction),
@@ -796,9 +986,11 @@ namespace rule_engine::python::runtime {
                     runtime_error(ResidentRuntimeErrorCode::stale_fence, "resident work fence is stale at commit"));
             }
             if (*control == WorkControlState::canceled) {
+                refresh_elapsed();
                 return ResidentEvaluationReceipt {
                     .attempts = attempt,
                     .host_turns = host_turns,
+                    .resource_usage = resource_usage,
                     .mode = request.mode,
                     .evaluation =
                         EvaluationResult {
@@ -816,9 +1008,11 @@ namespace rule_engine::python::runtime {
 
             auto committed = transactions_.commit(request.work, *transaction);
             if (committed) {
+                refresh_elapsed();
                 return ResidentEvaluationReceipt {
                     .attempts = attempt,
                     .host_turns = host_turns,
+                    .resource_usage = resource_usage,
                     .mode = request.mode,
                     .evaluation = std::move(*terminal),
                     .candidate = std::move(*transaction),

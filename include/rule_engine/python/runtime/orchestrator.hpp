@@ -101,6 +101,8 @@ namespace rule_engine::python::runtime {
         [[nodiscard]] virtual std::expected<EvaluationHandle, DiagnosticSet> start(const VmInvocation &invocation) = 0;
         [[nodiscard]] virtual std::expected<VmStep, ResidentVmDriverError> step(EvaluationHandle &evaluation,
                                                                                 HostResponses responses) = 0;
+        [[nodiscard]] virtual std::expected<VmResourceUsage, ResidentVmDriverError>
+        resource_usage(const EvaluationHandle &evaluation) const noexcept = 0;
     };
 
     struct DispatchFreeRuntimeEngineDriver final: IResidentVmDriver {
@@ -109,6 +111,8 @@ namespace rule_engine::python::runtime {
         [[nodiscard]] std::expected<EvaluationHandle, DiagnosticSet> start(const VmInvocation &invocation) override;
         [[nodiscard]] std::expected<VmStep, ResidentVmDriverError> step(EvaluationHandle &evaluation,
                                                                         HostResponses responses) override;
+        [[nodiscard]] std::expected<VmResourceUsage, ResidentVmDriverError>
+        resource_usage(const EvaluationHandle &evaluation) const noexcept override;
 
     private:
         RuntimeEngine &engine_;
@@ -164,6 +168,7 @@ namespace rule_engine::python::runtime {
         commit_failure,
         cancellation_failed,
         host_turn_limit,
+        invalid_resource_usage,
     };
 
     struct ResidentRuntimeError {
@@ -177,6 +182,7 @@ namespace rule_engine::python::runtime {
     struct ResidentEvaluationReceipt {
         std::uint32_t attempts {};
         std::uint64_t host_turns {};
+        VmResourceUsage resource_usage;
         effects::ExecutionMode mode {effects::ExecutionMode::live};
         EvaluationResult evaluation;
         std::optional<RuntimeTransaction> candidate;

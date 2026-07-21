@@ -3,6 +3,8 @@
 #include "rule_engine/python/contract/compiler.hpp"
 #include "rule_engine/python/contract/subject.hpp"
 
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -151,9 +153,39 @@ namespace rule_engine::python {
         std::optional<EvaluationResult> result;
     };
 
+    // Normal-executor work consumed by one fresh VM session. Cumulative fields
+    // are evaluation-owned across transparent retries. Peak fields describe
+    // independently bounded, per-attempt resident resources and therefore use
+    // max aggregation rather than subtraction from the next attempt.
+    struct VmResourceUsage {
+        std::chrono::nanoseconds elapsed {};
+        std::chrono::nanoseconds active_cpu {};
+        std::uint64_t instructions {};
+        std::uint32_t peak_frames {};
+        std::size_t peak_live_heap_bytes {};
+        std::size_t logical_heap_allocation_bytes {};
+        std::uint64_t loop_iterations_and_yields {};
+        std::uint32_t logical_facts {};
+        std::uint32_t provider_rounds {};
+        std::size_t fact_bytes {};
+        std::uint32_t service_calls {};
+        std::uint32_t peak_active_service_calls {};
+        std::size_t service_response_bytes {};
+        std::uint32_t history_queries {};
+        std::uint32_t history_rows {};
+        std::size_t history_bytes {};
+        std::uint32_t state_keys {};
+        std::size_t state_bytes {};
+        std::uint32_t effect_intents {};
+        std::size_t effect_bytes {};
+        std::uint32_t recorder_events {};
+        std::size_t recorder_bytes {};
+    };
+
     struct VmSession {
         virtual ~VmSession() = default;
         [[nodiscard]] virtual VmStep step(HostResponses responses) = 0;
+        [[nodiscard]] virtual VmResourceUsage resource_usage() const noexcept = 0;
     };
 
     struct VmInvocation {

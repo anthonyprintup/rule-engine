@@ -1,12 +1,15 @@
 #include "rule_engine/python/runtime/adapters.hpp"
 #include "rule_engine/python/runtime/orchestrator.hpp"
+#include "rule_engine/python/vm/register_vm.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -19,6 +22,7 @@ namespace {
     using namespace rule_engine::python;
     using namespace rule_engine::python::effects;
     using namespace rule_engine::python::runtime;
+    using namespace std::chrono_literals;
 
     [[nodiscard]] SourceSpan source_span() {
         return {.source = SourceId {"rules.py"}, .begin_byte = 1U, .end_byte = 2U};
@@ -38,6 +42,15 @@ namespace {
             .label = DataLabel {.classification = Classification::internal},
             .canonical_digest = std::move(digest),
         };
+    }
+
+    [[nodiscard]] FrozenValue canonical_frozen_bool(const bool value) {
+        vm::ValueHeap heap;
+        auto thawed = heap.thaw(make_fact(value));
+        REQUIRE(thawed.has_value());
+        auto frozen = heap.freeze(*thawed);
+        REQUIRE(frozen.has_value());
+        return std::move(*frozen);
     }
 
     [[nodiscard]] FactRequest fact_request() {
@@ -225,10 +238,14 @@ namespace {
     };
 
     struct ScriptedSession final: VmSession {
-        explicit ScriptedSession(const SessionScenario value): scenario {value} {}
+        explicit ScriptedSession(const SessionScenario value, const VmResourceUsage reported = {}):
+            scenario {value}, reported_usage {reported} {}
 
         SessionScenario scenario {SessionScenario::constant};
+        VmResourceUsage reported_usage;
         std::uint32_t stage {};
+
+        [[nodiscard]] VmResourceUsage resource_usage() const noexcept override { return reported_usage; }
 
         [[nodiscard]] VmStep step(HostResponses responses) override {
             if (responses.cancel) {
@@ -300,11 +317,16 @@ namespace {
 
         SessionScenario scenario {SessionScenario::constant};
         std::uint32_t starts {};
+        std::vector<VmInvocation> invocations;
+        std::vector<VmResourceUsage> reported_usages;
 
-        [[nodiscard]] std::expected<std::unique_ptr<VmSession>, DiagnosticSet> start(const CompiledPack &,
-                                                                                     const VmInvocation &) override {
+        [[nodiscard]] std::expected<std::unique_ptr<VmSession>, DiagnosticSet>
+        start(const CompiledPack &, const VmInvocation &invocation) override {
+            const auto index = starts;
             ++starts;
-            return std::unique_ptr<VmSession> {std::make_unique<ScriptedSession>(scenario)};
+            invocations.push_back(invocation);
+            const auto usage = index < reported_usages.size() ? reported_usages[index] : VmResourceUsage {};
+            return std::unique_ptr<VmSession> {std::make_unique<ScriptedSession>(scenario, usage)};
         }
     };
 
@@ -335,6 +357,64 @@ namespace {
             return compiled_pack();
         }
     };
+
+    struct FixedCompiler final: PackCompiler {
+        explicit FixedCompiler(CompiledPack value): pack {std::move(value)} {}
+
+        CompiledPack pack;
+
+        [[nodiscard]] std::expected<CompiledPack, DiagnosticSet>
+        compile(const VerifiedRulePack &, const SchemaCatalog &, const OperatorBindings &) override {
+            return pack;
+        }
+    };
+
+    struct RecordingRegisterVmFactory final: VmFactory {
+        std::vector<VmInvocation> invocations;
+
+        [[nodiscard]] std::expected<std::unique_ptr<VmSession>, DiagnosticSet>
+        start(const CompiledPack &pack, const VmInvocation &invocation) override {
+            invocations.push_back(invocation);
+            auto session = vm::RegisterVmSession::create(pack, invocation);
+            if (!session) {
+                return std::unexpected(std::move(session.error()));
+            }
+            return std::unique_ptr<VmSession> {std::move(*session)};
+        }
+    };
+
+    [[nodiscard]] CompiledPack real_state_pack() {
+        return {
+            .pack = PackId {"pack"},
+            .version = PackVersion {"1"},
+            .source_digest = SourceDigest {"sha256:source"},
+            .compiler_abi = std::string {python_static_compiler_abi_v1},
+            .semantic_hash = "sha256:semantic",
+            .constants =
+                {
+                    vm::make_state_operand("peer-state/v1", "counter", SchemaId {"bool"}),
+                    make_fact(true),
+                },
+            .functions = {BytecodeFunction {
+                .id = ExecutableId {"rule"},
+                .qualified_name = "rule",
+                .register_count = 2U,
+                .instructions =
+                    {
+                        {.opcode = Opcode::read_state, .destination = 0U, .immediate = 0U, .span = source_span()},
+                        {.opcode = Opcode::load_const, .destination = 1U, .immediate = 1U, .span = source_span()},
+                        {.opcode = Opcode::write_state, .operand_a = 1U, .immediate = 0U, .span = source_span()},
+                        {.opcode = Opcode::return_value, .operand_a = 1U, .span = source_span()},
+                    },
+            }},
+            .bindings = {OperatorBinding {
+                .id = BindingId {"binding-1"},
+                .executable = ExecutableId {"rule"},
+                .capabilities = {},
+                .budget = balanced_v1,
+            }},
+        };
+    }
 
     struct EngineProviderProbe final: IProviderDispatcher {
         std::uint32_t fact_dispatches {};
@@ -447,7 +527,7 @@ namespace {
             for (const auto &request : requests) {
                 result.push_back({
                     .request_id = request.request_id,
-                    .value = frozen_bool(reads != 1U, "sha256:state-read:" + std::to_string(reads)),
+                    .value = canonical_frozen_bool(reads != 1U),
                     .version = reads - 1U,
                 });
             }
@@ -532,6 +612,11 @@ namespace {
     }
 
     [[nodiscard]] ResidentEvaluationRequest evaluation_request() {
+        auto budget = balanced_v1;
+        // These integration cases exercise orchestration rather than the
+        // balanced.v1 wall deadline. Keep them deterministic when a debug test
+        // process is descheduled for longer than the production deadline.
+        budget.normal.elapsed = std::chrono::hours {1};
         return {
             .work =
                 ResidentWorkIdentity {
@@ -550,6 +635,7 @@ namespace {
                     .invocation = InvocationId {"invocation-1"},
                     .binding = BindingId {"binding-1"},
                     .subject = subject(),
+                    .budget = std::move(budget),
                     .deterministic_hash_seed = 17U,
                 },
             .input =
@@ -590,6 +676,27 @@ namespace {
         }
     };
 
+    struct RealVmFixture {
+        FixedCompiler compiler {real_state_pack()};
+        RecordingRegisterVmFactory vm;
+        EngineProviderProbe engine_provider;
+        UnusedEngineStore engine_store;
+        RuntimeEngine engine {compiler, vm, engine_provider, engine_store};
+        DispatchFreeRuntimeEngineDriver vm_driver {engine};
+        ProviderPort providers;
+        CapabilityPort capabilities;
+        StatePort state;
+        HistoryPort history;
+        ScriptedControl control;
+        TransactionPort transactions;
+
+        RealVmFixture() { REQUIRE(engine.activate(verified_pack(), {}, {}).has_value()); }
+
+        [[nodiscard]] HostResponsePorts ports() {
+            return {.providers = providers, .capabilities = capabilities, .state = state, .history = history};
+        }
+    };
+
 } // namespace
 
 TEST_CASE("resident runtime resumes one fact request without duplicate reads") {
@@ -623,6 +730,172 @@ TEST_CASE("resident runtime refreshes state while replaying captured facts after
     REQUIRE(fixture.transactions.proposals.size() == 2U);
     REQUIRE(fixture.transactions.proposals.back().state.size() == 1U);
     CHECK(fixture.transactions.proposals.back().state.front().expected_version == 1U);
+}
+
+TEST_CASE("MVCC retries inherit cumulative normal budgets while attempt peaks and recovery caps stay fresh") {
+    Fixture fixture {SessionScenario::state_conflict};
+    fixture.transactions.conflicts_remaining = 1U;
+    const VmResourceUsage attempt_usage {
+        .elapsed = 2ms,
+        .active_cpu = 1ms,
+        .instructions = 7U,
+        .peak_frames = 2U,
+        .peak_live_heap_bytes = 32U,
+        .logical_heap_allocation_bytes = 64U,
+        .loop_iterations_and_yields = 3U,
+        .logical_facts = 2U,
+        .provider_rounds = 1U,
+        .fact_bytes = 11U,
+        .service_calls = 2U,
+        .peak_active_service_calls = 2U,
+        .service_response_bytes = 13U,
+        .history_queries = 1U,
+        .history_rows = 2U,
+        .history_bytes = 17U,
+        .state_keys = 1U,
+        .state_bytes = 19U,
+        .effect_intents = 2U,
+        .effect_bytes = 23U,
+        .recorder_events = 3U,
+        .recorder_bytes = 29U,
+    };
+    fixture.vm.reported_usages = {attempt_usage, attempt_usage};
+    ResidentRuntime runtime {fixture.vm_driver, fixture.ports(), fixture.control, fixture.transactions};
+    const auto request = evaluation_request();
+
+    const auto result = runtime.evaluate(request);
+
+    const auto error_message = result ? std::string {} : result.error().message;
+    INFO("runtime error: " << error_message);
+    REQUIRE(result.has_value());
+    REQUIRE(result->committed());
+    REQUIRE(fixture.vm.invocations.size() == 2U);
+    const auto &remaining = fixture.vm.invocations[1].budget;
+    CHECK(remaining.normal.elapsed <= request.invocation.budget.normal.elapsed - 2ms);
+    CHECK(remaining.normal.active_cpu == request.invocation.budget.normal.active_cpu - 1ms);
+    CHECK(remaining.normal.instructions == request.invocation.budget.normal.instructions - 7U);
+    CHECK(remaining.normal.loop_iterations_and_yields ==
+          request.invocation.budget.normal.loop_iterations_and_yields - 3U);
+    CHECK(remaining.normal.logical_facts == request.invocation.budget.normal.logical_facts - 2U);
+    CHECK(remaining.normal.provider_rounds == request.invocation.budget.normal.provider_rounds - 1U);
+    CHECK(remaining.normal.fact_bytes == request.invocation.budget.normal.fact_bytes - 11U);
+    CHECK(remaining.normal.service_calls == request.invocation.budget.normal.service_calls - 2U);
+    CHECK(remaining.normal.service_response_bytes == request.invocation.budget.normal.service_response_bytes - 13U);
+    CHECK(remaining.normal.history_queries == request.invocation.budget.normal.history_queries - 1U);
+    CHECK(remaining.normal.history_rows == request.invocation.budget.normal.history_rows - 2U);
+    CHECK(remaining.normal.history_bytes == request.invocation.budget.normal.history_bytes - 17U);
+    CHECK(remaining.normal.state_keys == request.invocation.budget.normal.state_keys - 1U);
+    CHECK(remaining.normal.state_bytes == request.invocation.budget.normal.state_bytes - 19U);
+    CHECK(remaining.normal.effect_intents == request.invocation.budget.normal.effect_intents - 2U);
+    CHECK(remaining.normal.effect_bytes == request.invocation.budget.normal.effect_bytes - 23U);
+    CHECK(remaining.normal.recorder_events == request.invocation.budget.normal.recorder_events - 3U);
+    CHECK(remaining.normal.recorder_bytes == request.invocation.budget.normal.recorder_bytes - 29U);
+    CHECK(remaining.normal.frames == request.invocation.budget.normal.frames);
+    CHECK(remaining.normal.heap_bytes == request.invocation.budget.normal.heap_bytes);
+    CHECK(remaining.normal.active_service_calls == request.invocation.budget.normal.active_service_calls);
+    CHECK(remaining.normal.maximum_service_deadline == request.invocation.budget.normal.maximum_service_deadline);
+    CHECK(remaining.finalizer_or_fault.instructions == request.invocation.budget.finalizer_or_fault.instructions);
+    CHECK(remaining.double_fault.instructions == request.invocation.budget.double_fault.instructions);
+    CHECK(remaining.forced_cleanup.instructions == request.invocation.budget.forced_cleanup.instructions);
+    CHECK(result->resource_usage.instructions == 14U);
+    CHECK(result->resource_usage.elapsed >= 4ms);
+    CHECK(result->resource_usage.logical_heap_allocation_bytes == 128U);
+    CHECK(result->resource_usage.peak_frames == 2U);
+    CHECK(result->resource_usage.peak_live_heap_bytes == 32U);
+    CHECK(result->resource_usage.peak_active_service_calls == 2U);
+}
+
+TEST_CASE("resident runtime rejects over-budget and overflowing VM usage before commit") {
+    SECTION("one attempt exceeds its inherited instruction budget") {
+        Fixture fixture {SessionScenario::constant};
+        fixture.vm.reported_usages = {
+            VmResourceUsage {.instructions = balanced_v1.normal.instructions + 1U},
+        };
+        ResidentRuntime runtime {fixture.vm_driver, fixture.ports(), fixture.control, fixture.transactions};
+
+        const auto result = runtime.evaluate(evaluation_request());
+
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().code == ResidentRuntimeErrorCode::invalid_resource_usage);
+        CHECK(fixture.transactions.commits == 0U);
+    }
+
+    SECTION("logical allocation accounting cannot wrap across attempts") {
+        Fixture fixture {SessionScenario::state_conflict};
+        fixture.transactions.conflicts_remaining = 1U;
+        fixture.vm.reported_usages = {
+            VmResourceUsage {.logical_heap_allocation_bytes = std::numeric_limits<std::size_t>::max()},
+            VmResourceUsage {.logical_heap_allocation_bytes = 1U},
+        };
+        ResidentRuntime runtime {fixture.vm_driver, fixture.ports(), fixture.control, fixture.transactions};
+
+        const auto result = runtime.evaluate(evaluation_request());
+
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().code == ResidentRuntimeErrorCode::invalid_resource_usage);
+        CHECK(fixture.vm.starts == 2U);
+        CHECK(fixture.transactions.commits == 1U);
+    }
+}
+
+TEST_CASE("real register VM spends one instruction budget across a successful MVCC retry") {
+    RealVmFixture fixture;
+    fixture.transactions.conflicts_remaining = 1U;
+    ResidentRuntime runtime {fixture.vm_driver, fixture.ports(), fixture.control, fixture.transactions};
+    auto request = evaluation_request();
+    request.invocation.budget.normal.instructions = 8U;
+
+    const auto result = runtime.evaluate(request);
+
+    REQUIRE(result.has_value());
+    REQUIRE(result->committed());
+    const auto terminal_fault = result->evaluation.fault.has_value() && !result->evaluation.fault->frames.empty() ?
+                                    result->evaluation.fault->frames.front().code + " " +
+                                        result->evaluation.fault->frames.front().message :
+                                    std::string {};
+    INFO("terminal fault: " << terminal_fault);
+    CHECK(result->attempts == 2U);
+    CHECK(result->evaluation.outcome == EvaluationOutcome::match);
+    CHECK(result->resource_usage.instructions == 8U);
+    CHECK(result->resource_usage.state_keys == 2U);
+    CHECK(result->resource_usage.elapsed > std::chrono::nanoseconds::zero());
+    CHECK(result->resource_usage.peak_frames == 1U);
+    CHECK(result->resource_usage.peak_live_heap_bytes > 0U);
+    CHECK(result->resource_usage.logical_heap_allocation_bytes >= result->resource_usage.peak_live_heap_bytes);
+    REQUIRE(fixture.vm.invocations.size() == 2U);
+    CHECK(fixture.vm.invocations[1].budget.normal.instructions == 4U);
+    CHECK(fixture.vm.invocations[1].budget.normal.frames == request.invocation.budget.normal.frames);
+    CHECK(fixture.vm.invocations[1].budget.normal.heap_bytes == request.invocation.budget.normal.heap_bytes);
+    CHECK(fixture.vm.invocations[1].budget.finalizer_or_fault.instructions ==
+          request.invocation.budget.finalizer_or_fault.instructions);
+    CHECK(fixture.state.reads == 2U);
+}
+
+TEST_CASE("real register VM faults before work when a conflict leaves exactly zero instructions") {
+    RealVmFixture fixture;
+    fixture.transactions.conflicts_remaining = 1U;
+    ResidentRuntime runtime {fixture.vm_driver, fixture.ports(), fixture.control, fixture.transactions};
+    auto request = evaluation_request();
+    request.invocation.budget.normal.instructions = 4U;
+
+    const auto result = runtime.evaluate(request);
+
+    REQUIRE(result.has_value());
+    REQUIRE(result->committed());
+    const auto terminal_fault = result->evaluation.fault.has_value() && !result->evaluation.fault->frames.empty() ?
+                                    result->evaluation.fault->frames.front().code + " " +
+                                        result->evaluation.fault->frames.front().message :
+                                    std::string {};
+    INFO("terminal fault: " << terminal_fault);
+    CHECK(result->attempts == 2U);
+    CHECK(result->evaluation.outcome == EvaluationOutcome::faulted);
+    CHECK(result->resource_usage.instructions == 4U);
+    CHECK(result->resource_usage.state_keys == 1U);
+    REQUIRE(fixture.vm.invocations.size() == 2U);
+    CHECK(fixture.vm.invocations[1].budget.normal.instructions == 0U);
+    CHECK(fixture.state.reads == 1U);
+    REQUIRE(fixture.transactions.proposals.size() == 2U);
+    CHECK(fixture.transactions.proposals[1].state.empty());
 }
 
 TEST_CASE("resident runtime commits only durable effects and projects only eligible posts to the outbox") {

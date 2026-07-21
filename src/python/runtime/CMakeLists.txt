@@ -32,6 +32,7 @@ if(BUILD_TESTING)
         rule_engine_python_runtime_integration_tests
         PRIVATE
             rule_engine::python_runtime_adapters
+            rule_engine::python_vm
             rule_engine_test_options
             Catch2::Catch2WithMain
     )
