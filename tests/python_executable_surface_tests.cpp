@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "rule_engine/python/tools/benchmark.hpp"
 #include "rule_engine/python/tools/server.hpp"
 
 #ifndef RULE_ENGINE_PYTHON_SERVER_PATH
@@ -439,14 +440,50 @@ TEST_CASE("benchmark executable drives exact VM and validated optimized parity")
     const auto measured = run_process(benchmark, "--peers 8 --format json", temporary, "measured");
     CHECK(measured.exit_code == 0);
     CHECK(measured.standard_error.empty());
-    CHECK(measured.standard_output.find("\"schema\":\"rule-engine.python-benchmark.v1\"") != std::string::npos);
+    CHECK(measured.standard_output.find("\"schema\":\"rule-engine.python-benchmark.v2\"") != std::string::npos);
     CHECK(measured.standard_output.find("\"exact_vm_sessions\":8") != std::string::npos);
     CHECK(measured.standard_output.find("\"optimized_vm_sessions\":0") != std::string::npos);
     CHECK(measured.standard_output.find("\"optimizer_certificate_validated\":true") != std::string::npos);
     CHECK(measured.standard_output.find("\"parity_equivalent\":true") != std::string::npos);
     CHECK(measured.standard_output.find("\"parity_mismatches\":0") != std::string::npos);
+    CHECK(measured.standard_output.find("\"resident_network_simulated\":false") != std::string::npos);
+    CHECK(measured.standard_output.find("\"resident_postgresql_simulated\":false") != std::string::npos);
+    CHECK(measured.standard_output.find("\"resident_work_enqueued\":8") != std::string::npos);
+    CHECK(measured.standard_output.find("\"resident_work_committed\":8") != std::string::npos);
+    CHECK(measured.standard_output.find("\"resident_retry_attempts\":1") != std::string::npos);
+    CHECK(measured.standard_output.find("\"resident_stale_fence_rejections\":1") != std::string::npos);
+    CHECK(measured.standard_output.find("\"resident_ordering_violations\":0") != std::string::npos);
+    CHECK(measured.standard_output.find("\"resident_backpressure_transitions\":8") != std::string::npos);
 
     const auto rejected = run_process(benchmark, "--format sarif", temporary, "rejected");
     CHECK(rejected.exit_code == 2);
     CHECK(rejected.standard_error.find("BENCH-CLI-USAGE") != std::string::npos);
+}
+
+TEST_CASE("benchmark bounds a ten-thousand-peer in-memory resident simulation") {
+    const auto measured = rule_engine::python::tools::run_python_benchmark({
+        .peers = 10'000U,
+        .format = rule_engine::python::tools::OutputFormat::json,
+    });
+
+    REQUIRE(measured);
+    CHECK(measured->resident_simulation_model == "bounded-in-memory-coordinator-and-agent-spool-v1");
+    CHECK_FALSE(measured->resident_network_simulated);
+    CHECK_FALSE(measured->resident_postgresql_simulated);
+    CHECK(measured->resident_work_enqueued == 10'000U);
+    CHECK(measured->resident_work_committed == 10'000U);
+    CHECK(measured->resident_retry_attempts == 100U);
+    CHECK(measured->resident_stale_fence_rejections == 100U);
+    CHECK(measured->resident_ordering_violations == 0U);
+    CHECK(measured->resident_claim_batch_limit == 512U);
+    CHECK(measured->resident_peak_claim_batch > 0U);
+    CHECK(measured->resident_peak_claim_batch <= measured->resident_claim_batch_limit);
+    CHECK(measured->resident_peak_active_leases <= measured->resident_claim_batch_limit);
+    CHECK(measured->resident_final_ready_work == 0U);
+    CHECK(measured->resident_final_active_leases == 0U);
+    CHECK(measured->resident_backpressure_transitions == 10'000U);
+    CHECK(measured->resident_backpressure_clears == 10'000U);
+    CHECK(measured->resident_peak_agent_sessions == 1U);
+    CHECK(measured->resident_peak_pending_records == 2U);
+    CHECK(measured->resident_peak_pending_bytes == 160U);
 }

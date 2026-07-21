@@ -1,8 +1,11 @@
 #include "rule_engine/python/tools/benchmark.hpp"
 
+#include "rule_engine/python/cluster/coordinator.hpp"
+#include "rule_engine/python/cluster/store.hpp"
 #include "rule_engine/python/compiler.hpp"
 #include "rule_engine/python/optimizer/optimizer.hpp"
 #include "rule_engine/python/packaging/source_pack.hpp"
+#include "rule_engine/python/protocol/session.hpp"
 #include "rule_engine/python/vm/register_vm.hpp"
 
 #include <algorithm>
@@ -13,27 +16,54 @@
 #include <limits>
 #include <span>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 namespace rule_engine::python::tools {
     namespace {
 
+        namespace cluster = rule_engine::python::cluster;
         namespace compiler = rule_engine::python::compiler;
         namespace optimizer = rule_engine::python::optimizer;
         namespace packaging = rule_engine::python::packaging;
+        namespace protocol = rule_engine::python::protocol_v2;
         namespace vm = rule_engine::python::vm;
 
         constexpr std::string_view source_name = "benchmark.rules";
         constexpr std::string_view executable_name = "benchmark.constant_false";
         constexpr std::string_view binding_name = "benchmark-binding";
         constexpr std::size_t maximum_peer_count = 100'000U;
+        constexpr std::size_t resident_claim_batch_limit = 512U;
+        constexpr std::size_t resident_retry_stride = 100U;
+        constexpr std::size_t resident_spool_record_bytes = 80U;
+
+        struct ResidentSimulationMetrics {
+            std::uint64_t work_enqueued {};
+            std::uint64_t work_committed {};
+            std::uint64_t retry_attempts {};
+            std::uint64_t stale_fence_rejections {};
+            std::uint64_t ordering_violations {};
+            std::uint64_t peak_claim_batch {};
+            std::uint64_t peak_active_leases {};
+            std::uint64_t final_ready_work {};
+            std::uint64_t final_active_leases {};
+            std::uint64_t backpressure_transitions {};
+            std::uint64_t backpressure_clears {};
+            std::uint64_t peak_agent_sessions {};
+            std::uint64_t peak_pending_records {};
+            std::uint64_t peak_pending_bytes {};
+            std::uint64_t wall_nanoseconds {};
+        };
 
         constexpr std::string_view help_text = R"(Usage: rule_engine_benchmark [--peers COUNT] [--format text|json]
 
 Compile a deterministic Python rule pack, execute exact register bytecode for
 synthetic peers, validate a pure-false optimizer certificate, and compare every
-observable exact and optimized result with the shadow-parity contract.
+observable exact and optimized result with the shadow-parity contract. Also run
+a bounded in-memory resident coordinator/session simulation over the same peer
+count. The resident simulation does not open sockets, negotiate TLS, or exercise
+SQLite/PostgreSQL drivers and must not be interpreted as network/database scale.
 
 Options:
   --peers COUNT       Synthetic peer count from 1 through 100000 (default: 10000)
@@ -221,6 +251,255 @@ Options:
             return count <= 0 ? 0U : static_cast<std::uint64_t>(count);
         }
 
+        [[nodiscard]] RuntimeTransaction resident_transaction(const cluster::WorkLease &lease) {
+            const auto peer_number = std::to_string(lease.work.ingest_position);
+            return {
+                .input =
+                    EventEnvelope {
+                        .id = lease.work.event,
+                        .schema = SchemaId {"benchmark.resident-event/v1"},
+                        .tenant = TenantId {"benchmark"},
+                        .peer = PeerId {"synthetic-peer-" + peer_number},
+                        .subject = std::nullopt,
+                        .producer_unix_ms = lease.work.ingest_position,
+                        .ingest_unix_ms = lease.work.ingest_position,
+                        .label = DataLabel {},
+                        .causation = std::nullopt,
+                        .payload =
+                            FrozenValue {
+                                .value = make_fact(UnicodeValue {.utf8 = lease.work.event.value}),
+                                .label = DataLabel {},
+                                .canonical_digest = "sha256:benchmark-resident-event-" + peer_number,
+                            },
+                    },
+                .cursor =
+                    CursorAdvance {
+                        .consumer = lease.work.serial_domain,
+                        .expected_position = 0U,
+                        .new_position = 1U,
+                    },
+                .evaluation =
+                    EvaluationResult {
+                        .outcome = EvaluationOutcome::no_match,
+                        .verdict = false,
+                        .committed_effects = {},
+                        .state_mutations = {},
+                        .fault = std::nullopt,
+                    },
+                .state = {},
+                .emitted_events = {},
+                .journal = {},
+                .outbox = {},
+                .fence_token = lease.fence,
+            };
+        }
+
+        [[nodiscard]] bool resident_ordered_before(const cluster::WorkLease &left, const cluster::WorkLease &right) {
+            if (left.work.priority != right.work.priority) {
+                return left.work.priority > right.work.priority;
+            }
+            return std::tie(left.work.ingest_position, left.work.work_id) <=
+                   std::tie(right.work.ingest_position, right.work.work_id);
+        }
+
+        [[nodiscard]] std::expected<ResidentSimulationMetrics, PythonBenchmarkError>
+        run_resident_simulation(const std::size_t peers) {
+            const auto begin = std::chrono::steady_clock::now();
+            cluster::AuditTrail audit;
+            cluster::InMemoryRuntimeStore store {audit};
+            cluster::DeterministicWorkCoordinator coordinator {store, audit};
+            ResidentSimulationMetrics metrics;
+
+            for (std::size_t index = 0U; index < peers; ++index) {
+                const auto ordinal = index + 1U;
+                auto queued = coordinator.enqueue(cluster::WorkDefinition {
+                    .work_id = "benchmark-work-" + std::to_string(ordinal),
+                    .pack = PackId {"benchmark.python"},
+                    .generation = 1U,
+                    .serial_domain = "benchmark-peer-domain-" + std::to_string(ordinal),
+                    .event = EventId {"benchmark-resident-event-" + std::to_string(ordinal)},
+                    .priority = static_cast<std::int32_t>(index % 4U),
+                    .ingest_position = static_cast<std::uint64_t>(ordinal),
+                });
+                if (!queued || !*queued) {
+                    const auto detail = queued ? "work was unexpectedly deduplicated" : queued.error().message;
+                    return std::unexpected(
+                        benchmark_error(ExitCode::internal_invariant_failed, "BENCH-RESIDENT-ENQUEUE", detail));
+                }
+                ++metrics.work_enqueued;
+            }
+
+            for (std::size_t index = 0U; index < peers; ++index) {
+                const auto ordinal = index + 1U;
+                const auto peer = PeerId {"synthetic-peer-" + std::to_string(ordinal)};
+                const std::string epoch = "benchmark-agent-epoch-" + std::to_string(ordinal);
+                protocol::AgentSessionState session {
+                    peer,
+                    epoch,
+                    protocol::AgentSpoolLimits {
+                        .maximum_records = 2U,
+                        .maximum_bytes = 256U,
+                        .high_water_bytes = 128U,
+                        .low_water_bytes = 64U,
+                    },
+                };
+                auto established = session.establish(protocol::ServerHelloMessage {
+                    .selected_minor = protocol::initial_minor_version,
+                    .session = SessionId {"benchmark-session-" + std::to_string(ordinal)},
+                    .peer = peer,
+                    .session_fence = 1U,
+                    .acknowledged_sequence = 0U,
+                    .schemas = {},
+                    .capabilities = {},
+                    .credit = {.bytes = 256U, .messages = 2U, .work_attempts = 2U, .snapshot_chunks = 0U},
+                    .heartbeat_interval_ms = 1'000U,
+                });
+                if (!established) {
+                    return std::unexpected(benchmark_error(ExitCode::internal_invariant_failed,
+                                                           "BENCH-RESIDENT-SESSION", established.error().message));
+                }
+                metrics.peak_agent_sessions = std::max(metrics.peak_agent_sessions, std::uint64_t {1U});
+
+                for (std::uint64_t record = 1U; record <= 2U; ++record) {
+                    auto sequence = session.enqueue(
+                        protocol::WorkResultMessage {
+                            .originating_session = SessionId {"benchmark-session-" + std::to_string(ordinal)},
+                            .peer = peer,
+                            .originating_session_fence = 1U,
+                            .work_id = "benchmark-work-" + std::to_string(ordinal),
+                            .attempt_id = "benchmark-attempt-" + std::to_string(record),
+                            .work_fence = record,
+                            .generation = 1U,
+                            .facts = {},
+                            .scans = {},
+                        },
+                        resident_spool_record_bytes);
+                    if (!sequence || *sequence != record) {
+                        const auto detail = sequence ? "agent sequence was not contiguous" : sequence.error().message;
+                        return std::unexpected(
+                            benchmark_error(ExitCode::internal_invariant_failed, "BENCH-RESIDENT-SPOOL", detail));
+                    }
+                }
+                metrics.peak_pending_records =
+                    std::max(metrics.peak_pending_records, static_cast<std::uint64_t>(session.pending_records()));
+                metrics.peak_pending_bytes =
+                    std::max(metrics.peak_pending_bytes, static_cast<std::uint64_t>(session.pending_bytes()));
+                if (!session.backpressured()) {
+                    return std::unexpected(benchmark_error(ExitCode::internal_invariant_failed,
+                                                           "BENCH-RESIDENT-BACKPRESSURE",
+                                                           "the bounded agent spool did not enter backpressure"));
+                }
+                ++metrics.backpressure_transitions;
+
+                const auto transmit = session.take_transmit_batch();
+                if (transmit.size() != 2U) {
+                    return std::unexpected(benchmark_error(ExitCode::internal_invariant_failed, "BENCH-RESIDENT-CREDIT",
+                                                           "the bounded credit window did not release two records"));
+                }
+                auto acknowledged = session.acknowledge(protocol::AckMessage {
+                    .agent_epoch = epoch,
+                    .acknowledged_through = 2U,
+                    .credit = {.bytes = 256U, .messages = 2U, .work_attempts = 2U, .snapshot_chunks = 0U},
+                });
+                if (!acknowledged || session.backpressured() || session.pending_records() != 0U ||
+                    session.pending_bytes() != 0U) {
+                    const auto detail = acknowledged ? "agent spool did not drain below its low-water mark" :
+                                                       acknowledged.error().message;
+                    return std::unexpected(benchmark_error(ExitCode::internal_invariant_failed,
+                                                           "BENCH-RESIDENT-BACKPRESSURE-CLEAR", detail));
+                }
+                ++metrics.backpressure_clears;
+            }
+
+            const auto expected_retries = (peers + resident_retry_stride - 1U) / resident_retry_stride;
+            const auto maximum_claim_rounds =
+                (peers + expected_retries + resident_claim_batch_limit - 1U) / resident_claim_batch_limit + 2U;
+            std::size_t claim_rounds {};
+            std::uint64_t now_unix_ms {10'000U};
+            while (metrics.work_committed < peers) {
+                if (++claim_rounds > maximum_claim_rounds) {
+                    return std::unexpected(benchmark_error(ExitCode::internal_invariant_failed,
+                                                           "BENCH-RESIDENT-PROGRESS",
+                                                           "coordinator exceeded its bounded claim-round budget"));
+                }
+                auto leases = coordinator.claim("benchmark-node", now_unix_ms, 60'000U, resident_claim_batch_limit);
+                if (!leases) {
+                    return std::unexpected(benchmark_error(ExitCode::internal_invariant_failed, "BENCH-RESIDENT-CLAIM",
+                                                           leases.error().message));
+                }
+                if (leases->empty()) {
+                    return std::unexpected(benchmark_error(ExitCode::internal_invariant_failed,
+                                                           "BENCH-RESIDENT-PROGRESS",
+                                                           "coordinator returned no work before completion"));
+                }
+                metrics.peak_claim_batch =
+                    std::max(metrics.peak_claim_batch, static_cast<std::uint64_t>(leases->size()));
+                metrics.peak_active_leases =
+                    std::max(metrics.peak_active_leases, static_cast<std::uint64_t>(leases->size()));
+                for (std::size_t index = 1U; index < leases->size(); ++index) {
+                    if (!resident_ordered_before((*leases)[index - 1U], (*leases)[index])) {
+                        ++metrics.ordering_violations;
+                    }
+                }
+
+                for (const auto &lease : *leases) {
+                    auto transaction = resident_transaction(lease);
+                    const auto retry_this_attempt =
+                        lease.attempt == 1U && (lease.work.ingest_position - 1U) % resident_retry_stride == 0U;
+                    if (retry_this_attempt) {
+                        auto abandoned = coordinator.abandon(lease, now_unix_ms);
+                        if (!abandoned) {
+                            return std::unexpected(benchmark_error(ExitCode::internal_invariant_failed,
+                                                                   "BENCH-RESIDENT-ABANDON",
+                                                                   abandoned.error().message));
+                        }
+                        ++metrics.retry_attempts;
+                        auto stale = coordinator.commit(lease, std::move(transaction), now_unix_ms);
+                        if (stale || stale.error().code != StoreErrorCode::stale_fence) {
+                            const auto detail =
+                                stale ? "an abandoned lease committed successfully" : stale.error().message;
+                            return std::unexpected(benchmark_error(ExitCode::internal_invariant_failed,
+                                                                   "BENCH-RESIDENT-STALE-FENCE", detail));
+                        }
+                        ++metrics.stale_fence_rejections;
+                        continue;
+                    }
+
+                    auto committed = coordinator.commit(lease, std::move(transaction), now_unix_ms);
+                    if (!committed) {
+                        return std::unexpected(benchmark_error(ExitCode::internal_invariant_failed,
+                                                               "BENCH-RESIDENT-COMMIT", committed.error().message));
+                    }
+                    ++metrics.work_committed;
+                }
+                ++now_unix_ms;
+            }
+
+            for (const auto &work : coordinator.snapshot()) {
+                metrics.final_ready_work += work.phase == cluster::WorkPhase::ready ? 1U : 0U;
+                metrics.final_active_leases += work.phase == cluster::WorkPhase::leased ? 1U : 0U;
+            }
+            auto stored = store.inspect();
+            if (!stored) {
+                return std::unexpected(benchmark_error(ExitCode::internal_invariant_failed, "BENCH-RESIDENT-INSPECT",
+                                                       stored.error().message));
+            }
+            if (metrics.work_enqueued != peers || metrics.work_committed != peers ||
+                metrics.retry_attempts != expected_retries || metrics.stale_fence_rejections != expected_retries ||
+                metrics.ordering_violations != 0U || metrics.peak_claim_batch > resident_claim_batch_limit ||
+                metrics.peak_active_leases > resident_claim_batch_limit || metrics.final_ready_work != 0U ||
+                metrics.final_active_leases != 0U || stored->receipts.size() != peers ||
+                stored->events.size() != peers || metrics.backpressure_transitions != peers ||
+                metrics.backpressure_clears != peers || metrics.peak_agent_sessions > 1U ||
+                metrics.peak_pending_records > 2U || metrics.peak_pending_bytes > 2U * resident_spool_record_bytes) {
+                return std::unexpected(
+                    benchmark_error(ExitCode::internal_invariant_failed, "BENCH-RESIDENT-INVARIANT",
+                                    "resident simulation violated a queue, fence, or resource bound"));
+            }
+            metrics.wall_nanoseconds = elapsed_nanoseconds(begin, std::chrono::steady_clock::now());
+            return metrics;
+        }
+
         [[nodiscard]] std::string json_quote(const std::string_view value) {
             std::string result {'"'};
             for (const auto character : value) {
@@ -370,6 +649,11 @@ Options:
         }
         const auto optimized_end = std::chrono::steady_clock::now();
 
+        auto resident = run_resident_simulation(options.peers);
+        if (!resident) {
+            return std::unexpected(std::move(resident.error()));
+        }
+
         return PythonBenchmarkReport {
             .peers = options.peers,
             .semantic_hash = artifact->pack.semantic_hash,
@@ -384,11 +668,30 @@ Options:
             .optimized_instructions_charged = optimized_instructions,
             .exact_wall_nanoseconds = elapsed_nanoseconds(exact_begin, exact_end),
             .optimized_wall_nanoseconds = elapsed_nanoseconds(optimized_begin, optimized_end),
+            .resident_simulation_model = "bounded-in-memory-coordinator-and-agent-spool-v1",
+            .resident_network_simulated = false,
+            .resident_postgresql_simulated = false,
+            .resident_work_enqueued = resident->work_enqueued,
+            .resident_work_committed = resident->work_committed,
+            .resident_retry_attempts = resident->retry_attempts,
+            .resident_stale_fence_rejections = resident->stale_fence_rejections,
+            .resident_ordering_violations = resident->ordering_violations,
+            .resident_claim_batch_limit = resident_claim_batch_limit,
+            .resident_peak_claim_batch = resident->peak_claim_batch,
+            .resident_peak_active_leases = resident->peak_active_leases,
+            .resident_final_ready_work = resident->final_ready_work,
+            .resident_final_active_leases = resident->final_active_leases,
+            .resident_backpressure_transitions = resident->backpressure_transitions,
+            .resident_backpressure_clears = resident->backpressure_clears,
+            .resident_peak_agent_sessions = resident->peak_agent_sessions,
+            .resident_peak_pending_records = resident->peak_pending_records,
+            .resident_peak_pending_bytes = resident->peak_pending_bytes,
+            .resident_simulation_wall_nanoseconds = resident->wall_nanoseconds,
         };
     }
 
     std::string render_python_benchmark_json(const PythonBenchmarkReport &report) {
-        return "{\"schema\":\"rule-engine.python-benchmark.v1\",\"peers\":" + std::to_string(report.peers) +
+        return "{\"schema\":\"rule-engine.python-benchmark.v2\",\"peers\":" + std::to_string(report.peers) +
                ",\"semantic_hash\":" + json_quote(report.semantic_hash) +
                ",\"executable\":" + json_quote(report.executable) +
                ",\"optimized_strategy\":" + json_quote(report.optimized_strategy) +
@@ -400,11 +703,31 @@ Options:
                ",\"exact_instructions_charged\":" + std::to_string(report.exact_instructions_charged) +
                ",\"optimized_instructions_charged\":" + std::to_string(report.optimized_instructions_charged) +
                ",\"exact_wall_nanoseconds\":" + std::to_string(report.exact_wall_nanoseconds) +
-               ",\"optimized_wall_nanoseconds\":" + std::to_string(report.optimized_wall_nanoseconds) + "}\n";
+               ",\"optimized_wall_nanoseconds\":" + std::to_string(report.optimized_wall_nanoseconds) +
+               ",\"resident_simulation_model\":" + json_quote(report.resident_simulation_model) +
+               ",\"resident_network_simulated\":" + (report.resident_network_simulated ? "true" : "false") +
+               ",\"resident_postgresql_simulated\":" + (report.resident_postgresql_simulated ? "true" : "false") +
+               ",\"resident_work_enqueued\":" + std::to_string(report.resident_work_enqueued) +
+               ",\"resident_work_committed\":" + std::to_string(report.resident_work_committed) +
+               ",\"resident_retry_attempts\":" + std::to_string(report.resident_retry_attempts) +
+               ",\"resident_stale_fence_rejections\":" + std::to_string(report.resident_stale_fence_rejections) +
+               ",\"resident_ordering_violations\":" + std::to_string(report.resident_ordering_violations) +
+               ",\"resident_claim_batch_limit\":" + std::to_string(report.resident_claim_batch_limit) +
+               ",\"resident_peak_claim_batch\":" + std::to_string(report.resident_peak_claim_batch) +
+               ",\"resident_peak_active_leases\":" + std::to_string(report.resident_peak_active_leases) +
+               ",\"resident_final_ready_work\":" + std::to_string(report.resident_final_ready_work) +
+               ",\"resident_final_active_leases\":" + std::to_string(report.resident_final_active_leases) +
+               ",\"resident_backpressure_transitions\":" + std::to_string(report.resident_backpressure_transitions) +
+               ",\"resident_backpressure_clears\":" + std::to_string(report.resident_backpressure_clears) +
+               ",\"resident_peak_agent_sessions\":" + std::to_string(report.resident_peak_agent_sessions) +
+               ",\"resident_peak_pending_records\":" + std::to_string(report.resident_peak_pending_records) +
+               ",\"resident_peak_pending_bytes\":" + std::to_string(report.resident_peak_pending_bytes) +
+               ",\"resident_simulation_wall_nanoseconds\":" +
+               std::to_string(report.resident_simulation_wall_nanoseconds) + "}\n";
     }
 
     std::string render_python_benchmark_text(const PythonBenchmarkReport &report) {
-        return "schema: rule-engine.python-benchmark.v1\npeers: " + std::to_string(report.peers) +
+        return "schema: rule-engine.python-benchmark.v2\npeers: " + std::to_string(report.peers) +
                "\nsemantic_hash: " + report.semantic_hash + "\nexecutable: " + report.executable +
                "\noptimized_strategy: " + report.optimized_strategy +
                "\noptimizer_certificate_validated: " + (report.optimizer_certificate_validated ? "true" : "false") +
@@ -415,7 +738,27 @@ Options:
                "\nexact_instructions_charged: " + std::to_string(report.exact_instructions_charged) +
                "\noptimized_instructions_charged: " + std::to_string(report.optimized_instructions_charged) +
                "\nexact_wall_nanoseconds: " + std::to_string(report.exact_wall_nanoseconds) +
-               "\noptimized_wall_nanoseconds: " + std::to_string(report.optimized_wall_nanoseconds) + '\n';
+               "\noptimized_wall_nanoseconds: " + std::to_string(report.optimized_wall_nanoseconds) +
+               "\nresident_simulation_model: " + report.resident_simulation_model +
+               "\nresident_network_simulated: " + (report.resident_network_simulated ? "true" : "false") +
+               "\nresident_postgresql_simulated: " + (report.resident_postgresql_simulated ? "true" : "false") +
+               "\nresident_work_enqueued: " + std::to_string(report.resident_work_enqueued) +
+               "\nresident_work_committed: " + std::to_string(report.resident_work_committed) +
+               "\nresident_retry_attempts: " + std::to_string(report.resident_retry_attempts) +
+               "\nresident_stale_fence_rejections: " + std::to_string(report.resident_stale_fence_rejections) +
+               "\nresident_ordering_violations: " + std::to_string(report.resident_ordering_violations) +
+               "\nresident_claim_batch_limit: " + std::to_string(report.resident_claim_batch_limit) +
+               "\nresident_peak_claim_batch: " + std::to_string(report.resident_peak_claim_batch) +
+               "\nresident_peak_active_leases: " + std::to_string(report.resident_peak_active_leases) +
+               "\nresident_final_ready_work: " + std::to_string(report.resident_final_ready_work) +
+               "\nresident_final_active_leases: " + std::to_string(report.resident_final_active_leases) +
+               "\nresident_backpressure_transitions: " + std::to_string(report.resident_backpressure_transitions) +
+               "\nresident_backpressure_clears: " + std::to_string(report.resident_backpressure_clears) +
+               "\nresident_peak_agent_sessions: " + std::to_string(report.resident_peak_agent_sessions) +
+               "\nresident_peak_pending_records: " + std::to_string(report.resident_peak_pending_records) +
+               "\nresident_peak_pending_bytes: " + std::to_string(report.resident_peak_pending_bytes) +
+               "\nresident_simulation_wall_nanoseconds: " +
+               std::to_string(report.resident_simulation_wall_nanoseconds) + '\n';
     }
 
     std::string_view benchmark_help() noexcept { return help_text; }
