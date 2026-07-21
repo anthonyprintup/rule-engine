@@ -1,3 +1,4 @@
+# pyright: strict, reportPrivateUsage=false, reportUnusedFunction=false
 from __future__ import annotations
 
 import base64
@@ -7,10 +8,14 @@ import math
 import re
 import struct
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum, StrEnum
 from types import MappingProxyType
-from typing import Final
+from typing import Final, Self, cast
+
+type _LiteralValue = None | bool | float | str | bytes
+type _EnumMemberValue = None | bool | int | str
 
 _ID_PATTERN: Final = re.compile(r"[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?\Z")
 _ALIAS_PATTERN: Final = re.compile(r"[a-z][a-z0-9_-]{0,62}\Z")
@@ -129,7 +134,7 @@ def optional(item: ValueSpec, /) -> ValueSpec:
     return union_of(NONE, item)
 
 
-def literal(*values: None | bool | int | float | str | bytes) -> ValueSpec:
+def literal(*values: None | bool | float | str | bytes) -> ValueSpec:
     if not values:
         raise BindingValidationError("a literal specification cannot be empty")
     for value in values:
@@ -168,7 +173,7 @@ class ParameterSpec:
     def __init__(
         self,
         name: str,
-        value: ValueSpec,
+        value: object,
         /,
         *,
         required: bool = True,
@@ -203,14 +208,26 @@ class _RecordValue:
 
 
 class BindingSpec:
-    __slots__ = ("_id", "_template_id", "_canonical_arguments")
+    __slots__ = ("_canonical_arguments", "_id", "_template_id")
 
-    def __new__(cls, token: object = None, *args: object, **kwargs: object) -> BindingSpec:
+    def __new__(
+        cls,
+        token: object = None,
+        id: str = "",
+        template_id: str = "",
+        canonical_arguments: bytes = b"",
+    ) -> Self:
         if token is not _BINDING_TOKEN:
             raise BindingValidationError("BindingSpec is opaque; use a generated binding factory")
         return super().__new__(cls)
 
-    def __init__(self, token: object, id: str, template_id: str, canonical_arguments: bytes) -> None:
+    def __init__(
+        self,
+        token: object = None,
+        id: str = "",
+        template_id: str = "",
+        canonical_arguments: bytes = b"",
+    ) -> None:
         self._id = id
         self._template_id = template_id
         self._canonical_arguments = canonical_arguments
@@ -225,7 +242,7 @@ class BindingSpec:
 
 
 class BindingFactory:
-    __slots__ = ("template_id", "parameters", "_by_name")
+    __slots__ = ("_by_name", "parameters", "template_id")
 
     def __init__(self, template_id: str, parameters: tuple[ParameterSpec, ...] | list[ParameterSpec], /) -> None:
         _validate_stable_id(template_id, "template ID")
@@ -276,14 +293,24 @@ class _GenerationResult:
 
 
 class GenerationContext:
-    __slots__ = ("_inputs", "_json_cache", "_emitted", "_sealed")
+    __slots__ = ("_emitted", "_inputs", "_json_cache", "_sealed")
 
-    def __new__(cls, token: object = None, *args: object, **kwargs: object) -> GenerationContext:
+    def __new__(
+        cls,
+        token: object = None,
+        inputs: dict[str, _DeclaredInput] | None = None,
+    ) -> Self:
         if token is not _CONTEXT_TOKEN:
             raise GeneratorSdkError("GenerationContext is created only by the private worker")
         return super().__new__(cls)
 
-    def __init__(self, token: object, inputs: dict[str, _DeclaredInput]) -> None:
+    def __init__(
+        self,
+        token: object = None,
+        inputs: dict[str, _DeclaredInput] | None = None,
+    ) -> None:
+        if inputs is None:
+            raise GeneratorSdkError("GenerationContext requires private worker inputs")
         self._inputs = MappingProxyType(dict(inputs))
         self._json_cache: dict[str, object] = {}
         self._emitted: dict[str, BindingSpec] = {}
@@ -316,7 +343,7 @@ class GenerationContext:
             self._json_cache[name] = _freeze_json(value)
         return self._json_cache[name]
 
-    def emit(self, binding: BindingSpec) -> None:
+    def emit(self, binding: object) -> None:
         if self._sealed:
             raise ContextSealedError("generator context is sealed")
         if not isinstance(binding, BindingSpec):
@@ -338,7 +365,9 @@ class GenerationContext:
         return declared
 
 
-def _create_generation_context(inputs: dict[str, tuple[str | InputFormat, bytes]]) -> GenerationContext:
+def _create_generation_context(
+    inputs: Mapping[str, tuple[str | InputFormat, object]],
+) -> GenerationContext:
     declared: dict[str, _DeclaredInput] = {}
     for name, (raw_format, payload) in inputs.items():
         if not _ALIAS_PATTERN.fullmatch(name):
@@ -355,7 +384,7 @@ def _create_generation_context(inputs: dict[str, tuple[str | InputFormat, bytes]
     return GenerationContext(_CONTEXT_TOKEN, declared)
 
 
-def _finish_generation(context: GenerationContext) -> _GenerationResult:
+def _finish_generation(context: object) -> _GenerationResult:
     if not isinstance(context, GenerationContext):
         raise GeneratorSdkError("worker tried to finish an invalid generation context")
     if context._sealed:
@@ -375,7 +404,7 @@ def _finish_generation(context: GenerationContext) -> _GenerationResult:
     return _GenerationResult(proposals, canonical, "sha256:" + hashlib.sha256(canonical).hexdigest())
 
 
-def _validate_parameters(parameters: tuple[ParameterSpec, ...]) -> None:
+def _validate_parameters(parameters: tuple[object, ...]) -> None:
     seen: set[str] = set()
     for parameter in parameters:
         if not isinstance(parameter, ParameterSpec):
@@ -385,7 +414,7 @@ def _validate_parameters(parameters: tuple[ParameterSpec, ...]) -> None:
         seen.add(parameter.name)
 
 
-def _validate_stable_id(value: str, label: str) -> None:
+def _validate_stable_id(value: object, label: str) -> None:
     if not isinstance(value, str) or unicodedata.normalize("NFC", value) != value or not _ID_PATTERN.fullmatch(value):
         raise BindingValidationError(f"invalid {label}: {value!r}")
 
@@ -402,8 +431,10 @@ def _validate_value(spec: ValueSpec, value: object, path: str) -> object:
         if type(value) is int:
             return value
     elif kind == "float":
-        if type(value) in (int, float) and type(value) is not bool and math.isfinite(float(value)):
+        if type(value) is int:
             return float(value)
+        if type(value) is float and math.isfinite(value):
+            return value
     elif kind == "str":
         if isinstance(value, str):
             return value
@@ -412,31 +443,36 @@ def _validate_value(spec: ValueSpec, value: object, path: str) -> object:
             return value
     elif kind == "list":
         if isinstance(value, list):
-            return [_validate_value(spec.children[0], item, f"{path}[]") for item in value]
+            values = cast(list[object], value)
+            return [_validate_value(spec.children[0], item, f"{path}[]") for item in values]
     elif kind == "tuple":
         if isinstance(value, tuple):
-            variadic = bool(spec.metadata[0])
+            values = cast(tuple[object, ...], value)
+            variadic = cast(bool, spec.metadata[0])
             if variadic:
-                return tuple(_validate_value(spec.children[0], item, f"{path}[]") for item in value)
-            if len(value) == len(spec.children):
+                return tuple(_validate_value(spec.children[0], item, f"{path}[]") for item in values)
+            if len(values) == len(spec.children):
                 return tuple(
                     _validate_value(item_spec, item, f"{path}[{index}]")
-                    for index, (item_spec, item) in enumerate(zip(spec.children, value, strict=True))
+                    for index, (item_spec, item) in enumerate(zip(spec.children, values, strict=True))
                 )
     elif kind == "dict":
         if isinstance(value, dict):
+            values = cast(dict[object, object], value)
             return {
                 _validate_value(spec.children[0], key, f"{path}.key"): _validate_value(
                     spec.children[1], item, f"{path}[{key!r}]"
                 )
-                for key, item in value.items()
+                for key, item in values.items()
             }
     elif kind == "set":
         if isinstance(value, set):
-            return {_validate_value(spec.children[0], item, f"{path}[]") for item in value}
+            values = cast(set[object], value)
+            return {_validate_value(spec.children[0], item, f"{path}[]") for item in values}
     elif kind == "frozenset":
         if isinstance(value, frozenset):
-            return frozenset(_validate_value(spec.children[0], item, f"{path}[]") for item in value)
+            values = cast(frozenset[object], value)
+            return frozenset(_validate_value(spec.children[0], item, f"{path}[]") for item in values)
     elif kind == "union":
         for child in spec.children:
             try:
@@ -444,11 +480,13 @@ def _validate_value(spec: ValueSpec, value: object, path: str) -> object:
             except BindingValidationError:
                 pass
     elif kind == "literal":
-        for literal_value in spec.metadata[0]:
+        literal_values = cast(tuple[_LiteralValue, ...], spec.metadata[0])
+        for literal_value in literal_values:
             if type(value) is type(literal_value) and value == literal_value:
                 return value
     elif kind == "enum":
-        schema_id, members = spec.metadata
+        schema_id = cast(str, spec.metadata[0])
+        members = cast(tuple[tuple[str, _EnumMemberValue], ...], spec.metadata[1])
         member_map = dict(members)
         if isinstance(value, Enum) and value.name in member_map and value.value == member_map[value.name]:
             return _EnumValue(schema_id, value.name)
@@ -456,13 +494,25 @@ def _validate_value(spec: ValueSpec, value: object, path: str) -> object:
             if type(value) is type(member_value) and value == member_value:
                 return _EnumValue(schema_id, member)
     elif kind == "record":
-        schema_id, fields = spec.metadata
+        schema_id = cast(str, spec.metadata[0])
+        fields = cast(tuple[ParameterSpec, ...], spec.metadata[1])
         if isinstance(value, dict):
+            values = cast(dict[object, object], value)
             expected = {field.name for field in fields}
-            if set(value) == expected:
+            if set(values) == expected:
                 return _RecordValue(
                     schema_id,
-                    tuple((field.name, _validate_value(field.value, value[field.name], f"{path}.{field.name}")) for field in fields),
+                    tuple(
+                        (
+                            field.name,
+                            _validate_value(
+                                field.value,
+                                values[field.name],
+                                f"{path}.{field.name}",
+                            ),
+                        )
+                        for field in fields
+                    ),
                 )
     raise BindingValidationError(f"binding argument {path!r} does not match {kind}")
 
@@ -498,15 +548,19 @@ def _canonical_node(value: object) -> object:
             "fields": [[name, _canonical_node(item)] for name, item in value.fields],
         }
     if isinstance(value, list):
-        return {"$": "list", "items": [_canonical_node(item) for item in value]}
+        values = cast(list[object], value)
+        return {"$": "list", "items": [_canonical_node(item) for item in values]}
     if isinstance(value, tuple):
-        return {"$": "tuple", "items": [_canonical_node(item) for item in value]}
+        values = cast(tuple[object, ...], value)
+        return {"$": "tuple", "items": [_canonical_node(item) for item in values]}
     if isinstance(value, dict):
-        pairs = [(_canonical_node(key), _canonical_node(item)) for key, item in value.items()]
+        values = cast(dict[object, object], value)
+        pairs = [(_canonical_node(key), _canonical_node(item)) for key, item in values.items()]
         pairs.sort(key=lambda pair: _canonical_json_bytes(pair[0]))
         return {"$": "dict", "items": [[key, item] for key, item in pairs]}
     if isinstance(value, (set, frozenset)):
-        items = [_canonical_node(item) for item in value]
+        values = cast(set[object] | frozenset[object], value)
+        items = [_canonical_node(item) for item in values]
         items.sort(key=_canonical_json_bytes)
         return {"$": "frozenset" if isinstance(value, frozenset) else "set", "items": items}
     raise BindingValidationError(f"value of type {type(value).__name__} is not canonical")
@@ -537,9 +591,11 @@ def _freeze_json(value: object) -> object:
             raise InputDecodeError("non-finite JSON number is forbidden")
         return value
     if isinstance(value, list):
-        return tuple(_freeze_json(item) for item in value)
+        values = cast(list[object], value)
+        return tuple(_freeze_json(item) for item in values)
     if isinstance(value, dict):
-        return MappingProxyType({name: _freeze_json(item) for name, item in value.items()})
+        values = cast(dict[str, object], value)
+        return MappingProxyType({name: _freeze_json(item) for name, item in values.items()})
     raise InputDecodeError(f"unsupported JSON value: {type(value).__name__}")
 
 

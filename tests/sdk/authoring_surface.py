@@ -1,17 +1,17 @@
 from datetime import datetime, timedelta
 
 from rule_engine import (
+    EventRecord,
+    History,
     Identity,
     Model,
     Sensitive,
-    EventRecord,
-    StateRecord,
-    State,
-    StateKey,
-    StateScope,
-    History,
     Service,
     ServiceCall,
+    State,
+    StateKey,
+    StateRecord,
+    StateScope,
     TaskGroup,
     TaskGroupExit,
     WireRecord,
@@ -29,7 +29,6 @@ from rule_engine import (
     transaction,
     wire_field,
 )
-
 
 type Score = int
 

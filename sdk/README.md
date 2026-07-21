@@ -17,3 +17,19 @@ materialize the Python 3.14 authoring environment.
 The C++ compiler and VM remain authoritative. These Python artifacts provide
 editor types, parse-time declarations, and trusted-generator proposal
 serialization only.
+
+## External static qualification
+
+From the repository root, run the exact independently installed tools below.
+They read the strict checked-in `pyproject.toml` configuration and do not become
+build, runtime, or SDK dependencies:
+
+```powershell
+uvx --from pyright==1.1.411 pyright sdk tests/sdk/authoring_surface.py
+uvx --from ruff==0.15.22 ruff check sdk tests/sdk/authoring_surface.py
+```
+
+The author SDK was qualified on 2026-07-21 with Pyright 1.1.411 and Ruff
+0.15.22. Both tools support the SDK's required Python 3.14 syntax; the recorded
+qualification result is zero Pyright errors/warnings and all Ruff checks
+passing. CPython itself remains pinned separately and exactly to 3.14.6.
