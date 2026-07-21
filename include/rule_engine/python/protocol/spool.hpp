@@ -47,6 +47,8 @@ namespace rule_engine::python::protocol_v2 {
         [[nodiscard]] bool backpressured() const noexcept;
 
         [[nodiscard]] std::expected<std::uint64_t, ProtocolError> enqueue(const DurableAgentBody &body) noexcept;
+        [[nodiscard]] std::expected<std::vector<std::uint64_t>, ProtocolError>
+        enqueue_batch(std::span<const DurableAgentBody> bodies) noexcept;
         [[nodiscard]] std::expected<std::vector<StoredSpoolRecord>, ProtocolError>
         pending(std::size_t maximum_records, std::size_t maximum_bytes) const noexcept;
         [[nodiscard]] std::expected<void, ProtocolError> mark_transmitted(std::uint64_t sequence) noexcept;
@@ -76,6 +78,7 @@ namespace rule_engine::python::protocol_v2 {
         take_transmit_batch(std::size_t maximum_records = 256) noexcept;
         [[nodiscard]] std::expected<void, ProtocolError> acknowledge(const AckMessage &ack) noexcept;
         [[nodiscard]] std::expected<void, ProtocolError> reject(const NackMessage &nack) noexcept;
+        void update_credit(CreditWindow credit) noexcept;
         void disconnect() noexcept;
 
         [[nodiscard]] bool established() const noexcept { return session_.has_value(); }

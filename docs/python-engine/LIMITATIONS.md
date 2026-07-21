@@ -153,3 +153,35 @@ Every entry records impact, rationale, mitigation, observability, and revisit co
 - **Mitigation:** Production configuration can set `require_hard_resolver_bounds` and inject an `IEndpointResolver` that advertises and implements hard deadline and cancellation bounds; the dialer fails closed before resolution otherwise. Callers serialize connection operations, resolve listener names before binding, supply bounded accept workers externally, and always close the socket after bounded best-effort TLS shutdown.
 - **Observability:** Record resolver implementation/capability, configured and elapsed resolve/connect/handshake/read/write deadlines, endpoint/address attempts, cancellations, accept-worker saturation, and TLS shutdown outcome.
 - **Revisit:** Replace the system resolver with a proven cross-platform cancelable DNS backend and add an owned bounded session scheduler when production service composition is implemented; strengthen TLS shutdown only if a separately bounded bidirectional close is operationally required.
+
+## L-022 — The production Windows agent accepts numeric server endpoints only
+
+- **Impact:** `rule_engine_agent` cannot resolve DNS names in `server_endpoint`; operators configure one to eight IPv4/IPv6 addresses plus a separate certificate `server_name`.
+- **Rationale:** The platform `getaddrinfo` path cannot prove a hard deadline after resolution enters the OS. Claiming a hard resolver bound would weaken the production abuse boundary.
+- **Mitigation:** Configuration rejects nonnumeric endpoints, the injected numeric resolver is immediate and cancellation-aware, reconnects fail over the bounded address list, and TLS still verifies the configured DNS name, chain, exact URI SAN, and exact SHA-256 fingerprint.
+- **Observability:** Configuration validation reports endpoint syntax without printing credential contents; connection diagnostics identify only the attempted numeric endpoint and failure class.
+- **Revisit:** Permit DNS only after integrating a resolver backend with tested hard cancellation and deadline guarantees.
+
+## L-023 — Provider dispatch cannot consume a later cancel frame concurrently
+
+- **Impact:** Once a fact/scan provider call begins, a cancel message arriving on the same synchronous TLS connection is handled only after that call returns.
+- **Rationale:** The current agent loop deliberately serializes one socket operation and one data-provider dispatch; introducing an unbounded worker/thread model would create a larger resource-exhaustion surface.
+- **Mitigation:** Every accepted request has an absolute provider deadline, the agent rejects deadlines more than 60 seconds in the future, queued cancellation is applied before subsequent dispatch, console shutdown cancels bounded transport operations, and providers return only typed terminal statuses.
+- **Observability:** Agent counters distinguish accepted work, canceled work, deadline/provider failures, reconnects, and durable replay.
+- **Revisit:** Add a bounded owned dispatch scheduler and an independent control-frame reader only with explicit queue, worker, memory, and shutdown limits.
+
+## L-024 — Initial process inventory is once per agent process
+
+- **Impact:** The agent publishes one authoritative process snapshot after its first successful session; it does not yet own a periodic inventory scheduler. Partial/failed enumeration publishes nothing, preserving the coordinator's last-good view.
+- **Rationale:** Inventory cadence and fleet-wide jitter are coordinator/operations policy, while this slice establishes the durable snapshot and provider trust boundaries.
+- **Mitigation:** A successful begin/chunk/commit projection is validated and inserted into SQLite atomically before any frame is sent. Pending rows replay after reconnect, and the snapshot is not regenerated during that process lifetime.
+- **Observability:** Snapshot rows, replay counts, provider inventory attempts, and absence of a new authoritative commit expose the current state without treating partial enumeration as deletion.
+- **Revisit:** Add a bounded, jittered reconciliation schedule with explicit cadence, overlap, and backpressure policy.
+
+## L-025 — Agent certificate revocation is not checked online
+
+- **Impact:** The production agent validates the TLS chain, DNS name, exact URI SAN, and pinned SHA-256 certificate fingerprint, but this slice does not configure CRL files or OCSP fetching.
+- **Rationale:** Online revocation checks can add unbounded network dependencies, while a required local CRL needs a separately specified refresh and fail-closed expiry lifecycle.
+- **Mitigation:** Operators rotate the exact configured fingerprint and trust bundle through deployment configuration; startup fails closed when either does not match or credentials cannot be loaded.
+- **Observability:** Authentication failures expose only the failure class and never certificate, private-key, or trust-bundle contents.
+- **Revisit:** Add an operator-managed, expiry-checked local CRL or a separately bounded stapled-status design before claiming revocation coverage.

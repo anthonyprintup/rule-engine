@@ -17,6 +17,10 @@ This document separates implemented, verified behavior from the target architect
 - Versioned PEP 561 authoring stubs and a fail-closed author runtime plus a deterministic trusted-generator SDK, validated under the exact private CPython runtime.
 - Text, JSON, and SARIF command models for pack/check/admin workflows, source diagnostics, watch-generation cancellation, redaction, and conservative mutation previews.
 - Typed Windows process, image, PE, signer, memory, and scan providers use recursive subject identities and return only facts or scan observations. The provider suite includes process-incarnation and generation validation, deadline/error mapping, PE parsing bounds, signer policy, and scan-space tests.
+- The production Windows `rule_engine_agent` has deterministic `--help`/`--version`, exact `--config PATH` plus optional trailing `--validate-config`, and a strict bounded configuration for absolute spool/credential paths, numeric failover endpoints, TLS DNS name, exact URI SAN and SHA-256 fingerprint, peer identity, active generation, and mandatory hard resolver bounds.
+- The agent composes TLS 1.3 mutual authentication with persistent SQLite epoch/sequence spooling, hello/lease/cancel/ACK/NACK/credit handling, bounded reconnect/replay, pending-result deduplication, and atomic authoritative snapshot batches. Results and complete snapshot batches are durable before their first send.
+- Agent work is dispatched only through `WindowsAgentProviderRuntime` fact, scan, and process-inventory entry points. Its transport/provider seams contain no predicate, rule, bytecode, or verdict field; stale sessions/fences/generations, unknown messages/config keys, oversized future deadlines, missing backends, and invalid provider projections fail closed.
+- Focused fake-session and provider tests cover strict config/CLI rejection, whole-snapshot durability, reconnect replay without duplicate dispatch, duplicate leases, cancellation, transient NACK retry, cumulative ACK, stale fences, the facts-only boundary, and `BUILD_TESTING=OFF`. `rule_engine_python_agent` installs/exports through the central package graph with the installed executable name `rule_engine_agent`.
 
 ## Security boundary
 
@@ -29,10 +33,11 @@ Agents do not receive predicates, rule bytecode, or match decisions. They receiv
 - The compiler/VM do not yet implement every construct described by the target subset. Current gaps include complete iterator/container lowering, comprehensions and generator expressions, nested generator/coroutine object creation, `yield from`, general async task bytecode, keyword/default/variadic binding, full pattern matching rollback, typed exception matching and exception groups, `finally` lowering, complete model/class semantics, and state deletion.
 - The VM currently materializes the entry subject through fact requests rather than a complete author-visible subject object. Some handler metadata and decisions remain convention-based because the frozen bytecode contract lacks structured fields for them.
 - The generic VM contract lacks cumulative cross-retry resource counters and typed emitted-event payloads, so those guarantees cannot yet be enforced end to end. Fact responses also lack a returned schema hash; the authoritative catalog and VM must validate values before use.
-- The TLS transport accepts caller-owned connected sockets; production dial/listen/DNS/backoff orchestration is not yet qualified. CRL and SQLite spool tests cover important failures but not every revocation state or crash boundary.
+- Production agent dialing, identity pinning, reconnect, and durable replay are implemented. The listener still lacks an owned bounded service scheduler, and CRL/SQLite tests do not cover every revocation state or crash boundary.
 - PostgreSQL 17 was unavailable on the implementation host. The driver-enabled branch was warning-clean compiled against the API surface, but real libpq linking, migrations, TLS connections, concurrency, failover, cancellation, and pooling remain unqualified. The current adapter owns one mutexed connection.
 - Activation/admin control-plane state is not yet stored in the durable runtime schema. The current administrative domain and command layer must fail closed unless a real authenticated backend is supplied.
-- Provider-to-protocol reconciliation, concrete command backends/executables, bundled-runtime installation, Linux builds, package/install smoke tests, fuzzing, fault injection, and the 10,000-peer stability run remain final integration gates until recorded otherwise.
+- Concrete server/admin command backends, bundled-runtime installation, Linux builds, full package/install smoke tests, fuzzing, fault injection, and the 10,000-peer stability run remain final integration gates until recorded otherwise.
+- Production-agent limitations remain numeric-only endpoints ([L-022](LIMITATIONS.md#l-022--the-production-windows-agent-accepts-numeric-server-endpoints-only)), serialized in-flight cancellation ([L-023](LIMITATIONS.md#l-023--provider-dispatch-cannot-consume-a-later-cancel-frame-concurrently)), once-per-process initial inventory ([L-024](LIMITATIONS.md#l-024--initial-process-inventory-is-once-per-agent-process)), and no online certificate revocation check ([L-025](LIMITATIONS.md#l-025--agent-certificate-revocation-is-not-checked-online)).
 - Regex match and context contents cannot be independently recomputed by a server that intentionally does not possess the scanned source. The server validates authenticated attribution, identities, permissions, bounds, lengths, pattern membership, and framing; the provider remains the source of fact truth.
 - Complete Unicode NFC/case-fold path normalization, locked-wheel dependency materialization, external Pyright/ruff validation, and cryptographic authentication of internal deterministic VM digests remain future hardening work.
 
@@ -49,7 +54,7 @@ fallback.
 
 This proves the Windows source/build removal gate for the current integration
 snapshot; it does not prove release qualification. Real worker JSON-to-compiler
-interoperability, production socket orchestration, durable activation/admin
-state, executable backends, install packaging, Linux/PostgreSQL builds, fuzzing,
-fault injection, and scale qualification remain open and must be recorded above
-until their tests pass.
+interoperability, listener/server service composition, durable activation/admin
+state, remaining executable backends, complete install packaging,
+Linux/PostgreSQL builds, fuzzing, fault injection, and scale qualification remain
+open and must be recorded above until their tests pass.

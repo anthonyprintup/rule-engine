@@ -68,6 +68,7 @@ set(
     rule_engine_python_executable_support
     rule_engine_python_windows
     rule_engine_python_windows_runtime
+    rule_engine_python_windows_agent
 )
 set(
     RULE_ENGINE_INSTALL_LIBRARY_TARGETS
