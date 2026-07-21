@@ -46,6 +46,26 @@ namespace rule_engine::python::vm {
             return text == nullptr ? std::nullopt : std::optional<std::string> {text->utf8};
         }
 
+        [[nodiscard]] bool valid_state_operand(const FactValue &value) {
+            if (!value.valid()) {
+                return false;
+            }
+            const auto *record = std::get_if<FactRecord>(&value.node->data);
+            if (record == nullptr || record->schema.value != state_operand_schema || record->fields.size() != 3U) {
+                return false;
+            }
+            for (std::uint32_t field = 1U; field <= 3U; ++field) {
+                if (record->fields[field - 1U].field_id != field) {
+                    return false;
+                }
+                const auto text = record_text_field(value, state_operand_schema, field);
+                if (!text.has_value() || text->empty()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         [[nodiscard]] std::optional<std::string> fact_text(const FactValue &value) {
             if (!value.valid()) {
                 return std::nullopt;
@@ -1506,6 +1526,58 @@ namespace rule_engine::python::vm {
             return std::nullopt;
         }
 
+        [[nodiscard]] std::optional<VmError> delete_state(const Instruction &instruction, Frame &frame) {
+            if (forced_cleanup_active || (phase != ExecutorPhase::normal && phase != ExecutorPhase::recovery_retry)) {
+                return VmError {.code = VmErrorCode::state_budget_exhausted,
+                                .message = "state mutation is forbidden in recovery executors",
+                                .span = instruction.span};
+            }
+            if (instruction.immediate >= pack.constants.size()) {
+                return VmError {.code = VmErrorCode::invalid_bytecode,
+                                .message = "delete_state constant index is out of range",
+                                .span = instruction.span};
+            }
+            const auto namespace_name =
+                record_text_field(pack.constants[instruction.immediate], state_operand_schema, 1U);
+            const auto name = record_text_field(pack.constants[instruction.immediate], state_operand_schema, 2U);
+            const auto schema = record_text_field(pack.constants[instruction.immediate], state_operand_schema, 3U);
+            if (!namespace_name.has_value() || !name.has_value() || !schema.has_value() || namespace_name->empty() ||
+                name->empty() || schema->empty()) {
+                return VmError {.code = VmErrorCode::invalid_bytecode,
+                                .message = "delete_state constant is not a valid state operand",
+                                .span = instruction.span};
+            }
+            const auto key = *namespace_name + "\x1f" + *name + "\x1f" + *schema;
+            if (const auto fault = charge_state_key(key, instruction.span); fault.has_value()) {
+                return fault;
+            }
+            const auto prior = state_values.find(key);
+            const auto overlay = state_overlay.find(key);
+            const auto version = overlay != state_overlay.end() ? overlay->second.version :
+                                 prior != state_values.end()    ? prior->second.version :
+                                                                  0U;
+            StateMutation mutation {
+                .owner = function(frame).id,
+                .namespace_name = *namespace_name,
+                .key = *name,
+                .expected_version = version,
+                .value = std::nullopt,
+            };
+            const auto existing = std::ranges::find_if(state_mutations, [&](const auto &candidate) {
+                return candidate.owner == mutation.owner && candidate.namespace_name == mutation.namespace_name &&
+                       candidate.key == mutation.key;
+            });
+            if (existing == state_mutations.end()) {
+                state_mutations.push_back(std::move(mutation));
+            } else {
+                *existing = std::move(mutation);
+            }
+            state_overlay.insert_or_assign(
+                key, StateEntry {.value = std::nullopt, .version = version, .error = std::nullopt});
+            ++frame.pc;
+            return std::nullopt;
+        }
+
         [[nodiscard]] std::optional<VmError> append_effect(const Instruction &instruction, Frame &frame) {
             if (instruction.immediate >= pack.constants.size() || !register_valid(frame, instruction.operand_a)) {
                 return VmError {.code = VmErrorCode::invalid_bytecode,
@@ -1739,6 +1811,142 @@ namespace rule_engine::python::vm {
                         frame.registers[instruction.destination] = frame.registers[instruction.operand_a];
                         ++frame.pc;
                         break;
+                    case Opcode::build_list:
+                    case Opcode::build_tuple: {
+                        if (instruction.operand_a > frame.registers.size() ||
+                            instruction.operand_b > frame.registers.size() - instruction.operand_a) {
+                            return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                                 .message = "container build register range is invalid",
+                                                 .span = instruction.span});
+                        }
+                        const auto values =
+                            std::span {frame.registers}.subspan(instruction.operand_a, instruction.operand_b);
+                        if (!std::ranges::all_of(values, [&](const auto value) { return heap.valid(value); })) {
+                            return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                                 .message = "container build reads an uninitialized register",
+                                                 .span = instruction.span});
+                        }
+                        if (const auto work_fault = charge_instructions(instruction.operand_b, instruction.span);
+                            work_fault.has_value()) {
+                            return fail(*work_fault);
+                        }
+                        auto result = instruction.opcode == Opcode::build_list ? heap.allocate_list(values) :
+                                                                                 heap.allocate_tuple(values);
+                        if (!result) {
+                            return fail(result.error());
+                        }
+                        frame.registers[instruction.destination] = *result;
+                        ++frame.pc;
+                        break;
+                    }
+                    case Opcode::build_dict: {
+                        if (instruction.operand_a > frame.registers.size() ||
+                            instruction.operand_b > (frame.registers.size() - instruction.operand_a) / 2U) {
+                            return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                                 .message = "dictionary build register range is invalid",
+                                                 .span = instruction.span});
+                        }
+                        for (std::uint32_t pair = 0U; pair < instruction.operand_b; ++pair) {
+                            const auto key_register = instruction.operand_a + pair * 2U;
+                            if (!register_valid(frame, key_register) || !register_valid(frame, key_register + 1U)) {
+                                return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                                     .message = "dictionary build reads an uninitialized register",
+                                                     .span = instruction.span});
+                            }
+                        }
+                        if (const auto work_fault = charge_instructions(
+                                static_cast<std::uint64_t>(instruction.operand_b) * 2U, instruction.span);
+                            work_fault.has_value()) {
+                            return fail(*work_fault);
+                        }
+                        auto result = heap.allocate_map();
+                        if (!result) {
+                            return fail(result.error());
+                        }
+                        for (std::uint32_t pair = 0U; pair < instruction.operand_b; ++pair) {
+                            const auto key_register = instruction.operand_a + pair * 2U;
+                            const auto value_register = key_register + 1U;
+                            auto inserted = heap.map_insert(*result, frame.registers[key_register],
+                                                            frame.registers[value_register]);
+                            if (!inserted) {
+                                return fail(inserted.error());
+                            }
+                        }
+                        frame.registers[instruction.destination] = *result;
+                        ++frame.pc;
+                        break;
+                    }
+                    case Opcode::get_iter: {
+                        if (!register_valid(frame, instruction.operand_a)) {
+                            return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                                 .message = "get_iter reads an uninitialized register",
+                                                 .span = instruction.span});
+                        }
+                        auto iterator = heap.get_iterator(frame.registers[instruction.operand_a]);
+                        if (!iterator) {
+                            return fail(iterator.error());
+                        }
+                        frame.registers[instruction.destination] = *iterator;
+                        ++frame.pc;
+                        break;
+                    }
+                    case Opcode::iter_next: {
+                        if (!register_valid(frame, instruction.operand_a)) {
+                            return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                                 .message = "iter_next reads an uninitialized iterator register",
+                                                 .span = instruction.span});
+                        }
+                        auto exhausted = heap.iterator_exhausted(frame.registers[instruction.operand_a]);
+                        if (!exhausted) {
+                            return fail(exhausted.error());
+                        }
+                        if (*exhausted) {
+                            frame.pc = instruction.immediate;
+                            break;
+                        }
+                        if (const auto loop_fault = charge_loop(instruction.span); loop_fault.has_value()) {
+                            return fail(*loop_fault);
+                        }
+                        auto value = heap.iterator_next(frame.registers[instruction.operand_a]);
+                        if (!value) {
+                            return fail(value.error());
+                        }
+                        frame.registers[instruction.destination] = *value;
+                        ++frame.pc;
+                        break;
+                    }
+                    case Opcode::load_subscript: {
+                        if (!register_valid(frame, instruction.operand_a) ||
+                            !register_valid(frame, instruction.operand_b)) {
+                            return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                                 .message = "load_subscript reads an uninitialized register",
+                                                 .span = instruction.span});
+                        }
+                        auto value = heap.load_subscript(frame.registers[instruction.operand_a],
+                                                         frame.registers[instruction.operand_b]);
+                        if (!value) {
+                            return fail(value.error());
+                        }
+                        frame.registers[instruction.destination] = *value;
+                        ++frame.pc;
+                        break;
+                    }
+                    case Opcode::store_subscript:
+                        if (!register_valid(frame, instruction.destination) ||
+                            !register_valid(frame, instruction.operand_a) ||
+                            !register_valid(frame, instruction.operand_b)) {
+                            return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                                 .message = "store_subscript reads an uninitialized register",
+                                                 .span = instruction.span});
+                        }
+                        if (auto stored = heap.store_subscript(frame.registers[instruction.operand_a],
+                                                               frame.registers[instruction.operand_b],
+                                                               frame.registers[instruction.destination]);
+                            !stored) {
+                            return fail(stored.error());
+                        }
+                        ++frame.pc;
+                        break;
                     case Opcode::unary_op: {
                         if (!register_valid(frame, instruction.operand_a) ||
                             !operation_in_range(instruction.immediate,
@@ -1812,7 +2020,8 @@ namespace rule_engine::python::vm {
                         break;
                     }
                     case Opcode::jump:
-                        if (instruction.immediate <= frame.pc) {
+                        if (instruction.immediate <= frame.pc &&
+                            code.instructions[instruction.immediate].opcode != Opcode::iter_next) {
                             if (const auto loop_fault = charge_loop(instruction.span); loop_fault.has_value()) {
                                 return fail(*loop_fault);
                             }
@@ -1830,7 +2039,8 @@ namespace rule_engine::python::vm {
                             return fail(condition.error());
                         }
                         if (!*condition) {
-                            if (instruction.immediate <= frame.pc) {
+                            if (instruction.immediate <= frame.pc &&
+                                code.instructions[instruction.immediate].opcode != Opcode::iter_next) {
                                 if (const auto loop_fault = charge_loop(instruction.span); loop_fault.has_value()) {
                                     return fail(*loop_fault);
                                 }
@@ -2059,6 +2269,11 @@ namespace rule_engine::python::vm {
                             return fail(*fault);
                         }
                         break;
+                    case Opcode::delete_state:
+                        if (const auto fault = delete_state(instruction, frame); fault.has_value()) {
+                            return fail(*fault);
+                        }
+                        break;
                     case Opcode::append_effect:
                         if (const auto fault = append_effect(instruction, frame); fault.has_value()) {
                             return fail(*fault);
@@ -2277,6 +2492,15 @@ namespace rule_engine::python::vm {
             return std::unexpected(std::move(verified.error()));
         }
         DiagnosticSet diagnostics;
+        for (const auto &function : pack.functions) {
+            for (const auto &instruction : function.instructions) {
+                if (instruction.opcode == Opcode::delete_state &&
+                    !valid_state_operand(pack.constants[instruction.immediate])) {
+                    diagnostics.push_back(diagnostic(
+                        "PYVM0010", "delete_state constant is not a canonical state operand", instruction.span));
+                }
+            }
+        }
         if (invocation.execution.empty() || invocation.invocation.empty() || invocation.binding.empty() ||
             !invocation.subject.valid()) {
             diagnostics.push_back(diagnostic("PYVM0001", "VM invocation identity or subject is invalid"));

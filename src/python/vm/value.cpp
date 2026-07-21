@@ -515,6 +515,9 @@ namespace rule_engine::python::vm {
         struct ListStorage {
             std::vector<PyValue> values;
         };
+        struct TupleStorage {
+            std::vector<PyValue> values;
+        };
         struct MapStorage {
             std::vector<std::pair<PyValue, PyValue>> entries;
         };
@@ -522,8 +525,13 @@ namespace rule_engine::python::vm {
             SchemaId schema;
             std::vector<RecordFieldValue> fields;
         };
+        struct IteratorStorage {
+            PyValue source;
+            std::size_t index {};
+            std::size_t expected_size {};
+        };
         using Payload = std::variant<std::monostate, bool, BigInteger, double, UnicodeStorage, BytesStorage,
-                                     ListStorage, MapStorage, RecordStorage>;
+                                     ListStorage, MapStorage, RecordStorage, TupleStorage, IteratorStorage>;
 
         struct Object {
             ValueKind kind {ValueKind::none};
@@ -553,6 +561,9 @@ namespace rule_engine::python::vm {
                 case ValueKind::list:
                     bytes += std::get<ListStorage>(object.payload).values.size() * sizeof(PyValue);
                     break;
+                case ValueKind::tuple:
+                    bytes += std::get<TupleStorage>(object.payload).values.size() * sizeof(PyValue);
+                    break;
                 case ValueKind::map:
                     bytes += std::get<MapStorage>(object.payload).entries.size() * sizeof(std::pair<PyValue, PyValue>);
                     break;
@@ -563,7 +574,8 @@ namespace rule_engine::python::vm {
                 }
                 case ValueKind::none:
                 case ValueKind::boolean:
-                case ValueKind::floating: break;
+                case ValueKind::floating:
+                case ValueKind::iterator: break;
                 default: break;
             }
             return bytes;
@@ -629,6 +641,73 @@ namespace rule_engine::python::vm {
                 return BigInteger {.negative = false, .magnitude = std::get<bool>(object.payload) ? "1" : "0"};
             }
             return std::nullopt;
+        }
+
+        [[nodiscard]] std::expected<bool, VmError>
+        hashable(const PyValue value, std::unordered_set<std::uint64_t> &active, const std::uint32_t depth = 0U) const {
+            if (depth > 128U) {
+                return std::unexpected(error(VmErrorCode::value_error, "hash recursion limit exceeded"));
+            }
+            const auto current = object(value);
+            if (!current) {
+                return std::unexpected(current.error());
+            }
+            switch ((*current)->kind) {
+                case ValueKind::none:
+                case ValueKind::boolean:
+                case ValueKind::integer:
+                case ValueKind::floating:
+                case ValueKind::unicode:
+                case ValueKind::bytes: return true;
+                case ValueKind::tuple: {
+                    const auto identity = (static_cast<std::uint64_t>(value.slot) << 32U) | value.generation;
+                    if (!active.insert(identity).second) {
+                        return std::unexpected(error(VmErrorCode::value_error, "hash recursion cycle detected"));
+                    }
+                    for (const auto item : std::get<TupleStorage>((*current)->payload).values) {
+                        auto item_hashable = hashable(item, active, depth + 1U);
+                        if (!item_hashable || !*item_hashable) {
+                            active.erase(identity);
+                            return item_hashable;
+                        }
+                    }
+                    active.erase(identity);
+                    return true;
+                }
+                case ValueKind::list:
+                case ValueKind::map:
+                case ValueKind::record:
+                case ValueKind::iterator: return false;
+                default: return std::unexpected(error(VmErrorCode::engine_fault, "VM value has an invalid kind"));
+            }
+        }
+
+        [[nodiscard]] std::expected<std::size_t, VmError> sequence_index(const PyValue value,
+                                                                         const std::size_t size) const {
+            const auto key = object(value);
+            if (!key) {
+                return std::unexpected(key.error());
+            }
+            const auto integer = integer_like(**key);
+            if (!integer.has_value()) {
+                return std::unexpected(error(VmErrorCode::type_error, "sequence index must be an integer"));
+            }
+            std::size_t magnitude {};
+            const auto [end, conversion] = std::from_chars(
+                integer->magnitude.data(), integer->magnitude.data() + integer->magnitude.size(), magnitude);
+            if (conversion != std::errc {} || end != integer->magnitude.data() + integer->magnitude.size()) {
+                return std::unexpected(error(VmErrorCode::value_error, "sequence index is out of range"));
+            }
+            if (integer->negative) {
+                if (magnitude > size) {
+                    return std::unexpected(error(VmErrorCode::value_error, "sequence index is out of range"));
+                }
+                return size - magnitude;
+            }
+            if (magnitude >= size) {
+                return std::unexpected(error(VmErrorCode::value_error, "sequence index is out of range"));
+            }
+            return magnitude;
         }
 
         [[nodiscard]] std::expected<bool, VmError>
@@ -699,6 +778,30 @@ namespace rule_engine::python::vm {
                     }
                     const auto &left_values = std::get<ListStorage>((*left_object)->payload).values;
                     const auto &right_values = std::get<ListStorage>((*right_object)->payload).values;
+                    if (left_values.size() != right_values.size()) {
+                        active.erase(pair);
+                        return false;
+                    }
+                    for (std::size_t index = 0; index < left_values.size(); ++index) {
+                        auto item_equal = equal_recursive(left_values[index], right_values[index], active, depth + 1U);
+                        if (!item_equal || !*item_equal) {
+                            active.erase(pair);
+                            return item_equal;
+                        }
+                    }
+                    active.erase(pair);
+                    return true;
+                }
+                case ValueKind::tuple: {
+                    const auto pair = std::pair {
+                        (static_cast<std::uint64_t>(left.slot) << 32U) | left.generation,
+                        (static_cast<std::uint64_t>(right.slot) << 32U) | right.generation,
+                    };
+                    if (!active.insert(pair).second) {
+                        return true;
+                    }
+                    const auto &left_values = std::get<TupleStorage>((*left_object)->payload).values;
+                    const auto &right_values = std::get<TupleStorage>((*right_object)->payload).values;
                     if (left_values.size() != right_values.size()) {
                         active.erase(pair);
                         return false;
@@ -786,6 +889,7 @@ namespace rule_engine::python::vm {
                 }
                 case ValueKind::boolean:
                 case ValueKind::integer: break;
+                case ValueKind::iterator: return false;
                 default: return std::unexpected(error(VmErrorCode::engine_fault, "VM value has an invalid kind"));
             }
             return false;
@@ -811,7 +915,13 @@ namespace rule_engine::python::vm {
             return true;
         }
 
-        [[nodiscard]] std::expected<std::string, FreezeError> canonical_map_key(const PyValue value) const {
+        [[nodiscard]] std::expected<std::string, FreezeError>
+        canonical_map_key(const PyValue value, std::unordered_set<std::uint64_t> &active,
+                          const std::uint32_t depth) const {
+            if (depth > 128U) {
+                return std::unexpected(
+                    freeze_error(FreezeErrorCode::budget_exhausted, "map key exceeds maximum tuple depth"));
+            }
             const auto object_value = object(value);
             if (!object_value) {
                 return std::unexpected(freeze_error(FreezeErrorCode::invalid_handle, object_value.error().message));
@@ -852,9 +962,27 @@ namespace rule_engine::python::vm {
                     result.append(reinterpret_cast<const char *>(bytes.data()), bytes.size());
                     break;
                 }
+                case ValueKind::tuple: {
+                    const auto identity = (static_cast<std::uint64_t>(value.slot) << 32U) | value.generation;
+                    if (!active.insert(identity).second) {
+                        return std::unexpected(freeze_error(FreezeErrorCode::cycle, "tuple map key contains a cycle"));
+                    }
+                    append_token(result, "tuple");
+                    for (const auto item : std::get<TupleStorage>(current.payload).values) {
+                        auto encoded = canonical_map_key(item, active, depth + 1U);
+                        if (!encoded) {
+                            active.erase(identity);
+                            return std::unexpected(std::move(encoded.error()));
+                        }
+                        append_token(result, *encoded);
+                    }
+                    active.erase(identity);
+                    break;
+                }
                 case ValueKind::list:
                 case ValueKind::map:
                 case ValueKind::record:
+                case ValueKind::iterator:
                     return std::unexpected(freeze_error(FreezeErrorCode::unsupported_type,
                                                         "container or record is not a canonical map key"));
                 default:
@@ -862,6 +990,11 @@ namespace rule_engine::python::vm {
                         freeze_error(FreezeErrorCode::unsupported_type, "VM value has an invalid kind"));
             }
             return result;
+        }
+
+        [[nodiscard]] std::expected<std::string, FreezeError> canonical_map_key(const PyValue value) const {
+            std::unordered_set<std::uint64_t> active;
+            return canonical_map_key(value, active, 0U);
         }
 
         [[nodiscard]] std::expected<FactValue, FreezeError> freeze_value(const PyValue value, FreezeState &state,
@@ -956,6 +1089,10 @@ namespace rule_engine::python::vm {
                 case ValueKind::list:
                 case ValueKind::map:
                 case ValueKind::record: break;
+                case ValueKind::tuple:
+                case ValueKind::iterator:
+                    return std::unexpected(freeze_error(FreezeErrorCode::unsupported_type,
+                                                        "VM value kind cannot cross a canonical boundary"));
                 default:
                     return std::unexpected(
                         freeze_error(FreezeErrorCode::unsupported_type, "VM value has an invalid kind"));
@@ -1246,6 +1383,21 @@ namespace rule_engine::python::vm {
         });
     }
 
+    std::expected<PyValue, VmError> ValueHeap::allocate_tuple(const std::span<const PyValue> values) {
+        const auto remaining = impl_->maximum_live_bytes - impl_->stats.live_bytes;
+        if (remaining < sizeof(Impl::Object) || values.size() > (remaining - sizeof(Impl::Object)) / sizeof(PyValue)) {
+            return std::unexpected(
+                error(VmErrorCode::heap_budget_exhausted, "tuple allocation would exceed the live VM heap budget"));
+        }
+        if (!std::ranges::all_of(values, [this](const auto value) { return valid(value); })) {
+            return std::unexpected(error(VmErrorCode::invalid_handle, "tuple contains an invalid VM handle"));
+        }
+        return impl_->allocate(Impl::Object {
+            .kind = ValueKind::tuple,
+            .payload = Impl::TupleStorage {.values = std::vector<PyValue> {values.begin(), values.end()}},
+        });
+    }
+
     std::expected<PyValue, VmError>
     ValueHeap::allocate_map(const std::span<const std::pair<PyValue, PyValue>> entries) {
         const auto remaining = impl_->maximum_live_bytes - impl_->stats.live_bytes;
@@ -1258,9 +1410,12 @@ namespace rule_engine::python::vm {
             if (!valid(key) || !valid(value)) {
                 return std::unexpected(error(VmErrorCode::invalid_handle, "map contains an invalid VM handle"));
             }
-            const auto key_kind = kind(key);
-            if (!key_kind || *key_kind == ValueKind::list || *key_kind == ValueKind::map ||
-                *key_kind == ValueKind::record) {
+            std::unordered_set<std::uint64_t> active;
+            const auto key_hashable = impl_->hashable(key, active);
+            if (!key_hashable) {
+                return std::unexpected(key_hashable.error());
+            }
+            if (!*key_hashable) {
                 return std::unexpected(error(VmErrorCode::type_error, "unhashable map key"));
             }
         }
@@ -1331,14 +1486,17 @@ namespace rule_engine::python::vm {
         if (slot->object->kind != ValueKind::map) {
             return std::unexpected(error(VmErrorCode::type_error, "map insert target is not a map"));
         }
-        const auto key_kind = kind(key);
-        if (!key_kind || *key_kind == ValueKind::list || *key_kind == ValueKind::map ||
-            *key_kind == ValueKind::record) {
+        std::unordered_set<std::uint64_t> active;
+        const auto key_hashable = impl_->hashable(key, active);
+        if (!key_hashable) {
+            return std::unexpected(key_hashable.error());
+        }
+        if (!*key_hashable) {
             return std::unexpected(error(VmErrorCode::type_error, "unhashable map key"));
         }
         auto &entries = std::get<Impl::MapStorage>(slot->object->payload).entries;
         for (auto &[existing_key, existing_value] : entries) {
-            auto same = equal(existing_key, key);
+            auto same = existing_key == key ? std::expected<bool, VmError> {true} : equal(existing_key, key);
             if (!same) {
                 return std::unexpected(same.error());
             }
@@ -1358,6 +1516,195 @@ namespace rule_engine::python::vm {
         impl_->stats.logical_allocated_bytes += charge;
         impl_->stats.peak_live_bytes = std::max(impl_->stats.peak_live_bytes, impl_->stats.live_bytes);
         return {};
+    }
+
+    std::expected<PyValue, VmError> ValueHeap::load_subscript(const PyValue container, const PyValue key) {
+        const auto object = impl_->object(container);
+        if (!object) {
+            return std::unexpected(object.error());
+        }
+        switch ((*object)->kind) {
+            case ValueKind::list: {
+                const auto &values = std::get<Impl::ListStorage>((*object)->payload).values;
+                auto index = impl_->sequence_index(key, values.size());
+                return index ? std::expected<PyValue, VmError> {values[*index]} : std::unexpected(index.error());
+            }
+            case ValueKind::tuple: {
+                const auto &values = std::get<Impl::TupleStorage>((*object)->payload).values;
+                auto index = impl_->sequence_index(key, values.size());
+                return index ? std::expected<PyValue, VmError> {values[*index]} : std::unexpected(index.error());
+            }
+            case ValueKind::unicode: {
+                const auto &codepoints = std::get<Impl::UnicodeStorage>((*object)->payload).codepoints;
+                auto index = impl_->sequence_index(key, codepoints.size());
+                if (!index) {
+                    return std::unexpected(index.error());
+                }
+                return allocate_unicode_codepoints(std::u32string {codepoints[*index]});
+            }
+            case ValueKind::bytes: {
+                const auto &bytes = std::get<Impl::BytesStorage>((*object)->payload).bytes;
+                auto index = impl_->sequence_index(key, bytes.size());
+                if (!index) {
+                    return std::unexpected(index.error());
+                }
+                return allocate_integer(std::to_string(std::to_integer<unsigned int>(bytes[*index])));
+            }
+            case ValueKind::map: {
+                std::unordered_set<std::uint64_t> active;
+                const auto key_hashable = impl_->hashable(key, active);
+                if (!key_hashable) {
+                    return std::unexpected(key_hashable.error());
+                }
+                if (!*key_hashable) {
+                    return std::unexpected(error(VmErrorCode::type_error, "unhashable map key"));
+                }
+                for (const auto &[existing_key, value] : std::get<Impl::MapStorage>((*object)->payload).entries) {
+                    auto same = existing_key == key ? std::expected<bool, VmError> {true} : equal(existing_key, key);
+                    if (!same) {
+                        return std::unexpected(same.error());
+                    }
+                    if (*same) {
+                        return value;
+                    }
+                }
+                return std::unexpected(error(VmErrorCode::value_error, "map key was not found"));
+            }
+            case ValueKind::none:
+            case ValueKind::boolean:
+            case ValueKind::integer:
+            case ValueKind::floating:
+            case ValueKind::record:
+            case ValueKind::iterator:
+                return std::unexpected(error(VmErrorCode::type_error, "VM value does not support subscription"));
+            default: return std::unexpected(error(VmErrorCode::engine_fault, "VM value has an invalid kind"));
+        }
+    }
+
+    std::expected<void, VmError> ValueHeap::store_subscript(const PyValue container, const PyValue key,
+                                                            const PyValue value) {
+        if (!valid(value)) {
+            return std::unexpected(error(VmErrorCode::invalid_handle, "subscript assignment value is invalid"));
+        }
+        auto *slot = impl_->find(container);
+        if (slot == nullptr) {
+            return std::unexpected(error(VmErrorCode::invalid_handle, "subscript assignment target is invalid"));
+        }
+        if (slot->object->kind == ValueKind::list) {
+            auto &values = std::get<Impl::ListStorage>(slot->object->payload).values;
+            auto index = impl_->sequence_index(key, values.size());
+            if (!index) {
+                return std::unexpected(index.error());
+            }
+            values[*index] = value;
+            return {};
+        }
+        if (slot->object->kind == ValueKind::map) {
+            return map_insert(container, key, value);
+        }
+        return std::unexpected(error(VmErrorCode::type_error, "VM value does not support item assignment"));
+    }
+
+    std::expected<PyValue, VmError> ValueHeap::get_iterator(const PyValue iterable) {
+        const auto object = impl_->object(iterable);
+        if (!object) {
+            return std::unexpected(object.error());
+        }
+        std::size_t expected_size {};
+        switch ((*object)->kind) {
+            case ValueKind::list: expected_size = std::get<Impl::ListStorage>((*object)->payload).values.size(); break;
+            case ValueKind::tuple:
+                expected_size = std::get<Impl::TupleStorage>((*object)->payload).values.size();
+                break;
+            case ValueKind::map: expected_size = std::get<Impl::MapStorage>((*object)->payload).entries.size(); break;
+            case ValueKind::unicode:
+                expected_size = std::get<Impl::UnicodeStorage>((*object)->payload).codepoints.size();
+                break;
+            case ValueKind::bytes: expected_size = std::get<Impl::BytesStorage>((*object)->payload).bytes.size(); break;
+            case ValueKind::iterator: return iterable;
+            case ValueKind::none:
+            case ValueKind::boolean:
+            case ValueKind::integer:
+            case ValueKind::floating:
+            case ValueKind::record: return std::unexpected(error(VmErrorCode::type_error, "VM value is not iterable"));
+            default: return std::unexpected(error(VmErrorCode::engine_fault, "VM value has an invalid kind"));
+        }
+        return impl_->allocate(Impl::Object {
+            .kind = ValueKind::iterator,
+            .payload = Impl::IteratorStorage {.source = iterable, .index = 0U, .expected_size = expected_size},
+        });
+    }
+
+    std::expected<bool, VmError> ValueHeap::iterator_exhausted(const PyValue iterator) const {
+        const auto iterator_object = impl_->object(iterator);
+        if (!iterator_object) {
+            return std::unexpected(iterator_object.error());
+        }
+        if ((*iterator_object)->kind != ValueKind::iterator) {
+            return std::unexpected(error(VmErrorCode::type_error, "VM value is not an iterator"));
+        }
+        const auto &state = std::get<Impl::IteratorStorage>((*iterator_object)->payload);
+        const auto source = impl_->object(state.source);
+        if (!source) {
+            return std::unexpected(source.error());
+        }
+        std::size_t size {};
+        switch ((*source)->kind) {
+            case ValueKind::list: size = std::get<Impl::ListStorage>((*source)->payload).values.size(); break;
+            case ValueKind::tuple: size = std::get<Impl::TupleStorage>((*source)->payload).values.size(); break;
+            case ValueKind::map:
+                size = std::get<Impl::MapStorage>((*source)->payload).entries.size();
+                if (size != state.expected_size) {
+                    return std::unexpected(error(VmErrorCode::value_error, "dictionary changed size during iteration"));
+                }
+                break;
+            case ValueKind::unicode: size = std::get<Impl::UnicodeStorage>((*source)->payload).codepoints.size(); break;
+            case ValueKind::bytes: size = std::get<Impl::BytesStorage>((*source)->payload).bytes.size(); break;
+            default: return std::unexpected(error(VmErrorCode::engine_fault, "iterator source has an invalid kind"));
+        }
+        return state.index >= size;
+    }
+
+    std::expected<PyValue, VmError> ValueHeap::iterator_next(const PyValue iterator) {
+        auto exhausted = iterator_exhausted(iterator);
+        if (!exhausted) {
+            return std::unexpected(exhausted.error());
+        }
+        if (*exhausted) {
+            return std::unexpected(error(VmErrorCode::value_error, "iterator is exhausted"));
+        }
+        const auto iterator_object = impl_->object(iterator);
+        const auto state = std::get<Impl::IteratorStorage>((*iterator_object)->payload);
+        const auto source = impl_->object(state.source);
+        std::expected<PyValue, VmError> result =
+            std::unexpected(error(VmErrorCode::engine_fault, "iterator source has an invalid kind"));
+        switch ((*source)->kind) {
+            case ValueKind::list: result = std::get<Impl::ListStorage>((*source)->payload).values[state.index]; break;
+            case ValueKind::tuple: result = std::get<Impl::TupleStorage>((*source)->payload).values[state.index]; break;
+            case ValueKind::map:
+                result = std::get<Impl::MapStorage>((*source)->payload).entries[state.index].first;
+                break;
+            case ValueKind::unicode: {
+                const auto codepoint = std::get<Impl::UnicodeStorage>((*source)->payload).codepoints[state.index];
+                result = allocate_unicode_codepoints(std::u32string {codepoint});
+                break;
+            }
+            case ValueKind::bytes: {
+                const auto byte = std::get<Impl::BytesStorage>((*source)->payload).bytes[state.index];
+                result = allocate_integer(std::to_string(std::to_integer<unsigned int>(byte)));
+                break;
+            }
+            default: break;
+        }
+        if (!result) {
+            return result;
+        }
+        auto *updated = impl_->find(iterator);
+        if (updated == nullptr || updated->object->kind != ValueKind::iterator) {
+            return std::unexpected(error(VmErrorCode::engine_fault, "iterator was invalidated while advancing"));
+        }
+        ++std::get<Impl::IteratorStorage>(updated->object->payload).index;
+        return result;
     }
 
     std::expected<ValueKind, VmError> ValueHeap::kind(const PyValue value) const {
@@ -1381,8 +1728,10 @@ namespace rule_engine::python::vm {
             case ValueKind::unicode: return !std::get<Impl::UnicodeStorage>((*object)->payload).codepoints.empty();
             case ValueKind::bytes: return !std::get<Impl::BytesStorage>((*object)->payload).bytes.empty();
             case ValueKind::list: return !std::get<Impl::ListStorage>((*object)->payload).values.empty();
+            case ValueKind::tuple: return !std::get<Impl::TupleStorage>((*object)->payload).values.empty();
             case ValueKind::map: return !std::get<Impl::MapStorage>((*object)->payload).entries.empty();
             case ValueKind::record: return true;
+            case ValueKind::iterator: return true;
             default: return std::unexpected(error(VmErrorCode::engine_fault, "VM value has an invalid kind"));
         }
     }
@@ -1743,6 +2092,24 @@ namespace rule_engine::python::vm {
             }
             return allocate_list(result);
         }
+        if (operation == BinaryOperation::add && (*left_object)->kind == ValueKind::tuple &&
+            (*right_object)->kind == ValueKind::tuple) {
+            const auto &prefix = std::get<Impl::TupleStorage>((*left_object)->payload).values;
+            const auto &suffix = std::get<Impl::TupleStorage>((*right_object)->payload).values;
+            const auto remaining = impl_->maximum_live_bytes - impl_->stats.live_bytes;
+            const auto capacity =
+                remaining < sizeof(Impl::Object) ? 0U : (remaining - sizeof(Impl::Object)) / sizeof(PyValue);
+            if (prefix.size() > capacity || suffix.size() > capacity - prefix.size()) {
+                return std::unexpected(
+                    error(VmErrorCode::heap_budget_exhausted, "tuple operation would exceed the live VM heap budget"));
+            }
+            std::vector<PyValue> result = prefix;
+            result.insert(result.end(), suffix.begin(), suffix.end());
+            if (work_charge != nullptr) {
+                *work_charge = static_cast<std::uint64_t>(result.size());
+            }
+            return allocate_tuple(result);
+        }
         return std::unexpected(error(VmErrorCode::type_error, "binary operands have incompatible types"));
     }
 
@@ -1768,6 +2135,18 @@ namespace rule_engine::python::vm {
             switch ((*container)->kind) {
                 case ValueKind::list:
                     for (const auto item : std::get<Impl::ListStorage>((*container)->payload).values) {
+                        auto same = equal(left, item);
+                        if (!same) {
+                            return std::unexpected(same.error());
+                        }
+                        if (*same) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    break;
+                case ValueKind::tuple:
+                    for (const auto item : std::get<Impl::TupleStorage>((*container)->payload).values) {
                         auto same = equal(left, item);
                         if (!same) {
                             return std::unexpected(same.error());
@@ -1831,6 +2210,7 @@ namespace rule_engine::python::vm {
                 case ValueKind::integer:
                 case ValueKind::floating:
                 case ValueKind::record:
+                case ValueKind::iterator:
                     return std::unexpected(error(VmErrorCode::type_error, "right operand is not a container"));
                 default: return std::unexpected(error(VmErrorCode::engine_fault, "VM value has an invalid kind"));
             }
@@ -1887,6 +2267,17 @@ namespace rule_engine::python::vm {
             return std::unexpected(error(VmErrorCode::type_error, "VM value is not a list"));
         }
         return std::get<Impl::ListStorage>((*object)->payload).values;
+    }
+
+    std::expected<std::vector<PyValue>, VmError> ValueHeap::tuple_items(const PyValue value) const {
+        auto object = impl_->object(value);
+        if (!object) {
+            return std::unexpected(object.error());
+        }
+        if ((*object)->kind != ValueKind::tuple) {
+            return std::unexpected(error(VmErrorCode::type_error, "VM value is not a tuple"));
+        }
+        return std::get<Impl::TupleStorage>((*object)->payload).values;
     }
 
     std::expected<SchemaId, VmError> ValueHeap::record_schema(const PyValue value) const {
@@ -2069,6 +2460,9 @@ namespace rule_engine::python::vm {
             if (slot->object->kind == ValueKind::list) {
                 const auto &items = std::get<Impl::ListStorage>(slot->object->payload).values;
                 worklist.insert(worklist.end(), items.begin(), items.end());
+            } else if (slot->object->kind == ValueKind::tuple) {
+                const auto &items = std::get<Impl::TupleStorage>(slot->object->payload).values;
+                worklist.insert(worklist.end(), items.begin(), items.end());
             } else if (slot->object->kind == ValueKind::map) {
                 for (const auto &[key, item] : std::get<Impl::MapStorage>(slot->object->payload).entries) {
                     worklist.push_back(key);
@@ -2078,6 +2472,8 @@ namespace rule_engine::python::vm {
                 for (const auto &field : std::get<Impl::RecordStorage>(slot->object->payload).fields) {
                     worklist.push_back(field.value);
                 }
+            } else if (slot->object->kind == ValueKind::iterator) {
+                worklist.push_back(std::get<Impl::IteratorStorage>(slot->object->payload).source);
             }
         }
 

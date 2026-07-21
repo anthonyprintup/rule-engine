@@ -202,22 +202,27 @@ namespace rule_engine::python::packaging {
             return 0U;
         }
 
-        std::vector<wchar_t> environment_block(const std::uint32_t hash_seed,
-                                               const std::filesystem::path &temporary_directory) {
+        std::wstring windows_system_root() {
             std::array<wchar_t, MAX_PATH + 1U> windows_directory {};
             const auto windows_length =
                 GetWindowsDirectoryW(windows_directory.data(), static_cast<UINT>(windows_directory.size()));
-            const std::wstring system_root = windows_length > 0U && windows_length < windows_directory.size() ?
-                                                 std::wstring {windows_directory.data(), windows_length} :
-                                                 std::wstring {L"C:\\Windows"};
-            const std::array variables {
-                std::wstring {L"PYTHONDONTWRITEBYTECODE=1"},
-                std::wstring {L"PYTHONHASHSEED="} + std::to_wstring(hash_seed),
-                std::wstring {L"PYTHONNOUSERSITE=1"},
-                std::wstring {L"SYSTEMROOT="} + system_root,
-                std::wstring {L"TEMP="} + temporary_directory.wstring(),
-                std::wstring {L"TMP="} + temporary_directory.wstring(),
-            };
+            return windows_length > 0U && windows_length < windows_directory.size() ?
+                       std::wstring {windows_directory.data(), windows_length} :
+                       std::wstring {L"C:\\Windows"};
+        }
+
+        std::wstring render_command_line(const std::span<const std::wstring> arguments) {
+            std::wstring command_line;
+            for (const auto &argument : arguments) {
+                if (!command_line.empty()) {
+                    command_line.push_back(L' ');
+                }
+                command_line += quote_argument(argument);
+            }
+            return command_line;
+        }
+
+        std::vector<wchar_t> environment_block(const std::span<const std::wstring> variables) {
             std::vector<wchar_t> block;
             for (const auto &variable : variables) {
                 block.insert(block.end(), variable.begin(), variable.end());
@@ -233,6 +238,34 @@ namespace rule_engine::python::packaging {
 #endif
 
     } // namespace
+
+    WindowsWorkerProcessContract windows_private_worker_process_contract(
+        const PrivatePythonRuntime &runtime, const WorkerMode mode, const std::uint32_t hash_seed,
+        const std::filesystem::path &temporary_directory, std::wstring system_root) {
+        const auto mode_name = mode == WorkerMode::static_parse ? L"parse" : L"generate";
+        return WindowsWorkerProcessContract {
+            .arguments =
+                {
+                    runtime.python_executable.wstring(),
+                    L"-I",
+                    L"-S",
+                    L"-s",
+                    L"-B",
+                    runtime.worker_script.wstring(),
+                    std::wstring {L"--mode="} + mode_name,
+                    L"--protocol=1",
+                },
+            .environment =
+                {
+                    L"PYTHONDONTWRITEBYTECODE=1",
+                    std::wstring {L"PYTHONHASHSEED="} + std::to_wstring(hash_seed),
+                    L"PYTHONNOUSERSITE=1",
+                    std::wstring {L"SYSTEMROOT="} + std::move(system_root),
+                    std::wstring {L"TEMP="} + temporary_directory.wstring(),
+                    std::wstring {L"TMP="} + temporary_directory.wstring(),
+                },
+        };
+    }
 
     std::expected<WorkerProcessResult, PackagingError>
     WindowsJobWorkerLauncher::launch(const PrivatePythonRuntime &runtime, const WorkerMode mode,
@@ -330,13 +363,12 @@ namespace rule_engine::python::packaging {
                 launcher_error(PackagingErrorCode::worker_crashed, "cannot restrict inherited worker handles"));
         }
 
-        const auto mode_name = mode == WorkerMode::static_parse ? L"parse" : L"generate";
-        auto command_line = quote_argument(runtime.python_executable.wstring()) + L" -S -s -B " +
-                            quote_argument(runtime.worker_script.wstring()) + L" --mode=" + mode_name +
-                            L" --protocol=1";
+        const auto process_contract =
+            windows_private_worker_process_contract(runtime, mode, hash_seed, *temporary, windows_system_root());
+        auto command_line = render_command_line(process_contract.arguments);
         std::vector<wchar_t> mutable_command {command_line.begin(), command_line.end()};
         mutable_command.push_back(L'\0');
-        auto environment = environment_block(hash_seed, *temporary);
+        auto environment = environment_block(process_contract.environment);
         STARTUPINFOEXW startup {};
         startup.StartupInfo.cb = sizeof(startup);
         startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;

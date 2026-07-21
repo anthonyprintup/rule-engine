@@ -567,15 +567,23 @@ Options:
             return std::unexpected(benchmark_error(ExitCode::internal_invariant_failed, "BENCH-CERTIFICATE-MISSING",
                                                    "compiled executable has no optimization certificate"));
         }
-        auto selection =
-            optimizer::select_optimization(artifact->pack.optimization_certificates,
-                                           optimizer::OptimizationRequest {
-                                               .executable = ExecutableId {std::string {executable_name}},
-                                               .expected_executable_semantic_hash = certificate->semantic_hash,
-                                               .request_specialization = false,
-                                               .request_pruning = true,
-                                               .full_flight_recorder_armed = false,
-                                           });
+        const auto function = std::ranges::find(artifact->pack.functions, ExecutableId {std::string {executable_name}},
+                                                &BytecodeFunction::id);
+        if (function == artifact->pack.functions.end() || function->instructions.empty() ||
+            function->instructions.size() > std::numeric_limits<std::uint32_t>::max()) {
+            return std::unexpected(benchmark_error(ExitCode::internal_invariant_failed, "BENCH-BYTECODE-MISSING",
+                                                   "compiled executable has no bounded exact bytecode body"));
+        }
+        auto selection = optimizer::select_optimization(
+            artifact->pack.optimization_certificates,
+            optimizer::OptimizationRequest {
+                .executable = ExecutableId {std::string {executable_name}},
+                .expected_executable_semantic_hash = certificate->semantic_hash,
+                .request_specialization = false,
+                .request_pruning = true,
+                .full_flight_recorder_armed = false,
+                .exact_instruction_count = static_cast<std::uint32_t>(function->instructions.size()),
+            });
         if (!selection) {
             return std::unexpected(
                 benchmark_error(ExitCode::internal_invariant_failed, "BENCH-OPTIMIZER", selection.error().message));
@@ -616,9 +624,11 @@ Options:
             exact_instructions += resources.instructions;
             exact_snapshots.push_back({
                 .evaluation = std::move(*completed.result),
+                .fact_reads = {},
                 .logical_reads = {},
                 .recorder = std::move(completed.recorder_delta),
                 .resources = resources,
+                .diagnostics = {},
             });
         }
         const auto exact_end = std::chrono::steady_clock::now();
@@ -636,11 +646,13 @@ Options:
                         .state_mutations = {},
                         .fault = std::nullopt,
                     },
+                .fact_reads = {},
                 .logical_reads = {},
                 .recorder = {},
                 // Prefix pruning avoids physical dispatch, but the optimized lane
                 // must retain the exact semantic charge for budget equivalence.
                 .resources = exact.resources,
+                .diagnostics = {},
             };
             optimized_instructions += optimized.resources.instructions;
             if (!optimizer::compare_shadow_execution(exact, optimized).equivalent) {

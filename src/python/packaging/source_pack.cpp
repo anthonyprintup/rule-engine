@@ -1,5 +1,7 @@
 #include "rule_engine/python/packaging/source_pack.hpp"
 
+#include "rule_engine/python/packaging/signing.hpp"
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -624,6 +626,17 @@ namespace rule_engine::python::packaging {
             output += ';';
         }
 
+        std::vector<std::byte> source_pack_signature_message(const std::string_view canonical_index_bytes) {
+            constexpr char signature_domain_bytes[] = "rule-engine-rpack-signature-v1\0";
+            const std::string_view signature_domain {signature_domain_bytes, sizeof(signature_domain_bytes) - 1U};
+            std::vector<std::byte> message;
+            message.reserve(signature_domain.size() + canonical_index_bytes.size());
+            message.insert(message.end(), as_bytes(signature_domain).begin(), as_bytes(signature_domain).end());
+            message.insert(message.end(), as_bytes(canonical_index_bytes).begin(),
+                           as_bytes(canonical_index_bytes).end());
+            return message;
+        }
+
     } // namespace
 
     std::string sha256_hex(const std::span<const std::byte> bytes) {
@@ -955,9 +968,46 @@ namespace rule_engine::python::packaging {
         return envelope;
     }
 
-    std::expected<LoadedSourcePack, PackagingError>
-    verify_and_load_source_pack(const SourcePackArchive &archive, const TrustPolicy &policy,
-                                const SignatureVerifier &signature_verifier, const SourcePackLimits &limits) {
+    namespace {
+
+        struct VerifiedDependencyClosure {
+            PackId pack;
+            SourceDigest closure_digest;
+        };
+
+        struct DependencyVerificationState {
+            std::size_t unique_packs {};
+            std::size_t unique_bytes {};
+            std::map<std::string, VerifiedDependencyClosure, std::less<>> verified_by_artifact_digest;
+            std::map<std::string, std::string, std::less<>> artifact_digest_by_pack_id;
+            std::set<std::string, std::less<>> active_pack_ids;
+        };
+
+        struct ActivePackGuard {
+            std::set<std::string, std::less<>> &active_pack_ids;
+            std::string pack_id;
+
+            ~ActivePackGuard() { active_pack_ids.erase(pack_id); }
+        };
+
+        struct DependencyPayload {
+            const PackDependency *declaration {};
+            const ArchiveEntry *archive_entry {};
+        };
+
+        enum struct SignatureValidationMode { enforce_trust, structure_only };
+
+    } // namespace
+
+    static std::expected<LoadedSourcePack, PackagingError> verify_and_load_source_pack_recursive(
+        const SourcePackArchive &archive, const TrustPolicy &policy, const SignatureVerifier *signature_verifier,
+        const SourcePackLimits &limits, DependencyVerificationState &state, const std::size_t depth,
+        const SignatureValidationMode signature_validation, const std::optional<PackId> &expected_pack = std::nullopt,
+        const std::optional<SourceDigest> &artifact_digest = std::nullopt) {
+        if (depth > limits.maximum_dependency_depth) {
+            return std::unexpected(
+                error(PackagingErrorCode::size_limit, "dependency depth exceeds the configured bound"));
+        }
         if (archive.entries.empty() || archive.entries.size() > limits.maximum_entries) {
             return std::unexpected(
                 error(PackagingErrorCode::size_limit, "archive entry count exceeds the configured bound"));
@@ -1009,6 +1059,26 @@ namespace rule_engine::python::packaging {
         auto manifest = parse_canonical_manifest(bytes_to_text(manifest_entry->second->bytes));
         if (!manifest) {
             return std::unexpected(manifest.error());
+        }
+        if (expected_pack && manifest->pack != *expected_pack) {
+            return std::unexpected(error(PackagingErrorCode::dependency_mismatch,
+                                         "dependency payload pack ID differs from its declaration",
+                                         expected_pack->value));
+        }
+        if (state.active_pack_ids.contains(manifest->pack.value)) {
+            return std::unexpected(error(PackagingErrorCode::dependency_cycle,
+                                         "dependency closure contains a pack-ID cycle", manifest->pack.value));
+        }
+        state.active_pack_ids.insert(manifest->pack.value);
+        ActivePackGuard active_pack_guard {.active_pack_ids = state.active_pack_ids, .pack_id = manifest->pack.value};
+        if (artifact_digest) {
+            const auto [known_pack, inserted] =
+                state.artifact_digest_by_pack_id.emplace(manifest->pack.value, artifact_digest->value);
+            if (!inserted && known_pack->second != artifact_digest->value) {
+                return std::unexpected(error(PackagingErrorCode::dependency_mismatch,
+                                             "one pack ID resolves to multiple dependency artifacts",
+                                             manifest->pack.value));
+            }
         }
         if (manifest->dependencies.size() > limits.maximum_dependencies) {
             return std::unexpected(
@@ -1063,12 +1133,32 @@ namespace rule_engine::python::packaging {
             }
         }
 
+        std::vector<DependencyPayload> dependency_payloads;
+        dependency_payloads.reserve(manifest->dependencies.size());
+        std::set<std::string, std::less<>> declared_dependency_paths;
         for (const auto &dependency : manifest->dependencies) {
             const auto digest = std::string_view {dependency.digest.value}.substr(7U);
             const auto dependency_path = "deps/" + std::string {digest} + ".rpack";
-            if (!entries.contains(dependency_path)) {
+            const auto dependency_entry = entries.find(dependency_path);
+            if (dependency_entry == entries.end()) {
                 return std::unexpected(error(PackagingErrorCode::dependency_mismatch,
                                              "manifest dependency payload is absent", dependency.alias));
+            }
+            const auto actual_digest = "sha256:" + sha256_hex(dependency_entry->second->bytes);
+            if (actual_digest != dependency.digest.value) {
+                return std::unexpected(error(PackagingErrorCode::dependency_mismatch,
+                                             "dependency artifact digest differs from its declaration",
+                                             dependency.alias));
+            }
+            declared_dependency_paths.insert(dependency_path);
+            dependency_payloads.push_back(
+                DependencyPayload {.declaration = &dependency, .archive_entry = dependency_entry->second});
+        }
+        for (const auto &[path, entry] : entries) {
+            static_cast<void>(entry);
+            if (path.starts_with("deps/") && !declared_dependency_paths.contains(path)) {
+                return std::unexpected(error(PackagingErrorCode::dependency_mismatch,
+                                             "dependency payload is not declared by the manifest", path));
             }
         }
         if (manifest->generator) {
@@ -1106,7 +1196,8 @@ namespace rule_engine::python::packaging {
         std::string signature_algorithm;
         const auto signature_entry = entries.find("META-INF/signature.json");
         if (signature_entry == entries.end()) {
-            if (policy.mode != TrustMode::development || !policy.allow_unsigned_packs) {
+            if (signature_validation == SignatureValidationMode::enforce_trust &&
+                (policy.mode != TrustMode::development || !policy.allow_unsigned_packs)) {
                 return std::unexpected(error(PackagingErrorCode::signature_required,
                                              "production policy requires a trusted Ed25519 signature"));
             }
@@ -1124,64 +1215,129 @@ namespace rule_engine::python::packaging {
             if (!envelope) {
                 return std::unexpected(envelope.error());
             }
-            const auto signer = std::ranges::find_if(policy.signers, [&envelope](const TrustedSigner &candidate) {
-                return candidate.key_id == envelope->key_id;
-            });
-            if (signer == policy.signers.end()) {
-                return std::unexpected(error(PackagingErrorCode::signer_unknown,
-                                             "signature key is not in the trust policy", envelope->key_id));
+            if (signature_validation == SignatureValidationMode::structure_only) {
+                trust = PackTrust {
+                    .kind = PackTrustKind::development_unsigned,
+                    .signer_key_id = {},
+                    .generator_execution_authorized = false,
+                };
+            } else {
+                const auto signer = std::ranges::find_if(policy.signers, [&envelope](const TrustedSigner &candidate) {
+                    return candidate.key_id == envelope->key_id;
+                });
+                if (signer == policy.signers.end()) {
+                    return std::unexpected(error(PackagingErrorCode::signer_unknown,
+                                                 "signature key is not in the trust policy", envelope->key_id));
+                }
+                if (signer->revoked) {
+                    return std::unexpected(
+                        error(PackagingErrorCode::signer_revoked, "signature key is revoked", envelope->key_id));
+                }
+                if (signer->public_key.size() != 32U || "sha256:" + sha256_hex(signer->public_key) != signer->key_id) {
+                    return std::unexpected(error(PackagingErrorCode::signer_unknown,
+                                                 "trusted signer key ID does not match its public key",
+                                                 signer->key_id));
+                }
+                if (!std::ranges::any_of(signer->allowed_pack_prefixes, [&manifest](const std::string &prefix) {
+                        return !prefix.empty() && manifest->pack.value.starts_with(prefix);
+                    })) {
+                    return std::unexpected(error(PackagingErrorCode::signer_out_of_scope,
+                                                 "signature key is not authorized for this pack ID",
+                                                 manifest->pack.value));
+                }
+                if (signature_verifier == nullptr) {
+                    return std::unexpected(
+                        error(PackagingErrorCode::crypto_backend_unavailable, "signature verifier is unavailable"));
+                }
+                const auto message = source_pack_signature_message(canonical_index_bytes);
+                auto verified = signature_verifier->verify_ed25519(signer->public_key, message, envelope->signature);
+                if (!verified) {
+                    return std::unexpected(verified.error());
+                }
+                if (!*verified) {
+                    return std::unexpected(error(PackagingErrorCode::signature_invalid,
+                                                 "Ed25519 verifier rejected the pack signature", envelope->key_id));
+                }
+                trust = PackTrust {
+                    .kind = PackTrustKind::production_signed,
+                    .signer_key_id = envelope->key_id,
+                    .generator_execution_authorized = true,
+                };
+                signature_algorithm = "Ed25519";
             }
-            if (signer->revoked) {
-                return std::unexpected(
-                    error(PackagingErrorCode::signer_revoked, "signature key is revoked", envelope->key_id));
+        }
+
+        std::vector<VerifiedDependencyClosure> verified_dependencies;
+        verified_dependencies.reserve(dependency_payloads.size());
+        for (const auto &payload : dependency_payloads) {
+            const auto &dependency = *payload.declaration;
+            const auto known_pack = state.artifact_digest_by_pack_id.find(dependency.pack.value);
+            if (known_pack != state.artifact_digest_by_pack_id.end() && known_pack->second != dependency.digest.value) {
+                return std::unexpected(error(PackagingErrorCode::dependency_mismatch,
+                                             "one pack ID resolves to multiple dependency artifacts",
+                                             dependency.pack.value));
             }
-            if (signer->public_key.size() != 32U || "sha256:" + sha256_hex(signer->public_key) != signer->key_id) {
-                return std::unexpected(error(PackagingErrorCode::signer_unknown,
-                                             "trusted signer key ID does not match its public key", signer->key_id));
+
+            const auto cached = state.verified_by_artifact_digest.find(dependency.digest.value);
+            if (cached != state.verified_by_artifact_digest.end()) {
+                if (cached->second.pack != dependency.pack) {
+                    return std::unexpected(error(PackagingErrorCode::dependency_mismatch,
+                                                 "one dependency artifact is declared with multiple pack IDs",
+                                                 dependency.alias));
+                }
+                verified_dependencies.push_back(cached->second);
+                continue;
             }
-            if (!std::ranges::any_of(signer->allowed_pack_prefixes, [&manifest](const std::string &prefix) {
-                    return !prefix.empty() && manifest->pack.value.starts_with(prefix);
-                })) {
-                return std::unexpected(error(PackagingErrorCode::signer_out_of_scope,
-                                             "signature key is not authorized for this pack ID", manifest->pack.value));
+
+            if (depth >= limits.maximum_dependency_depth) {
+                return std::unexpected(error(PackagingErrorCode::size_limit,
+                                             "dependency depth exceeds the configured bound", dependency.alias));
             }
-            constexpr char signature_domain_bytes[] = "rule-engine-rpack-signature-v1\0";
-            const std::string_view signature_domain {signature_domain_bytes, sizeof(signature_domain_bytes) - 1U};
-            std::vector<std::byte> message;
-            message.reserve(signature_domain.size() + canonical_index_bytes.size());
-            message.insert(message.end(), as_bytes(signature_domain).begin(), as_bytes(signature_domain).end());
-            message.insert(message.end(), as_bytes(canonical_index_bytes).begin(),
-                           as_bytes(canonical_index_bytes).end());
-            auto verified = signature_verifier.verify_ed25519(signer->public_key, message, envelope->signature);
+            if (state.unique_packs >= limits.maximum_dependency_packs) {
+                return std::unexpected(error(PackagingErrorCode::size_limit,
+                                             "dependency pack count exceeds the configured bound", dependency.alias));
+            }
+            const auto artifact_bytes = payload.archive_entry->bytes.size();
+            if (artifact_bytes > limits.maximum_dependency_bytes ||
+                state.unique_bytes > limits.maximum_dependency_bytes - artifact_bytes) {
+                return std::unexpected(error(PackagingErrorCode::size_limit,
+                                             "dependency artifact bytes exceed the configured bound",
+                                             dependency.alias));
+            }
+            ++state.unique_packs;
+            state.unique_bytes += artifact_bytes;
+
+            auto dependency_archive = decode_canonical_source_pack(payload.archive_entry->bytes, limits);
+            if (!dependency_archive) {
+                return std::unexpected(dependency_archive.error());
+            }
+            auto verified = verify_and_load_source_pack_recursive(*dependency_archive, policy, signature_verifier,
+                                                                  limits, state, depth + 1U, signature_validation,
+                                                                  dependency.pack, dependency.digest);
             if (!verified) {
                 return std::unexpected(verified.error());
             }
-            if (!*verified) {
-                return std::unexpected(error(PackagingErrorCode::signature_invalid,
-                                             "Ed25519 verifier rejected the pack signature", envelope->key_id));
-            }
-            trust = PackTrust {
-                .kind = PackTrustKind::production_signed,
-                .signer_key_id = envelope->key_id,
-                .generator_execution_authorized = true,
-            };
-            signature_algorithm = "Ed25519";
+            VerifiedDependencyClosure closure {.pack = dependency.pack, .closure_digest = verified->closure_digest};
+            state.verified_by_artifact_digest.emplace(dependency.digest.value, closure);
+            verified_dependencies.push_back(std::move(closure));
         }
 
         constexpr char closure_domain_bytes[] = "rule-engine-rpack-closure-v1\0";
         std::string closure_material {closure_domain_bytes, sizeof(closure_domain_bytes) - 1U};
         append_sized(closure_material, source_digest.value);
-        for (const auto &dependency : manifest->dependencies) {
+        for (std::size_t dependency_index = 0U; dependency_index < manifest->dependencies.size(); ++dependency_index) {
+            const auto &dependency = manifest->dependencies[dependency_index];
             append_sized(closure_material, dependency.alias);
             append_sized(closure_material, dependency.pack.value);
             append_sized(closure_material, dependency.digest.value);
+            append_sized(closure_material, verified_dependencies[dependency_index].closure_digest.value);
         }
         const SourceDigest closure_digest {"sha256:" + sha256_hex(as_bytes(closure_material))};
 
         PackManifest contract_manifest {
             .pack = manifest->pack,
             .version = manifest->version,
-            .compiler_abi = "python-3.14.6/design-v1",
+            .compiler_abi = std::string {python_static_compiler_abi_v1},
             .budget_profile = manifest->budget_profile,
             .entry_modules = manifest->entry_modules,
             .dependency_digests = {},
@@ -1227,6 +1383,36 @@ namespace rule_engine::python::packaging {
             .trust = std::move(trust),
             .contract_pack = std::move(contract_pack),
         };
+    }
+
+    std::expected<std::vector<std::byte>, PackagingError>
+    canonical_source_pack_signature_message(const SourcePackArchive &unsigned_archive, const SourcePackLimits &limits) {
+        if (std::ranges::any_of(unsigned_archive.entries,
+                                [](const ArchiveEntry &entry) { return entry.path == "META-INF/signature.json"; })) {
+            return std::unexpected(error(PackagingErrorCode::invalid_signature_envelope,
+                                         "source pack already contains a signature envelope"));
+        }
+        const TrustPolicy structural_policy {
+            .mode = TrustMode::development,
+            .allow_unsigned_packs = true,
+            .allow_unsigned_generators = false,
+            .signers = {},
+        };
+        DependencyVerificationState state;
+        const auto loaded = verify_and_load_source_pack_recursive(unsigned_archive, structural_policy, nullptr, limits,
+                                                                  state, 0U, SignatureValidationMode::structure_only);
+        if (!loaded) {
+            return std::unexpected(loaded.error());
+        }
+        return source_pack_signature_message(canonical_index(loaded->index));
+    }
+
+    std::expected<LoadedSourcePack, PackagingError>
+    verify_and_load_source_pack(const SourcePackArchive &archive, const TrustPolicy &policy,
+                                const SignatureVerifier &signature_verifier, const SourcePackLimits &limits) {
+        DependencyVerificationState state;
+        return verify_and_load_source_pack_recursive(archive, policy, &signature_verifier, limits, state, 0U,
+                                                     SignatureValidationMode::enforce_trust);
     }
 
 } // namespace rule_engine::python::packaging

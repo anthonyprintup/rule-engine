@@ -1,7 +1,6 @@
 #pragma once
 
-#include "rule_engine/python/contract/budget.hpp"
-#include "rule_engine/python/contract/core.hpp"
+#include "rule_engine/python/contract/compiler.hpp"
 #include "rule_engine/python/packaging/error.hpp"
 #include "rule_engine/python/packaging/runtime.hpp"
 
@@ -18,7 +17,7 @@
 namespace rule_engine::python::packaging {
 
     inline constexpr std::string_view static_source_schema_v1 = "rule-engine.source/1";
-    inline constexpr std::string_view static_ast_schema_v1 = "rule-engine.ast/1";
+    inline constexpr std::string_view static_ast_schema_v1 = python_ast_schema_v1;
     inline constexpr std::string_view generator_request_schema_v1 = "rule-engine.generator-request/1";
     inline constexpr std::string_view generated_bindings_schema_v1 = "rule-engine.bindings/1";
 
@@ -72,6 +71,19 @@ namespace rule_engine::python::packaging {
         std::vector<std::byte> stdout_bytes;
         std::string stderr_excerpt;
     };
+
+    struct WindowsWorkerProcessContract {
+        std::vector<std::wstring> arguments;
+        std::vector<std::wstring> environment;
+    };
+
+    // Pure description of the exact executable arguments and reduced
+    // environment used by WindowsJobWorkerLauncher. The launcher still
+    // validates that the supplied runtime is the staged private distribution.
+    [[nodiscard]] WindowsWorkerProcessContract
+    windows_private_worker_process_contract(const PrivatePythonRuntime &runtime, WorkerMode mode,
+                                            std::uint32_t hash_seed, const std::filesystem::path &temporary_directory,
+                                            std::wstring system_root);
 
     struct WorkerLauncher {
         virtual ~WorkerLauncher() = default;

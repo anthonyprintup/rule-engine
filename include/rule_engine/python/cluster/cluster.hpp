@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rule_engine/python/cluster/admin_authorization.hpp"
 #include "rule_engine/python/cluster/activation.hpp"
 #include "rule_engine/python/cluster/audit.hpp"
 #include "rule_engine/python/cluster/breaker.hpp"

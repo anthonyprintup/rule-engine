@@ -37,17 +37,11 @@ namespace rule_engine::python::optimizer {
         [[nodiscard]] std::optional<ExactFallbackReason>
         unsafe_certificate_reason(const OptimizationCertificate &certificate,
                                   const OptimizationRequest &request) noexcept {
-            if (!certificate.transitively_pure) {
-                return ExactFallbackReason::certificate_not_transitively_pure;
-            }
-            if (certificate.may_fault) {
-                return ExactFallbackReason::certificate_may_fault;
+            if (request.full_flight_recorder_armed) {
+                return ExactFallbackReason::recorder_policy_requires_exact;
             }
             if (certificate.recorder_observable) {
                 return ExactFallbackReason::certificate_recorder_observable;
-            }
-            if (request.full_flight_recorder_armed) {
-                return ExactFallbackReason::recorder_policy_requires_exact;
             }
             if (certificate.reads_state) {
                 return ExactFallbackReason::certificate_reads_state;
@@ -61,8 +55,14 @@ namespace rule_engine::python::optimizer {
             if (certificate.emits_effects) {
                 return ExactFallbackReason::certificate_emits_effects;
             }
+            if (certificate.may_fault) {
+                return ExactFallbackReason::certificate_may_fault;
+            }
             if (!certificate.logical_facts.empty()) {
                 return ExactFallbackReason::certificate_has_logical_reads;
+            }
+            if (!certificate.transitively_pure) {
+                return ExactFallbackReason::certificate_not_transitively_pure;
             }
             return std::nullopt;
         }
@@ -77,6 +77,13 @@ namespace rule_engine::python::optimizer {
                    left.route.provider == right.route.provider && left.route.fact == right.route.fact &&
                    left.schema == right.schema && left.status == right.status && left.span == right.span &&
                    left.label == right.label && left.value_digest == right.value_digest;
+        }
+
+        [[nodiscard]] bool same_fact_read(const FactReadObservation &left, const FactReadObservation &right) noexcept {
+            return left.sequence == right.sequence && left.subject_key_digest == right.subject_key_digest &&
+                   left.route.provider == right.route.provider && left.route.fact == right.route.fact &&
+                   left.schema == right.schema && left.status == right.status && left.label == right.label &&
+                   left.value_digest == right.value_digest;
         }
 
         [[nodiscard]] bool same_policy(const EffectPolicySnapshot &left, const EffectPolicySnapshot &right) noexcept {
@@ -131,6 +138,17 @@ namespace rule_engine::python::optimizer {
                    std::ranges::equal(left->frames, right->frames, same_fault_frame);
         }
 
+        [[nodiscard]] bool same_related_diagnostic(const RelatedDiagnostic &left,
+                                                   const RelatedDiagnostic &right) noexcept {
+            return left.span == right.span && left.message == right.message;
+        }
+
+        [[nodiscard]] bool same_diagnostic(const Diagnostic &left, const Diagnostic &right) noexcept {
+            return left.code == right.code && left.severity == right.severity && left.message == right.message &&
+                   left.span == right.span && left.related.size() == right.related.size() &&
+                   std::ranges::equal(left.related, right.related, same_related_diagnostic);
+        }
+
         template<typename Left, typename Right, typename Predicate>
         [[nodiscard]] std::optional<std::size_t> first_difference(const std::span<const Left> exact,
                                                                   const std::span<const Right> optimized,
@@ -163,14 +181,13 @@ namespace rule_engine::python::optimizer {
 
     } // namespace
 
-    std::expected<void, OptimizerError>
-    validate_optimization_certificate(const OptimizationCertificate &certificate,
-                                      const ExecutableId &expected_executable,
-                                      const std::string_view expected_executable_semantic_hash) {
-        if (expected_executable.empty() || expected_executable_semantic_hash.empty()) {
-            return std::unexpected(
-                make_error(OptimizerErrorCode::invalid_request, expected_executable,
-                           "optimizer certificate validation requires executable identity and semantic hash"));
+    std::expected<void, OptimizerError> validate_optimization_certificate(
+        const OptimizationCertificate &certificate, const ExecutableId &expected_executable,
+        const std::string_view expected_executable_semantic_hash, const std::uint32_t exact_instruction_count) {
+        if (expected_executable.empty() || expected_executable_semantic_hash.empty() || exact_instruction_count == 0) {
+            return std::unexpected(make_error(OptimizerErrorCode::invalid_request, expected_executable,
+                                              "optimizer certificate validation requires executable identity, semantic "
+                                              "hash, and exact instruction count"));
         }
         if (certificate.executable != expected_executable) {
             return std::unexpected(make_error(OptimizerErrorCode::certificate_executable_mismatch, expected_executable,
@@ -181,11 +198,25 @@ namespace rule_engine::python::optimizer {
                                               expected_executable,
                                               "optimizer certificate semantic hash does not match executable"));
         }
-        if (certificate.transitively_pure &&
-            (certificate.may_fault || certificate.recorder_observable || certificate.reads_state ||
-             certificate.reads_history || certificate.calls_services || certificate.emits_effects)) {
-            return std::unexpected(make_error(OptimizerErrorCode::contradictory_certificate, expected_executable,
-                                              "optimizer certificate purity contradicts its behavior summary"));
+        if (!std::ranges::is_sorted(certificate.logical_facts) ||
+            std::ranges::adjacent_find(certificate.logical_facts) != certificate.logical_facts.end() ||
+            std::ranges::any_of(certificate.logical_facts, &std::string::empty)) {
+            return std::unexpected(make_error(OptimizerErrorCode::noncanonical_certificate, expected_executable,
+                                              "optimizer certificate logical fact routes are not canonical"));
+        }
+        if (!std::ranges::is_sorted(certificate.pure_false_prefix_exits) ||
+            std::ranges::adjacent_find(certificate.pure_false_prefix_exits) !=
+                certificate.pure_false_prefix_exits.end() ||
+            std::ranges::any_of(certificate.pure_false_prefix_exits,
+                                [](const std::uint32_t exit) { return exit == 0; })) {
+            return std::unexpected(make_error(OptimizerErrorCode::noncanonical_certificate, expected_executable,
+                                              "optimizer certificate pure-prefix exits are not canonical"));
+        }
+        if (std::ranges::any_of(
+                certificate.pure_false_prefix_exits,
+                [exact_instruction_count](const std::uint32_t exit) { return exit >= exact_instruction_count; })) {
+            return std::unexpected(make_error(OptimizerErrorCode::certificate_prefix_out_of_bounds, expected_executable,
+                                              "optimizer certificate pure-prefix exit is outside exact bytecode"));
         }
         return {};
     }
@@ -193,9 +224,11 @@ namespace rule_engine::python::optimizer {
     std::expected<OptimizationSelection, OptimizerError>
     select_optimization(const std::span<const OptimizationCertificate> certificates,
                         const OptimizationRequest &request) {
-        if (request.executable.empty() || request.expected_executable_semantic_hash.empty()) {
-            return std::unexpected(make_error(OptimizerErrorCode::invalid_request, request.executable,
-                                              "optimizer selection requires executable identity and semantic hash"));
+        if (request.executable.empty() || request.expected_executable_semantic_hash.empty() ||
+            request.exact_instruction_count == 0) {
+            return std::unexpected(make_error(
+                OptimizerErrorCode::invalid_request, request.executable,
+                "optimizer selection requires executable identity, semantic hash, and exact instruction count"));
         }
 
         const OptimizationCertificate *certificate = nullptr;
@@ -214,13 +247,20 @@ namespace rule_engine::python::optimizer {
         }
 
         const auto validation = validate_optimization_certificate(*certificate, request.executable,
-                                                                  request.expected_executable_semantic_hash);
+                                                                  request.expected_executable_semantic_hash,
+                                                                  request.exact_instruction_count);
         if (!validation.has_value()) {
             if (validation.error().code == OptimizerErrorCode::certificate_semantic_hash_mismatch) {
                 return exact_selection(request, ExactFallbackReason::certificate_semantic_hash_mismatch, true, false);
             }
             if (validation.error().code == OptimizerErrorCode::contradictory_certificate) {
                 return exact_selection(request, ExactFallbackReason::contradictory_certificate, true, false);
+            }
+            if (validation.error().code == OptimizerErrorCode::noncanonical_certificate) {
+                return exact_selection(request, ExactFallbackReason::certificate_noncanonical, true, false);
+            }
+            if (validation.error().code == OptimizerErrorCode::certificate_prefix_out_of_bounds) {
+                return exact_selection(request, ExactFallbackReason::certificate_prefix_out_of_bounds, true, false);
             }
             return exact_selection(request, ExactFallbackReason::certificate_missing, true, false);
         }
@@ -231,8 +271,11 @@ namespace rule_engine::python::optimizer {
         if (const auto unsafe = unsafe_certificate_reason(*certificate, request); unsafe.has_value()) {
             return exact_selection(request, *unsafe, true, true);
         }
+        if (certificate->pure_false_prefix_exits.empty()) {
+            return exact_selection(request, ExactFallbackReason::certificate_has_no_pure_prefix, true, true);
+        }
 
-        const auto pruning_enabled = request.request_pruning && !certificate->pure_false_prefix_exits.empty();
+        const auto pruning_enabled = request.request_pruning;
         const auto specialization_enabled = request.request_specialization;
         if (!pruning_enabled && !specialization_enabled) {
             return exact_selection(request, ExactFallbackReason::no_applicable_transform, true, true);
@@ -275,6 +318,17 @@ namespace rule_engine::python::optimizer {
                          });
         }
 
+        if (const auto difference =
+                first_difference(std::span {exact.fact_reads}, std::span {optimized.fact_reads}, same_fact_read);
+            difference.has_value()) {
+            add_mismatch(report, limits,
+                         RedactedShadowMismatch {
+                             .dimension = ShadowParityDimension::fact_reads,
+                             .exact_count = exact.fact_reads.size(),
+                             .optimized_count = optimized.fact_reads.size(),
+                             .first_difference_index = difference,
+                         });
+        }
         if (const auto difference = first_difference(std::span {exact.logical_reads},
                                                      std::span {optimized.logical_reads}, same_logical_read);
             difference.has_value()) {
@@ -333,10 +387,21 @@ namespace rule_engine::python::optimizer {
         if (exact.resources != optimized.resources) {
             add_mismatch(report, limits,
                          RedactedShadowMismatch {
-                             .dimension = ShadowParityDimension::semantic_resources,
+                             .dimension = ShadowParityDimension::budgets,
                              .exact_count = 1,
                              .optimized_count = 1,
                              .first_difference_index = 0,
+                         });
+        }
+        if (const auto difference =
+                first_difference(std::span {exact.diagnostics}, std::span {optimized.diagnostics}, same_diagnostic);
+            difference.has_value()) {
+            add_mismatch(report, limits,
+                         RedactedShadowMismatch {
+                             .dimension = ShadowParityDimension::diagnostics,
+                             .exact_count = exact.diagnostics.size(),
+                             .optimized_count = optimized.diagnostics.size(),
+                             .first_difference_index = difference,
                          });
         }
 

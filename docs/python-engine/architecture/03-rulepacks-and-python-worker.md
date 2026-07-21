@@ -286,7 +286,7 @@ Python warns that sufficiently large/complex source can crash an interpreter thr
 
 ### 9.1 Framing and scalar representation
 
-Each message is `<u32 little-endian byte length><UTF-8 JSON payload>`. Maximum frame size is 256 MiB and is checked before allocation. Objects use a fixed key order when emitted, although the C++ decoder does not depend on JSON member order. Each request and response contains protocol version, mode, request ID, and runtime identity.
+Each message is `<u32 little-endian byte length><UTF-8 JSON payload>`. Maximum frame size is 256 MiB and is checked before allocation. The pinned private worker/compiler ABI uses a versioned canonical key order for every object, and the C++ decoder requires that exact order. Unknown, duplicate, missing, or out-of-order members fail closed. This removes parser ambiguity and makes the byte-for-byte worker output part of the reproducibility contract; a producer shape or ordering change must bump the worker/compiler ABI. Source-language and pack formats retain their independently specified canonicalization rules. Each request and response contains protocol version, mode, request ID, and runtime identity.
 
 AST values never rely on JSON's numeric/string limitations:
 

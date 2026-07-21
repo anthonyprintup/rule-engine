@@ -41,6 +41,9 @@ namespace rule_engine::python::packaging {
         std::size_t maximum_source_bytes {balanced_v1.compile.source_closure_bytes};
         std::size_t maximum_generator_input_bytes {balanced_v1.compile.generator_input_bytes};
         std::size_t maximum_dependencies {256};
+        std::size_t maximum_dependency_depth {16};
+        std::size_t maximum_dependency_packs {1'024};
+        std::size_t maximum_dependency_bytes {256U * mebibyte};
     };
 
     struct PackDependency {

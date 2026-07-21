@@ -12,7 +12,7 @@
 
 namespace rule_engine::python::tools {
 
-    enum struct PackAction : std::uint8_t { build, verify, inspect, stubs };
+    enum struct PackAction : std::uint8_t { build, sign, verify, inspect, stubs };
 
     enum struct GeneratorPolicy : std::uint8_t {
         disabled,
@@ -24,8 +24,14 @@ namespace rule_engine::python::tools {
         std::string input_path;
         std::string output_path;
         std::string signer_reference;
+        std::string requested_key_id;
+        std::string trust_config_path;
+        std::string runtime_root;
+        std::string sdk_root;
+        std::string temporary_root;
         OutputFormat format {OutputFormat::text};
         GeneratorPolicy generator_policy {GeneratorPolicy::disabled};
+        bool development_unsigned {};
     };
 
     struct PackToolResult {
@@ -58,7 +64,11 @@ namespace rule_engine::python::tools {
 
     struct CheckCommand {
         std::string pack_path;
+        std::string trust_config_path;
+        std::string runtime_root;
+        std::string temporary_root;
         OutputFormat format {OutputFormat::text};
+        bool development_unsigned {};
         bool watch {};
         bool explain_facts {};
         bool explain_plan {};

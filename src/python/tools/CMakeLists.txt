@@ -5,6 +5,8 @@ add_library(
     cli.cpp
     common.cpp
     diagnostics.cpp
+    filesystem.cpp
+    process.cpp
     redaction.cpp
 )
 add_library(rule_engine::python_tools ALIAS rule_engine_python_tools)
@@ -13,6 +15,9 @@ target_link_libraries(
     rule_engine_python_tools
     PUBLIC
         rule_engine::python_contract
+        rule_engine::python_compiler
+        rule_engine::python_optimizer
+        rule_engine::python_packaging
         rule_engine::project_options
 )
 
@@ -38,10 +43,22 @@ target_link_libraries(
         rule_engine::project_options
 )
 
-# The root project still owns legacy targets with the public executable names.
-# Unique CMake target names keep this transition slice independently buildable;
-# OUTPUT_NAME provides the production-facing Python executable names in this
-# subdirectory until the root cleanup lane removes the retired targets.
+add_executable(rule_engine_python_pack_cli bin/rule_engine_pack_main.cpp)
+set_target_properties(rule_engine_python_pack_cli PROPERTIES OUTPUT_NAME rule_engine_pack)
+target_link_libraries(rule_engine_python_pack_cli PRIVATE rule_engine::python_tools)
+target_compile_definitions(
+    rule_engine_python_pack_cli
+    PRIVATE RULE_ENGINE_TRACKED_SDK_ROOT="${PROJECT_SOURCE_DIR}/sdk"
+)
+
+add_executable(rule_engine_python_check_cli bin/rule_engine_check_main.cpp)
+set_target_properties(rule_engine_python_check_cli PROPERTIES OUTPUT_NAME rule_engine_check)
+target_link_libraries(rule_engine_python_check_cli PRIVATE rule_engine::python_tools)
+
+add_executable(rule_engine_python_admin_cli bin/rule_engine_admin_main.cpp)
+set_target_properties(rule_engine_python_admin_cli PROPERTIES OUTPUT_NAME rule_engine_admin)
+target_link_libraries(rule_engine_python_admin_cli PRIVATE rule_engine::python_tools)
+
 add_executable(rule_engine_python_server server_main.cpp)
 set_target_properties(rule_engine_python_server PROPERTIES OUTPUT_NAME rule_engine_server)
 target_link_libraries(rule_engine_python_server PRIVATE rule_engine::python_executable_support)
@@ -51,6 +68,19 @@ set_target_properties(rule_engine_python_benchmark PROPERTIES OUTPUT_NAME rule_e
 target_link_libraries(rule_engine_python_benchmark PRIVATE rule_engine::python_executable_support)
 
 if(BUILD_TESTING)
+    if(NOT TARGET rule_engine_stage_python_runtime)
+        message(FATAL_ERROR "Python tooling tests require the canonical private-runtime staging target")
+    endif()
+    get_property(
+        tooling_private_runtime_root
+        TARGET rule_engine_stage_python_runtime
+        PROPERTY RULE_ENGINE_PRIVATE_PYTHON_RUNTIME_ROOT
+    )
+    if(NOT tooling_private_runtime_root)
+        message(FATAL_ERROR "Python runtime staging target did not publish its private-runtime root")
+    endif()
+    file(TO_CMAKE_PATH "${tooling_private_runtime_root}" tooling_private_runtime_root_for_cxx)
+
     add_executable(
         rule_engine_python_tools_tests
         "${PROJECT_SOURCE_DIR}/tests/python_tools_tests.cpp"
@@ -67,6 +97,13 @@ if(BUILD_TESTING)
             $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:/clang:-Wno-c2y-extensions>
             $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:GNU>>:-Wno-c2y-extensions>
     )
+    target_compile_definitions(
+        rule_engine_python_tools_tests
+        PRIVATE
+            RULE_ENGINE_TOOLING_SDK_ROOT="${PROJECT_SOURCE_DIR}/sdk"
+            RULE_ENGINE_TOOLING_STAGED_RUNTIME_ROOT="${tooling_private_runtime_root_for_cxx}"
+    )
+    add_dependencies(rule_engine_python_tools_tests rule_engine_stage_python_runtime)
 
     add_executable(
         rule_engine_python_executable_surface_tests
@@ -101,4 +138,35 @@ if(BUILD_TESTING)
         NAME rule_engine_python_executable_surface_tests
         COMMAND $<TARGET_FILE:rule_engine_python_executable_surface_tests>
     )
+    add_test(
+        NAME rule_engine_python_tools_executable_smoke
+        COMMAND
+            "${CMAKE_COMMAND}"
+            "-DRULE_ENGINE_PACK_EXE=$<TARGET_FILE:rule_engine_python_pack_cli>"
+            "-DRULE_ENGINE_CHECK_EXE=$<TARGET_FILE:rule_engine_python_check_cli>"
+            "-DRULE_ENGINE_RUNTIME_ROOT=${tooling_private_runtime_root}"
+            "-DRULE_ENGINE_SMOKE_ROOT=${CMAKE_CURRENT_BINARY_DIR}/executable-smoke"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/executable_smoke.cmake"
+    )
+    if(WIN32)
+        find_program(
+            rule_engine_tooling_powershell
+            NAMES pwsh powershell
+            REQUIRED
+        )
+        add_test(
+            NAME rule_engine_python_tools_production_signing_smoke
+            COMMAND
+                "${rule_engine_tooling_powershell}"
+                -NoLogo
+                -NoProfile
+                -NonInteractive
+                -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/executable_production_smoke.ps1"
+                -PackExe "$<TARGET_FILE:rule_engine_python_pack_cli>"
+                -CheckExe "$<TARGET_FILE:rule_engine_python_check_cli>"
+                -RuntimeRoot "${tooling_private_runtime_root}"
+                -SmokeRoot "${CMAKE_CURRENT_BINARY_DIR}/production-executable-smoke"
+        )
+    endif()
 endif()

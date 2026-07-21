@@ -86,51 +86,52 @@ target_compile_definitions(
         RULE_ENGINE_PROTOCOL_USE_WINSQLITE=$<BOOL:${rule_engine_protocol_use_winsqlite}>
 )
 
-add_executable(rule_engine_python_protocol_fixture "${PROJECT_SOURCE_DIR}/tests/python_protocol_fixture.cpp")
-target_link_libraries(
-    rule_engine_python_protocol_fixture
-    PRIVATE
-        rule_engine::python_protocol
-        rule_engine::project_options
-)
+if(BUILD_TESTING)
+    add_executable(rule_engine_python_protocol_fixture "${PROJECT_SOURCE_DIR}/tests/python_protocol_fixture.cpp")
+    target_link_libraries(
+        rule_engine_python_protocol_fixture
+        PRIVATE
+            rule_engine::python_protocol
+            rule_engine::project_options
+    )
 
-add_executable(
-    rule_engine_python_protocol_v2_tests
-    "${PROJECT_SOURCE_DIR}/tests/python_protocol_v2_tests.cpp"
-    "${PROJECT_SOURCE_DIR}/tests/python_protocol_runtime_tests.cpp"
-)
-enable_testing()
-add_dependencies(rule_engine_python_protocol_v2_tests rule_engine_python_protocol_fixture)
-target_link_libraries(
-    rule_engine_python_protocol_v2_tests
-    PRIVATE
-        rule_engine::python_protocol
-        Catch2::Catch2WithMain
-)
-target_compile_definitions(
-    rule_engine_python_protocol_v2_tests
-    PRIVATE RULE_ENGINE_PROTOCOL_FIXTURE_PATH="$<TARGET_FILE:rule_engine_python_protocol_fixture>"
-)
-if(rule_engine_protocol_openssl_executable)
+    add_executable(
+        rule_engine_python_protocol_v2_tests
+        "${PROJECT_SOURCE_DIR}/tests/python_protocol_v2_tests.cpp"
+        "${PROJECT_SOURCE_DIR}/tests/python_protocol_runtime_tests.cpp"
+    )
+    add_dependencies(rule_engine_python_protocol_v2_tests rule_engine_python_protocol_fixture)
+    target_link_libraries(
+        rule_engine_python_protocol_v2_tests
+        PRIVATE
+            rule_engine::python_protocol
+            Catch2::Catch2WithMain
+    )
     target_compile_definitions(
         rule_engine_python_protocol_v2_tests
-        PRIVATE RULE_ENGINE_PROTOCOL_OPENSSL_EXECUTABLE="${rule_engine_protocol_openssl_executable}"
+        PRIVATE RULE_ENGINE_PROTOCOL_FIXTURE_PATH="$<TARGET_FILE:rule_engine_python_protocol_fixture>"
     )
-endif()
-if(WIN32)
-    target_link_libraries(rule_engine_python_protocol_v2_tests PRIVATE ws2_32)
-endif()
-target_compile_options(
-    rule_engine_python_protocol_v2_tests
-    PRIVATE
-        $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:/clang:-Wno-c2y-extensions>
-        $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:GNU>>:-Wno-c2y-extensions>
-)
-add_test(NAME rule_engine_python_protocol_v2 COMMAND $<TARGET_FILE:rule_engine_python_protocol_v2_tests>)
+    if(rule_engine_protocol_openssl_executable)
+        target_compile_definitions(
+            rule_engine_python_protocol_v2_tests
+            PRIVATE RULE_ENGINE_PROTOCOL_OPENSSL_EXECUTABLE="${rule_engine_protocol_openssl_executable}"
+        )
+    endif()
+    if(WIN32)
+        target_link_libraries(rule_engine_python_protocol_v2_tests PRIVATE ws2_32)
+    endif()
+    target_compile_options(
+        rule_engine_python_protocol_v2_tests
+        PRIVATE
+            $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:/clang:-Wno-c2y-extensions>
+            $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:GNU>>:-Wno-c2y-extensions>
+    )
+    add_test(NAME rule_engine_python_protocol_v2 COMMAND $<TARGET_FILE:rule_engine_python_protocol_v2_tests>)
 
-if(OpenSSL_FOUND AND OPENSSL_ROOT_DIR AND EXISTS "${OPENSSL_ROOT_DIR}/bin")
-    set_tests_properties(
-        rule_engine_python_protocol_v2
-        PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${OPENSSL_ROOT_DIR}/bin"
-    )
+    if(OpenSSL_FOUND AND OPENSSL_ROOT_DIR AND EXISTS "${OPENSSL_ROOT_DIR}/bin")
+        set_tests_properties(
+            rule_engine_python_protocol_v2
+            PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${OPENSSL_ROOT_DIR}/bin"
+        )
+    endif()
 endif()

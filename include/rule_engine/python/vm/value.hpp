@@ -69,6 +69,8 @@ namespace rule_engine::python::vm {
         list,
         map,
         record,
+        tuple,
+        iterator,
     };
 
     // These ordinals are part of the compiler/VM ABI. Keep them synchronized with
@@ -136,13 +138,19 @@ namespace rule_engine::python::vm {
         [[nodiscard]] std::expected<PyValue, VmError> allocate_unicode_codepoints(std::u32string value);
         [[nodiscard]] std::expected<PyValue, VmError> allocate_bytes(std::span<const std::byte> value);
         [[nodiscard]] std::expected<PyValue, VmError> allocate_list(std::span<const PyValue> values = {});
+        [[nodiscard]] std::expected<PyValue, VmError> allocate_tuple(std::span<const PyValue> values = {});
         [[nodiscard]] std::expected<PyValue, VmError>
         allocate_map(std::span<const std::pair<PyValue, PyValue>> entries = {});
         [[nodiscard]] std::expected<PyValue, VmError> allocate_record(SchemaId schema,
                                                                       std::span<const RecordFieldValue> fields = {});
 
         [[nodiscard]] std::expected<void, VmError> list_append(PyValue list, PyValue value);
+        [[nodiscard]] std::expected<void, VmError> store_subscript(PyValue container, PyValue key, PyValue value);
         [[nodiscard]] std::expected<void, VmError> map_insert(PyValue map, PyValue key, PyValue value);
+        [[nodiscard]] std::expected<PyValue, VmError> load_subscript(PyValue container, PyValue key);
+        [[nodiscard]] std::expected<PyValue, VmError> get_iterator(PyValue iterable);
+        [[nodiscard]] std::expected<bool, VmError> iterator_exhausted(PyValue iterator) const;
+        [[nodiscard]] std::expected<PyValue, VmError> iterator_next(PyValue iterator);
 
         [[nodiscard]] std::expected<ValueKind, VmError> kind(PyValue value) const;
         [[nodiscard]] std::expected<bool, VmError> truthy(PyValue value) const;
@@ -157,6 +165,7 @@ namespace rule_engine::python::vm {
         [[nodiscard]] std::expected<std::string, VmError> integer_decimal(PyValue value) const;
         [[nodiscard]] std::expected<std::string, VmError> unicode_utf8(PyValue value) const;
         [[nodiscard]] std::expected<std::vector<PyValue>, VmError> list_items(PyValue value) const;
+        [[nodiscard]] std::expected<std::vector<PyValue>, VmError> tuple_items(PyValue value) const;
         [[nodiscard]] std::expected<SchemaId, VmError> record_schema(PyValue value) const;
         [[nodiscard]] std::expected<std::vector<RecordFieldValue>, VmError> record_fields(PyValue value) const;
 
