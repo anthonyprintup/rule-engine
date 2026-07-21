@@ -16,7 +16,13 @@ This directory is the durable product specification for the Python rule engine. 
 10. [`architecture/09-activation-operations-and-tooling.md`](architecture/09-activation-operations-and-tooling.md) — atomic activation and operational surfaces.
 11. [`architecture/10-verification-and-cutover.md`](architecture/10-verification-and-cutover.md) — qualification and the no-compatibility cutover gate.
 
-The frozen cross-component API expectations are in [`CONTRACTS.md`](CONTRACTS.md). Consolidated design limitations are in [`LIMITATIONS.md`](LIMITATIONS.md). Current verified behavior and unfinished qualification work are recorded in [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md). The `decisions/` directory contains the eighteen accepted architecture decision records and their rejected alternatives.
+The frozen cross-component API expectations are in [`CONTRACTS.md`](CONTRACTS.md).
+Consolidated design limitations are in [`LIMITATIONS.md`](LIMITATIONS.md).
+Current verified behavior and unfinished qualification work are recorded in
+[`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md). Build, signing,
+server, agent, and recovery procedures are in [`OPERATIONS.md`](OPERATIONS.md).
+The `decisions/` directory contains the eighteen accepted architecture decision
+records and their rejected alternatives.
 
 ## Status convention
 
