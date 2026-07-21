@@ -1,4 +1,6 @@
+#include "rule_engine/python/protocol/snapshot.hpp"
 #include "rule_engine/python/windows/provider.hpp"
+#include "rule_engine/python/windows/runtime.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -14,6 +16,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -21,6 +25,7 @@
 #include <vector>
 
 namespace py = rule_engine::python;
+namespace proto = rule_engine::python::protocol_v2;
 namespace win = rule_engine::python::windows;
 
 namespace {
@@ -132,6 +137,61 @@ namespace {
         return output;
     }
 
+    [[nodiscard]] win::WindowsAgentRuntimeIdentity runtime_identity() {
+        return win::WindowsAgentRuntimeIdentity {.session = py::SessionId {"session:test"},
+                                                 .peer = py::PeerId {"peer:test"},
+                                                 .session_fence = 7U,
+                                                 .generation = 3U,
+                                                 .route = "windows"};
+    }
+
+    [[nodiscard]] proto::WorkLeaseMessage
+    runtime_work(std::vector<py::FactRequest> facts, std::vector<py::ScanRequest> scans = {},
+                 std::string work_id = "work:test", std::string attempt_id = "attempt:1",
+                 const std::uint64_t work_fence = 11U, const std::uint64_t generation = 3U) {
+        const auto identity = runtime_identity();
+        return proto::WorkLeaseMessage {.session = identity.session,
+                                        .peer = identity.peer,
+                                        .session_fence = identity.session_fence,
+                                        .work_id = std::move(work_id),
+                                        .attempt_id = std::move(attempt_id),
+                                        .work_fence = work_fence,
+                                        .generation = generation,
+                                        .server_sequence = 1U,
+                                        .route = identity.route,
+                                        .facts = std::move(facts),
+                                        .scans = std::move(scans)};
+    }
+
+    [[nodiscard]] proto::CancelWorkMessage runtime_cancel(const proto::WorkLeaseMessage &work,
+                                                          std::vector<py::RequestId> requests = {}) {
+        return proto::CancelWorkMessage {.session = work.session,
+                                         .peer = work.peer,
+                                         .session_fence = work.session_fence,
+                                         .work_id = work.work_id,
+                                         .attempt_id = work.attempt_id,
+                                         .work_fence = work.work_fence,
+                                         .server_sequence = work.server_sequence,
+                                         .route = work.route,
+                                         .requests = std::move(requests)};
+    }
+
+    [[nodiscard]] win::SubjectObservation observation(py::SubjectKey subject, const std::uint64_t marker) {
+        return win::SubjectObservation {
+            .subject = std::move(subject),
+            .eager_fields = {
+                {.field_id = 100U, .value = py::make_fact(py::IntegerValue {.decimal = std::to_string(marker)})}}};
+    }
+
+    [[nodiscard]] win::InventoryProjectionRequest
+    projection_request(std::string snapshot_id, py::SchemaId schema,
+                       std::optional<py::SubjectKey> parent = std::nullopt, const std::size_t chunk_items = 1'024U) {
+        return win::InventoryProjectionRequest {.snapshot_id = std::move(snapshot_id),
+                                                .parent = std::move(parent),
+                                                .subject_schema = std::move(schema),
+                                                .chunk_items = chunk_items};
+    }
+
 } // namespace
 
 static_assert(!HasPredicate<py::FactRequest>);
@@ -140,6 +200,9 @@ static_assert(!HasVerdict<py::FactResponse>);
 static_assert(!HasVerdict<py::ScanResponse>);
 static_assert(!HasRuleId<py::FactRequest>);
 static_assert(!HasRuleId<py::ScanRequest>);
+static_assert(!HasPredicate<proto::WorkLeaseMessage>);
+static_assert(!HasVerdict<proto::WorkResultMessage>);
+static_assert(!HasRuleId<win::WindowsAgentProviderRuntime>);
 
 TEST_CASE("Windows process identities reject PID reuse by creation time") {
     const auto first = win::process_subject(py::PeerId {"peer:test"}, 42U, 100U);
@@ -400,4 +463,224 @@ TEST_CASE("Windows memory-region inventory is complete or explicitly non-authori
         REQUIRE(item.subject.parent != nullptr);
         REQUIRE(item.subject.descriptor.value == win::memory_region_schema);
     }
+}
+
+TEST_CASE("Windows agent runtime binds typed fact and scan batches and replays exact duplicates") {
+    win::WindowsAgentProviderRuntime runtime {runtime_identity()};
+    const auto process = current_process();
+    auto fact = request(process, "process.pid", win::unix_time_ms() + 5'000U);
+    fact.request_id = py::RequestId {"runtime:fact"};
+    auto scan = scan_request("runtime:scan", process, "process.image.file", 0U, 4'096U,
+                             py::optimizer::scan_permission_read, "mz", "bytes:4d5a", 4U);
+    const auto work = runtime_work({fact}, {scan});
+
+    const auto first = runtime.dispatch(work);
+    REQUIRE(first.has_value());
+    REQUIRE(first->originating_session == work.session);
+    REQUIRE(first->originating_session_fence == work.session_fence);
+    REQUIRE(first->facts.size() == 1U);
+    REQUIRE(first->facts.front().status == py::FactTerminalStatus::value);
+    REQUIRE(first->scans.size() == 1U);
+    REQUIRE(first->scans.front().status == py::FactTerminalStatus::value);
+    REQUIRE_FALSE(first->scans.front().matches.empty());
+    REQUIRE(std::holds_alternative<proto::WorkResultMessage>(proto::DurableAgentBody {*first}));
+
+    const auto duplicate = runtime.dispatch(work);
+    REQUIRE(duplicate.has_value());
+    REQUIRE(runtime.tracked_work() == 1U);
+    REQUIRE(win::canonical_provider_value(*duplicate->facts.front().value) ==
+            win::canonical_provider_value(*first->facts.front().value));
+    REQUIRE(duplicate->scans.front().matches.front().offset == first->scans.front().matches.front().offset);
+
+    auto conflicting = work;
+    ++conflicting.facts.front().deadline_unix_ms;
+    const auto conflict = runtime.dispatch(conflicting);
+    REQUIRE_FALSE(conflict.has_value());
+    REQUIRE(conflict.error().code == win::AgentRuntimeErrorCode::work_conflict);
+
+    auto stale_session = work;
+    stale_session.work_id = "runtime:stale-session";
+    stale_session.session = py::SessionId {"session:old"};
+    const auto session_failure = runtime.dispatch(stale_session);
+    REQUIRE_FALSE(session_failure.has_value());
+    REQUIRE(session_failure.error().code == win::AgentRuntimeErrorCode::stale_session);
+
+    auto stale_fence = work;
+    stale_fence.work_id = "runtime:stale-fence";
+    --stale_fence.session_fence;
+    const auto fence_failure = runtime.dispatch(stale_fence);
+    REQUIRE_FALSE(fence_failure.has_value());
+    REQUIRE(fence_failure.error().code == win::AgentRuntimeErrorCode::stale_fence);
+
+    auto stale_generation = work;
+    stale_generation.work_id = "runtime:stale-generation";
+    --stale_generation.generation;
+    const auto generation_failure = runtime.dispatch(stale_generation);
+    REQUIRE_FALSE(generation_failure.has_value());
+    REQUIRE(generation_failure.error().code == win::AgentRuntimeErrorCode::stale_generation);
+
+    auto expired_fact = request(process, "process.pid", win::unix_time_ms() - 1U);
+    expired_fact.request_id = py::RequestId {"runtime:expired"};
+    const auto expired = runtime.dispatch(runtime_work({expired_fact}, {}, "runtime:expired-work"));
+    REQUIRE(expired.has_value());
+    REQUIRE(expired->facts.front().status == py::FactTerminalStatus::timed_out);
+}
+
+TEST_CASE("Windows agent runtime honors exact cancellation and work fences without dispatching semantics") {
+    win::WindowsAgentProviderRuntime runtime {runtime_identity()};
+    const auto process = current_process();
+    auto first = request(process, "process.pid", win::unix_time_ms() + 5'000U);
+    first.request_id = py::RequestId {"runtime:cancel:first"};
+    auto second = request(process, "process.creation_time", win::unix_time_ms() + 5'000U);
+    second.request_id = py::RequestId {"runtime:cancel:second"};
+    const auto work = runtime_work({first, second}, {}, "runtime:cancel-work");
+
+    REQUIRE(runtime.cancel(runtime_cancel(work, {first.request_id})).has_value());
+    const auto result = runtime.dispatch(work);
+    REQUIRE(result.has_value());
+    REQUIRE(result->facts.size() == 2U);
+    REQUIRE(result->facts[0].status == py::FactTerminalStatus::canceled);
+    REQUIRE(result->facts[0].diagnostic.has_value());
+    REQUIRE(result->facts[1].status == py::FactTerminalStatus::value);
+
+    auto stale_cancel = runtime_cancel(work);
+    --stale_cancel.session_fence;
+    const auto stale = runtime.cancel(stale_cancel);
+    REQUIRE_FALSE(stale.has_value());
+    REQUIRE(stale.error().code == win::AgentRuntimeErrorCode::stale_fence);
+
+    auto duplicate_cancel = runtime_cancel(work, {first.request_id, first.request_id});
+    const auto malformed = runtime.cancel(duplicate_cancel);
+    REQUIRE_FALSE(malformed.has_value());
+    REQUIRE(malformed.error().code == win::AgentRuntimeErrorCode::invalid_work);
+
+    auto superseding = work;
+    superseding.attempt_id = "attempt:2";
+    ++superseding.work_fence;
+    ++superseding.server_sequence;
+    const auto newer = runtime.dispatch(superseding);
+    REQUIRE(newer.has_value());
+    const auto old = runtime.dispatch(work);
+    REQUIRE_FALSE(old.has_value());
+    REQUIRE(old.error().code == win::AgentRuntimeErrorCode::stale_fence);
+
+    const auto empty = runtime.dispatch(runtime_work({}, {}, "runtime:empty"));
+    REQUIRE_FALSE(empty.has_value());
+    REQUIRE(empty.error().code == win::AgentRuntimeErrorCode::invalid_work);
+}
+
+TEST_CASE("Windows inventory projection retains last-good state across duplicates invalid stages and reconciliation") {
+    win::WindowsAgentProviderRuntime runtime {runtime_identity()};
+    const auto peer = py::PeerId {"peer:test"};
+    const auto schema = py::SchemaId {std::string {win::process_schema}};
+    const auto first = win::process_subject(peer, 10U, 100U);
+    const auto second = win::process_subject(peer, 20U, 200U);
+    const auto initial =
+        win::make_inventory_snapshot(peer, schema, std::nullopt, 1U, {observation(second, 2U), observation(first, 1U)});
+    const auto published =
+        runtime.project_inventory(projection_request("snapshot:1", schema, std::nullopt, 1U), initial);
+    REQUIRE(published.has_value());
+    REQUIRE_FALSE(published->duplicate);
+    REQUIRE(published->observations.size() == 2U);
+    REQUIRE(published->removals.empty());
+    REQUIRE(published->durable_messages.size() == 4U);
+    REQUIRE(published->inventory_digest == initial.commit.canonical_digest);
+    REQUIRE(published->protocol_digest.starts_with("sha256:"));
+    REQUIRE(published->observations.front().canonical_digest == initial.commit.canonical_digest);
+    REQUIRE(std::holds_alternative<proto::AuthoritativeSnapshotBegin>(published->durable_messages[0]));
+    REQUIRE(std::holds_alternative<proto::AuthoritativeSnapshotChunk>(published->durable_messages[1]));
+    const auto &first_chunk = std::get<proto::AuthoritativeSnapshotChunk>(published->durable_messages[1]);
+    REQUIRE(py::canonical_subject_key(first_chunk.subjects.front()) == py::canonical_subject_key(first));
+    const auto identity = runtime_identity();
+    proto::AuthoritativeSnapshotAssembler assembler {identity.peer, identity.session, identity.session_fence, schema,
+                                                     std::nullopt};
+    REQUIRE(assembler.begin(std::get<proto::AuthoritativeSnapshotBegin>(published->durable_messages[0])).has_value());
+    REQUIRE(assembler.append(std::get<proto::AuthoritativeSnapshotChunk>(published->durable_messages[1])).has_value());
+    REQUIRE(assembler.append(std::get<proto::AuthoritativeSnapshotChunk>(published->durable_messages[2])).has_value());
+    const auto assembled =
+        assembler.commit(std::get<proto::AuthoritativeSnapshotCommit>(published->durable_messages[3]));
+    REQUIRE(assembled.has_value());
+    REQUIRE(assembled->current.size() == 2U);
+    REQUIRE(assembled->canonical_digest == published->protocol_digest);
+
+    const auto duplicate = runtime.project_inventory(projection_request("snapshot:duplicate", schema), initial);
+    REQUIRE(duplicate.has_value());
+    REQUIRE(duplicate->duplicate);
+    REQUIRE(duplicate->durable_messages.empty());
+    REQUIRE(runtime.last_good_generation(schema, std::nullopt) == 1U);
+
+    auto corrupted =
+        win::make_inventory_snapshot(peer, schema, std::nullopt, 2U, {observation(first, 1U), observation(second, 2U)});
+    corrupted.commit.canonical_digest = "sha256:corrupted";
+    const auto digest_rejected = runtime.project_inventory(projection_request("snapshot:corrupted", schema), corrupted);
+    REQUIRE_FALSE(digest_rejected.has_value());
+    REQUIRE(digest_rejected.error().code == win::AgentRuntimeErrorCode::invalid_inventory);
+    REQUIRE(runtime.last_good_generation(schema, std::nullopt) == 1U);
+
+    const auto invalid = win::invalid_inventory_snapshot(peer, schema, 2U,
+                                                         win::ProviderError {.code = win::ProviderErrorCode::malformed,
+                                                                             .operation = "test inventory",
+                                                                             .message = "interrupted enumeration",
+                                                                             .platform_code = 0U});
+    const auto rejected = runtime.project_inventory(projection_request("snapshot:invalid", schema), invalid);
+    REQUIRE_FALSE(rejected.has_value());
+    REQUIRE(rejected.error().code == win::AgentRuntimeErrorCode::invalid_inventory);
+    REQUIRE(runtime.last_good_generation(schema, std::nullopt) == 1U);
+
+    const auto reconciled = win::make_inventory_snapshot(peer, schema, std::nullopt, 3U, {observation(first, 9U)});
+    const auto reconciliation = runtime.project_inventory(projection_request("snapshot:3", schema), reconciled);
+    REQUIRE(reconciliation.has_value());
+    REQUIRE(reconciliation->observations.size() == 1U);
+    REQUIRE(reconciliation->removals.size() == 1U);
+    REQUIRE(py::canonical_subject_key(reconciliation->removals.front().subject) == py::canonical_subject_key(second));
+    REQUIRE(reconciliation->removals.front().canonical_digest == reconciled.commit.canonical_digest);
+    REQUIRE(runtime.last_good_generation(schema, std::nullopt) == 3U);
+
+    const auto stale = win::make_inventory_snapshot(peer, schema, std::nullopt, 2U, {observation(first, 9U)});
+    const auto stale_result = runtime.project_inventory(projection_request("snapshot:stale", schema), stale);
+    REQUIRE_FALSE(stale_result.has_value());
+    REQUIRE(stale_result.error().code == win::AgentRuntimeErrorCode::stale_generation);
+    REQUIRE(runtime.last_good_generation(schema, std::nullopt) == 3U);
+
+    const auto empty = win::make_inventory_snapshot(peer, schema, std::nullopt, 4U, {});
+    const auto emptied = runtime.project_inventory(projection_request("snapshot:4", schema), empty);
+    REQUIRE(emptied.has_value());
+    REQUIRE(emptied->observations.empty());
+    REQUIRE(emptied->removals.size() == 1U);
+    REQUIRE(emptied->durable_messages.size() == 2U);
+    REQUIRE(std::holds_alternative<proto::AuthoritativeSnapshotBegin>(emptied->durable_messages.front()));
+    REQUIRE(std::holds_alternative<proto::AuthoritativeSnapshotCommit>(emptied->durable_messages.back()));
+
+    win::WindowsAgentRuntimeLimits tight_limits;
+    tight_limits.maximum_last_good_inventory_bytes = 1U;
+    win::WindowsAgentProviderRuntime bounded {runtime_identity(), tight_limits};
+    const auto bounded_result = bounded.project_inventory(projection_request("snapshot:bounded", schema), initial);
+    REQUIRE_FALSE(bounded_result.has_value());
+    REQUIRE(bounded_result.error().code == win::AgentRuntimeErrorCode::limit_exceeded);
+    REQUIRE(bounded.last_good_scopes() == 0U);
+}
+
+TEST_CASE("Windows inventory projection emits descendant removals before a removed parent") {
+    win::WindowsAgentProviderRuntime runtime {runtime_identity()};
+    const auto peer = py::PeerId {"peer:test"};
+    const auto process_schema = py::SchemaId {std::string {win::process_schema}};
+    const auto memory_schema = py::SchemaId {std::string {win::memory_region_schema}};
+    const auto process = win::process_subject(peer, 30U, 300U);
+    const auto region = win::memory_region_subject(process, 0x1000U, 0x2000U);
+
+    const auto root = win::make_inventory_snapshot(peer, process_schema, std::nullopt, 1U, {observation(process, 1U)});
+    REQUIRE(runtime.project_inventory(projection_request("root:1", process_schema), root).has_value());
+    const auto child = win::make_inventory_snapshot(peer, memory_schema, process, 1U, {observation(region, 2U)});
+    REQUIRE(runtime.project_inventory(projection_request("child:1", memory_schema, process), child).has_value());
+    REQUIRE(runtime.last_good_scopes() == 2U);
+
+    const auto empty_root = win::make_inventory_snapshot(peer, process_schema, std::nullopt, 2U, {});
+    const auto cascade = runtime.project_inventory(projection_request("root:2", process_schema), empty_root);
+    REQUIRE(cascade.has_value());
+    REQUIRE(cascade->removals.size() == 2U);
+    REQUIRE(cascade->removals[0].subject.descriptor == memory_schema);
+    REQUIRE(cascade->removals[1].subject.descriptor == process_schema);
+    REQUIRE(runtime.last_good_scopes() == 1U);
+    REQUIRE_FALSE(runtime.last_good_generation(memory_schema, process).has_value());
+    REQUIRE(runtime.last_good_generation(process_schema, std::nullopt) == 2U);
 }

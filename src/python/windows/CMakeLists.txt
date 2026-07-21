@@ -24,6 +24,17 @@ target_link_libraries(
         wintrust
 )
 
+add_library(rule_engine_python_windows_runtime runtime.cpp)
+add_library(rule_engine::python_windows_runtime ALIAS rule_engine_python_windows_runtime)
+target_include_directories(rule_engine_python_windows_runtime PUBLIC "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(
+    rule_engine_python_windows_runtime
+    PUBLIC
+        rule_engine::python_windows
+        rule_engine::python_protocol
+        rule_engine::project_options
+)
+
 add_executable(
     rule_engine_python_windows_provider_tests
     "${PROJECT_SOURCE_DIR}/tests/python_windows_provider_tests.cpp"
@@ -35,7 +46,7 @@ set_target_properties(
 target_link_libraries(
     rule_engine_python_windows_provider_tests
     PRIVATE
-        rule_engine::python_windows
+        rule_engine::python_windows_runtime
         Catch2::Catch2WithMain
 )
 target_compile_options(
