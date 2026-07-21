@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.31)
-project(rule_engine LANGUAGES C CXX)
+project(rule_engine VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -14,14 +14,43 @@ if(MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
     endforeach()
 endif()
 
+include(CTest)
 include(FetchContent)
 
 FetchContent_Declare(
-    Catch2
-    GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-    GIT_TAG v3.7.1
+    asio
+    SYSTEM
+    GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+    GIT_TAG 231cb29bab30f82712fcd54faaea42424cc6e710
 )
-FetchContent_MakeAvailable(Catch2)
+FetchContent_MakeAvailable(asio)
+
+add_library(rule_engine_asio INTERFACE)
+add_library(asio::asio ALIAS rule_engine_asio)
+target_include_directories(rule_engine_asio SYSTEM INTERFACE "${asio_SOURCE_DIR}/asio/include")
+target_compile_definitions(
+    rule_engine_asio
+    INTERFACE
+        ASIO_NO_DEPRECATED
+        ASIO_STANDALONE
+        ASIO_NO_EXCEPTIONS
+        ASIO_NO_TYPEID
+        ASIO_NO_TS_EXECUTORS
+        ASIO_DISABLE_STD_ANY
+)
+if(WIN32)
+    target_compile_definitions(rule_engine_asio INTERFACE _WIN32_WINNT=0x0A00)
+    target_link_libraries(rule_engine_asio INTERFACE ws2_32)
+endif()
+
+if(BUILD_TESTING)
+    FetchContent_Declare(
+        Catch2
+        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+        GIT_TAG fa43b77429ba76c462b1898d6cd2f2d7a9416b14
+    )
+    FetchContent_MakeAvailable(Catch2)
+endif()
 
 add_library(rule_engine_project_options INTERFACE)
 add_library(rule_engine::project_options ALIAS rule_engine_project_options)
@@ -79,15 +108,15 @@ target_compile_options(
         >
 )
 
-enable_testing()
-
-add_test(
-    NAME rule_engine_python_only_source_gate
-    COMMAND
-        "${CMAKE_COMMAND}"
-        -DRULE_ENGINE_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
-        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/VerifyPythonOnly.cmake"
-)
+if(BUILD_TESTING)
+    add_test(
+        NAME rule_engine_python_only_source_gate
+        COMMAND
+            "${CMAKE_COMMAND}"
+            -DRULE_ENGINE_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/VerifyPythonOnly.cmake"
+    )
+endif()
 
 add_library(rule_engine_python_contract src/python/contract.cpp)
 add_library(rule_engine::python_contract ALIAS rule_engine_python_contract)
@@ -113,64 +142,68 @@ if(WIN32)
     add_subdirectory(src/python/windows)
 endif()
 
-include("${catch2_SOURCE_DIR}/extras/Catch.cmake")
+if(BUILD_TESTING)
+    include("${catch2_SOURCE_DIR}/extras/Catch.cmake")
 
-add_executable(rule_engine_python_contract_tests tests/python_contract_tests.cpp)
-target_link_libraries(
-    rule_engine_python_contract_tests
-    PRIVATE
-        rule_engine::python_contract
-        Catch2::Catch2WithMain
-)
-target_compile_options(
-    rule_engine_python_contract_tests
-    PRIVATE
-        $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:/clang:-Wno-c2y-extensions>
-        $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:GNU>>:-Wno-c2y-extensions>
-)
-catch_discover_tests(rule_engine_python_contract_tests)
+    add_executable(rule_engine_python_contract_tests tests/python_contract_tests.cpp)
+    target_link_libraries(
+        rule_engine_python_contract_tests
+        PRIVATE
+            rule_engine::python_contract
+            Catch2::Catch2WithMain
+    )
+    target_compile_options(
+        rule_engine_python_contract_tests
+        PRIVATE
+            $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:/clang:-Wno-c2y-extensions>
+            $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:GNU>>:-Wno-c2y-extensions>
+    )
+    catch_discover_tests(rule_engine_python_contract_tests)
 
-add_executable(rule_engine_python_engine_tests tests/python_engine_tests.cpp)
-target_link_libraries(
-    rule_engine_python_engine_tests
-    PRIVATE
-        rule_engine::python_engine
-        Catch2::Catch2WithMain
-)
-target_compile_options(
-    rule_engine_python_engine_tests
-    PRIVATE
-        $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:
-            /clang:-Wno-c2y-extensions
-            /clang:-Wno-missing-designated-field-initializers
-        >
-        $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:GNU>>:
-            -Wno-c2y-extensions
-            -Wno-missing-designated-field-initializers
-        >
-)
-catch_discover_tests(rule_engine_python_engine_tests)
+    add_executable(rule_engine_python_engine_tests tests/python_engine_tests.cpp)
+    target_link_libraries(
+        rule_engine_python_engine_tests
+        PRIVATE
+            rule_engine::python_engine
+            Catch2::Catch2WithMain
+    )
+    target_compile_options(
+        rule_engine_python_engine_tests
+        PRIVATE
+            $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:
+                /clang:-Wno-c2y-extensions
+                /clang:-Wno-missing-designated-field-initializers
+            >
+            $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:GNU>>:
+                -Wno-c2y-extensions
+                -Wno-missing-designated-field-initializers
+            >
+    )
+    catch_discover_tests(rule_engine_python_engine_tests)
 
-add_executable(rule_engine_python_integration_tests tests/python_integration_tests.cpp)
-target_link_libraries(
-    rule_engine_python_integration_tests
-    PRIVATE
-        rule_engine::python_engine
-        rule_engine::python_compiler
-        rule_engine::python_vm
-        rule_engine::python_cluster
-        Catch2::Catch2WithMain
-)
-target_compile_options(
-    rule_engine_python_integration_tests
-    PRIVATE
-        $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:
-            /clang:-Wno-c2y-extensions
-            /clang:-Wno-missing-designated-field-initializers
-        >
-        $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:GNU>>:
-            -Wno-c2y-extensions
-            -Wno-missing-designated-field-initializers
-        >
-)
-catch_discover_tests(rule_engine_python_integration_tests)
+    add_executable(rule_engine_python_integration_tests tests/python_integration_tests.cpp)
+    target_link_libraries(
+        rule_engine_python_integration_tests
+        PRIVATE
+            rule_engine::python_engine
+            rule_engine::python_compiler
+            rule_engine::python_vm
+            rule_engine::python_cluster
+            Catch2::Catch2WithMain
+    )
+    target_compile_options(
+        rule_engine_python_integration_tests
+        PRIVATE
+            $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>:
+                /clang:-Wno-c2y-extensions
+                /clang:-Wno-missing-designated-field-initializers
+            >
+            $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:GNU>>:
+                -Wno-c2y-extensions
+                -Wno-missing-designated-field-initializers
+            >
+    )
+    catch_discover_tests(rule_engine_python_integration_tests)
+endif()
+
+include(cmake/RuleEngineInstall.cmake)
