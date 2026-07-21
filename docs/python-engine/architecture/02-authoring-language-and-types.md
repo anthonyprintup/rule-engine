@@ -271,6 +271,28 @@ capabilities, canonical identities, activation-selected namespaces, schemas,
 and operator bindings are lowered into a canonical state operand. Until then the
 call fails with `PY-NYI-STATE-LOWERING`.
 
+### 5.5 Current closed exception implementation
+
+The current compiler implements a deliberately closed exception subset. Source
+may raise `ValueError`, `TypeError`, or `ArithmeticError`, optionally with one
+literal string message, and may catch those names or the catch-all `Exception`.
+Handlers are tested in source order. An untyped `except` is also a catch-all and
+must be last. `else`, `finally`, nested handlers, bare re-raise inside a handler,
+and `return`/`break`/`continue` through cleanup regions are lowered to verified
+VM control flow. Engine-generated value, type, and arithmetic faults enter the
+same typed handlers; instruction-budget exhaustion, cancellation, and VM
+integrity faults never become catchable source exceptions.
+
+The compiler resolves the four exception names statically and rejects a handler
+when a function or module binding shadows the selected name. It also rejects
+handler binding (`except ValueError as error`), tuple or computed filters,
+user-defined exception classes, exception causes, exception groups/`except*`,
+and bare re-raise from a `finally` body. These are fail-closed implementation
+limits, not alternate Python semantics. The lowering geometry, verifier
+invariants, security reasoning, and exact diagnostic surface are specified in
+[section 5.9 of the compiler/VM architecture](04-compiler-ir-and-vm.md#59-implemented-exception-and-cleanup-lowering)
+and recorded as [L-028](../LIMITATIONS.md#l-028--the-exception-frontend-is-intentionally-closed).
+
 ## 6. Static classes, records, and object semantics
 
 - Base classes are literal names resolved in the closed module graph. The compiler computes exact C3 MRO and rejects inconsistent MROs.

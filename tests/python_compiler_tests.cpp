@@ -798,7 +798,7 @@ namespace {
                                                    "from rule_engine import rule\n"
                                                    "\n"
                                                    "def later_entry() -> int:\n"
-                                                   "    raise \"later dictionary entry was evaluated\"\n"
+                                                   "    raise ValueError(\"later dictionary entry was evaluated\")\n"
                                                    "\n"
                                                    "@rule(\"com.example.dict-fault-order\")\n"
                                                    "def dictionary_fault_order() -> bool:\n"
@@ -817,6 +817,392 @@ namespace {
         CHECK(faulted.result->fault->frames.front().code == "PYVM2001");
         CHECK(faulted.result->fault->frames.front().message.find("unhashable map key") != std::string::npos);
         CHECK(faulted.result->fault->frames.front().message.find("later dictionary entry") == std::string::npos);
+    }
+
+    TEST_CASE("exact worker lowers ordered typed handlers else and bare re-raise into the verified VM",
+              "[compiler-vm-progress]") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+
+        const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                   "from rule_engine import rule\n"
+                                                   "\n"
+                                                   "def reraised() -> bool:\n"
+                                                   "    try:\n"
+                                                   "        try:\n"
+                                                   "            raise TypeError(\"inner\")\n"
+                                                   "        except ValueError:\n"
+                                                   "            return False\n"
+                                                   "        except TypeError:\n"
+                                                   "            raise\n"
+                                                   "    except TypeError:\n"
+                                                   "        return True\n"
+                                                   "    except Exception:\n"
+                                                   "        return False\n"
+                                                   "\n"
+                                                   "@rule(\"com.example.exceptions\")\n"
+                                                   "def exception_regions() -> bool:\n"
+                                                   "    else_ran = False\n"
+                                                   "    try:\n"
+                                                   "        probe = [1]\n"
+                                                   "    except ArithmeticError:\n"
+                                                   "        return False\n"
+                                                   "    else:\n"
+                                                   "        else_ran = True\n"
+                                                   "    try:\n"
+                                                   "        quotient = 1 // 0\n"
+                                                   "    except ValueError:\n"
+                                                   "        return False\n"
+                                                   "    except ArithmeticError:\n"
+                                                   "        return else_ran and reraised()\n"
+                                                   "    except Exception:\n"
+                                                   "        return False\n"
+                                                   "    return False\n",
+                                                   "com.example.exceptions");
+        INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
+        REQUIRE(compiled.has_value());
+        REQUIRE(verify_bytecode(*compiled).has_value());
+
+        const auto entry_position =
+            std::ranges::find(compiled->functions, ExecutableId {"com.example.exceptions"}, &BytecodeFunction::id);
+        REQUIRE(entry_position != compiled->functions.end());
+        const auto &entry = *entry_position;
+        CHECK(std::ranges::count(entry.instructions, Opcode::match_exception, &Instruction::opcode) == 4);
+        CHECK(std::ranges::count(entry.instructions, Opcode::leave_except, &Instruction::opcode) >= 1);
+        CHECK(std::ranges::count(entry.instructions, Opcode::reraise, &Instruction::opcode) >= 2);
+        CHECK(entry.exception_regions.size() == 2U);
+
+        auto session = vm::RegisterVmSession::create(*compiled, invocation());
+        REQUIRE(session.has_value());
+        auto completed = (*session)->step({});
+        while (completed.state == VmStepState::yielded) { completed = (*session)->step({}); }
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        CHECK(completed.result->verdict == true);
+    }
+
+    TEST_CASE("exact worker lowers nested finally and loop control through verified cleanup regions",
+              "[compiler-vm-progress]") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+
+        const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                   "from rule_engine import rule\n"
+                                                   "\n"
+                                                   "def replacement() -> bool:\n"
+                                                   "    try:\n"
+                                                   "        try:\n"
+                                                   "            return False\n"
+                                                   "        finally:\n"
+                                                   "            raise ValueError(\"replacement\")\n"
+                                                   "    except ValueError:\n"
+                                                   "        return True\n"
+                                                   "    return False\n"
+                                                   "\n"
+                                                   "@rule(\"com.example.finally\")\n"
+                                                   "def finalizers() -> bool:\n"
+                                                   "    total = 0\n"
+                                                   "    try:\n"
+                                                   "        try:\n"
+                                                   "            total = total + 1\n"
+                                                   "        finally:\n"
+                                                   "            total = total + 10\n"
+                                                   "    finally:\n"
+                                                   "        total = total + 100\n"
+                                                   "    for value in [1, 2, 3]:\n"
+                                                   "        try:\n"
+                                                   "            total = total + value\n"
+                                                   "            if value == 1:\n"
+                                                   "                continue\n"
+                                                   "            if value == 2:\n"
+                                                   "                break\n"
+                                                   "        finally:\n"
+                                                   "            total = total + 10\n"
+                                                   "    else:\n"
+                                                   "        total = 0\n"
+                                                   "    return total == 134 and replacement()\n",
+                                                   "com.example.finally");
+        INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
+        REQUIRE(compiled.has_value());
+        REQUIRE(verify_bytecode(*compiled).has_value());
+
+        const auto entry_position =
+            std::ranges::find(compiled->functions, ExecutableId {"com.example.finally"}, &BytecodeFunction::id);
+        REQUIRE(entry_position != compiled->functions.end());
+        const auto &entry = *entry_position;
+        CHECK(std::ranges::count(entry.exception_regions, ExceptionRegionKind::cleanup, &ExceptionRegion::kind) == 3);
+        CHECK(std::ranges::count(entry.instructions, Opcode::unwind_jump, &Instruction::opcode) >= 4);
+        CHECK(std::ranges::count(entry.instructions, Opcode::leave_try, &Instruction::opcode) >= 3);
+
+        auto session = vm::RegisterVmSession::create(*compiled, invocation());
+        REQUIRE(session.has_value());
+        auto completed = (*session)->step({});
+        while (completed.state == VmStepState::yielded) { completed = (*session)->step({}); }
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        CHECK(completed.result->verdict == true);
+
+        SECTION("ordinary edge cannot bypass source-produced cleanup") {
+            auto malformed = *compiled;
+            auto malformed_entry =
+                std::ranges::find(malformed.functions, ExecutableId {"com.example.finally"}, &BytecodeFunction::id);
+            REQUIRE(malformed_entry != malformed.functions.end());
+            auto escaping = malformed_entry->instructions.end();
+            for (const auto &region : malformed_entry->exception_regions) {
+                if (region.kind != ExceptionRegionKind::cleanup) {
+                    continue;
+                }
+                escaping = std::ranges::find_if(malformed_entry->instructions.begin() + region.begin_instruction,
+                                                malformed_entry->instructions.begin() + region.end_instruction,
+                                                [&](const Instruction &instruction) {
+                                                    return instruction.opcode == Opcode::unwind_jump &&
+                                                           (instruction.immediate < region.begin_instruction ||
+                                                            instruction.immediate >= region.end_instruction);
+                                                });
+                if (escaping != malformed_entry->instructions.begin() + region.end_instruction) {
+                    break;
+                }
+                escaping = malformed_entry->instructions.end();
+            }
+            REQUIRE(escaping != malformed_entry->instructions.end());
+            escaping->opcode = Opcode::jump;
+            const auto rejected = verify_bytecode(malformed);
+            REQUIRE_FALSE(rejected.has_value());
+            CHECK(std::ranges::any_of(rejected.error(), [](const Diagnostic &item) { return item.code == "PYC0114"; }));
+        }
+
+        SECTION("source-produced filter chain cannot be cycled") {
+            auto malformed = *compiled;
+            auto filter = std::ranges::find_if(malformed.functions, [](const BytecodeFunction &candidate) {
+                return std::ranges::any_of(candidate.instructions, [](const Instruction &instruction) {
+                    return instruction.opcode == Opcode::match_exception;
+                });
+            });
+            REQUIRE(filter != malformed.functions.end());
+            const auto match = std::ranges::find(filter->instructions, Opcode::match_exception, &Instruction::opcode);
+            REQUIRE(match != filter->instructions.end());
+            match->operand_b = static_cast<std::uint32_t>(match - filter->instructions.begin());
+            const auto rejected = verify_bytecode(malformed);
+            REQUIRE_FALSE(rejected.has_value());
+            CHECK(std::ranges::any_of(rejected.error(), [](const Diagnostic &item) { return item.code == "PYC0112"; }));
+        }
+    }
+
+    TEST_CASE("exact worker routes implicit engine faults to their closed typed handlers") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+
+        const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                   "from rule_engine import rule\n"
+                                                   "\n"
+                                                   "@rule(\"com.example.implicit-faults\")\n"
+                                                   "def implicit_faults() -> bool:\n"
+                                                   "    caught = 0\n"
+                                                   "    try:\n"
+                                                   "        missing = [1][9]\n"
+                                                   "    except ValueError:\n"
+                                                   "        caught = caught + 1\n"
+                                                   "    except Exception:\n"
+                                                   "        return False\n"
+                                                   "    try:\n"
+                                                   "        invalid = {[]: True}\n"
+                                                   "    except TypeError:\n"
+                                                   "        caught = caught + 1\n"
+                                                   "    except Exception:\n"
+                                                   "        return False\n"
+                                                   "    try:\n"
+                                                   "        quotient = 1 // 0\n"
+                                                   "    except ArithmeticError:\n"
+                                                   "        caught = caught + 1\n"
+                                                   "    except Exception:\n"
+                                                   "        return False\n"
+                                                   "    finally:\n"
+                                                   "        caught = caught + 10\n"
+                                                   "    return caught == 13\n",
+                                                   "com.example.implicit-faults");
+        INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
+        REQUIRE(compiled.has_value());
+        REQUIRE(verify_bytecode(*compiled).has_value());
+
+        auto session = vm::RegisterVmSession::create(*compiled, invocation());
+        REQUIRE(session.has_value());
+        auto completed = (*session)->step({});
+        while (completed.state == VmStepState::yielded) { completed = (*session)->step({}); }
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        CHECK(completed.result->verdict == true);
+    }
+
+    TEST_CASE("source handlers cannot suppress instruction budgets or deployment cancellation") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+
+        const auto source = "from rule_engine import Model, provider_fact, rule\n"
+                            "\n"
+                            "class Process(Model):\n"
+                            "    is_signed: bool = provider_fact(route=\"process.is_signed\")\n"
+                            "\n"
+                            "@rule(\"com.example.unsuppressible\")\n"
+                            "def unsuppressible(process: Process) -> bool:\n"
+                            "    marker = [False]\n"
+                            "    try:\n"
+                            "        return process.is_signed\n"
+                            "    except Exception:\n"
+                            "        return True\n"
+                            "    finally:\n"
+                            "        marker[0] = True\n";
+        const auto compiled =
+            compile_exact_source(*runtime.runtime, runtime.temporary_parent, source, "com.example.unsuppressible");
+        INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
+        REQUIRE(compiled.has_value());
+        REQUIRE(verify_bytecode(*compiled).has_value());
+        REQUIRE(compiled->functions.size() == 1U);
+        const auto &function = compiled->functions.front();
+        const auto await = std::ranges::find(function.instructions, Opcode::await_fact, &Instruction::opcode);
+        REQUIRE(await != function.instructions.end());
+        CHECK(std::ranges::count(function.exception_regions, ExceptionRegionKind::handler, &ExceptionRegion::kind) ==
+              1);
+        CHECK(std::ranges::count(function.exception_regions, ExceptionRegionKind::cleanup, &ExceptionRegion::kind) ==
+              1);
+
+        SECTION("instruction budget bypasses Exception and runs forced cleanup") {
+            auto bounded = invocation();
+            bounded.budget.normal.instructions = static_cast<std::uint64_t>(await - function.instructions.begin());
+            REQUIRE(bounded.budget.normal.instructions > 0U);
+            auto session = vm::RegisterVmSession::create(*compiled, bounded);
+            REQUIRE(session.has_value());
+            auto faulted = (*session)->step({});
+            while (faulted.state == VmStepState::yielded) { faulted = (*session)->step({}); }
+            REQUIRE(faulted.state == VmStepState::faulted);
+            REQUIRE(faulted.result.has_value());
+            REQUIRE(faulted.result->fault.has_value());
+            REQUIRE_FALSE(faulted.result->fault->frames.empty());
+            CHECK(faulted.result->fault->frames.front().code == "PYVM4003");
+            CHECK((*session)->recovery_counters().forced_cleanup.instructions > 0U);
+        }
+
+        SECTION("cancellation bypasses Exception and resumes the same cleanup") {
+            auto session = vm::RegisterVmSession::create(*compiled, invocation());
+            REQUIRE(session.has_value());
+            const auto waiting = (*session)->step({});
+            REQUIRE(waiting.state == VmStepState::waiting_for_facts);
+            REQUIRE(waiting.fact_requests.size() == 1U);
+            HostResponses cancel;
+            cancel.cancel = true;
+            auto canceled = (*session)->step(std::move(cancel));
+            while (canceled.state == VmStepState::yielded) { canceled = (*session)->step({}); }
+            REQUIRE(canceled.state == VmStepState::canceled);
+            REQUIRE(canceled.result.has_value());
+            CHECK(canceled.result->outcome == EvaluationOutcome::canceled);
+            CHECK(canceled.result->verdict == std::nullopt);
+            CHECK((*session)->recovery_counters().forced_cleanup.instructions > 0U);
+        }
+    }
+
+    TEST_CASE("exact worker exception gaps fail closed with stable source-spanned diagnostics") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+
+        const auto source = "from rule_engine import rule\n"
+                            "\n"
+                            "@rule(\"com.example.rejected-exceptions\")\n"
+                            "def rejected_exceptions() -> bool:\n"
+                            "    try:\n"
+                            "        pass\n"
+                            "    except ValueError as error:\n"
+                            "        pass\n"
+                            "    try:\n"
+                            "        pass\n"
+                            "    except (ValueError, TypeError):\n"
+                            "        pass\n"
+                            "    try:\n"
+                            "        pass\n"
+                            "    except Exception:\n"
+                            "        pass\n"
+                            "    except ValueError:\n"
+                            "        pass\n"
+                            "    try:\n"
+                            "        pass\n"
+                            "    except TypeError:\n"
+                            "        pass\n"
+                            "    except TypeError:\n"
+                            "        pass\n"
+                            "    try:\n"
+                            "        pass\n"
+                            "    except ArithmeticError:\n"
+                            "        pass\n"
+                            "    ArithmeticError = 1\n"
+                            "    try:\n"
+                            "        pass\n"
+                            "    except* ValueError:\n"
+                            "        pass\n"
+                            "    try:\n"
+                            "        pass\n"
+                            "    finally:\n"
+                            "        raise\n"
+                            "    try:\n"
+                            "        raise ValueError(\"message\") from TypeError(\"cause\")\n"
+                            "    except ValueError:\n"
+                            "        pass\n"
+                            "    raise Exception(\"catch-all is not concrete\")\n"
+                            "    raise \"dynamic exception\"\n"
+                            "    raise\n"
+                            "    return False\n";
+        const auto first =
+            compile_exact_source(*runtime.runtime, runtime.temporary_parent, source, "com.example.rejected-exceptions");
+        const auto second =
+            compile_exact_source(*runtime.runtime, runtime.temporary_parent, source, "com.example.rejected-exceptions");
+        REQUIRE_FALSE(first.has_value());
+        REQUIRE_FALSE(second.has_value());
+        CHECK(diagnostic_text(first.error()) == diagnostic_text(second.error()));
+        const auto has_code = [&](const std::string_view code) {
+            return std::ranges::any_of(first.error(), [&](const Diagnostic &item) {
+                return item.code == code && item.span.has_value() && item.span->valid();
+            });
+        };
+        CHECK(has_code("PY-NYI-EXCEPTION-BINDING"));
+        CHECK(has_code("PY-NYI-EXCEPTION-FILTER"));
+        CHECK(has_code("PY-EXCEPTION-NAME-SHADOWED"));
+        CHECK(has_code("PY-EXCEPTION-HANDLER-ORDER"));
+        CHECK(has_code("PY-NYI-EXCEPTION-GROUP-LOWERING"));
+        CHECK(has_code("PY-NYI-BARE-RAISE"));
+        CHECK(has_code("PY-NYI-EXCEPTION-CAUSE"));
+        CHECK(has_code("PY-NYI-RAISE-EXPRESSION"));
     }
 
     TEST_CASE("exact worker keeps state deletion and comprehension prerequisites fail closed") {
@@ -1376,7 +1762,7 @@ namespace {
                  {field("body", ast_sequence({ast_reference(9)})), field("handlers", ast_sequence({ast_reference(11)})),
                   field("orelse", ast_sequence({})), field("finalbody", ast_sequence({}))});
         nodes[8] = node(9, "Raise", {field("exc", ast_reference(10)), field("cause", ast_none())});
-        nodes.push_back(node(10, "Constant", {field("value", ast_string("recoverable"))}));
+        nodes.push_back(node(10, "Name", {field("id", ast_string("ValueError"))}));
         nodes.push_back(node(
             11, "ExceptHandler",
             {field("type", ast_none()), field("name", ast_none()), field("body", ast_sequence({ast_reference(12)}))}));
@@ -1528,6 +1914,9 @@ namespace {
 
         SECTION("finally unwind") {
             auto nodes = constant_rule_nodes(false);
+            const auto function_body = std::ranges::find(nodes[1].fields, "body", &AstField::name);
+            REQUIRE(function_body != nodes[1].fields.end());
+            function_body->value = ast_sequence({ast_reference(8), ast_reference(14)});
             nodes[7] = node(8, "Try",
                             {field("body", ast_sequence({ast_reference(10)})),
                              field("handlers", ast_sequence({ast_reference(11)})), field("orelse", ast_sequence({})),
@@ -1539,13 +1928,17 @@ namespace {
                                   field("body", ast_sequence({ast_reference(12)}))}));
             nodes.push_back(node(12, "Pass", {}));
             nodes.push_back(node(13, "Pass", {}));
+            nodes.push_back(node(14, "Return", {field("value", ast_reference(15))}));
+            nodes.push_back(node(15, "Constant", {field("value", ast_bool(true))}));
             const auto payload = encode_ast_envelope(envelope(std::move(nodes)));
             REQUIRE(payload.has_value());
             const auto result = StaticCompiler {}.compile(pack(), *payload, {}, {});
-            REQUIRE_FALSE(result.has_value());
-            INFO(diagnostic_text(result.error()));
-            REQUIRE(std::ranges::any_of(result.error(),
-                                        [](const Diagnostic &item) { return item.code == "PY-NYI-FINALLY-LOWERING"; }));
+            INFO((result.has_value() ? std::string {} : diagnostic_text(result.error())));
+            REQUIRE(result.has_value());
+            REQUIRE(result->pack.functions.front().exception_regions.size() == 2U);
+            CHECK(std::ranges::any_of(
+                result->pack.functions.front().exception_regions,
+                [](const ExceptionRegion &region) { return region.kind == ExceptionRegionKind::cleanup; }));
         }
     }
 

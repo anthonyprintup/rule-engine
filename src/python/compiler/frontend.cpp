@@ -1150,10 +1150,20 @@ namespace rule_engine::python::compiler {
             struct LoopFrame {
                 std::uint32_t continue_target {};
                 std::vector<std::size_t> break_jumps;
+                std::size_t handler_depth {};
+                std::uint32_t cleanup_depth {};
+            };
+            struct HandlerFrame {
+                SourceSpan span;
+                std::uint32_t finalizer_depth {};
             };
             std::vector<LoopFrame> loops;
+            std::vector<HandlerFrame> handlers;
+            std::set<std::string, std::less<>> statically_bound_names;
             std::uint32_t conditional_depth {};
             std::uint32_t direct_await_depth {};
+            std::uint32_t finalizer_depth {};
+            std::uint32_t cleanup_depth {};
             bool may_fault {};
 
             Lowerer(const AstIndex &index_value, const FunctionModel &function_value,
@@ -1177,7 +1187,10 @@ namespace rule_engine::python::compiler {
                     locals.emplace(function.parameters[position].first,
                                    ExpressionResult {.reg = static_cast<std::uint32_t>(position),
                                                      .type = function.parameters[position].second});
+                    statically_bound_names.insert(function.parameters[position].first);
                 }
+                collect_function_bindings(*function.node, true);
+                collect_module_bindings();
             }
 
             std::uint32_t allocate() { return bytecode.register_count++; }
@@ -1235,6 +1248,137 @@ namespace rule_engine::python::compiler {
                     .immediate = immediate,
                     .span = span,
                 });
+            }
+
+            [[nodiscard]] static std::optional<PythonFaultKind>
+            exception_filter_kind(const std::string_view name) noexcept {
+                if (name == "ValueError") {
+                    return PythonFaultKind::value_error;
+                }
+                if (name == "TypeError") {
+                    return PythonFaultKind::type_error;
+                }
+                if (name == "ArithmeticError") {
+                    return PythonFaultKind::arithmetic_error;
+                }
+                if (name == "Exception") {
+                    return PythonFaultKind::exception;
+                }
+                return std::nullopt;
+            }
+
+            [[nodiscard]] static std::optional<PythonFaultKind>
+            concrete_exception_kind(const std::string_view name) noexcept {
+                const auto kind = exception_filter_kind(name);
+                return kind.has_value() && *kind != PythonFaultKind::exception ? kind : std::nullopt;
+            }
+
+            void emit_leave_handlers(const std::size_t target_depth, const SourceSpan &span) {
+                for (auto depth = handlers.size(); depth > target_depth; --depth) {
+                    emit(Opcode::leave_except, 0U, 0U, 0U, 0U, span);
+                }
+            }
+
+            void collect_binding_target(const AstNode *target) {
+                if (target == nullptr) {
+                    return;
+                }
+                if (target->kind == "Name") {
+                    statically_bound_names.insert(index.string(*target, "id").value_or(std::string {}));
+                    return;
+                }
+                if (target->kind == "Tuple" || target->kind == "List") {
+                    for (const auto *element : index.sequence(*target, "elts")) { collect_binding_target(element); }
+                    return;
+                }
+                if (target->kind == "Starred") {
+                    collect_binding_target(index.reference(*target, "value"));
+                }
+            }
+
+            void collect_function_bindings(const AstNode &node, const bool root = false) {
+                if (!root &&
+                    (node.kind == "FunctionDef" || node.kind == "AsyncFunctionDef" || node.kind == "ClassDef")) {
+                    statically_bound_names.insert(index.string(node, "name").value_or(std::string {}));
+                    return;
+                }
+                if (!root && node.kind == "Lambda") {
+                    return;
+                }
+                if (node.kind == "Name") {
+                    const auto *context = index.reference(node, "ctx");
+                    if (context != nullptr && (context->kind == "Store" || context->kind == "Del")) {
+                        statically_bound_names.insert(index.string(node, "id").value_or(std::string {}));
+                    }
+                }
+                if (node.kind == "ExceptHandler") {
+                    if (const auto name = index.string(node, "name")) {
+                        statically_bound_names.insert(*name);
+                    }
+                }
+                for (const auto &field : node.fields) {
+                    if (const auto *reference = std::get_if<AstNodeReference>(&field.value.data)) {
+                        if (const auto *child = index.node(reference->id)) {
+                            collect_function_bindings(*child);
+                        }
+                        continue;
+                    }
+                    const auto *sequence = std::get_if<AstValue::Sequence>(&field.value.data);
+                    if (sequence == nullptr || !*sequence) {
+                        continue;
+                    }
+                    for (const auto &item : (*sequence)->values) {
+                        const auto *reference = std::get_if<AstNodeReference>(&item.data);
+                        if (reference != nullptr) {
+                            if (const auto *child = index.node(reference->id)) {
+                                collect_function_bindings(*child);
+                            }
+                        }
+                    }
+                }
+            }
+
+            void collect_module_bindings() {
+                const auto module = std::ranges::find(index.envelope.modules, function.module, &AstModule::name);
+                if (module == index.envelope.modules.end()) {
+                    return;
+                }
+                const auto *root = index.node(module->root);
+                if (root == nullptr) {
+                    return;
+                }
+                for (const auto *statement : index.sequence(*root, "body")) {
+                    if (statement->kind == "FunctionDef" || statement->kind == "AsyncFunctionDef" ||
+                        statement->kind == "ClassDef") {
+                        statically_bound_names.insert(index.string(*statement, "name").value_or(std::string {}));
+                        continue;
+                    }
+                    if (statement->kind == "Assign") {
+                        for (const auto *target : index.sequence(*statement, "targets")) {
+                            collect_binding_target(target);
+                        }
+                        continue;
+                    }
+                    if (statement->kind == "AnnAssign" || statement->kind == "NamedExpr") {
+                        collect_binding_target(index.reference(*statement, "target"));
+                        continue;
+                    }
+                    if (statement->kind != "Import" && statement->kind != "ImportFrom") {
+                        continue;
+                    }
+                    for (const auto *alias : index.sequence(*statement, "names")) {
+                        auto bound = index.string(*alias, "asname");
+                        if (!bound) {
+                            bound = index.string(*alias, "name");
+                            if (bound && statement->kind == "Import") {
+                                bound = bound->substr(0U, bound->find('.'));
+                            }
+                        }
+                        if (bound) {
+                            statically_bound_names.insert(*bound);
+                        }
+                    }
+                }
             }
 
             std::optional<ExpressionResult> constant(const AstNode &node) {
@@ -1947,6 +2091,386 @@ namespace rule_engine::python::compiler {
                 return true;
             }
 
+            [[nodiscard]] bool exception_name_shadowed(const std::string_view name) const {
+                if (statically_bound_names.contains(name)) {
+                    return true;
+                }
+                const auto qualified = function.module + "." + std::string {name};
+                return std::ranges::any_of(
+                    functions, [&](const FunctionModel &candidate) { return candidate.qualified_name == qualified; });
+            }
+
+            bool lower_raise(const AstNode &statement) {
+                const auto *cause_field = index.field(statement, "cause");
+                if (cause_field == nullptr) {
+                    diagnostics.push_back(make_diagnostic("PY-AST-FIELD", "Raise is missing cause", statement.span));
+                    return false;
+                }
+                if (!std::holds_alternative<std::monostate>(cause_field->value.data)) {
+                    const auto *cause = index.reference(statement, "cause");
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-NYI-EXCEPTION-CAUSE",
+                        "raise ... from ... requires exception-cause state absent from the bytecode contract",
+                        cause != nullptr ? cause->span : statement.span));
+                    return false;
+                }
+
+                const auto *exception_field = index.field(statement, "exc");
+                if (exception_field == nullptr) {
+                    diagnostics.push_back(make_diagnostic("PY-AST-FIELD", "Raise is missing exc", statement.span));
+                    return false;
+                }
+                if (std::holds_alternative<std::monostate>(exception_field->value.data)) {
+                    const auto definitely_active =
+                        !handlers.empty() && handlers.back().finalizer_depth == finalizer_depth;
+                    if (!definitely_active) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-NYI-BARE-RAISE",
+                            "bare raise requires an exception that is active on every path; it is supported only "
+                            "inside an except handler and outside a conditionally entered finally body",
+                            statement.span));
+                        return false;
+                    }
+                    emit(Opcode::reraise, 0U, 0U, 0U, 0U, statement.span);
+                    may_fault = true;
+                    return true;
+                }
+
+                const auto *exception = index.reference(statement, "exc");
+                if (exception == nullptr) {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-NYI-RAISE-EXPRESSION",
+                        "raise requires a statically recognized engine-owned exception class", statement.span));
+                    return false;
+                }
+
+                const AstNode *target = exception;
+                std::vector<const AstNode *> arguments;
+                if (exception->kind == "Call") {
+                    target = index.reference(*exception, "func");
+                    if (!index.sequence(*exception, "keywords").empty()) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-NYI-RAISE-EXPRESSION",
+                            "engine-owned exception construction does not support keyword arguments", exception->span));
+                        return false;
+                    }
+                    arguments = index.sequence(*exception, "args");
+                    if (arguments.size() > 1U) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-NYI-RAISE-EXPRESSION",
+                            "engine-owned exception construction accepts at most one message expression",
+                            exception->span));
+                        return false;
+                    }
+                }
+                if (target == nullptr || target->kind != "Name") {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-NYI-RAISE-EXPRESSION", "raise target must be ValueError, TypeError, or ArithmeticError",
+                        exception->span));
+                    return false;
+                }
+
+                const auto name = index.string(*target, "id").value_or(std::string {});
+                const auto kind = concrete_exception_kind(name);
+                if (!kind.has_value()) {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-NYI-RAISE-EXPRESSION",
+                        name == "Exception" ?
+                            "Exception is a catch-all filter and cannot be raised by the closed bytecode contract" :
+                            "raise target '" + name + "' is not a concrete engine-owned exception class",
+                        target->span));
+                    return false;
+                }
+                if (exception_name_shadowed(name)) {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-EXCEPTION-NAME-SHADOWED",
+                        "engine-owned exception name '" + name + "' is shadowed in this function", target->span));
+                    return false;
+                }
+
+                std::optional<ExpressionResult> message;
+                if (arguments.empty()) {
+                    AstNode empty_message {
+                        .id = 0U,
+                        .kind = "Constant",
+                        .span = exception->span,
+                        .fields = {AstField {.name = "value", .value = ast_string("")}},
+                    };
+                    message = constant(empty_message);
+                } else {
+                    message = expression(*arguments.front());
+                    if (message.has_value() && message->type.kind != StaticTypeKind::string) {
+                        diagnostics.push_back(make_diagnostic("PY-TYPE-RAISE-MESSAGE",
+                                                              "engine-owned exception message must have type str",
+                                                              arguments.front()->span));
+                        return false;
+                    }
+                }
+                if (!message.has_value()) {
+                    return false;
+                }
+
+                emit(Opcode::raise_fault, message->reg, message->reg, 0U,
+                     static_cast<std::uint32_t>(std::to_underlying(*kind)), statement.span);
+                may_fault = true;
+                return true;
+            }
+
+            struct ExceptionHandlerPlan {
+                const AstNode *node {};
+                PythonFaultKind kind {PythonFaultKind::exception};
+                SourceSpan filter_span;
+            };
+
+            std::optional<std::vector<ExceptionHandlerPlan>>
+            plan_exception_handlers(const std::vector<const AstNode *> &handler_nodes) {
+                std::vector<ExceptionHandlerPlan> result;
+                result.reserve(handler_nodes.size());
+                std::set<PythonFaultKind> seen;
+                bool catch_all_seen {};
+                for (const auto *handler : handler_nodes) {
+                    if (handler->kind != "ExceptHandler") {
+                        diagnostics.push_back(
+                            make_diagnostic("PY-AST-FIELD", "Try handler is not an ExceptHandler", handler->span));
+                        return std::nullopt;
+                    }
+
+                    const auto *name_field = index.field(*handler, "name");
+                    if (name_field == nullptr) {
+                        diagnostics.push_back(
+                            make_diagnostic("PY-AST-FIELD", "ExceptHandler is missing name", handler->span));
+                        return std::nullopt;
+                    }
+                    if (!std::holds_alternative<std::monostate>(name_field->value.data)) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-NYI-EXCEPTION-BINDING",
+                            "except ... as name requires exception-object binding and deterministic target cleanup",
+                            handler->span));
+                        return std::nullopt;
+                    }
+
+                    const auto *type_field = index.field(*handler, "type");
+                    if (type_field == nullptr) {
+                        diagnostics.push_back(
+                            make_diagnostic("PY-AST-FIELD", "ExceptHandler is missing type", handler->span));
+                        return std::nullopt;
+                    }
+
+                    auto kind = PythonFaultKind::exception;
+                    auto filter_span = handler->span;
+                    if (!std::holds_alternative<std::monostate>(type_field->value.data)) {
+                        const auto *type = index.reference(*handler, "type");
+                        if (type == nullptr || type->kind != "Name") {
+                            diagnostics.push_back(make_diagnostic(
+                                "PY-NYI-EXCEPTION-FILTER",
+                                "exception handler type must be ValueError, TypeError, ArithmeticError, or Exception",
+                                type != nullptr ? type->span : handler->span));
+                            return std::nullopt;
+                        }
+                        const auto name = index.string(*type, "id").value_or(std::string {});
+                        const auto resolved = exception_filter_kind(name);
+                        if (!resolved.has_value()) {
+                            diagnostics.push_back(make_diagnostic("PY-NYI-EXCEPTION-FILTER",
+                                                                  "exception handler type '" + name +
+                                                                      "' is outside the engine-owned exception table",
+                                                                  type->span));
+                            return std::nullopt;
+                        }
+                        if (exception_name_shadowed(name)) {
+                            diagnostics.push_back(make_diagnostic(
+                                "PY-EXCEPTION-NAME-SHADOWED",
+                                "engine-owned exception name '" + name + "' is shadowed in this function", type->span));
+                            return std::nullopt;
+                        }
+                        kind = *resolved;
+                        filter_span = type->span;
+                    }
+
+                    if (catch_all_seen) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-EXCEPTION-HANDLER-ORDER",
+                            "no exception handler may follow a catch-all Exception handler", filter_span));
+                        return std::nullopt;
+                    }
+                    if (!seen.insert(kind).second) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-EXCEPTION-HANDLER-ORDER",
+                            "exception handler kind is duplicated in the same try statement", filter_span));
+                        return std::nullopt;
+                    }
+                    catch_all_seen = kind == PythonFaultKind::exception;
+                    result.push_back(ExceptionHandlerPlan {
+                        .node = handler,
+                        .kind = kind,
+                        .filter_span = filter_span,
+                    });
+                }
+                return result;
+            }
+
+            [[nodiscard]] std::size_t emit_try_exit(const bool has_finalizer, const SourceSpan &span) {
+                const auto instruction = bytecode.instructions.size();
+                emit(has_finalizer ? Opcode::unwind_jump : Opcode::jump, 0U, 0U, 0U, 0U, span);
+                return instruction;
+            }
+
+            bool lower_try(const AstNode &statement) {
+                const auto body = index.sequence(statement, "body");
+                const auto handler_nodes = index.sequence(statement, "handlers");
+                const auto else_body = index.sequence(statement, "orelse");
+                const auto final_body = index.sequence(statement, "finalbody");
+                const auto has_handlers = !handler_nodes.empty();
+                const auto has_finalizer = !final_body.empty();
+                if (body.empty()) {
+                    diagnostics.push_back(
+                        make_diagnostic("PY-AST-FIELD", "Try body must not be empty", statement.span));
+                    return false;
+                }
+                if (!has_handlers && !has_finalizer) {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-AST-FIELD", "Try requires at least one handler or a finally body", statement.span));
+                    return false;
+                }
+                if (!has_handlers && !else_body.empty()) {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-AST-FIELD", "try/finally cannot contain an else suite without exception handlers",
+                        statement.span));
+                    return false;
+                }
+
+                const auto planned_handlers = plan_exception_handlers(handler_nodes);
+                if (!planned_handlers.has_value()) {
+                    return false;
+                }
+
+                const auto cleanup_region_begin = static_cast<std::uint32_t>(bytecode.instructions.size());
+                if (has_finalizer) {
+                    emit(Opcode::enter_try, 0U, 0U, 0U, 0U, statement.span);
+                    ++cleanup_depth;
+                }
+
+                const auto handler_region_begin = static_cast<std::uint32_t>(bytecode.instructions.size());
+                if (has_handlers) {
+                    emit(Opcode::enter_try, 0U, 0U, 0U, 0U, statement.span);
+                }
+                ++conditional_depth;
+                const auto body_terminated = statements(body);
+                --conditional_depth;
+                const auto handler_region_end = static_cast<std::uint32_t>(bytecode.instructions.size());
+
+                auto normal_terminated = body_terminated;
+                std::vector<std::size_t> exit_jumps;
+                if (!body_terminated) {
+                    if (has_handlers) {
+                        emit(Opcode::leave_try, 0U, 0U, 0U, 0U, statement.span);
+                    }
+                    ++conditional_depth;
+                    normal_terminated = statements(else_body);
+                    --conditional_depth;
+                    if (!normal_terminated) {
+                        exit_jumps.push_back(emit_try_exit(has_finalizer, statement.span));
+                    }
+                }
+
+                auto handlers_terminated = true;
+                std::optional<std::uint32_t> filter_begin;
+                if (has_handlers) {
+                    filter_begin = static_cast<std::uint32_t>(bytecode.instructions.size());
+                    std::vector<std::size_t> filters;
+                    filters.reserve(planned_handlers->size());
+                    for (const auto &handler : *planned_handlers) {
+                        const auto exception_register = allocate();
+                        filters.push_back(bytecode.instructions.size());
+                        emit(Opcode::match_exception, exception_register, 0U, 0U,
+                             static_cast<std::uint32_t>(std::to_underlying(handler.kind)), handler.filter_span);
+                    }
+                    const auto unmatched = static_cast<std::uint32_t>(bytecode.instructions.size());
+                    emit(Opcode::reraise, 0U, 0U, 0U, 0U, statement.span);
+                    for (std::size_t position = 0U; position < filters.size(); ++position) {
+                        bytecode.instructions[filters[position]].operand_b =
+                            position + 1U < filters.size() ? static_cast<std::uint32_t>(filters[position + 1U]) :
+                                                             unmatched;
+                    }
+
+                    for (std::size_t position = 0U; position < planned_handlers->size(); ++position) {
+                        const auto &handler = (*planned_handlers)[position];
+                        bytecode.instructions[filters[position]].operand_a =
+                            static_cast<std::uint32_t>(bytecode.instructions.size());
+                        handlers.push_back(HandlerFrame {
+                            .span = handler.node->span,
+                            .finalizer_depth = finalizer_depth,
+                        });
+                        ++conditional_depth;
+                        const auto handler_terminated = statements(index.sequence(*handler.node, "body"));
+                        --conditional_depth;
+                        handlers.pop_back();
+                        handlers_terminated = handlers_terminated && handler_terminated;
+                        if (!handler_terminated) {
+                            emit(Opcode::leave_except, 0U, 0U, 0U, 0U, handler.node->span);
+                            exit_jumps.push_back(emit_try_exit(has_finalizer, handler.node->span));
+                        }
+                    }
+
+                    bytecode.exception_regions.push_back(ExceptionRegion {
+                        .begin_instruction = handler_region_begin,
+                        .end_instruction = handler_region_end,
+                        .handler_instruction = *filter_begin,
+                        .cleanup_instruction = *filter_begin,
+                        .kind = ExceptionRegionKind::handler,
+                    });
+                }
+
+                const auto inner_terminated = normal_terminated && handlers_terminated;
+                if (!has_finalizer) {
+                    const auto end = static_cast<std::uint32_t>(bytecode.instructions.size());
+                    for (const auto jump : exit_jumps) { bytecode.instructions[jump].immediate = end; }
+                    return inner_terminated;
+                }
+
+                --cleanup_depth;
+                const auto cleanup_region_end = static_cast<std::uint32_t>(bytecode.instructions.size());
+                const auto cleanup_reraise = static_cast<std::uint32_t>(bytecode.instructions.size());
+                emit(Opcode::reraise, 0U, 0U, 0U, 0U, statement.span);
+                const auto cleanup_entry = static_cast<std::uint32_t>(bytecode.instructions.size());
+                ++finalizer_depth;
+                ++conditional_depth;
+                const auto finalizer_terminated = statements(final_body);
+                --conditional_depth;
+                --finalizer_depth;
+                if (!finalizer_terminated) {
+                    emit(Opcode::leave_try, 0U, 0U, 0U, 0U, statement.span);
+                }
+
+                const auto try_terminated = finalizer_terminated || inner_terminated;
+                std::uint32_t continuation {};
+                if (!try_terminated) {
+                    continuation = static_cast<std::uint32_t>(bytecode.instructions.size());
+                    emit(Opcode::enter_try, 0U, 0U, 0U, 0U, statement.span);
+                } else if (!exit_jumps.empty()) {
+                    continuation = static_cast<std::uint32_t>(bytecode.instructions.size());
+                    AstNode unreachable_value {
+                        .id = 0U,
+                        .kind = "Constant",
+                        .span = statement.span,
+                        .fields = {AstField {.name = "value",
+                                             .value = function.public_api ? ast_bool(false) : ast_none()}},
+                    };
+                    if (const auto value = constant(unreachable_value)) {
+                        emit(Opcode::return_value, value->reg, value->reg, 0U, 0U, statement.span);
+                    }
+                }
+                for (const auto jump : exit_jumps) { bytecode.instructions[jump].immediate = continuation; }
+
+                bytecode.exception_regions.push_back(ExceptionRegion {
+                    .begin_instruction = cleanup_region_begin,
+                    .end_instruction = cleanup_region_end,
+                    .handler_instruction = cleanup_reraise,
+                    .cleanup_instruction = cleanup_entry,
+                    .kind = ExceptionRegionKind::cleanup,
+                });
+                return try_terminated;
+            }
+
             bool statements(const std::vector<const AstNode *> &body) {
                 bool terminated {};
                 for (const auto *statement : body) {
@@ -2085,6 +2609,7 @@ namespace rule_engine::python::compiler {
                                                       "return value is incompatible with the function annotation",
                                 statement->span));
                         }
+                        emit_leave_handlers(0U, statement->span);
                         emit(Opcode::return_value, result->reg, result->reg, 0, 0, statement->span);
                         terminated = true;
                         continue;
@@ -2224,7 +2749,10 @@ namespace rule_engine::python::compiler {
                         }
                         const auto false_jump = bytecode.instructions.size();
                         emit(Opcode::jump_if_false, condition->reg, condition->reg, 0U, 0U, test->span);
-                        loops.push_back(LoopFrame {.continue_target = loop_start, .break_jumps = {}});
+                        loops.push_back(LoopFrame {.continue_target = loop_start,
+                                                   .break_jumps = {},
+                                                   .handler_depth = handlers.size(),
+                                                   .cleanup_depth = cleanup_depth});
                         ++conditional_depth;
                         const auto body_terminated = statements(index.sequence(*statement, "body"));
                         --conditional_depth;
@@ -2249,28 +2777,20 @@ namespace rule_engine::python::compiler {
                                 "PY-SCOPE", statement->kind + " appears outside a loop", statement->span));
                             continue;
                         }
+                        emit_leave_handlers(loops.back().handler_depth, statement->span);
+                        const auto unwind = cleanup_depth > loops.back().cleanup_depth;
                         if (statement->kind == "Break") {
                             loops.back().break_jumps.push_back(bytecode.instructions.size());
-                            emit(Opcode::jump, 0U, 0U, 0U, 0U, statement->span);
+                            emit(unwind ? Opcode::unwind_jump : Opcode::jump, 0U, 0U, 0U, 0U, statement->span);
                         } else {
-                            emit(Opcode::jump, 0U, 0U, 0U, loops.back().continue_target, statement->span);
+                            emit(unwind ? Opcode::unwind_jump : Opcode::jump, 0U, 0U, 0U, loops.back().continue_target,
+                                 statement->span);
                         }
                         terminated = true;
                         continue;
                     }
                     if (statement->kind == "Raise") {
-                        const auto *value = index.reference(*statement, "exc");
-                        if (value == nullptr) {
-                            diagnostics.push_back(make_diagnostic(
-                                "PY-NYI-BARE-RAISE", "bare raise requires active-exception metadata absent from F0",
-                                statement->span));
-                            continue;
-                        }
-                        const auto result = expression(*value);
-                        if (result) {
-                            emit(Opcode::raise_fault, result->reg, result->reg, 0U, 0U, statement->span);
-                            terminated = true;
-                        }
+                        terminated = lower_raise(*statement);
                         continue;
                     }
                     if (statement->kind == "For") {
@@ -2317,7 +2837,10 @@ namespace rule_engine::python::compiler {
 
                         const auto loop_header = static_cast<std::uint32_t>(bytecode.instructions.size());
                         emit(Opcode::iter_next, target_register, iterator_register, 0U, 0U, target->span);
-                        loops.push_back(LoopFrame {.continue_target = loop_header, .break_jumps = {}});
+                        loops.push_back(LoopFrame {.continue_target = loop_header,
+                                                   .break_jumps = {},
+                                                   .handler_depth = handlers.size(),
+                                                   .cleanup_depth = cleanup_depth});
                         ++conditional_depth;
                         const auto body_terminated = statements(index.sequence(*statement, "body"));
                         --conditional_depth;
@@ -2345,54 +2868,7 @@ namespace rule_engine::python::compiler {
                         continue;
                     }
                     if (statement->kind == "Try") {
-                        if (!index.sequence(*statement, "finalbody").empty()) {
-                            diagnostics.push_back(make_diagnostic(
-                                "PY-NYI-FINALLY-LOWERING",
-                                "finally lowering is not implemented by the current AST compiler", statement->span));
-                            continue;
-                        }
-                        const auto handlers = index.sequence(*statement, "handlers");
-                        if (handlers.size() != 1U || index.reference(*handlers.front(), "type") != nullptr ||
-                            index.string(*handlers.front(), "name").has_value()) {
-                            diagnostics.push_back(make_diagnostic(
-                                "PY-NYI-EXCEPTION-FILTER",
-                                "the current AST compiler lowers exactly one unbound catch-all except handler",
-                                statement->span));
-                            continue;
-                        }
-                        const auto region_begin = static_cast<std::uint32_t>(bytecode.instructions.size());
-                        emit(Opcode::enter_try, 0U, 0U, 0U, 0U, statement->span);
-                        ++conditional_depth;
-                        const auto body_terminated = statements(index.sequence(*statement, "body"));
-                        --conditional_depth;
-                        const auto region_end = static_cast<std::uint32_t>(bytecode.instructions.size());
-                        auto normal_terminated = body_terminated;
-                        if (!body_terminated) {
-                            emit(Opcode::leave_try, 0U, 0U, 0U, 0U, statement->span);
-                            ++conditional_depth;
-                            normal_terminated = statements(index.sequence(*statement, "orelse"));
-                            --conditional_depth;
-                        }
-                        std::optional<std::size_t> end_jump;
-                        if (!normal_terminated) {
-                            end_jump = bytecode.instructions.size();
-                            emit(Opcode::jump, 0U, 0U, 0U, 0U, statement->span);
-                        }
-                        const auto handler_begin = static_cast<std::uint32_t>(bytecode.instructions.size());
-                        ++conditional_depth;
-                        const auto handler_terminated = statements(index.sequence(*handlers.front(), "body"));
-                        --conditional_depth;
-                        const auto end = static_cast<std::uint32_t>(bytecode.instructions.size());
-                        if (end_jump) {
-                            bytecode.instructions[*end_jump].immediate = end;
-                        }
-                        bytecode.exception_regions.push_back(ExceptionRegion {
-                            .begin_instruction = region_begin,
-                            .end_instruction = region_end,
-                            .handler_instruction = handler_begin,
-                            .cleanup_instruction = handler_begin,
-                        });
-                        terminated = normal_terminated && handler_terminated;
+                        terminated = lower_try(*statement);
                         continue;
                     }
                     diagnostics.push_back(make_diagnostic(

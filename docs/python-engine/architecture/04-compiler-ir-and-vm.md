@@ -302,6 +302,105 @@ destructuring targets, item deletion, `range`, `async for`, arbitrary iterator
 protocols, and the source-level state API remain fail-closed until their typed
 scope, exception, replay, and charging contracts exist.
 
+### 5.9 Implemented exception and cleanup lowering
+
+The current frontend implements a closed exception slice whose semantics fit
+the verified register ABI. CPython parses the syntax but never executes an
+exception expression or chooses a handler. C++ resolves names, emits regions,
+verifies their graph, classifies runtime faults, and owns every unwind.
+
+#### Closed author-exception table
+
+| Source name | ABI kind | Role |
+|---|---|---|
+| `ValueError` | `value_error` | Concrete raise kind and exact handler filter |
+| `TypeError` | `type_error` | Concrete raise kind and exact handler filter |
+| `ArithmeticError` | `arithmetic_error` | Concrete raise kind and exact handler filter |
+| `Exception` | `exception` | Catch-all filter for the three concrete kinds |
+
+A bare `except:` uses the same closed catch-all as `except Exception:`. It does
+not catch cancellation, hard budgets, invalid bytecode, stale handles, host
+protocol faults, or engine faults. `Exception` is filter-only and cannot be
+raised. The compiler rejects a duplicate handler, a handler after a catch-all,
+and a name shadowed anywhere in the function or current module. It never
+reorders handlers to make a source program acceptable.
+
+Explicit raises are limited to `raise ValueError`, `raise TypeError`, or
+`raise ArithmeticError`, optionally called with zero or one positional `str`
+message and no keywords. `raise ... from ...`, arbitrary expressions, multiple
+arguments, user exception classes, and handler binding with `as` have no ABI
+representation and fail with stable source-spanned diagnostics. A bare
+`raise` emits `reraise` only in a handler body where an active exception is
+guaranteed on every entry. A conditionally active bare raise in `finally` is
+rejected: the VM guard for a missing current exception is an integrity failure,
+not Python's catchable `RuntimeError`, so lowering it would be an approximation.
+
+#### Handler and cleanup geometry
+
+~~~mermaid
+flowchart LR
+    A["try body: protected handler interval"]
+    A -->|"normal"| B["else suite"]
+    A -->|"author fault"| C["ordered match_exception chain"]
+    C -->|"match"| D["handler body"]
+    C -->|"no match"| E["reraise"]
+    B --> F["unwind_jump or normal join"]
+    D --> G["leave_except"]
+    G --> F
+    A -->|"return / break / continue"| H["saved unwind reason"]
+    E --> H
+    F --> H
+    H -->|"finally present"| I["cleanup entry"]
+    I --> J["leave_try resumes saved reason"]
+    H -->|"no finally"| K["continuation"]
+    J --> K
+    L["hard budget or cancellation"] -->|"bypass filters"| I
+~~~
+
+For `try/except/else`, only the `try` body belongs to the handler interval.
+Normal completion executes `leave_try` and then `else`; a fault in `else` does
+not select the preceding handlers. The exceptional entry is a source-ordered
+linked list of `match_exception` instructions ending in `reraise`. Every
+normally completing handler executes `leave_except` before joining ordinary
+control flow.
+
+`try/finally` adds an outer cleanup region. Combined
+`try/except/else/finally` is the same outer region protecting the complete
+inner handler construct, including filter and handler blocks. Cleanup entry and
+its distinct exceptional-resume `reraise` are outside the protected half-open
+interval. Every ordinary edge leaving that interval is `unwind_jump`; cleanup
+ends with `leave_try`, which resumes the saved normal target, return value,
+loop target, author exception, cancellation, or hard fault.
+
+Regions are disjoint or strictly nested. The VM selects the smallest exited
+cleanup first and records completed regions, so nested finalizers execute
+inside-out exactly once. A normal finalizer can replace a pending normal,
+return, loop, or author-exception unwind with its own return, jump, or exception.
+Forced cleanup cannot replace cancellation or a hard fault; an attempted
+replacement follows the bounded double/triple-fault policy.
+
+Loop frames record handler and cleanup depth. A loop inside a handler retains
+that handler on its own `break`; a handler opened inside a loop is left before
+breaking or continuing the loop. Plain backedges remain plain jumps so
+`iter_next` owns the single per-iteration charge. An edge that actually exits a
+`finally` region uses `unwind_jump`, preserving cleanup and loop-budget order.
+
+The independent verifier checks interval bounds and strict nesting, distinct
+cleanup entries, exceptional-only entry, ordered filter ownership and terminal
+`reraise`, current-exception reachability, initialized registers, and the
+absence of ordinary edges that enter a region midway or bypass cleanup.
+Malformed generated or mutated graphs fail activation with `PYC01xx`; rule
+handlers never receive a verifier failure.
+
+This remains a bounded implementation slice. Exception objects, `as` binding,
+argument tuples, traceback/context/cause state, user subclasses, conditional
+bare re-raise in finalizers, `BaseException`, and `except*`/exception groups are
+not implemented. Returns and loop transfers leave active handler state before
+an enclosing finalizer runs; accepted source cannot observe that state because
+binding and finalizer bare re-raise are rejected. Full Python observability at
+that boundary requires unwind records that carry handler-scope exits. These
+limitations and revisit conditions are recorded as L-028.
+
 ## 6. Independent bytecode verification
 
 The verifier is a separate component that consumes serialized bytecode rather than compiler-internal objects. Activation requires successful verification.
