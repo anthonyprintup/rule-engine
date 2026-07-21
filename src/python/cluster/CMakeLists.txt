@@ -4,11 +4,15 @@ add_library(
     audit.cpp
     breaker.cpp
     configuration.cpp
+    control_plane.cpp
+    control_serialization.cpp
     coordinator.cpp
     migrations.cpp
+    postgres_control_plane.cpp
     postgres_store.cpp
     readiness.cpp
     serialization.cpp
+    sqlite_control_plane.cpp
     sqlite_store.cpp
     store.cpp
 )

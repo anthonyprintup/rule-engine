@@ -74,6 +74,20 @@ namespace {
             audit);
     }
 
+    std::expected<std::unique_ptr<SqliteActivationControlStore>, StoreError>
+    open_control(const TemporaryDatabase &database) {
+        return SqliteActivationControlStore::open(SqliteDevConfig {
+            .database_path = database.path.string(),
+            .server_processes = 1,
+            .busy_timeout = std::chrono::seconds {2},
+            .wal = true,
+            .foreign_keys = true,
+            .remote_cluster = false,
+            .high_availability = false,
+            .deployment_mode = DeploymentMode::single_node_dev,
+        });
+    }
+
     FrozenValue frozen(const std::string &digest, const std::string &text = "value") {
         return FrozenValue {
             .value = make_fact(UnicodeValue {.utf8 = text}),
@@ -224,6 +238,63 @@ namespace {
             .capability_hashes = {},
             .diagnostics = {},
         };
+    }
+
+    GenerationSnapshot ready_generation(const std::uint64_t number, const std::string &source,
+                                        const std::string &schema = "state-schema-v1",
+                                        const std::string &state_namespace = "state-live") {
+        const auto first = node("node-a", 11);
+        const auto second = node("node-b", 12);
+        const auto semantic = "sha256:semantic-" + std::to_string(number);
+        const auto binding = "sha256:binding-" + std::to_string(number);
+        return GenerationSnapshot {
+            .request = generation(number, source, schema, state_namespace),
+            .phase = GenerationPhase::ready,
+            .target_nodes = {first.node_id, second.node_id},
+            .reports = {compilation(first, semantic, binding), compilation(second, semantic, binding)},
+            .semantic_hash = semantic,
+            .binding_hash = binding,
+            .requeued_work = {},
+            .failure = {},
+        };
+    }
+
+    AdminMutationRequest mutation_request(const std::string &identity, const std::uint64_t expected_pack_version,
+                                          const std::uint64_t at_unix_ms) {
+        return AdminMutationRequest {.operation_id = "operation-" + identity,
+                                     .request_id = RequestId {"request-" + identity},
+                                     .idempotency_key = "idempotency-" + identity,
+                                     .actor = "operator-a",
+                                     .reason = "test " + identity,
+                                     .expected_pack_version = expected_pack_version,
+                                     .at_unix_ms = at_unix_ms};
+    }
+
+    AdminApplyRequest apply_request(const AdminOperationRecord &operation, const std::uint64_t expected_pack_version,
+                                    const std::uint64_t at_unix_ms) {
+        return AdminApplyRequest {.operation_id = operation.operation_id,
+                                  .idempotency_key = operation.idempotency_key,
+                                  .expected_pack_version = expected_pack_version,
+                                  .at_unix_ms = at_unix_ms};
+    }
+
+    std::uint64_t stage_and_activate(DurableActivationAdmin &admin, const GenerationSnapshot &generation,
+                                     const std::uint64_t pack_version, const std::string &identity,
+                                     const std::uint64_t at_unix_ms) {
+        const auto stage =
+            admin.preview_stage(mutation_request(identity + "-stage", pack_version, at_unix_ms), generation);
+        REQUIRE(stage.has_value());
+        REQUIRE(admin.apply_stage(apply_request(*stage, pack_version, at_unix_ms + 1), generation).has_value());
+
+        const auto activation =
+            admin.preview_activation(mutation_request(identity + "-activate", pack_version + 1, at_unix_ms + 2),
+                                     generation.request.pack, generation.request.generation);
+        REQUIRE(activation.has_value());
+        REQUIRE(admin.begin_drain(apply_request(*activation, pack_version + 1, at_unix_ms + 3), at_unix_ms + 100)
+                    .has_value());
+        REQUIRE(admin.fence_stragglers(apply_request(*activation, pack_version + 2, at_unix_ms + 4), {}).has_value());
+        REQUIRE(admin.flip(apply_request(*activation, pack_version + 3, at_unix_ms + 5)).has_value());
+        return pack_version + 4;
     }
 
     void stage_ready(ActivationController &activation, const GenerationRequest &request,
@@ -403,6 +474,300 @@ namespace {
                     })
                     ->size() == 2);
         REQUIRE((*reopened)->inspect()->outbox.size() == 1);
+    }
+
+    TEST_CASE("SQLite runtime and activation stores coexist on one durable authority") {
+        TemporaryDatabase database;
+        const auto staged_generation = ready_generation(1, "sha256:shared-source");
+        {
+            AuditTrail audit;
+            const auto runtime = open_sqlite(database, audit);
+            const auto control = open_control(database);
+            REQUIRE(runtime.has_value());
+            REQUIRE(control.has_value());
+            DurableActivationAdmin admin {**control};
+            const auto preview = admin.preview_stage(mutation_request("shared-stage", 0, 10), staged_generation);
+            REQUIRE(preview.has_value());
+            REQUIRE(admin.apply_stage(apply_request(*preview, 0, 11), staged_generation).has_value());
+            REQUIRE((*runtime)->install_consumer_fence("shared:peer", 2).has_value());
+            REQUIRE((*runtime)->transact_event(transaction("shared-event", "shared:peer", 0, 2, 0)).has_value());
+        }
+
+        AuditTrail reopened_audit;
+        const auto runtime = open_sqlite(database, reopened_audit);
+        const auto control = open_control(database);
+        REQUIRE(runtime.has_value());
+        REQUIRE(control.has_value());
+        REQUIRE((*runtime)->load_receipt(EventId {"shared-event"})->has_value());
+        const auto inspection = (*control)->inspect();
+        REQUIRE(inspection.has_value());
+        REQUIRE(inspection->state.generations.size() == 1);
+        REQUIRE(inspection->audit.size() == 2);
+    }
+
+    TEST_CASE("durable activation operations are idempotent and resume across SQLite restarts") {
+        TemporaryDatabase database;
+        const auto first_generation = ready_generation(1, "sha256:source-one");
+        const auto stage_request = mutation_request("durable-stage-one", 0, 10);
+        const auto activation_request = mutation_request("durable-activate-one", 1, 20);
+
+        {
+            const auto store = open_control(database);
+            REQUIRE(store.has_value());
+            DurableActivationAdmin admin {**store};
+
+            const auto stage = admin.preview_stage(stage_request, first_generation);
+            REQUIRE(stage.has_value());
+            REQUIRE(stage->phase == AdminOperationPhase::previewed);
+            REQUIRE(admin.preview_stage(stage_request, first_generation)->phase == AdminOperationPhase::previewed);
+
+            auto changed_generation = first_generation;
+            changed_generation.request.source_digest = SourceDigest {"sha256:different"};
+            const auto changed_retry = admin.preview_stage(stage_request, changed_generation);
+            REQUIRE_FALSE(changed_retry.has_value());
+            REQUIRE(changed_retry.error().code == StoreErrorCode::constraint_violation);
+
+            const auto preview_inspection = admin.inspect();
+            REQUIRE(preview_inspection.has_value());
+            REQUIRE(preview_inspection->state.generations.empty());
+            REQUIRE(preview_inspection->state.packs.empty());
+            REQUIRE(preview_inspection->audit.size() == 1);
+
+            const auto staged = admin.apply_stage(apply_request(*stage, 0, 11), first_generation);
+            REQUIRE(staged.has_value());
+            REQUIRE(admin.apply_stage(apply_request(*stage, 0, 12), first_generation).has_value());
+
+            const auto activation = admin.preview_activation(activation_request, first_generation.request.pack, 1);
+            REQUIRE(activation.has_value());
+            const auto activation_preview = admin.state_snapshot();
+            REQUIRE(activation_preview.has_value());
+            REQUIRE(activation_preview->packs.size() == 1);
+            REQUIRE_FALSE(activation_preview->packs.front().active_generation.has_value());
+            REQUIRE_FALSE(activation_preview->packs.front().drain_target.has_value());
+            REQUIRE(activation_preview->packs.front().resource_version == 1);
+        }
+
+        {
+            const auto store = open_control(database);
+            REQUIRE(store.has_value());
+            DurableActivationAdmin admin {**store};
+            const auto activation = admin.preview_activation(activation_request, first_generation.request.pack, 1);
+            REQUIRE(activation.has_value());
+            REQUIRE(activation->phase == AdminOperationPhase::previewed);
+
+            const auto drained = admin.begin_drain(apply_request(*activation, 1, 21), 500);
+            REQUIRE(drained.has_value());
+            REQUIRE_FALSE(drained->old_generation.has_value());
+            REQUIRE(drained->successor_assignment_fence == 1);
+            REQUIRE(admin.begin_drain(apply_request(*activation, 1, 22), 500)->successor_assignment_fence == 1);
+
+            const auto draining = admin.state_snapshot();
+            REQUIRE(draining.has_value());
+            REQUIRE(draining->packs.front().resource_version == 2);
+            REQUIRE_FALSE(draining->packs.front().accepting_assignments);
+            REQUIRE(draining->packs.front().drain_target == 1);
+        }
+
+        {
+            const auto store = open_control(database);
+            REQUIRE(store.has_value());
+            DurableActivationAdmin admin {**store};
+            const auto operation = admin.operation_snapshot(activation_request.operation_id);
+            REQUIRE(operation.has_value());
+            REQUIRE(operation->has_value());
+
+            const auto fenced =
+                admin.fence_stragglers(apply_request(**operation, 2, 23), {"work-b", "work-a", "work-a"});
+            REQUIRE(fenced.has_value());
+            REQUIRE(*fenced == std::vector<std::string> {"work-a", "work-b"});
+            const auto fence_retry = admin.fence_stragglers(apply_request(**operation, 2, 24), {"work-a", "work-b"});
+            REQUIRE(fence_retry.has_value());
+            REQUIRE(*fence_retry == *fenced);
+        }
+
+        {
+            const auto store = open_control(database);
+            REQUIRE(store.has_value());
+            DurableActivationAdmin admin {**store};
+            const auto operation = admin.operation_snapshot(activation_request.operation_id);
+            REQUIRE(operation.has_value());
+            REQUIRE(operation->has_value());
+
+            const auto flipped = admin.flip(apply_request(**operation, 3, 25));
+            REQUIRE(flipped.has_value());
+            REQUIRE(flipped->active_generation == 1);
+            REQUIRE_FALSE(flipped->retired_generation.has_value());
+            REQUIRE(flipped->assignment_fence == 2);
+            REQUIRE(flipped->requeued_work == std::vector<std::string> {"work-a", "work-b"});
+            const auto flip_retry = admin.flip(apply_request(**operation, 3, 26));
+            REQUIRE(flip_retry.has_value());
+            REQUIRE(flip_retry->active_generation == flipped->active_generation);
+            REQUIRE(flip_retry->activation_cursor == flipped->activation_cursor);
+            REQUIRE(admin.preview_activation(activation_request, first_generation.request.pack, 1)->phase ==
+                    AdminOperationPhase::applied);
+
+            const auto inspection = admin.inspect();
+            REQUIRE(inspection.has_value());
+            REQUIRE(inspection->state.storage_revision == 6);
+            REQUIRE(inspection->state.packs.front().resource_version == 4);
+            REQUIRE(inspection->state.packs.front().active_generation == 1);
+            REQUIRE(inspection->state.packs.front().accepting_assignments);
+            REQUIRE_FALSE(inspection->state.packs.front().drain_boundary.has_value());
+            REQUIRE(inspection->state.packs.front().pending_requeues.empty());
+            REQUIRE(inspection->state.generations.front().phase == GenerationPhase::active);
+            REQUIRE(inspection->operations.size() == 2);
+            REQUIRE(inspection->audit.size() == 6);
+            REQUIRE(inspection->audit.front().action == "admin.pack.stage.preview");
+            REQUIRE(inspection->audit.back().action == "admin.pack.activate.flip");
+            REQUIRE(std::ranges::all_of(inspection->audit,
+                                        [](const AuditRecord &record) { return record.actor == "operator-a"; }));
+        }
+    }
+
+    TEST_CASE("control-plane apply rejects stale previews without partially staging a generation") {
+        TemporaryDatabase database;
+        const auto store = open_control(database);
+        REQUIRE(store.has_value());
+        DurableActivationAdmin admin {**store};
+        const auto first_generation = ready_generation(1, "sha256:source-one");
+        const auto second_generation = ready_generation(2, "sha256:source-two");
+
+        const auto first = admin.preview_stage(mutation_request("winner", 0, 10), first_generation);
+        const auto second = admin.preview_stage(mutation_request("stale", 0, 11), second_generation);
+        REQUIRE(first.has_value());
+        REQUIRE(second.has_value());
+        REQUIRE(admin.state_snapshot()->generations.empty());
+        REQUIRE(admin.apply_stage(apply_request(*first, 0, 12), first_generation).has_value());
+
+        const auto stale_apply = admin.apply_stage(apply_request(*second, 0, 13), second_generation);
+        REQUIRE_FALSE(stale_apply.has_value());
+        REQUIRE(stale_apply.error().code == StoreErrorCode::stale_fence);
+        const auto inspection = admin.inspect();
+        REQUIRE(inspection.has_value());
+        REQUIRE(inspection->state.generations.size() == 1);
+        REQUIRE(inspection->state.generations.front().request.generation == 1);
+        REQUIRE(inspection->state.packs.front().resource_version == 1);
+        REQUIRE(inspection->audit.size() == 3);
+        REQUIRE(admin.operation_snapshot(second->operation_id)->value().phase == AdminOperationPhase::previewed);
+    }
+
+    TEST_CASE("durable staging fails closed on implicit incompatible state transitions") {
+        TemporaryDatabase database;
+        const auto store = open_control(database);
+        REQUIRE(store.has_value());
+        DurableActivationAdmin admin {**store};
+        const auto active = ready_generation(1, "sha256:source-one");
+        REQUIRE(stage_and_activate(admin, active, 0, "state-baseline", 10) == 4);
+
+        auto incompatible = ready_generation(2, "sha256:source-two", "state-schema-v2", "state-v2");
+        const auto rejected = admin.preview_stage(mutation_request("implicit-state-change", 4, 30), incompatible);
+        REQUIRE_FALSE(rejected.has_value());
+        REQUIRE(rejected.error().code == StoreErrorCode::incompatible_schema);
+        REQUIRE(admin.state_snapshot()->generations.size() == 1);
+
+        incompatible.request.state_transition = StateTransitionPlan {.mode = StateTransitionMode::migrate,
+                                                                     .source_namespace = "state-live",
+                                                                     .target_namespace = "state-v2",
+                                                                     .migration_id = "migration-v2",
+                                                                     .reset_authorized = false,
+                                                                     .accept_state_gap = false};
+        const auto explicit_migration =
+            admin.preview_stage(mutation_request("explicit-state-change", 4, 31), incompatible);
+        REQUIRE(explicit_migration.has_value());
+        REQUIRE(explicit_migration->state_transition.mode == StateTransitionMode::migrate);
+        REQUIRE(admin.state_snapshot()->generations.size() == 1);
+    }
+
+    TEST_CASE("rollback is a durable forward activation with an explicit state strategy") {
+        TemporaryDatabase database;
+        const auto first_generation = ready_generation(1, "sha256:source-one");
+        const auto second_generation = ready_generation(2, "sha256:source-two");
+        AdminMutationRequest rollback_request;
+        StateTransitionPlan rollback_transition;
+        GenerationSnapshot rollback_generation;
+
+        {
+            const auto store = open_control(database);
+            REQUIRE(store.has_value());
+            DurableActivationAdmin admin {**store};
+            auto pack_version = stage_and_activate(admin, first_generation, 0, "first", 10);
+            pack_version = stage_and_activate(admin, second_generation, pack_version, "second", 30);
+            REQUIRE(pack_version == 8);
+
+            rollback_request = mutation_request("rollback-one", pack_version, 50);
+            rollback_transition = StateTransitionPlan {.mode = StateTransitionMode::carry,
+                                                       .source_namespace = {},
+                                                       .target_namespace = {},
+                                                       .migration_id = {},
+                                                       .reset_authorized = false,
+                                                       .accept_state_gap = false};
+            const auto preview =
+                admin.preview_rollback(rollback_request, first_generation.request.pack, 1, 3, rollback_transition);
+            REQUIRE(preview.has_value());
+            REQUIRE(preview->state_transition.source_namespace == "state-live");
+            REQUIRE(preview->state_transition.target_namespace == "state-live");
+            REQUIRE(admin.state_snapshot()->generations.size() == 2);
+
+            rollback_generation = first_generation;
+            rollback_generation.request.generation = 3;
+            rollback_generation.request.rollback_from = 1;
+            rollback_generation.request.state_transition = preview->state_transition;
+            const auto staged = admin.apply_rollback_stage(apply_request(*preview, 8, 51), rollback_generation);
+            REQUIRE(staged.has_value());
+            REQUIRE(staged->request.rollback_from == 1);
+            REQUIRE(admin.state_snapshot()->packs.front().resource_version == 9);
+        }
+
+        {
+            const auto store = open_control(database);
+            REQUIRE(store.has_value());
+            DurableActivationAdmin admin {**store};
+            const auto preview =
+                admin.preview_rollback(rollback_request, first_generation.request.pack, 1, 3, rollback_transition);
+            REQUIRE(preview.has_value());
+            REQUIRE(preview->phase == AdminOperationPhase::staged);
+            REQUIRE(admin.apply_rollback_stage(apply_request(*preview, 8, 52), rollback_generation).has_value());
+
+            const auto drained = admin.begin_drain(apply_request(*preview, 9, 53), 900);
+            REQUIRE(drained.has_value());
+            REQUIRE(drained->old_generation == 2);
+            REQUIRE(drained->target_generation == 3);
+        }
+
+        {
+            const auto store = open_control(database);
+            REQUIRE(store.has_value());
+            DurableActivationAdmin admin {**store};
+            const auto operation = admin.operation_snapshot(rollback_request.operation_id);
+            REQUIRE(operation.has_value());
+            REQUIRE(operation->has_value());
+            REQUIRE(admin.fence_stragglers(apply_request(**operation, 10, 54), {"rollback-work"}).has_value());
+            const auto activated = admin.flip(apply_request(**operation, 11, 55));
+            REQUIRE(activated.has_value());
+            REQUIRE(activated->retired_generation == 2);
+            REQUIRE(activated->active_generation == 3);
+            REQUIRE(activated->requeued_work == std::vector<std::string> {"rollback-work"});
+
+            const auto inspection = admin.inspect();
+            REQUIRE(inspection.has_value());
+            REQUIRE(inspection->state.packs.front().resource_version == 12);
+            REQUIRE(inspection->state.packs.front().active_generation == 3);
+            REQUIRE(inspection->state.packs.front().accepting_assignments);
+            REQUIRE(inspection->state.generations.size() == 3);
+            REQUIRE(inspection->state.generations[0].phase == GenerationPhase::retired);
+            REQUIRE(inspection->state.generations[1].phase == GenerationPhase::retired);
+            REQUIRE(inspection->state.generations[2].phase == GenerationPhase::active);
+            REQUIRE(inspection->operations.size() == 5);
+            REQUIRE(inspection->audit.size() == 17);
+            REQUIRE(admin.preview_rollback(rollback_request, first_generation.request.pack, 1, 3, rollback_transition)
+                        ->phase == AdminOperationPhase::applied);
+
+            const auto reused_generation =
+                admin.preview_rollback(mutation_request("rollback-stale-generation", 12, 56),
+                                       first_generation.request.pack, 1, 2, rollback_transition);
+            REQUIRE_FALSE(reused_generation.has_value());
+            REQUIRE(reused_generation.error().code == StoreErrorCode::stale_fence);
+        }
     }
 
     TEST_CASE("SQLite shared leases fence a crashed coordinator and recover its receipt") {
@@ -930,6 +1295,11 @@ namespace {
             audit);
         REQUIRE_FALSE(unavailable.has_value());
         REQUIRE(unavailable.error().code == StoreErrorCode::unavailable);
+        const auto unavailable_control = PostgreSqlActivationControlStore::open(PostgreSql17Config {
+            .connection_reference = "secret://runtime/postgres",
+        });
+        REQUIRE_FALSE(unavailable_control.has_value());
+        REQUIRE(unavailable_control.error().code == StoreErrorCode::unavailable);
 #endif
     }
 
