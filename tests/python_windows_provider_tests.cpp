@@ -70,10 +70,10 @@ namespace {
 
     [[nodiscard]] py::FactRequest request(py::SubjectKey subject, std::string route,
                                           const std::uint64_t deadline = 0U) {
-        const auto *descriptor = win::find_windows_fact_descriptor(subject.descriptor, route);
+        const auto descriptor = win::find_windows_fact_descriptor(subject.descriptor, route);
         const auto fallback = py::resolve_schema_identity(py::SchemaCatalog {}, py::SchemaId {"bool"});
         REQUIRE(fallback.has_value());
-        const auto schema = descriptor == nullptr ? *fallback : descriptor->value_schema;
+        const auto schema = !descriptor.has_value() ? *fallback : descriptor->value_schema;
         return py::FactRequest {.request_id = py::RequestId {"request:test"},
                                 .subject = std::move(subject),
                                 .route = py::FactRoute {.provider = "windows", .fact = std::move(route)},

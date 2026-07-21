@@ -38,8 +38,9 @@ namespace rule_engine::python::windows {
                              "windows.process-user-value.v1|1:text|required|2:text|required"},
             ValueSchemaSpec {process_token_value_schema,
                              "windows.process-token-value.v1|1:bool|required|2:text|required|3:text|required"},
-            ValueSchemaSpec {process_memory_value_schema,
-                             "windows.process-memory-value.v1|1:int|required|2:int|required|3:int|required|4:int|required"},
+            ValueSchemaSpec {
+                process_memory_value_schema,
+                "windows.process-memory-value.v1|1:int|required|2:int|required|3:int|required|4:int|required"},
             ValueSchemaSpec {signer_value_schema,
                              "windows.signer-value.v1|1:text|required|2:bool|required|3:bool|required|4:int|required|"
                              "5:optional-text|required|6:optional-text|required|7:optional-bytes|required|"
@@ -114,8 +115,8 @@ namespace rule_engine::python::windows {
             const auto canonical = descriptor == value_schema_specs.end() ? schema : descriptor->canonical_descriptor;
             return SchemaIdentity {
                 .id = std::move(id),
-                .canonical_hash = canonical_schema_hash("rule-engine.windows.fact-value-schema.v1|" +
-                                                        std::string {canonical}),
+                .canonical_hash =
+                    canonical_schema_hash("rule-engine.windows.fact-value-schema.v1|" + std::string {canonical}),
             };
         }
 
@@ -294,29 +295,19 @@ namespace rule_engine::python::windows {
 
     } // namespace
 
-    const std::vector<WindowsFactDescriptor> &windows_fact_catalog() {
-        static const auto catalog = [] {
-            std::vector<WindowsFactDescriptor> result;
-            result.reserve(fact_descriptor_specs.size());
-            for (const auto &descriptor : fact_descriptor_specs) {
-                result.push_back(WindowsFactDescriptor {
-                    .subject_schema = SchemaId {std::string {descriptor.subject_schema}},
-                    .route = std::string {descriptor.route},
-                    .value_schema = provider_schema_identity(descriptor.value_schema),
-                });
-            }
-            return result;
-        }();
-        return catalog;
-    }
-
-    const WindowsFactDescriptor *find_windows_fact_descriptor(const SchemaId &subject_schema,
-                                                               const std::string_view route) {
-        const auto &catalog = windows_fact_catalog();
-        const auto found = std::ranges::find_if(catalog, [&](const WindowsFactDescriptor &descriptor) {
-            return descriptor.subject_schema == subject_schema && descriptor.route == route;
+    std::optional<WindowsFactDescriptor> find_windows_fact_descriptor(const SchemaId &subject_schema,
+                                                                      const std::string_view route) {
+        const auto found = std::ranges::find_if(fact_descriptor_specs, [&](const FactDescriptorSpec &descriptor) {
+            return descriptor.subject_schema == subject_schema.value && descriptor.route == route;
         });
-        return found == catalog.end() ? nullptr : std::addressof(*found);
+        if (found == fact_descriptor_specs.end()) {
+            return std::nullopt;
+        }
+        return WindowsFactDescriptor {
+            .subject_schema = SchemaId {std::string {found->subject_schema}},
+            .route = std::string {found->route},
+            .value_schema = provider_schema_identity(found->value_schema),
+        };
     }
 
     FactTerminalStatus terminal_status(const ProviderErrorCode code) noexcept {

@@ -1505,8 +1505,8 @@ namespace rule_engine::python::windows {
             return response;
         }
 
-        const auto *descriptor = find_windows_fact_descriptor(request.subject.descriptor, request.route.fact);
-        if (descriptor == nullptr) {
+        const auto descriptor = find_windows_fact_descriptor(request.subject.descriptor, request.route.fact);
+        if (!descriptor.has_value()) {
             const auto failure =
                 error(ProviderErrorCode::unsupported, "fact dispatch", "fact route has no provider descriptor");
             response.status = terminal_status(failure.code);

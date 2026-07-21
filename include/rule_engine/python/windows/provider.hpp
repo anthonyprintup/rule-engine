@@ -102,9 +102,8 @@ namespace rule_engine::python::windows {
 
     [[nodiscard]] FactTerminalStatus terminal_status(ProviderErrorCode code) noexcept;
     [[nodiscard]] Diagnostic provider_diagnostic(const ProviderError &error);
-    [[nodiscard]] const std::vector<WindowsFactDescriptor> &windows_fact_catalog();
-    [[nodiscard]] const WindowsFactDescriptor *find_windows_fact_descriptor(const SchemaId &subject_schema,
-                                                                             std::string_view route);
+    [[nodiscard]] std::optional<WindowsFactDescriptor> find_windows_fact_descriptor(const SchemaId &subject_schema,
+                                                                                    std::string_view route);
 
     [[nodiscard]] SubjectKey process_subject(PeerId peer, std::uint32_t pid, std::uint64_t creation_time);
     [[nodiscard]] SubjectKey memory_region_subject(const SubjectKey &process, std::uint64_t allocation_base,

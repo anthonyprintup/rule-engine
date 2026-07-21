@@ -92,9 +92,8 @@ namespace {
 
     [[nodiscard]] proto::WorkLeaseMessage work(const proto::ServerHelloMessage &server,
                                                const std::uint64_t sequence = 1U) {
-        const auto *descriptor =
-            win::find_windows_fact_descriptor(py::SchemaId {"windows.process.v1"}, "process.path");
-        REQUIRE(descriptor != nullptr);
+        const auto descriptor = win::find_windows_fact_descriptor(py::SchemaId {"windows.process.v1"}, "process.path");
+        REQUIRE(descriptor.has_value());
         return proto::WorkLeaseMessage {
             .session = server.session,
             .peer = server.peer,
