@@ -230,6 +230,47 @@ Evaluation order, short-circuit behavior, chained comparisons, call-argument eva
 
 Rejected valid syntax receives `PY-UNSUPPORTED` with the AST kind, source span, explanation, and a supported replacement when one exists. Syntax rejected by CPython receives `PY-SYNTAX` with CPython's location normalized to the original UTF-8 source.
 
+### 5.4 Current bounded container and loop implementation
+
+The allowlist above is the target source-language contract. The current static
+compiler implements a smaller fail-closed slice. In addition to its earlier
+scalar/control-flow support, it now lowers:
+
+- fresh list and tuple displays without starred unpacking;
+- fresh dictionary displays without `**` unpacking;
+- subscription reads for list, tuple, dictionary, string, bytes, or a
+  runtime-checked unknown value;
+- one-target subscription assignment to lists and dictionaries; and
+- synchronous `for` with one local-name target, including `else`, `break`, and
+  `continue`, over VM list/tuple/dictionary/string/bytes values.
+
+List and tuple elements are evaluated left to right before the bounded build
+operation. A dictionary is allocated empty, then each key and value is evaluated
+and inserted before the next entry is evaluated. That ordering is intentional:
+an unhashable key or failing equality operation must prevent later entry
+expressions from running. Normal assignment evaluates the right-hand side before
+the subscription container and index/key.
+
+Every successful iterator advance is charged before mutation of iterator state;
+the exhausted edge is not charged. `continue` returns to that charged advance,
+normal exhaustion enters `else`, and `break` skips `else`. Dictionary iteration
+yields keys in insertion order.
+
+The current slice rejects sets, slices, `range`, starred/`**` expansion,
+comprehensions and generator expressions, item deletion, destructuring loop
+targets, `async for`, and arbitrary Python iterator protocols. Comprehensions are
+not approximated with fixed display bytecode because their result count and
+scope depend on runtime iteration; they require a bounded append/builder opcode
+and an isolated comprehension binding scope.
+
+Persistent state deletion remains the specified
+`state.delete(StateKey, identity=...)` API, not `del state[...]`. The VM already
+has a transactional `delete_state` opcode, but the compiler cannot emit it until
+module-level `StateKey[T]` declarations, injected `State`/`SharedState`
+capabilities, canonical identities, activation-selected namespaces, schemas,
+and operator bindings are lowered into a canonical state operand. Until then the
+call fails with `PY-NYI-STATE-LOWERING`.
+
 ## 6. Static classes, records, and object semantics
 
 - Base classes are literal names resolved in the closed module graph. The compiler computes exact C3 MRO and rejects inconsistent MROs.

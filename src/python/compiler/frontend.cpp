@@ -235,6 +235,15 @@ namespace rule_engine::python::compiler {
                 if (name == "bytes") {
                     return {.kind = StaticTypeKind::bytes, .qualified_name = "bytes"};
                 }
+                if (name == "list") {
+                    return {.kind = StaticTypeKind::list, .qualified_name = "list[Any]"};
+                }
+                if (name == "tuple") {
+                    return {.kind = StaticTypeKind::tuple, .qualified_name = "tuple[Any]"};
+                }
+                if (name == "dict") {
+                    return {.kind = StaticTypeKind::dictionary, .qualified_name = "dict[Any,Any]"};
+                }
                 if (name == "None") {
                     return {.kind = StaticTypeKind::none, .qualified_name = "None"};
                 }
@@ -256,6 +265,9 @@ namespace rule_engine::python::compiler {
                 }
                 if (name == "list") {
                     return {.kind = StaticTypeKind::list, .qualified_name = "list[" + nested.qualified_name + "]"};
+                }
+                if (name == "tuple") {
+                    return {.kind = StaticTypeKind::tuple, .qualified_name = "tuple[" + nested.qualified_name + "]"};
                 }
                 if (name == "dict") {
                     return {.kind = StaticTypeKind::dictionary, .qualified_name = "dict"};
@@ -1113,6 +1125,8 @@ namespace rule_engine::python::compiler {
                 case StaticTypeKind::string: return SchemaId {"text"};
                 case StaticTypeKind::bytes: return SchemaId {"bytes"};
                 case StaticTypeKind::list: return SchemaId {type.qualified_name.empty() ? "list" : type.qualified_name};
+                case StaticTypeKind::tuple:
+                    return SchemaId {type.qualified_name.empty() ? "tuple" : type.qualified_name};
                 case StaticTypeKind::dictionary:
                     return SchemaId {type.qualified_name.empty() ? "dict" : type.qualified_name};
                 case StaticTypeKind::model: return SchemaId {type.qualified_name};
@@ -1261,100 +1275,205 @@ namespace rule_engine::python::compiler {
                 return ExpressionResult {.reg = destination, .type = std::move(type)};
             }
 
-            std::optional<FactValue> literal_fact(const AstNode &node) {
-                if (node.kind == "Constant") {
-                    const auto *value = index.field(node, "value");
-                    if (value == nullptr) {
+            [[nodiscard]] static StaticType any_type() {
+                return {.kind = StaticTypeKind::unknown, .qualified_name = "Any"};
+            }
+
+            [[nodiscard]] static std::string type_name(const StaticType &type) {
+                return type.qualified_name.empty() ? std::string {"Any"} : type.qualified_name;
+            }
+
+            [[nodiscard]] static StaticType unified_type(const std::vector<ExpressionResult> &values,
+                                                         const std::size_t offset = 0U, const std::size_t stride = 1U) {
+                if (offset >= values.size()) {
+                    return any_type();
+                }
+                auto result = values[offset].type;
+                for (auto position = offset + stride; position < values.size(); position += stride) {
+                    result = unify(std::move(result), values[position].type);
+                }
+                return result;
+            }
+
+            std::optional<ExpressionResult> collection_display(const AstNode &node) {
+                std::vector<ExpressionResult> values;
+                std::uint32_t item_count {};
+                Opcode opcode {Opcode::build_list};
+                StaticType result_type;
+
+                if (node.kind == "Dict") {
+                    const auto keys = index.sequence(node, "keys");
+                    const auto mapped_values = index.sequence(node, "values");
+                    if (keys.size() != mapped_values.size()) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-NYI-COLLECTION-UNPACKING",
+                            "dictionary ** unpacking requires bounded expansion bytecode that is not implemented",
+                            node.span));
                         return std::nullopt;
                     }
-                    if (std::holds_alternative<std::monostate>(value->value.data)) {
-                        return make_fact(std::monostate {});
-                    }
-                    if (const auto *boolean = std::get_if<bool>(&value->value.data)) {
-                        return make_fact(*boolean);
-                    }
-                    if (const auto *integer = std::get_if<IntegerValue>(&value->value.data)) {
-                        return make_fact(*integer);
-                    }
-                    if (const auto *floating = std::get_if<AstFloatBits>(&value->value.data)) {
-                        return make_fact(std::bit_cast<double>(floating->bits));
-                    }
-                    if (const auto *unicode = std::get_if<UnicodeValue>(&value->value.data)) {
-                        return make_fact(*unicode);
-                    }
-                    if (const auto *bytes = std::get_if<BytesValue>(&value->value.data)) {
-                        return make_fact(*bytes);
-                    }
-                    return std::nullopt;
-                }
-                if (node.kind == "List") {
-                    FactList list;
-                    for (const auto *element : index.sequence(node, "elts")) {
-                        const auto value = literal_fact(*element);
+                    const auto destination = allocate();
+                    emit(Opcode::build_dict, destination, 0U, 0U, 0U, node.span);
+                    values.reserve(keys.size() * 2U);
+                    for (std::size_t position = 0U; position < keys.size(); ++position) {
+                        const auto key = expression(*keys[position]);
+                        if (!key) {
+                            return std::nullopt;
+                        }
+                        values.push_back(*key);
+                        const auto value = expression(*mapped_values[position]);
                         if (!value) {
                             return std::nullopt;
                         }
-                        list.items.push_back(*value);
+                        values.push_back(*value);
+                        emit(Opcode::store_subscript, value->reg, destination, key->reg, 0U, node.span);
                     }
-                    return make_fact(std::move(list));
+                    const auto key_type = unified_type(values, 0U, 2U);
+                    const auto value_type = unified_type(values, 1U, 2U);
+                    may_fault = true;
+                    return ExpressionResult {
+                        .reg = destination,
+                        .type = {.kind = StaticTypeKind::dictionary,
+                                 .qualified_name = "dict[" + type_name(key_type) + "," + type_name(value_type) + "]"},
+                    };
                 }
-                if (node.kind == "Dict") {
-                    const auto keys = index.sequence(node, "keys");
-                    const auto values = index.sequence(node, "values");
-                    if (keys.size() != values.size()) {
-                        return std::nullopt;
-                    }
-                    FactMap map;
-                    for (std::size_t position = 0; position < keys.size(); ++position) {
-                        const auto key = literal_fact(*keys[position]);
-                        const auto value = literal_fact(*values[position]);
-                        if (!key || !value) {
-                            return std::nullopt;
-                        }
-                        map.entries.push_back(FactMapEntry {.key = *key, .value = *value});
-                    }
-                    return make_fact(std::move(map));
-                }
-                return std::nullopt;
-            }
 
-            std::optional<ExpressionResult> literal_collection(const AstNode &node) {
-                const auto value = literal_fact(node);
-                if (!value) {
+                const auto elements = index.sequence(node, "elts");
+                if (std::ranges::any_of(elements, [](const AstNode *element) { return element->kind == "Starred"; })) {
                     diagnostics.push_back(make_diagnostic(
-                        "PY-NYI-COLLECTION-LOWERING",
-                        "only recursively constant list and dictionary displays are lowered by the F0 bytecode",
+                        "PY-NYI-COLLECTION-UNPACKING",
+                        "starred display elements require bounded expansion bytecode that is not implemented",
                         node.span));
                     return std::nullopt;
                 }
-                const auto constant_index = static_cast<std::uint32_t>(pack.constants.size());
-                pack.constants.push_back(*value);
+                values.reserve(elements.size());
+                for (const auto *element : elements) {
+                    const auto value = expression(*element);
+                    if (!value) {
+                        return std::nullopt;
+                    }
+                    values.push_back(*value);
+                }
+                item_count = static_cast<std::uint32_t>(values.size());
+                const auto element_type = unified_type(values);
+                if (node.kind == "Tuple") {
+                    opcode = Opcode::build_tuple;
+                    result_type = {.kind = StaticTypeKind::tuple,
+                                   .qualified_name = "tuple[" + type_name(element_type) + "]"};
+                } else {
+                    result_type = {.kind = StaticTypeKind::list,
+                                   .qualified_name = "list[" + type_name(element_type) + "]"};
+                }
+
+                const auto first_value = values.empty() ? 0U : bytecode.register_count;
+                for (const auto &value : values) {
+                    const auto staging = allocate();
+                    emit(Opcode::move, staging, value.reg, 0U, 0U, node.span);
+                }
                 const auto destination = allocate();
-                emit(Opcode::load_const, destination, 0U, 0U, constant_index, node.span);
-                return ExpressionResult {
-                    .reg = destination,
-                    .type = {.kind = node.kind == "List" ? StaticTypeKind::list : StaticTypeKind::dictionary,
-                             .qualified_name = node.kind == "List" ? "list[Any]" : "dict[Any,Any]"},
-                };
+                emit(opcode, destination, first_value, item_count, 0U, node.span);
+                may_fault = true;
+                return ExpressionResult {.reg = destination, .type = std::move(result_type)};
+            }
+
+            [[nodiscard]] static bool supports_subscription(const StaticTypeKind kind) noexcept {
+                return kind == StaticTypeKind::list || kind == StaticTypeKind::tuple ||
+                       kind == StaticTypeKind::dictionary || kind == StaticTypeKind::string ||
+                       kind == StaticTypeKind::bytes || kind == StaticTypeKind::unknown;
+            }
+
+            [[nodiscard]] static bool sequence_subscription(const StaticTypeKind kind) noexcept {
+                return kind == StaticTypeKind::list || kind == StaticTypeKind::tuple ||
+                       kind == StaticTypeKind::string || kind == StaticTypeKind::bytes;
+            }
+
+            [[nodiscard]] static bool supports_iteration(const StaticTypeKind kind) noexcept {
+                return kind == StaticTypeKind::list || kind == StaticTypeKind::tuple ||
+                       kind == StaticTypeKind::dictionary || kind == StaticTypeKind::string ||
+                       kind == StaticTypeKind::bytes || kind == StaticTypeKind::unknown;
+            }
+
+            [[nodiscard]] static bool state_capability_type(const StaticType &type) noexcept {
+                return type.kind == StaticTypeKind::model &&
+                       (type.qualified_name == "State" || type.qualified_name == "SharedState" ||
+                        type.qualified_name.ends_with(".State") || type.qualified_name.ends_with(".SharedState"));
+            }
+
+            [[nodiscard]] static StaticType subscription_result_type(const StaticType &container) {
+                if (container.kind == StaticTypeKind::string) {
+                    return {.kind = StaticTypeKind::string, .qualified_name = "str"};
+                }
+                if (container.kind == StaticTypeKind::bytes) {
+                    return {.kind = StaticTypeKind::integer, .qualified_name = "int"};
+                }
+                return any_type();
+            }
+
+            [[nodiscard]] static StaticType iteration_result_type(const StaticType &iterable) {
+                if (iterable.kind == StaticTypeKind::string) {
+                    return {.kind = StaticTypeKind::string, .qualified_name = "str"};
+                }
+                if (iterable.kind == StaticTypeKind::bytes) {
+                    return {.kind = StaticTypeKind::integer, .qualified_name = "int"};
+                }
+                return any_type();
+            }
+
+            std::optional<ExpressionResult> subscription(const AstNode &node) {
+                const auto *container_node = index.reference(node, "value");
+                const auto *key_node = index.reference(node, "slice");
+                if (container_node == nullptr || key_node == nullptr) {
+                    diagnostics.push_back(
+                        make_diagnostic("PY-AST-FIELD", "Subscript is missing value or slice", node.span));
+                    return std::nullopt;
+                }
+                if (key_node->kind == "Slice") {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-NYI-SLICE-LOWERING", "slice subscription is not lowered by the bounded VM yet", node.span));
+                    return std::nullopt;
+                }
+                const auto container = expression(*container_node);
+                if (!container) {
+                    return std::nullopt;
+                }
+                const auto key = expression(*key_node);
+                if (!key) {
+                    return std::nullopt;
+                }
+                if (!supports_subscription(container->type.kind)) {
+                    diagnostics.push_back(make_diagnostic("PY-TYPE-SUBSCRIPT",
+                                                          "value of type '" + type_name(container->type) +
+                                                              "' does not support subscription",
+                                                          container_node->span));
+                    return std::nullopt;
+                }
+                if (sequence_subscription(container->type.kind) && key->type.kind != StaticTypeKind::unknown &&
+                    !integral(key->type.kind)) {
+                    diagnostics.push_back(
+                        make_diagnostic("PY-TYPE-SUBSCRIPT", "sequence index must have type int", key_node->span));
+                    return std::nullopt;
+                }
+                const auto destination = allocate();
+                emit(Opcode::load_subscript, destination, container->reg, key->reg, 0U, node.span);
+                may_fault = true;
+                return ExpressionResult {.reg = destination, .type = subscription_result_type(container->type)};
             }
 
             std::optional<ExpressionResult> expression(const AstNode &node) {
                 if (node.kind == "Constant") {
                     return constant(node);
                 }
-                if (node.kind == "List" || node.kind == "Dict") {
-                    return literal_collection(node);
+                if (node.kind == "List" || node.kind == "Tuple" || node.kind == "Dict") {
+                    return collection_display(node);
                 }
-                if (node.kind == "Tuple" || node.kind == "Set") {
+                if (node.kind == "Set") {
                     diagnostics.push_back(make_diagnostic(
                         "PY-NYI-COLLECTION-LOWERING",
-                        node.kind + " runtime construction is not lowered by the F0 compiler", node.span));
+                        "set runtime construction requires a bounded set value/opcode that is not implemented",
+                        node.span));
                     return std::nullopt;
                 }
                 if (node.kind == "Subscript") {
-                    diagnostics.push_back(make_diagnostic("PY-NYI-SUBSCRIPT-LOWERING",
-                                                          "subscription is not lowered by the F0 compiler", node.span));
-                    return std::nullopt;
+                    return subscription(node);
                 }
                 if (node.kind == "ListComp" || node.kind == "SetComp" || node.kind == "DictComp" ||
                     node.kind == "GeneratorExp") {
@@ -1708,6 +1827,22 @@ namespace rule_engine::python::compiler {
                     if (contains_name(forbidden_calls, name)) {
                         return std::nullopt;
                     }
+                    if (target != nullptr && target->kind == "Attribute" &&
+                        index.string(*target, "attr").value_or(std::string {}) == "delete") {
+                        const auto *owner = index.reference(*target, "value");
+                        const auto owner_name = owner != nullptr && owner->kind == "Name" ?
+                                                    index.string(*owner, "id").value_or(std::string {}) :
+                                                    std::string {};
+                        const auto local = locals.find(owner_name);
+                        if (local != locals.end() && state_capability_type(local->second.type)) {
+                            diagnostics.push_back(make_diagnostic(
+                                "PY-NYI-STATE-LOWERING",
+                                "state.delete(...) requires StateKey declaration and injected State/SharedState "
+                                "capability lowering before delete_state can be emitted",
+                                node.span));
+                            return std::nullopt;
+                        }
+                    }
                     const auto target_index = target == nullptr ? std::nullopt : function_index(*target);
                     if (!target_index) {
                         diagnostics.push_back(make_diagnostic(
@@ -1770,6 +1905,48 @@ namespace rule_engine::python::compiler {
                 return std::nullopt;
             }
 
+            bool store_subscription(const AstNode &target, const ExpressionResult &assigned_value,
+                                    const SourceSpan &assignment_span) {
+                const auto *container_node = index.reference(target, "value");
+                const auto *key_node = index.reference(target, "slice");
+                if (container_node == nullptr || key_node == nullptr) {
+                    diagnostics.push_back(
+                        make_diagnostic("PY-AST-FIELD", "Subscript target is missing value or slice", target.span));
+                    return false;
+                }
+                if (key_node->kind == "Slice") {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-NYI-SLICE-LOWERING", "slice assignment is not lowered by the bounded VM yet", target.span));
+                    return false;
+                }
+                const auto container = expression(*container_node);
+                if (!container) {
+                    return false;
+                }
+                const auto key = expression(*key_node);
+                if (!key) {
+                    return false;
+                }
+                if (container->type.kind != StaticTypeKind::list &&
+                    container->type.kind != StaticTypeKind::dictionary &&
+                    container->type.kind != StaticTypeKind::unknown) {
+                    diagnostics.push_back(make_diagnostic("PY-TYPE-SUBSCRIPT-STORE",
+                                                          "value of type '" + type_name(container->type) +
+                                                              "' does not support item assignment",
+                                                          container_node->span));
+                    return false;
+                }
+                if (container->type.kind == StaticTypeKind::list && key->type.kind != StaticTypeKind::unknown &&
+                    !integral(key->type.kind)) {
+                    diagnostics.push_back(make_diagnostic("PY-TYPE-SUBSCRIPT-STORE",
+                                                          "list assignment index must have type int", key_node->span));
+                    return false;
+                }
+                emit(Opcode::store_subscript, assigned_value.reg, container->reg, key->reg, 0U, assignment_span);
+                may_fault = true;
+                return true;
+            }
+
             bool statements(const std::vector<const AstNode *> &body) {
                 bool terminated {};
                 for (const auto *statement : body) {
@@ -1809,13 +1986,17 @@ namespace rule_engine::python::compiler {
                     if (statement->kind == "Assign") {
                         const auto targets = index.sequence(*statement, "targets");
                         const auto *value = index.reference(*statement, "value");
-                        if (targets.size() != 1 || targets.front()->kind != "Name" || !value) {
+                        if (targets.size() != 1 || value == nullptr) {
                             diagnostics.push_back(make_diagnostic(
-                                "PY-NYI-ASSIGNMENT", "only one local-name assignment is lowered yet", statement->span));
+                                "PY-NYI-ASSIGNMENT", "exactly one assignment target is lowered by this compiler slice",
+                                statement->span));
                             continue;
                         }
                         const auto result = expression(*value);
-                        if (result) {
+                        if (!result) {
+                            continue;
+                        }
+                        if (targets.front()->kind == "Name") {
                             const auto name = index.string(*targets.front(), "id").value_or(std::string {});
                             const auto existing = locals.find(name);
                             if (existing == locals.end()) {
@@ -1824,7 +2005,17 @@ namespace rule_engine::python::compiler {
                                 emit(Opcode::move, existing->second.reg, result->reg, 0U, 0U, statement->span);
                                 existing->second.type = unify(existing->second.type, result->type);
                             }
+                            continue;
                         }
+                        if (targets.front()->kind == "Subscript") {
+                            static_cast<void>(store_subscription(*targets.front(), *result, statement->span));
+                            continue;
+                        }
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-NYI-ASSIGNMENT",
+                            "assignment target '" + targets.front()->kind +
+                                "' requires unpacking or attribute-store bytecode that is not implemented",
+                            targets.front()->span));
                         continue;
                     }
                     if (statement->kind == "AnnAssign") {
@@ -1859,6 +2050,14 @@ namespace rule_engine::python::compiler {
                             emit(Opcode::move, existing->second.reg, result->reg, 0U, 0U, statement->span);
                             existing->second.type = declared;
                         }
+                        continue;
+                    }
+                    if (statement->kind == "Delete") {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-NYI-DELETE-LOWERING",
+                            "del targets require local/item deletion semantics; persistent state deletion uses "
+                            "state.delete(StateKey, identity=...) and is lowered separately",
+                            statement->span));
                         continue;
                     }
                     if (statement->kind == "Return") {
@@ -2075,9 +2274,67 @@ namespace rule_engine::python::compiler {
                         continue;
                     }
                     if (statement->kind == "For") {
-                        diagnostics.push_back(make_diagnostic("PY-NYI-ITERATION-LOWERING",
-                                                              "for loops are not lowered by the F0 compiler",
-                                                              statement->span));
+                        const auto *target = index.reference(*statement, "target");
+                        const auto *iterable_node = index.reference(*statement, "iter");
+                        if (target == nullptr || iterable_node == nullptr) {
+                            diagnostics.push_back(
+                                make_diagnostic("PY-AST-FIELD", "For is missing target or iterable", statement->span));
+                            continue;
+                        }
+                        if (target->kind != "Name") {
+                            diagnostics.push_back(make_diagnostic(
+                                "PY-NYI-ITERATION-TARGET",
+                                "for-loop target '" + target->kind +
+                                    "' requires destructuring or item/attribute assignment that is not implemented",
+                                target->span));
+                            continue;
+                        }
+                        const auto iterable = expression(*iterable_node);
+                        if (!iterable) {
+                            continue;
+                        }
+                        if (!supports_iteration(iterable->type.kind)) {
+                            diagnostics.push_back(make_diagnostic("PY-TYPE-ITERABLE",
+                                                                  "value of type '" + type_name(iterable->type) +
+                                                                      "' is not iterable in the bounded VM",
+                                                                  iterable_node->span));
+                            continue;
+                        }
+                        const auto iterator_register = allocate();
+                        emit(Opcode::get_iter, iterator_register, iterable->reg, 0U, 0U, iterable_node->span);
+
+                        const auto target_name = index.string(*target, "id").value_or(std::string {});
+                        const auto item_type = iteration_result_type(iterable->type);
+                        auto local = locals.find(target_name);
+                        std::uint32_t target_register {};
+                        if (local == locals.end()) {
+                            target_register = allocate();
+                            locals.emplace(target_name, ExpressionResult {.reg = target_register, .type = item_type});
+                        } else {
+                            target_register = local->second.reg;
+                            local->second.type = unify(local->second.type, item_type);
+                        }
+
+                        const auto loop_header = static_cast<std::uint32_t>(bytecode.instructions.size());
+                        emit(Opcode::iter_next, target_register, iterator_register, 0U, 0U, target->span);
+                        loops.push_back(LoopFrame {.continue_target = loop_header, .break_jumps = {}});
+                        ++conditional_depth;
+                        const auto body_terminated = statements(index.sequence(*statement, "body"));
+                        --conditional_depth;
+                        if (!body_terminated) {
+                            emit(Opcode::jump, 0U, 0U, 0U, loop_header, statement->span);
+                        }
+                        auto loop = std::move(loops.back());
+                        loops.pop_back();
+                        bytecode.instructions[loop_header].immediate =
+                            static_cast<std::uint32_t>(bytecode.instructions.size());
+                        ++conditional_depth;
+                        static_cast<void>(statements(index.sequence(*statement, "orelse")));
+                        --conditional_depth;
+                        const auto loop_exit = static_cast<std::uint32_t>(bytecode.instructions.size());
+                        for (const auto jump : loop.break_jumps) { bytecode.instructions[jump].immediate = loop_exit; }
+                        may_fault = true;
+                        terminated = false;
                         continue;
                     }
                     if (statement->kind == "TryStar") {

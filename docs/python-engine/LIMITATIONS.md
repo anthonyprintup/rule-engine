@@ -185,3 +185,11 @@ Every entry records impact, rationale, mitigation, observability, and revisit co
 - **Mitigation:** Operators rotate the exact configured fingerprint and trust bundle through deployment configuration; startup fails closed when either does not match or credentials cannot be loaded.
 - **Observability:** Authentication failures expose only the failure class and never certificate, private-key, or trust-bundle contents.
 - **Revisit:** Add an operator-managed, expiry-checked local CRL or a separately bounded stapled-status design before claiming revocation coverage.
+
+## L-026 — Container and iteration frontend is intentionally partial
+
+- **Impact:** The current compiler lowers fresh list/tuple/dictionary displays, subscription reads, one-target list/dictionary item assignment, and synchronous local-target `for`/`else`/`break`/`continue`. Starred and `**` expansion, sets, slices, comprehensions/generator expressions, item deletion, destructuring targets, `range`, `async for`, arbitrary iterator protocols, and source-level state operations still fail compilation.
+- **Rationale:** The available fixed-display and iterator opcodes can express the delivered slice with exact ordering and hard charges. The deferred constructs need additional builder, scope, unwind, async, capability, identity, or replay contracts; approximating them would change Python behavior or weaken the trust boundary.
+- **Mitigation:** Stable source-spanned diagnostics reject every deferred form. The exact CPython worker-to-C++-VM tests cover delivered ordering, control flow, verifier dataflow, and budget failures. Persistent deletion remains `state.delete(StateKey, identity=...)` and cannot reach `delete_state` until typed key and injected-capability lowering exists.
+- **Observability:** Count `PY-NYI-COLLECTION-UNPACKING`, `PY-NYI-SLICE-LOWERING`, `PY-NYI-COMPREHENSION-LOWERING`, `PY-NYI-ITERATION-TARGET`, `PY-NYI-DELETE-LOWERING`, and `PY-NYI-STATE-LOWERING` diagnostics by pack and source span.
+- **Revisit:** Add one construct at a time only after its typed HIR, exact VM opcode semantics, verifier rules, precharge behavior, CPython differential vectors, and persistence/replay effects are specified and tested.

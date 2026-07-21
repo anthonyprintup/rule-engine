@@ -264,6 +264,17 @@ namespace {
         });
     }
 
+    std::expected<CompiledPack, DiagnosticSet> compile_exact_source(const packaging::PrivatePythonRuntime &runtime,
+                                                                    const std::filesystem::path &temporary_root,
+                                                                    std::string source, const std::string &executable) {
+        packaging::WindowsJobWorkerLauncher launcher;
+        launcher.temporary_root = temporary_root;
+        packaging::WorkerClient client {.runtime = runtime, .launcher = launcher, .limits = {}};
+        WorkerAstEnvelopeProvider provider {client};
+        StaticPackCompiler compiler {provider};
+        return compiler.compile(pack(std::move(source)), {}, OperatorBindings {binding(executable)});
+    }
+
     std::vector<std::string> diagnostic_signatures(const DiagnosticSet &diagnostics) {
         std::vector<std::string> result;
         result.reserve(diagnostics.size());
@@ -613,6 +624,257 @@ namespace {
         REQUIRE(completed.state == VmStepState::complete);
         REQUIRE(completed.result.has_value());
         REQUIRE(completed.result->verdict == true);
+    }
+
+    TEST_CASE("exact worker lowers fresh container displays and subscription mutation into verified bytecode",
+              "[compiler-vm-progress]") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+        const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                   "from rule_engine import rule\n"
+                                                   "\n"
+                                                   "@rule(\"com.example.containers\")\n"
+                                                   "def containers() -> bool:\n"
+                                                   "    values = [1, 2]\n"
+                                                   "    values[0] = values[1]\n"
+                                                   "    pair = (values[0], 3)\n"
+                                                   "    mapping = {\"answer\": pair[0]}\n"
+                                                   "    return mapping[\"answer\"] == 2\n",
+                                                   "com.example.containers");
+        INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
+        REQUIRE(compiled.has_value());
+        REQUIRE(compiled->functions.size() == 1U);
+        const auto &function = compiled->functions.front();
+        const auto has_opcode = [&](const Opcode opcode) {
+            return std::ranges::any_of(function.instructions,
+                                       [&](const Instruction &instruction) { return instruction.opcode == opcode; });
+        };
+        CHECK(has_opcode(Opcode::build_list));
+        CHECK(has_opcode(Opcode::build_tuple));
+        CHECK(has_opcode(Opcode::build_dict));
+        CHECK(has_opcode(Opcode::load_subscript));
+        CHECK(has_opcode(Opcode::store_subscript));
+        REQUIRE(verify_bytecode(*compiled).has_value());
+
+        for (const auto &instruction : function.instructions) {
+            if (instruction.opcode == Opcode::build_list || instruction.opcode == Opcode::build_tuple) {
+                CHECK(instruction.operand_a <= function.register_count);
+                CHECK(instruction.operand_b <= function.register_count - instruction.operand_a);
+            }
+            if (instruction.opcode == Opcode::build_dict) {
+                CHECK(instruction.operand_a <= function.register_count);
+                CHECK(instruction.operand_b <= (function.register_count - instruction.operand_a) / 2U);
+            }
+        }
+
+        auto session = vm::RegisterVmSession::create(*compiled, invocation());
+        REQUIRE(session.has_value());
+        const auto completed = (*session)->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        CHECK(completed.result->verdict == true);
+
+        const auto first_build = std::ranges::find(function.instructions, Opcode::build_list, &Instruction::opcode);
+        REQUIRE(first_build != function.instructions.end());
+        auto bounded = invocation();
+        bounded.budget.normal.instructions =
+            static_cast<std::uint64_t>(std::distance(function.instructions.begin(), first_build)) + 1U;
+        auto budgeted = vm::RegisterVmSession::create(*compiled, bounded);
+        REQUIRE(budgeted.has_value());
+        const auto heap_before = (*budgeted)->heap_stats();
+        const auto faulted = (*budgeted)->step({});
+        REQUIRE(faulted.state == VmStepState::faulted);
+        REQUIRE(faulted.result.has_value());
+        REQUIRE(faulted.result->fault.has_value());
+        CHECK(faulted.result->fault->frames.front().code == "PYVM4003");
+        CHECK((*budgeted)->counters().instructions == bounded.budget.normal.instructions);
+        CHECK((*budgeted)->heap_stats().live_objects == heap_before.live_objects);
+        CHECK((*budgeted)->heap_stats().live_bytes == heap_before.live_bytes);
+
+        auto malformed = *compiled;
+        const auto malformed_build =
+            std::ranges::find(malformed.functions.front().instructions, Opcode::build_list, &Instruction::opcode);
+        REQUIRE(malformed_build != malformed.functions.front().instructions.end());
+        malformed_build->operand_a = malformed.functions.front().register_count;
+        malformed_build->operand_b = 1U;
+        CHECK_FALSE(verify_bytecode(malformed).has_value());
+    }
+
+    TEST_CASE("exact worker lowers deterministic for else break and continue with charged iterator edges",
+              "[compiler-vm-progress]") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+        const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                   "from rule_engine import rule\n"
+                                                   "\n"
+                                                   "@rule(\"com.example.loops\")\n"
+                                                   "def loops() -> bool:\n"
+                                                   "    total = 0\n"
+                                                   "    for value in [1, 2, 3]:\n"
+                                                   "        if value == 2:\n"
+                                                   "            continue\n"
+                                                   "        total = total + value\n"
+                                                   "    else:\n"
+                                                   "        total = total + 10\n"
+                                                   "    for value in []:\n"
+                                                   "        total = 0\n"
+                                                   "    else:\n"
+                                                   "        total = total + 1\n"
+                                                   "    for value in {\"x\": 1, \"y\": 2}:\n"
+                                                   "        if value == \"x\":\n"
+                                                   "            total = total + 4\n"
+                                                   "            break\n"
+                                                   "    else:\n"
+                                                   "        total = 0\n"
+                                                   "    return total == 19\n",
+                                                   "com.example.loops");
+        INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
+        REQUIRE(compiled.has_value());
+        REQUIRE(compiled->functions.size() == 1U);
+        const auto &function = compiled->functions.front();
+        CHECK(std::ranges::count(function.instructions, Opcode::get_iter, &Instruction::opcode) == 3);
+        CHECK(std::ranges::count(function.instructions, Opcode::iter_next, &Instruction::opcode) == 3);
+        REQUIRE(verify_bytecode(*compiled).has_value());
+        for (const auto &instruction : function.instructions) {
+            if (instruction.opcode == Opcode::iter_next) {
+                CHECK(instruction.immediate < function.instructions.size());
+            }
+        }
+
+        auto session = vm::RegisterVmSession::create(*compiled, invocation());
+        REQUIRE(session.has_value());
+        const auto completed = (*session)->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        CHECK(completed.result->verdict == true);
+        CHECK((*session)->counters().loop_iterations_and_yields == 4U);
+
+        auto bounded = invocation();
+        bounded.budget.normal.loop_iterations_and_yields = 3U;
+        auto budgeted = vm::RegisterVmSession::create(*compiled, bounded);
+        REQUIRE(budgeted.has_value());
+        const auto faulted = (*budgeted)->step({});
+        REQUIRE(faulted.state == VmStepState::faulted);
+        REQUIRE(faulted.result.has_value());
+        REQUIRE(faulted.result->fault.has_value());
+        CHECK(faulted.result->fault->frames.front().code == "PYVM4006");
+        CHECK((*budgeted)->counters().loop_iterations_and_yields == 3U);
+
+        auto malformed = *compiled;
+        const auto malformed_next =
+            std::ranges::find(malformed.functions.front().instructions, Opcode::iter_next, &Instruction::opcode);
+        REQUIRE(malformed_next != malformed.functions.front().instructions.end());
+        malformed_next->immediate = static_cast<std::uint32_t>(malformed.functions.front().instructions.size());
+        CHECK_FALSE(verify_bytecode(malformed).has_value());
+    }
+
+    TEST_CASE("exact worker dictionary lowering faults before evaluating a later entry") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+        const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                   "from rule_engine import rule\n"
+                                                   "\n"
+                                                   "def later_entry() -> int:\n"
+                                                   "    raise \"later dictionary entry was evaluated\"\n"
+                                                   "\n"
+                                                   "@rule(\"com.example.dict-fault-order\")\n"
+                                                   "def dictionary_fault_order() -> bool:\n"
+                                                   "    mapping = {[]: True, later_entry(): True}\n"
+                                                   "    return False\n",
+                                                   "com.example.dict-fault-order");
+        INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
+        REQUIRE(compiled.has_value());
+        auto session = vm::RegisterVmSession::create(*compiled, invocation());
+        REQUIRE(session.has_value());
+        const auto faulted = (*session)->step({});
+        REQUIRE(faulted.state == VmStepState::faulted);
+        REQUIRE(faulted.result.has_value());
+        REQUIRE(faulted.result->fault.has_value());
+        REQUIRE_FALSE(faulted.result->fault->frames.empty());
+        CHECK(faulted.result->fault->frames.front().code == "PYVM2001");
+        CHECK(faulted.result->fault->frames.front().message.find("unhashable map key") != std::string::npos);
+        CHECK(faulted.result->fault->frames.front().message.find("later dictionary entry") == std::string::npos);
+    }
+
+    TEST_CASE("exact worker keeps state deletion and comprehension prerequisites fail closed") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+
+        SECTION("state delete requires StateKey and injected capability lowering") {
+            const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                       "from rule_engine import State, StateKey, rule\n"
+                                                       "\n"
+                                                       "@rule(\"com.example.state-delete\")\n"
+                                                       "def clear(state: State, key: StateKey[bool]) -> bool:\n"
+                                                       "    state.delete(key)\n"
+                                                       "    return True\n",
+                                                       "com.example.state-delete");
+            REQUIRE_FALSE(compiled.has_value());
+            CHECK(std::ranges::any_of(compiled.error(), [](const Diagnostic &diagnostic) {
+                return diagnostic.code == "PY-NYI-STATE-LOWERING" &&
+                       diagnostic.message.find("StateKey") != std::string::npos &&
+                       diagnostic.message.find("delete_state") != std::string::npos;
+            }));
+        }
+
+        SECTION("comprehensions require a bounded result builder and scope model") {
+            const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                       "from rule_engine import rule\n"
+                                                       "\n"
+                                                       "@rule(\"com.example.comprehension\")\n"
+                                                       "def comprehension() -> bool:\n"
+                                                       "    return [value for value in [True]][0]\n",
+                                                       "com.example.comprehension");
+            REQUIRE_FALSE(compiled.has_value());
+            CHECK(std::ranges::any_of(compiled.error(), [](const Diagnostic &diagnostic) {
+                return diagnostic.code == "PY-NYI-COMPREHENSION-LOWERING";
+            }));
+        }
+
+        SECTION("ordinary item deletion is not miscompiled as persistent state deletion") {
+            const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                       "from rule_engine import rule\n"
+                                                       "\n"
+                                                       "@rule(\"com.example.item-delete\")\n"
+                                                       "def item_delete() -> bool:\n"
+                                                       "    values = [True]\n"
+                                                       "    del values[0]\n"
+                                                       "    return True\n",
+                                                       "com.example.item-delete");
+            REQUIRE_FALSE(compiled.has_value());
+            CHECK(std::ranges::any_of(compiled.error(), [](const Diagnostic &diagnostic) {
+                return diagnostic.code == "PY-NYI-DELETE-LOWERING" &&
+                       diagnostic.message.find("state.delete") != std::string::npos;
+            }));
+        }
     }
 
     TEST_CASE("UTF-8 source spans are byte offsets and never split a code point") {
@@ -1168,7 +1430,7 @@ namespace {
         REQUIRE(first->pack.schemas.canonical_hash == second->pack.schemas.canonical_hash);
     }
 
-    TEST_CASE("recursively constant list and dictionary displays become frozen constants") {
+    TEST_CASE("recursively constant list and dictionary displays allocate fresh VM containers") {
         auto nodes = constant_rule_nodes(false);
         const auto decorators = std::ranges::find(nodes[1].fields, "decorator_list", &AstField::name);
         const auto returns = std::ranges::find(nodes[1].fields, "returns", &AstField::name);
@@ -1195,14 +1457,17 @@ namespace {
         const auto artifact_diagnostics = artifact ? std::string {} : diagnostic_text(artifact.error());
         INFO(artifact_diagnostics);
         REQUIRE(artifact.has_value());
-        REQUIRE(artifact->pack.constants.size() == 1U);
-        const auto *list = std::get_if<FactList>(&artifact->pack.constants.front().node->data);
-        REQUIRE(list != nullptr);
-        REQUIRE(list->items.size() == 2U);
-        REQUIRE(std::holds_alternative<FactMap>(list->items.back().node->data));
+        REQUIRE(artifact->pack.constants.size() == 3U);
+        REQUIRE(artifact->pack.functions.size() == 1U);
+        const auto &instructions = artifact->pack.functions.front().instructions;
+        CHECK(std::ranges::count(instructions, Opcode::load_const, &Instruction::opcode) == 3);
+        CHECK(std::ranges::count(instructions, Opcode::build_dict, &Instruction::opcode) == 1);
+        CHECK(std::ranges::count(instructions, Opcode::build_list, &Instruction::opcode) == 1);
+        REQUIRE(artifact->pack.optimization_certificates.size() == 1U);
+        CHECK(artifact->pack.optimization_certificates.front().may_fault);
     }
 
-    TEST_CASE("unsupported F0 constructs fail with precise stable diagnostics") {
+    TEST_CASE("bounded collection control flow lowers while remaining F0 gaps fail precisely") {
         SECTION("subscription") {
             auto nodes = constant_rule_nodes(false);
             nodes[8] = node(9, "Subscript", {field("value", ast_reference(10)), field("slice", ast_reference(11))});
@@ -1211,10 +1476,12 @@ namespace {
             const auto payload = encode_ast_envelope(envelope(std::move(nodes)));
             REQUIRE(payload.has_value());
             const auto result = StaticCompiler {}.compile(pack(), *payload, {}, {});
-            REQUIRE_FALSE(result.has_value());
-            INFO(diagnostic_text(result.error()));
-            REQUIRE(std::ranges::any_of(
-                result.error(), [](const Diagnostic &item) { return item.code == "PY-NYI-SUBSCRIPT-LOWERING"; }));
+            INFO((result.has_value() ? std::string {} : diagnostic_text(result.error())));
+            REQUIRE(result.has_value());
+            REQUIRE(result->pack.functions.size() == 1U);
+            CHECK(std::ranges::any_of(result->pack.functions.front().instructions, [](const Instruction &instruction) {
+                return instruction.opcode == Opcode::load_subscript;
+            }));
         }
 
         SECTION("comprehension") {
@@ -1245,9 +1512,12 @@ namespace {
             const auto payload = encode_ast_envelope(envelope(std::move(nodes)));
             REQUIRE(payload.has_value());
             const auto result = StaticCompiler {}.compile(pack(), *payload, {}, {});
-            REQUIRE_FALSE(result.has_value());
-            REQUIRE(std::ranges::any_of(
-                result.error(), [](const Diagnostic &item) { return item.code == "PY-NYI-ITERATION-LOWERING"; }));
+            INFO((result.has_value() ? std::string {} : diagnostic_text(result.error())));
+            REQUIRE(result.has_value());
+            REQUIRE(result->pack.functions.size() == 1U);
+            const auto &instructions = result->pack.functions.front().instructions;
+            CHECK(std::ranges::count(instructions, Opcode::get_iter, &Instruction::opcode) == 1);
+            CHECK(std::ranges::count(instructions, Opcode::iter_next, &Instruction::opcode) == 1);
         }
 
         SECTION("finally unwind") {
