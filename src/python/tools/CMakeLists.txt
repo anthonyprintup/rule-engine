@@ -25,6 +25,7 @@ target_link_libraries(
 add_library(
     rule_engine_python_executable_support
     benchmark.cpp
+    resident_service.cpp
     server.cpp
 )
 add_library(rule_engine::python_executable_support ALIAS rule_engine_python_executable_support)
@@ -40,6 +41,7 @@ target_link_libraries(
         asio::asio
         rule_engine::python_compiler
         rule_engine::python_optimizer
+        rule_engine::python_runtime_adapters
         rule_engine::python_vm
         rule_engine::project_options
 )

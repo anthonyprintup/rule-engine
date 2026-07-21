@@ -142,6 +142,17 @@ listener.read_timeout_ms
 listener.write_timeout_ms
 listener.backlog
 listener.maximum_consecutive_failures
+service.worker_threads
+service.maximum_queued_sessions
+service.maximum_memory_bytes
+service.maximum_frame_bytes
+service.maximum_messages_per_session
+service.maximum_inflight_work_per_session
+service.maximum_session_duration_ms
+service.inbound_credit_bytes
+service.inbound_credit_messages
+service.inbound_credit_work_attempts
+service.inbound_credit_snapshot_chunks
 network.require_hard_resolver_bounds
 runtime.root
 pack.registry_path
@@ -157,6 +168,16 @@ observability.audit_path
 Run `rule_engine_server --help` from the same installed version for the
 production-only keys. Unknown and duplicate keys fail closed. Listener hosts
 are numeric literals so startup does not introduce an unbounded resolver path.
+The service owns a fixed joined worker pool and a bounded admission queue;
+overload closes the newly authenticated connection. Its configured application
+memory reservation covers owned frame/session reservations, not OS socket
+buffers, TLS-library allocations, allocator overhead, or backend-internal
+caches, so deployments still need a measured process/container memory limit.
+
+The current default store composition deliberately advertises zero work and
+zero durable-message credit because it cannot atomically commit an agent body
+and cumulative receipt. A peer that ignores credit is transiently NACKed and
+never receives an invented ACK; see [L-031](LIMITATIONS.md#l-031--resident-application-composition-cannot-yet-durably-accept-agent-records).
 
 ## 5. Configure the Windows agent
 
@@ -211,6 +232,16 @@ Mutating commands require an idempotent request identity and audited reason;
 destructive operations default to preview unless `--apply` is explicit. The
 server authorizes the authenticated principal against the exact operation and
 tenant/pack resource before any store access or audit mutation.
+
+The resident admin listener maps the certificate-authenticated peer through a
+bounded snapshot whose first line is `rule-engine.operator-bindings.v1` and
+whose remaining tab-separated rows contain tenant, peer, principal, principal
+kind, home tenant, pack prefix, and an explicit comma-separated capability
+set. Peers and principals are unique; tenant, pack prefix, principal kind, and
+capability must all authorize the exact resource. The current version-1
+canonical binary wire exposes only pack snapshot, operation snapshot, and
+final activation flip. The standalone admin CLI does not yet provide the
+corresponding network adapter.
 
 Use the configured JSON log, security audit, readiness, and Prometheus outputs
 for operations. Logs and diagnostics record identities, hashes, limits, and

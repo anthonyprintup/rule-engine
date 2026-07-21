@@ -8,8 +8,10 @@
 #include <expected>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <string>
+#include <vector>
 
 namespace rule_engine::python::protocol_v2 {
 
@@ -55,6 +57,15 @@ namespace rule_engine::python::protocol_v2 {
                                                               const TransportOperation &operation) noexcept;
         [[nodiscard]] std::expected<PeerEnvelope, ProtocolError> receive() noexcept;
         [[nodiscard]] std::expected<PeerEnvelope, ProtocolError> receive(const TransportOperation &operation) noexcept;
+        // The admin listener uses the same authenticated TLS transport but has
+        // its own bounded application codec. These methods preserve the
+        // canonical four-byte network-order frame prefix without interpreting
+        // the payload as a protocol-v2 peer envelope.
+        [[nodiscard]] std::expected<void, ProtocolError>
+        send_application_frame(std::span<const std::byte> payload,
+                               const TransportOperation &operation = {}) noexcept;
+        [[nodiscard]] std::expected<std::vector<std::byte>, ProtocolError>
+        receive_application_frame(const TransportOperation &operation = {}) noexcept;
         [[nodiscard]] bool established() const noexcept;
         void shutdown() noexcept;
 

@@ -553,6 +553,71 @@ namespace rule_engine::python::protocol_v2 {
 #endif
     }
 
+    std::expected<void, ProtocolError>
+    OpenSslTlsSession::send_application_frame(const std::span<const std::byte> payload,
+                                               const TransportOperation &operation) noexcept {
+#if RULE_ENGINE_PROTOCOL_HAS_OPENSSL
+        if (!established()) {
+            return std::unexpected(
+                transport_error(ProtocolErrorCode::transport_error, "TLS session is not established"));
+        }
+        const auto maximum = impl_->context->configuration.protocol_limits.maximum_frame_bytes;
+        if (payload.empty() || payload.size() > maximum ||
+            payload.size() > static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())) {
+            return std::unexpected(transport_error(payload.empty() ? ProtocolErrorCode::malformed :
+                                                                      ProtocolErrorCode::limit_exceeded,
+                                                   "TLS application frame length is invalid"));
+        }
+        const auto size = static_cast<std::uint32_t>(payload.size());
+        const std::array header {
+            static_cast<std::byte>((size >> 24U) & 0xffU), static_cast<std::byte>((size >> 16U) & 0xffU),
+            static_cast<std::byte>((size >> 8U) & 0xffU), static_cast<std::byte>(size & 0xffU),
+        };
+        if (auto written = write_all(impl_->ssl, header, operation); !written) {
+            return written;
+        }
+        return write_all(impl_->ssl, payload, operation);
+#else
+        static_cast<void>(payload);
+        static_cast<void>(operation);
+        return std::unexpected(
+            transport_error(ProtocolErrorCode::dependency_unavailable,
+                            "secure protocol transport is unavailable because OpenSSL 3 or newer was not linked"));
+#endif
+    }
+
+    std::expected<std::vector<std::byte>, ProtocolError>
+    OpenSslTlsSession::receive_application_frame(const TransportOperation &operation) noexcept {
+#if RULE_ENGINE_PROTOCOL_HAS_OPENSSL
+        if (!established()) {
+            return std::unexpected(
+                transport_error(ProtocolErrorCode::transport_error, "TLS session is not established"));
+        }
+        std::array<std::byte, 4> header {};
+        if (auto read = read_all(impl_->ssl, header, operation); !read) {
+            return std::unexpected(std::move(read.error()));
+        }
+        const auto size = (std::to_integer<std::uint32_t>(header[0]) << 24U) |
+                          (std::to_integer<std::uint32_t>(header[1]) << 16U) |
+                          (std::to_integer<std::uint32_t>(header[2]) << 8U) | std::to_integer<std::uint32_t>(header[3]);
+        if (size == 0U || size > impl_->context->configuration.protocol_limits.maximum_frame_bytes) {
+            return std::unexpected(
+                transport_error(size == 0U ? ProtocolErrorCode::malformed : ProtocolErrorCode::limit_exceeded,
+                                "TLS application frame length is invalid"));
+        }
+        std::vector<std::byte> payload(size);
+        if (auto read = read_all(impl_->ssl, payload, operation); !read) {
+            return std::unexpected(std::move(read.error()));
+        }
+        return payload;
+#else
+        static_cast<void>(operation);
+        return std::unexpected(
+            transport_error(ProtocolErrorCode::dependency_unavailable,
+                            "secure protocol transport is unavailable because OpenSSL 3 or newer was not linked"));
+#endif
+    }
+
     bool OpenSslTlsSession::established() const noexcept { return impl_ != nullptr && impl_->established; }
 
     void OpenSslTlsSession::shutdown() noexcept {

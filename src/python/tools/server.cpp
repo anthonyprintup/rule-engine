@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <chrono>
@@ -14,6 +15,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <stop_token>
 #include <string>
@@ -34,6 +36,8 @@ namespace rule_engine::python::tools {
         constexpr std::size_t maximum_policy_line_bytes = 4U * kibibyte;
         constexpr std::size_t maximum_policy_entries = 4'096U;
 
+        [[nodiscard]] std::uint64_t now_unix_ms() noexcept;
+
         constexpr std::string_view help_text = R"(Usage: rule_engine_server --config PATH [--validate-config]
 
 Run the resident Python rule-engine server from one explicit configuration file.
@@ -52,6 +56,12 @@ Required common configuration keys:
   listener.accept_timeout_ms, listener.handshake_timeout_ms,
   listener.read_timeout_ms, listener.write_timeout_ms, listener.backlog,
   listener.maximum_consecutive_failures, network.require_hard_resolver_bounds,
+  service.worker_threads, service.maximum_queued_sessions,
+  service.maximum_memory_bytes, service.maximum_frame_bytes,
+  service.maximum_messages_per_session, service.maximum_inflight_work_per_session,
+  service.maximum_session_duration_ms, service.inbound_credit_bytes,
+  service.inbound_credit_messages, service.inbound_credit_work_attempts,
+  service.inbound_credit_snapshot_chunks,
   runtime.root, pack.registry_path, bindings.operator_path,
   schemas.catalog_path, profiles.budget_path, profiles.retention_path,
   observability.prometheus_endpoint, observability.json_log_path,
@@ -70,9 +80,14 @@ Policy snapshots are bounded, versioned tab-separated UTF-8 files. The peer
 snapshot header is rule-engine.peer-enrollment.v1; signer and revocation headers
 are rule-engine.trusted-signers.v1 and rule-engine.revocations.v1.
 
-Known limitation: this integration slice accepts and authenticates TLS peers,
-then closes the connection without reading application bytes. Full protocol
-session and worker scheduling is not yet connected to the resident loop.
+Authenticated application sessions run on a fixed owned worker pool with a
+bounded queue and memory reservation. Agent ACKs require a backend-declared
+durable receipt. The current production composition has no durable agent-receipt
+table or activated event-to-work scheduler, so it establishes fenced sessions
+with zero work and zero durable-message credit; a peer that ignores credit is
+transiently NACKed without advancing ACK. The
+bounded admin wire surface currently supports pack/operation reads and the
+final activation flip; other control-plane operations remain CLI/backend work.
 )";
 
         enum struct ValueKind : std::uint8_t { text, integer, boolean };
@@ -161,6 +176,17 @@ session and worker scheduling is not yet connected to the resident loop.
                 {"listener.backlog", ValueKind::integer},
                 {"listener.maximum_consecutive_failures", ValueKind::integer},
                 {"network.require_hard_resolver_bounds", ValueKind::boolean},
+                {"service.worker_threads", ValueKind::integer},
+                {"service.maximum_queued_sessions", ValueKind::integer},
+                {"service.maximum_memory_bytes", ValueKind::integer},
+                {"service.maximum_frame_bytes", ValueKind::integer},
+                {"service.maximum_messages_per_session", ValueKind::integer},
+                {"service.maximum_inflight_work_per_session", ValueKind::integer},
+                {"service.maximum_session_duration_ms", ValueKind::integer},
+                {"service.inbound_credit_bytes", ValueKind::integer},
+                {"service.inbound_credit_messages", ValueKind::integer},
+                {"service.inbound_credit_work_attempts", ValueKind::integer},
+                {"service.inbound_credit_snapshot_chunks", ValueKind::integer},
                 {"tls.trust_anchors_pem", ValueKind::text},
                 {"tls.certificate_chain_pem", ValueKind::text},
                 {"tls.private_key_pem", ValueKind::text},
@@ -879,6 +905,259 @@ session and worker scheduling is not yet connected to the resident loop.
             return policy;
         }
 
+        [[nodiscard]] std::string admin_capability(const cluster::AdminControlOperation operation) {
+            using enum cluster::AdminControlOperation;
+            switch (operation) {
+                case pack_read: return "pack.read";
+                case operation_read: return "operation.read";
+                case activation_flip: return "pack.activate";
+                case stage_preview:
+                case stage_apply:
+                case activation_preview:
+                case activation_drain:
+                case activation_fence:
+                case rollback_preview:
+                case rollback_stage_apply:
+                case pack_inspect: return {};
+                default: return {};
+            }
+        }
+
+        struct OperatorBindingPolicy final: IResidentAdminAccessPolicy {
+            struct Binding {
+                protocol_v2::AuthenticatedPeer peer;
+                cluster::AuthenticatedAdminPrincipal principal;
+                std::string pack_prefix;
+                std::set<std::string, std::less<>> capabilities;
+            };
+
+            [[nodiscard]] std::expected<cluster::AuthenticatedAdminPrincipal, cluster::AuthorizedAdminError>
+            principal_for(const protocol_v2::AuthenticatedPeer &peer) const noexcept override {
+                const auto found = std::ranges::find_if(bindings, [&](const Binding &binding) {
+                    return binding.peer.tenant == peer.tenant && binding.peer.peer == peer.peer;
+                });
+                if (found == bindings.end()) {
+                    return std::unexpected(cluster::AuthorizedAdminError {
+                        .code = cluster::AuthorizedAdminErrorCode::unauthenticated,
+                        .message = "authenticated TLS peer has no administrator binding",
+                        .retryable = false,
+                        .store_code = std::nullopt,
+                    });
+                }
+                return found->principal;
+            }
+
+            [[nodiscard]] std::expected<cluster::AdminAuthorizationDecision, cluster::AdminAuthorizerFailure>
+            authorize(const cluster::AuthenticatedAdminPrincipal &principal,
+                      const cluster::AdminAuthorizationRequest &request) const override {
+                const auto found = std::ranges::find_if(bindings, [&](const Binding &binding) {
+                    return binding.principal.principal_id == principal.principal_id;
+                });
+                if (found == bindings.end()) {
+                    return cluster::AdminAuthorizationDecision {
+                        .outcome = cluster::AdminAuthorizationOutcome::denied,
+                        .decision_id = "operator-binding-missing",
+                        .detail = "principal binding is no longer current",
+                    };
+                }
+                const auto capability = admin_capability(request.operation);
+                const auto tenant_matches = request.resource.tenant == found->principal.home_tenant;
+                const auto pack_matches = request.resource.pack.value.starts_with(found->pack_prefix);
+                const auto allowed = !capability.empty() && found->capabilities.contains(capability) && tenant_matches &&
+                                     pack_matches;
+                return cluster::AdminAuthorizationDecision {
+                    .outcome = allowed ? cluster::AdminAuthorizationOutcome::allowed :
+                                         cluster::AdminAuthorizationOutcome::denied,
+                    .decision_id = allowed ? "operator-binding-allowed" : "operator-binding-denied",
+                    .detail = allowed ? "named operator capability matched" :
+                                        "tenant, pack prefix, or named capability did not match",
+                };
+            }
+
+            std::vector<Binding> bindings;
+        };
+
+        [[nodiscard]] std::expected<std::unique_ptr<OperatorBindingPolicy>, ToolFailure>
+        load_operator_bindings(const ServerConfig &config) {
+            auto lines = read_policy_lines(config.operator_bindings_path, "rule-engine.operator-bindings.v1");
+            if (!lines) {
+                return std::unexpected(std::move(lines.error()));
+            }
+            auto policy = std::make_unique<OperatorBindingPolicy>();
+            std::unordered_set<std::string> peers;
+            std::unordered_set<std::string> principals;
+            for (const auto &line : *lines) {
+                const auto fields = split_fields(line, '\t');
+                if (fields.size() != 7U || !safe_policy_atom(fields[0], 128U) ||
+                    !safe_policy_atom(fields[1], 128U) || !safe_policy_atom(fields[2], 128U) ||
+                    !safe_policy_atom(fields[4], 128U) || !safe_policy_atom(fields[5], 256U)) {
+                    return std::unexpected(unavailable("SRV-OPERATOR-BINDING-MALFORMED",
+                                                       "operator binding snapshot contains an invalid entry"));
+                }
+                cluster::AdminPrincipalKind kind {};
+                if (fields[3] == "administrator") {
+                    kind = cluster::AdminPrincipalKind::administrator;
+                } else if (fields[3] == "automation") {
+                    kind = cluster::AdminPrincipalKind::automation;
+                } else if (fields[3] == "pack_signer") {
+                    kind = cluster::AdminPrincipalKind::pack_signer;
+                } else {
+                    return std::unexpected(unavailable("SRV-OPERATOR-BINDING-MALFORMED",
+                                                       "operator binding principal kind is invalid"));
+                }
+                const auto peer_key = std::string {fields[0]} + '\n' + std::string {fields[1]};
+                if (!peers.insert(peer_key).second || !principals.insert(std::string {fields[2]}).second) {
+                    return std::unexpected(unavailable("SRV-OPERATOR-BINDING-DUPLICATE",
+                                                       "operator binding peer or principal is duplicated"));
+                }
+                auto capabilities = split_fields(fields[6], ',');
+                std::set<std::string, std::less<>> named;
+                for (const auto capability : capabilities) {
+                    if ((capability != "pack.read" && capability != "operation.read" &&
+                         capability != "pack.activate") || !named.insert(std::string {capability}).second) {
+                        return std::unexpected(unavailable("SRV-OPERATOR-BINDING-MALFORMED",
+                                                           "operator binding capability is unknown or duplicated"));
+                    }
+                }
+                policy->bindings.push_back(OperatorBindingPolicy::Binding {
+                    .peer = {.tenant = TenantId {std::string {fields[0]}}, .peer = PeerId {std::string {fields[1]}}},
+                    .principal = {.principal_id = std::string {fields[2]},
+                                  .home_tenant = TenantId {std::string {fields[4]}},
+                                  .kind = kind,
+                                  .authentication_id = peer_key},
+                    .pack_prefix = std::string {fields[5]},
+                    .capabilities = std::move(named),
+                });
+            }
+            if (policy->bindings.empty()) {
+                return std::unexpected(unavailable("SRV-OPERATOR-BINDING-EMPTY",
+                                                   "operator binding snapshot has no explicit principals"));
+            }
+            return policy;
+        }
+
+        struct FileAdminSecurityAudit final: cluster::IAdminSecurityAuditSink {
+            explicit FileAdminSecurityAudit(std::filesystem::path path): path_ {std::move(path)} {}
+
+            void record(const cluster::AdminSecurityAuditEvent &event) noexcept override {
+                std::scoped_lock lock {mutex_};
+                std::ofstream output {path_, std::ios::binary | std::ios::app};
+                if (!output) {
+                    return;
+                }
+                output << event.at_unix_ms << '\t' << static_cast<unsigned int>(event.outcome) << '\t'
+                       << (event.principal_id ? *event.principal_id : "-") << '\t'
+                       << event.request.resource.tenant.value << '\t' << event.request.resource.pack.value << '\n';
+            }
+
+        private:
+            std::filesystem::path path_;
+            std::mutex mutex_;
+        };
+
+        struct StoreBackedAgentSessionBackend final: IResidentAgentBackend {
+            StoreBackedAgentSessionBackend(cluster::IClusterRuntimeStore &store, std::string node_id,
+                                           const std::chrono::milliseconds lease_duration) noexcept:
+                store_ {store}, node_id_ {std::move(node_id)}, lease_duration_ {lease_duration} {}
+
+            [[nodiscard]] std::expected<ResidentAgentSession, protocol_v2::ProtocolError>
+            establish(const protocol_v2::AuthenticatedPeer &peer, const protocol_v2::AgentHelloMessage &hello,
+                      const std::stop_token cancellation) noexcept override {
+                if (cancellation.stop_requested()) {
+                    return std::unexpected(protocol_v2::ProtocolError {.code = protocol_v2::ProtocolErrorCode::canceled,
+                                                                       .message = "agent session establishment canceled"});
+                }
+                const auto serial = next_session_.fetch_add(1U, std::memory_order_relaxed) + 1U;
+                const auto session_id = "session:" + node_id_ + ':' + std::to_string(serial);
+                const cluster::LeaseResource resource {
+                    .scope = "agent-session",
+                    .key = peer.tenant.value + "/" + peer.peer.value,
+                };
+                auto lease = store_.claim_lease(resource, session_id, now_unix_ms(),
+                                                static_cast<std::uint64_t>(lease_duration_.count()));
+                if (!lease) {
+                    return std::unexpected(protocol_v2::ProtocolError {
+                        .code = protocol_v2::ProtocolErrorCode::backpressured,
+                        .message = "current peer session lease has not expired",
+                    });
+                }
+                const auto consumer = receipt_key(peer, hello.agent_epoch);
+                auto acknowledged = store_.load_consumer_fence(consumer);
+                if (!acknowledged) {
+                    static_cast<void>(store_.release_lease(*lease, now_unix_ms()));
+                    return std::unexpected(protocol_v2::ProtocolError {
+                        .code = protocol_v2::ProtocolErrorCode::persistence_error,
+                        .message = "durable agent receipt could not be loaded",
+                    });
+                }
+                {
+                    std::scoped_lock lock {mutex_};
+                    sessions_.emplace(session_id, *lease);
+                }
+                return ResidentAgentSession {
+                    .authenticated_peer = peer,
+                    .session = SessionId {session_id},
+                    .session_fence = lease->fence,
+                    .agent_epoch = hello.agent_epoch,
+                    .acknowledged_through = *acknowledged,
+                    .credit = {},
+                };
+            }
+
+            [[nodiscard]] std::expected<std::vector<protocol_v2::WorkLeaseMessage>, protocol_v2::ProtocolError>
+            take_work(const ResidentAgentSession &, const std::size_t,
+                      const std::stop_token cancellation) noexcept override {
+                if (cancellation.stop_requested()) {
+                    return std::unexpected(protocol_v2::ProtocolError {.code = protocol_v2::ProtocolErrorCode::canceled,
+                                                                       .message = "agent work poll canceled"});
+                }
+                // No event-to-compiled-pack scheduler exists in the current
+                // composition. Returning no work is safe and keeps C++ as the
+                // only future owner of semantic requests.
+                return std::vector<protocol_v2::WorkLeaseMessage> {};
+            }
+
+            [[nodiscard]] std::expected<DurableAgentReceipt, protocol_v2::ProtocolError>
+            persist(const ResidentAgentSession &, const std::uint64_t, const protocol_v2::DurableAgentBody &,
+                    const std::stop_token) noexcept override {
+                // IClusterRuntimeStore has no peer_sessions/agent_receipts
+                // transaction and no authoritative snapshot persistence seam.
+                // Never manufacture a cumulative ACK from an in-memory result.
+                return std::unexpected(protocol_v2::ProtocolError {
+                    .code = protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                    .message = "durable protocol-v2 agent receipt backend is not implemented",
+                });
+            }
+
+            void close(const ResidentAgentSession &session) noexcept override {
+                std::optional<cluster::FencedLease> lease;
+                {
+                    std::scoped_lock lock {mutex_};
+                    const auto found = sessions_.find(session.session.value);
+                    if (found != sessions_.end()) {
+                        lease = found->second;
+                        sessions_.erase(found);
+                    }
+                }
+                if (lease) {
+                    static_cast<void>(store_.release_lease(*lease, now_unix_ms()));
+                }
+            }
+
+        private:
+            [[nodiscard]] static std::string receipt_key(const protocol_v2::AuthenticatedPeer &peer,
+                                                         const std::string_view epoch) {
+                return "agent-receipt/" + peer.tenant.value + '/' + peer.peer.value + '/' + std::string {epoch};
+            }
+
+            cluster::IClusterRuntimeStore &store_;
+            std::string node_id_;
+            std::chrono::milliseconds lease_duration_;
+            std::atomic<std::uint64_t> next_session_ {};
+            std::mutex mutex_;
+            std::map<std::string, cluster::FencedLease, std::less<>> sessions_;
+        };
+
         [[nodiscard]] std::expected<cluster::StoreBackendCapabilities, ToolFailure>
         backend_capabilities(const ServerConfig &config) {
             cluster::StoreBackendConfig selected;
@@ -923,7 +1202,7 @@ session and worker scheduling is not yet connected to the resident loop.
                 .expected_server_name = {},
                 .require_crl = config.tls.require_crl,
                 .verification_time_unix_seconds = std::nullopt,
-                .protocol_limits = {},
+                .protocol_limits = {.maximum_frame_bytes = config.service.maximum_frame_bytes},
             };
             auto context = protocol_v2::OpenSslTlsContext::create(std::move(tls_config));
             if (!context) {
@@ -1093,6 +1372,17 @@ session and worker scheduling is not yet connected to the resident loop.
             "listener.backlog",
             "listener.maximum_consecutive_failures",
             "network.require_hard_resolver_bounds",
+            "service.worker_threads",
+            "service.maximum_queued_sessions",
+            "service.maximum_memory_bytes",
+            "service.maximum_frame_bytes",
+            "service.maximum_messages_per_session",
+            "service.maximum_inflight_work_per_session",
+            "service.maximum_session_duration_ms",
+            "service.inbound_credit_bytes",
+            "service.inbound_credit_messages",
+            "service.inbound_credit_work_attempts",
+            "service.inbound_credit_snapshot_chunks",
             "runtime.root",
             "pack.registry_path",
             "bindings.operator_path",
@@ -1141,9 +1431,25 @@ session and worker scheduling is not yet connected to the resident loop.
         const auto write_timeout = milliseconds_value(*entries, "listener.write_timeout_ms");
         const auto listen_backlog = uint32_value(*entries, "listener.backlog");
         const auto maximum_consecutive_failures = uint32_value(*entries, "listener.maximum_consecutive_failures");
+        const auto worker_threads = uint32_value(*entries, "service.worker_threads");
+        const auto maximum_queued_sessions = uint32_value(*entries, "service.maximum_queued_sessions");
+        const auto maximum_memory_bytes = uint32_value(*entries, "service.maximum_memory_bytes");
+        const auto maximum_frame_bytes = uint32_value(*entries, "service.maximum_frame_bytes");
+        const auto maximum_messages_per_session = uint32_value(*entries, "service.maximum_messages_per_session");
+        const auto maximum_inflight_work =
+            uint32_value(*entries, "service.maximum_inflight_work_per_session");
+        const auto maximum_session_duration = milliseconds_value(*entries, "service.maximum_session_duration_ms");
+        const auto inbound_credit_bytes = uint32_value(*entries, "service.inbound_credit_bytes");
+        const auto inbound_credit_messages = uint32_value(*entries, "service.inbound_credit_messages");
+        const auto inbound_credit_work = uint32_value(*entries, "service.inbound_credit_work_attempts");
+        const auto inbound_credit_snapshots = uint32_value(*entries, "service.inbound_credit_snapshot_chunks");
         if (!schema_version || !processes || !server_major || !pool_size || !lease_duration || !lease_renew_interval ||
             !statement_timeout || !busy_timeout || !accept_timeout || !handshake_timeout || !read_timeout ||
-            !write_timeout || !listen_backlog || !maximum_consecutive_failures) {
+            !write_timeout || !listen_backlog || !maximum_consecutive_failures || !worker_threads ||
+            !maximum_queued_sessions || !maximum_memory_bytes || !maximum_frame_bytes ||
+            !maximum_messages_per_session || !maximum_inflight_work || !maximum_session_duration ||
+            !inbound_credit_bytes || !inbound_credit_messages || !inbound_credit_work ||
+            !inbound_credit_snapshots) {
             return std::unexpected(!schema_version       ? std::move(schema_version.error()) :
                                    !processes            ? std::move(processes.error()) :
                                    !server_major         ? std::move(server_major.error()) :
@@ -1157,7 +1463,18 @@ session and worker scheduling is not yet connected to the resident loop.
                                    !read_timeout         ? std::move(read_timeout.error()) :
                                    !write_timeout        ? std::move(write_timeout.error()) :
                                    !listen_backlog       ? std::move(listen_backlog.error()) :
-                                                           std::move(maximum_consecutive_failures.error()));
+                                   !maximum_consecutive_failures ? std::move(maximum_consecutive_failures.error()) :
+                                   !worker_threads ? std::move(worker_threads.error()) :
+                                   !maximum_queued_sessions ? std::move(maximum_queued_sessions.error()) :
+                                   !maximum_memory_bytes ? std::move(maximum_memory_bytes.error()) :
+                                   !maximum_frame_bytes ? std::move(maximum_frame_bytes.error()) :
+                                   !maximum_messages_per_session ? std::move(maximum_messages_per_session.error()) :
+                                   !maximum_inflight_work ? std::move(maximum_inflight_work.error()) :
+                                   !maximum_session_duration ? std::move(maximum_session_duration.error()) :
+                                   !inbound_credit_bytes ? std::move(inbound_credit_bytes.error()) :
+                                   !inbound_credit_messages ? std::move(inbound_credit_messages.error()) :
+                                   !inbound_credit_work ? std::move(inbound_credit_work.error()) :
+                                                           std::move(inbound_credit_snapshots.error()));
         }
         result.schema_version = *schema_version;
         result.node_id = *entry_value<std::string>(*entries, "node.id");
@@ -1183,6 +1500,19 @@ session and worker scheduling is not yet connected to the resident loop.
         result.listener.write_timeout = *write_timeout;
         result.listener.backlog = *listen_backlog;
         result.listener.maximum_consecutive_failures = *maximum_consecutive_failures;
+        result.service.worker_threads = *worker_threads;
+        result.service.maximum_queued_sessions = *maximum_queued_sessions;
+        result.service.maximum_memory_bytes = *maximum_memory_bytes;
+        result.service.maximum_frame_bytes = *maximum_frame_bytes;
+        result.service.maximum_messages_per_session = *maximum_messages_per_session;
+        result.service.maximum_inflight_work_per_session = *maximum_inflight_work;
+        result.service.maximum_session_duration = *maximum_session_duration;
+        result.service.inbound_credit = {
+            .bytes = *inbound_credit_bytes,
+            .messages = *inbound_credit_messages,
+            .work_attempts = *inbound_credit_work,
+            .snapshot_chunks = *inbound_credit_snapshots,
+        };
         result.listener.require_hard_resolver_bounds =
             *entry_value<bool>(*entries, "network.require_hard_resolver_bounds");
         result.tls.trust_anchors_pem = entry_value<std::string>(*entries, "tls.trust_anchors_pem").value_or("");
@@ -1327,6 +1657,13 @@ session and worker scheduling is not yet connected to the resident loop.
                 config_error("SRV-CONFIG-LISTENER-BOUNDS",
                              "listener timeouts, backlog, failure bound, or hard-resolver policy is invalid"));
         }
+        if (auto service = validate_resident_service_limits(config.service); !service ||
+            config.service.maximum_session_duration > config.lease_duration ||
+            config.service.inbound_credit.work_attempts > config.service.maximum_inflight_work_per_session) {
+            return std::unexpected(
+                config_error("SRV-CONFIG-SERVICE-BOUNDS",
+                             "service worker, queue, frame, memory, credit, or session bounds are invalid"));
+        }
         const std::pair<const std::filesystem::path *, std::string_view> common_paths[] {
             {&config.runtime_root, "runtime.root"},
             {&config.pack_registry_path, "pack.registry_path"},
@@ -1412,6 +1749,8 @@ session and worker scheduling is not yet connected to the resident loop.
         std::optional<protocol_v2::TlsSessionListener> agent_listener;
         std::optional<protocol_v2::TlsSessionListener> admin_listener;
         std::optional<cluster::FencedLease> node_lease;
+        std::unique_ptr<ResidentApplicationService> application;
+        std::unique_ptr<ResidentServiceScheduler> scheduler;
         cluster::IClusterRuntimeStore *runtime_store {};
         const protocol_v2::ITrustPolicy *peer_trust_policy {};
         std::chrono::steady_clock::time_point renew_at {};
@@ -1426,6 +1765,7 @@ session and worker scheduling is not yet connected to the resident loop.
             if (admin_listener) {
                 admin_listener->cancel();
             }
+            stop_services();
             static_cast<void>(release_node_lease());
         }
 
@@ -1452,6 +1792,15 @@ session and worker scheduling is not yet connected to the resident loop.
             agent_listener.reset();
             admin_listener.reset();
         }
+
+        void stop_services() noexcept {
+            if (scheduler) {
+                scheduler->request_stop();
+                scheduler->join();
+                scheduler.reset();
+            }
+            application.reset();
+        }
     };
 
     ProductionResidentServerBackend::ProductionResidentServerBackend(): impl_ {std::make_unique<Impl>()} {}
@@ -1459,7 +1808,8 @@ session and worker scheduling is not yet connected to the resident loop.
 
     std::expected<void, ToolFailure>
     ProductionResidentServerBackend::qualify_activation(const ResidentServerContext &context) noexcept {
-        if (impl_->qualified || impl_->node_lease || impl_->agent_listener || impl_->admin_listener) {
+        if (impl_->qualified || impl_->node_lease || impl_->agent_listener || impl_->admin_listener ||
+            impl_->application || impl_->scheduler) {
             return std::unexpected(ToolFailure {
                 .kind = ToolFailureKind::internal_invariant,
                 .code = "SRV-BACKEND-STATE",
@@ -1474,6 +1824,14 @@ session and worker scheduling is not yet connected to the resident loop.
             return std::unexpected(unavailable_transport(
                 "SRV-PLAINTEXT-LISTENER-UNAVAILABLE",
                 "the resident listener integration currently requires authenticated TLS, including in development"));
+        }
+        if (context.agent_backend == nullptr || context.admin_backend == nullptr) {
+            return std::unexpected(ToolFailure {
+                .kind = ToolFailureKind::internal_invariant,
+                .code = "SRV-APPLICATION-BACKEND-MISSING",
+                .message = "resident agent and admin application backends must be explicitly composed",
+                .diagnostics = {},
+            });
         }
         if (auto runtime = packaging::validate_exact_private_runtime(context.runtime); !runtime) {
             return std::unexpected(unavailable("SRV-RUNTIME-NOT-READY",
@@ -1575,6 +1933,18 @@ session and worker scheduling is not yet connected to the resident loop.
             return std::unexpected(unavailable("SRV-NOT-READY", readiness_failure(readiness)));
         }
 
+        impl_->application = std::make_unique<ResidentApplicationService>(
+            context.config.service, context.peer_trust_policy, *context.agent_backend, *context.admin_backend);
+        auto scheduler = ResidentServiceScheduler::create(context.config.service, *impl_->application);
+        if (!scheduler) {
+            impl_->application.reset();
+            impl_->close_listeners();
+            static_cast<void>(impl_->release_node_lease());
+            return std::unexpected(unavailable_transport("SRV-SCHEDULER-UNAVAILABLE",
+                                                         "the bounded resident scheduler could not be started"));
+        }
+        impl_->scheduler = std::move(*scheduler);
+
         impl_->peer_trust_policy = std::addressof(context.peer_trust_policy);
         impl_->qualified = true;
         return {};
@@ -1583,6 +1953,7 @@ session and worker scheduling is not yet connected to the resident loop.
     std::expected<void, ToolFailure>
     ProductionResidentServerBackend::serve(const ResidentServerContext &context) noexcept {
         if (!impl_->qualified || !impl_->agent_listener || !impl_->admin_listener || !impl_->node_lease ||
+            !impl_->application || !impl_->scheduler ||
             impl_->runtime_store != std::addressof(context.store) || impl_->peer_trust_policy == nullptr) {
             return std::unexpected(ToolFailure {
                 .kind = ToolFailureKind::internal_invariant,
@@ -1599,6 +1970,7 @@ session and worker scheduling is not yet connected to the resident loop.
                 auto current = context.store.lease_is_current(*impl_->node_lease, at);
                 if (!current || !*current) {
                     impl_->close_listeners();
+                    impl_->stop_services();
                     static_cast<void>(impl_->release_node_lease());
                     impl_->qualified = false;
                     return std::unexpected(
@@ -1608,6 +1980,7 @@ session and worker scheduling is not yet connected to the resident loop.
                     *impl_->node_lease, at, static_cast<std::uint64_t>(context.config.lease_duration.count()));
                 if (!renewed) {
                     impl_->close_listeners();
+                    impl_->stop_services();
                     static_cast<void>(impl_->release_node_lease());
                     impl_->qualified = false;
                     return std::unexpected(
@@ -1617,13 +1990,18 @@ session and worker scheduling is not yet connected to the resident loop.
                 impl_->renew_at = std::chrono::steady_clock::now() + context.config.lease_renew_interval;
             }
 
+            const auto role = impl_->accept_agent ? ResidentSessionRole::agent :
+                                                    ResidentSessionRole::administrator;
             auto &listener = impl_->accept_agent ? *impl_->agent_listener : *impl_->admin_listener;
             impl_->accept_agent = !impl_->accept_agent;
             auto peer = listener.accept(*impl_->peer_trust_policy, impl_->stop.get_token());
             if (peer) {
-                // Authentication is complete before this point. Until the
-                // scheduler lane lands, do not consume any application byte.
-                peer->connection.shutdown();
+                ResidentSessionJob job {
+                    .role = role,
+                    .peer = std::move(peer->peer),
+                    .channel = make_resident_tls_channel(std::move(peer->connection)),
+                };
+                static_cast<void>(impl_->scheduler->submit(std::move(job)));
                 consecutive_failures = 0U;
                 continue;
             }
@@ -1638,6 +2016,7 @@ session and worker scheduling is not yet connected to the resident loop.
             }
             if (peer.error().code == protocol_v2::ProtocolErrorCode::dependency_unavailable) {
                 impl_->close_listeners();
+                impl_->stop_services();
                 static_cast<void>(impl_->release_node_lease());
                 impl_->qualified = false;
                 return std::unexpected(unavailable_transport(
@@ -1646,6 +2025,7 @@ session and worker scheduling is not yet connected to the resident loop.
             ++consecutive_failures;
             if (consecutive_failures >= context.config.listener.maximum_consecutive_failures) {
                 impl_->close_listeners();
+                impl_->stop_services();
                 static_cast<void>(impl_->release_node_lease());
                 impl_->qualified = false;
                 return std::unexpected(unavailable_transport(
@@ -1654,6 +2034,7 @@ session and worker scheduling is not yet connected to the resident loop.
         }
 
         impl_->close_listeners();
+        impl_->stop_services();
         auto released = impl_->release_node_lease();
         impl_->qualified = false;
         if (!released) {
@@ -1669,6 +2050,9 @@ session and worker scheduling is not yet connected to the resident loop.
         }
         if (impl_->admin_listener) {
             impl_->admin_listener->cancel();
+        }
+        if (impl_->scheduler) {
+            impl_->scheduler->request_stop();
         }
     }
 
@@ -1742,6 +2126,10 @@ session and worker scheduling is not yet connected to the resident loop.
         if (!peer_trust_policy) {
             return failure_output(peer_trust_policy.error());
         }
+        auto operator_bindings = load_operator_bindings(*config);
+        if (!operator_bindings) {
+            return failure_output(operator_bindings.error());
+        }
         auto agent_tls = create_tls(*config);
         if (!agent_tls) {
             return failure_output(agent_tls.error());
@@ -1768,6 +2156,9 @@ session and worker scheduling is not yet connected to the resident loop.
         if (!health.driver_available || !health.connected || !health.migrations_compatible) {
             return failure_output(unavailable("SRV-STORE-NOT-READY", health.detail));
         }
+        StoreBackedAgentSessionBackend agent_backend {**store, config->node_id, config->lease_duration};
+        FileAdminSecurityAudit admin_security_audit {config->audit_path};
+        AuthorizedResidentAdminBackend admin_backend {**activation_store, **operator_bindings, &admin_security_audit};
         const ResidentServerContext context {
             .config = *config,
             .store = **store,
@@ -1778,6 +2169,8 @@ session and worker scheduling is not yet connected to the resident loop.
             .peer_trust_policy = **peer_trust_policy,
             .agent_tls = agent_tls->has_value() ? std::addressof(**agent_tls) : nullptr,
             .admin_tls = admin_tls->has_value() ? std::addressof(**admin_tls) : nullptr,
+            .agent_backend = std::addressof(agent_backend),
+            .admin_backend = std::addressof(admin_backend),
         };
         if (auto active = backend.qualify_activation(context); !active) {
             return failure_output(active.error());

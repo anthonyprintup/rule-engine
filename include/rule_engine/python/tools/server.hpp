@@ -8,6 +8,7 @@
 #include "rule_engine/python/protocol/network.hpp"
 #include "rule_engine/python/protocol/session.hpp"
 #include "rule_engine/python/tools/common.hpp"
+#include "rule_engine/python/tools/resident_service.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -68,6 +69,7 @@ namespace rule_engine::python::tools {
         std::string agent_endpoint;
         std::string admin_endpoint;
         ServerListenerConfig listener;
+        ResidentServiceLimits service;
         ServerTlsConfig tls;
         std::filesystem::path runtime_root;
         std::filesystem::path pack_registry_path;
@@ -114,6 +116,8 @@ namespace rule_engine::python::tools {
         const protocol_v2::ITrustPolicy &peer_trust_policy;
         protocol_v2::OpenSslTlsContext *agent_tls;
         protocol_v2::OpenSslTlsContext *admin_tls;
+        IResidentAgentBackend *agent_backend {};
+        IResidentAdminBackend *admin_backend {};
     };
 
     // The backend seam keeps process tests injectable while production owns the
@@ -126,10 +130,8 @@ namespace rule_engine::python::tools {
         virtual void request_stop() noexcept = 0;
     };
 
-    // This slice terminates an authenticated connection without reading
-    // application bytes because the worker/session scheduler is integrated in a
-    // later lane. TLS, trust, durable activation, fencing, and bounded stop are
-    // nevertheless real production paths and fail closed independently.
+    // Owns the authenticated listeners, fixed worker pool, bounded session
+    // queue, application handlers, node lease, and deterministic shutdown.
     struct ProductionResidentServerBackend final: ResidentServerBackend {
         ProductionResidentServerBackend();
         ~ProductionResidentServerBackend() override;

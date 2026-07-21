@@ -67,13 +67,41 @@ material is rejected. A deployment must inject a real control-plane adapter;
 the standalone executable fails with the stable unavailable-transport exit when
 none is linked.
 
+The resident server has a separate TLS-only admin listener. Its version-1
+canonical length-prefixed application codec is deliberately narrow: pack
+snapshot, operation snapshot, and final activation flip. It resolves the mTLS
+peer through `rule-engine.operator-bindings.v1` and then calls
+`AuthorizedActivationAdmin`; it never trusts an actor string from the request.
+The bounded tab-separated binding snapshot is:
+
+```text
+rule-engine.operator-bindings.v1
+tenant<TAB>peer<TAB>principal<TAB>administrator|automation|pack_signer<TAB>home-tenant<TAB>pack-prefix<TAB>pack.read,operation.read,pack.activate
+```
+
+Each peer and principal is unique. Capabilities are named explicitly, tenant
+and pack prefix must match, and a `pack_signer` identity is rejected as an
+administrator even if the row lists an admin capability.
+
+## Resident service bounds
+
+`rule_engine_server` requires explicit worker count, queued-session count,
+application-memory reservation, frame size, messages per session, in-flight
+work, session duration, and independent inbound byte/message/work/snapshot
+credits. The fixed `std::jthread` pool owns every accepted TLS application
+session; overload closes the newly authenticated connection, shutdown requests
+cancellation and joins all workers, and no detached thread is used. The
+application-memory reservation does not claim to include OS socket buffers,
+OpenSSL allocator overhead, or backend-internal caches.
+
 ## Current limits
 
 - The worker's process and resource limits contain ordinary failure and abuse;
   they are not a hostile-code sandbox for a trusted generator.
-- The authenticated admin transport is an integration adapter and is not
-  linked by this component. The offline file signer is currently implemented
-  only on Windows; HSM/KMS/PKCS#11 providers remain deployment integrations.
+- The standalone admin CLI transport adapter is not linked by this component;
+  the resident server's narrow authenticated admin listener is linked as
+  described above. The offline file signer is currently implemented only on
+  Windows; HSM/KMS/PKCS#11 providers remain deployment integrations.
 - Archive publication uses a same-directory hard link to provide atomic
   no-clobber behavior. Filesystems without hard-link support fail closed.
 - `--watch` coordinates cancellation and publication generations, but a
