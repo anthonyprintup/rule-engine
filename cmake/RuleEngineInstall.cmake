@@ -6,6 +6,7 @@ if(POLICY CMP0207)
 endif()
 
 include(CMakePackageConfigHelpers)
+include(FetchContent)
 include(GNUInstallDirs)
 
 option(RULE_ENGINE_ENABLE_INSTALL_RULES "Configure the relocatable Rule Engine package" ON)
@@ -221,6 +222,28 @@ function(_rule_engine_detect_package_dependencies targets)
     set(RULE_ENGINE_CONFIG_NEEDS_POSTGRESQL "${needs_postgresql}" PARENT_SCOPE)
     set(RULE_ENGINE_CONFIG_NEEDS_RE2 "${needs_re2}" PARENT_SCOPE)
     set(RULE_ENGINE_CONFIG_NEEDS_SQLITE "${needs_sqlite}" PARENT_SCOPE)
+endfunction()
+
+function(_rule_engine_get_populated_dependency_source content_name marker output_variable)
+    FetchContent_GetProperties(
+        "${content_name}"
+        SOURCE_DIR dependency_source
+        POPULATED dependency_populated
+    )
+    if(NOT dependency_populated OR NOT dependency_source)
+        message(FATAL_ERROR
+            "The real install smoke requires already-populated FetchContent source ${content_name}"
+        )
+    endif()
+    cmake_path(ABSOLUTE_PATH dependency_source NORMALIZE OUTPUT_VARIABLE dependency_source)
+    if(NOT IS_DIRECTORY "${dependency_source}" OR
+       NOT EXISTS "${dependency_source}/${marker}")
+        message(FATAL_ERROR
+            "Populated FetchContent source ${content_name} failed its marker check: "
+            "${dependency_source}/${marker}"
+        )
+    endif()
+    set("${output_variable}" "${dependency_source}" PARENT_SCOPE)
 endfunction()
 
 function(_rule_engine_validate_sdk_manifest source_root output_version)
@@ -616,6 +639,21 @@ function(rule_engine_configure_install)
 
     if(BUILD_TESTING AND RULE_ENGINE_ENABLE_REAL_INSTALL_SMOKE_TEST AND
        EXISTS "${source_root}/cmake/RuleEngineRealInstallSmoke.cmake")
+        _rule_engine_get_populated_dependency_source(
+            asio
+            asio/include/asio.hpp
+            real_smoke_asio_source
+        )
+        _rule_engine_get_populated_dependency_source(
+            rule_engine_abseil
+            absl/base/config.h
+            real_smoke_abseil_source
+        )
+        _rule_engine_get_populated_dependency_source(
+            rule_engine_re2
+            re2/re2.h
+            real_smoke_re2_source
+        )
         set(expected_tool_names "")
         foreach(target IN LISTS install_executables)
             get_target_property(tool_name "${target}" OUTPUT_NAME)
@@ -637,10 +675,9 @@ function(rule_engine_configure_install)
                 "-DRULE_ENGINE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
                 "-DRULE_ENGINE_CMAKE_AR=${CMAKE_AR}"
                 "-DRULE_ENGINE_CMAKE_LINKER=${CMAKE_LINKER}"
-                "-DRULE_ENGINE_ASIO_SOURCE_DIR=${asio_SOURCE_DIR}"
-                "-DRULE_ENGINE_CATCH2_SOURCE_DIR=${catch2_SOURCE_DIR}"
-                "-DRULE_ENGINE_ABSEIL_SOURCE_DIR=${rule_engine_abseil_SOURCE_DIR}"
-                "-DRULE_ENGINE_RE2_SOURCE_DIR=${rule_engine_re2_SOURCE_DIR}"
+                "-DRULE_ENGINE_ASIO_SOURCE_DIR=${real_smoke_asio_source}"
+                "-DRULE_ENGINE_ABSEIL_SOURCE_DIR=${real_smoke_abseil_source}"
+                "-DRULE_ENGINE_RE2_SOURCE_DIR=${real_smoke_re2_source}"
                 "-DRULE_ENGINE_EXPECTED_TOOL_NAMES=${expected_tool_names_argument}"
                 -P "${source_root}/cmake/RuleEngineRealInstallSmoke.cmake"
         )

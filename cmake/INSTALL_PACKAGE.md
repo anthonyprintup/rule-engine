@@ -99,11 +99,15 @@ Cargo/Rust.
 
 `RuleEngineRealInstallSmoke.cmake` is the release gate registered as
 `rule_engine_install_smoke`. It configures the repository itself with tests off
-and FetchContent fully disconnected, builds and installs the real exported
-target graph, relocates the prefix, runs every discovered public executable with
-`--version`, and builds/runs a `python_protocol` downstream consumer solely from
-the installed prefix plus normal platform dependencies. The focused fixture is
-registered separately as `rule_engine_install_fixture_smoke`.
+and FetchContent fully disconnected. The parent configure passes only its
+already-populated Asio, Abseil, and RE2 source directories into that fresh
+producer. Both registration and execution validate dependency-specific marker
+files, and no download or update fallback is allowed. The gate then builds and
+installs the real exported target graph, relocates the prefix, runs every
+discovered public executable with `--version`, and builds/runs a
+`python_protocol` downstream consumer solely from the installed prefix plus
+normal platform dependencies. The focused fixture is registered separately as
+`rule_engine_install_fixture_smoke`.
 
 When registered by the integration build, run:
 
@@ -118,9 +122,8 @@ generator, make program, and C/C++ compiler paths through `-D` arguments.
 probe. Pass it as `CMAKE_PROJECT_INCLUDE` when configuring the repository. It
 defers this install module until the complete real target graph exists, so CMake
 generation validates the actual export set and generated dependency decisions.
-Building `rule_engine_install_package` then installs that real graph. This probe
-still observes the transitional root's configure-time Cargo requirement; it is
-not the clean downstream-consumer test described above.
+Building `rule_engine_install_package` then installs that real graph. All current
+probe, packaging, and downstream-consumer paths run without Cargo or Rust.
 
 ## Known limitations
 
@@ -140,6 +143,3 @@ not the clean downstream-consumer test described above.
   installed SDK contains the versioned base package and empty binding seam.
 - Executables are installed only after their Python-engine targets exist. The
   module intentionally never falls back to similarly named legacy executables.
-- Until the root cutover commit removes its retired YARA build, the standalone
-  hook probe of that historical root requires Cargo. The Python-only root and
-  the registered real-graph smoke remove Cargo/Rust from PATH.

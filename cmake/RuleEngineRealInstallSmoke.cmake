@@ -99,24 +99,41 @@ foreach(pair IN ITEMS
     endif()
 endforeach()
 set(fetchcontent_args -DFETCHCONTENT_FULLY_DISCONNECTED=ON)
-foreach(pair IN ITEMS
-    "ASIO;RULE_ENGINE_ASIO_SOURCE_DIR"
-    "CATCH2;RULE_ENGINE_CATCH2_SOURCE_DIR"
-    "RULE_ENGINE_ABSEIL;RULE_ENGINE_ABSEIL_SOURCE_DIR"
-    "RULE_ENGINE_RE2;RULE_ENGINE_RE2_SOURCE_DIR"
-)
-    list(GET pair 0 dependency_name)
-    list(GET pair 1 input_name)
-    if(DEFINED ${input_name} AND NOT "${${input_name}}" STREQUAL "")
-        list(APPEND
-            fetchcontent_args
-            "-DFETCHCONTENT_SOURCE_DIR_${dependency_name}=${${input_name}}"
+foreach(dependency IN ITEMS ASIO RULE_ENGINE_ABSEIL RULE_ENGINE_RE2)
+    if(dependency STREQUAL "ASIO")
+        set(input_name RULE_ENGINE_ASIO_SOURCE_DIR)
+        set(marker asio/include/asio.hpp)
+    elseif(dependency STREQUAL "RULE_ENGINE_ABSEIL")
+        set(input_name RULE_ENGINE_ABSEIL_SOURCE_DIR)
+        set(marker absl/base/config.h)
+    else()
+        set(input_name RULE_ENGINE_RE2_SOURCE_DIR)
+        set(marker re2/re2.h)
+    endif()
+    if(NOT DEFINED ${input_name} OR "${${input_name}}" STREQUAL "")
+        message(FATAL_ERROR
+            "${input_name} must identify an already-populated parent-build dependency source"
         )
     endif()
+    cmake_path(ABSOLUTE_PATH ${input_name} NORMALIZE OUTPUT_VARIABLE dependency_source)
+    if(NOT IS_DIRECTORY "${dependency_source}" OR
+       NOT EXISTS "${dependency_source}/${marker}")
+        message(FATAL_ERROR
+            "${input_name} failed its offline dependency marker check: "
+            "${dependency_source}/${marker}"
+        )
+    endif()
+    cmake_path(IS_PREFIX binary_root "${dependency_source}" NORMALIZE source_is_in_fresh_build)
+    if(source_is_in_fresh_build)
+        message(FATAL_ERROR
+            "${input_name} must come from the populated parent build, not the fresh producer"
+        )
+    endif()
+    list(APPEND
+        fetchcontent_args
+        "-DFETCHCONTENT_SOURCE_DIR_${dependency}=${dependency_source}"
+    )
 endforeach()
-if(NOT DEFINED RULE_ENGINE_REAL_SMOKE_BUILD_TESTING)
-    set(RULE_ENGINE_REAL_SMOKE_BUILD_TESTING OFF)
-endif()
 
 function(run_checked label)
     execute_process(
@@ -138,7 +155,7 @@ run_checked(
     ${generator_args}
     ${toolchain_args}
     ${fetchcontent_args}
-    "-DBUILD_TESTING=${RULE_ENGINE_REAL_SMOKE_BUILD_TESTING}"
+    -DBUILD_TESTING=OFF
     -DRULE_ENGINE_ENABLE_INSTALL_SMOKE_TEST=OFF
     -DRULE_ENGINE_ENABLE_REAL_INSTALL_SMOKE_TEST=OFF
     -DRULE_ENGINE_INSTALL_PRIVATE_PYTHON=OFF
