@@ -4,6 +4,7 @@ add_library(
     crypto.cpp
     generator.cpp
     runtime.cpp
+    signing.cpp
     source_pack.cpp
     worker.cpp
     windows_worker_launcher.cpp
@@ -16,6 +17,9 @@ target_link_libraries(
         rule_engine::python_contract
         rule_engine::project_options
 )
+if(WIN32)
+    target_link_libraries(rule_engine_python_packaging PRIVATE advapi32)
+endif()
 
 add_executable(rule_engine_python_runtime_stager runtime_stager_main.cpp)
 target_link_libraries(rule_engine_python_runtime_stager PRIVATE rule_engine::python_packaging)
@@ -89,6 +93,7 @@ set_property(
     PROPERTY RULE_ENGINE_PRIVATE_PYTHON_RUNTIME_ROOT "${RULE_ENGINE_PYTHON_RUNTIME_STAGE_DIR}"
 )
 
+if(BUILD_TESTING)
 add_executable(
     rule_engine_python_packaging_tests
     "${PROJECT_SOURCE_DIR}/tests/python_packaging_tests.cpp"
@@ -99,6 +104,9 @@ target_link_libraries(
         rule_engine::python_packaging
         Catch2::Catch2WithMain
 )
+if(WIN32)
+    target_link_libraries(rule_engine_python_packaging_tests PRIVATE advapi32)
+endif()
 target_compile_options(
     rule_engine_python_packaging_tests
     PRIVATE
@@ -161,3 +169,4 @@ add_test(
         "-DRULE_ENGINE_WORKER_SCRIPT=${python_worker_script}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/stage_cpython_runtime_tests.cmake"
 )
+endif()

@@ -3,6 +3,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -10,12 +11,23 @@
 #include <expected>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+// clang-format off
+#include <winapifamily.h>
+#include <Windows.h>
+#include <sddl.h>
+// clang-format on
+#endif
 
 namespace rule_engine::python::packaging {
     namespace {
@@ -51,6 +63,18 @@ namespace rule_engine::python::packaging {
             return result;
         }
 
+        std::string hex_text(const std::span<const std::byte> value) {
+            constexpr std::string_view digits = "0123456789abcdef";
+            std::string result;
+            result.reserve(value.size() * 2U);
+            for (const auto byte : value) {
+                const auto number = std::to_integer<unsigned int>(byte);
+                result.push_back(digits[number >> 4U]);
+                result.push_back(digits[number & 0x0fU]);
+            }
+            return result;
+        }
+
         std::string text(const std::span<const std::byte> value) {
             return {reinterpret_cast<const char *>(value.data()), value.size()};
         }
@@ -70,6 +94,99 @@ namespace rule_engine::python::packaging {
             return raw_value == nullptr ? std::nullopt : std::optional<std::string> {raw_value};
 #endif
         }
+
+#ifdef _WIN32
+        struct TestHandle {
+            HANDLE value {INVALID_HANDLE_VALUE};
+
+            ~TestHandle() {
+                if (value != nullptr && value != INVALID_HANDLE_VALUE) {
+                    CloseHandle(value);
+                }
+            }
+
+            TestHandle() = default;
+            TestHandle(const TestHandle &) = delete;
+            TestHandle &operator=(const TestHandle &) = delete;
+        };
+
+        std::wstring current_user_sid_text() {
+            TestHandle token;
+            REQUIRE(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token.value) != 0);
+            DWORD required {};
+            GetTokenInformation(token.value, TokenUser, nullptr, 0U, &required);
+            REQUIRE(GetLastError() == ERROR_INSUFFICIENT_BUFFER);
+            std::vector<std::byte> token_data(required);
+            REQUIRE(GetTokenInformation(token.value, TokenUser, token_data.data(), required, &required) != 0);
+            const auto *user = reinterpret_cast<const TOKEN_USER *>(token_data.data());
+            LPWSTR raw_sid {};
+            REQUIRE(ConvertSidToStringSidW(user->User.Sid, &raw_sid) != 0);
+            REQUIRE(raw_sid != nullptr);
+            std::wstring sid {raw_sid};
+            LocalFree(raw_sid);
+            return sid;
+        }
+
+        struct TemporarySigningKeyFile {
+            std::filesystem::path path;
+
+            TemporarySigningKeyFile(const std::span<const std::byte> seed, const bool expose_to_everyone) {
+                std::error_code filesystem_error;
+                const auto root = std::filesystem::temp_directory_path(filesystem_error);
+                REQUIRE_FALSE(filesystem_error);
+                path = root / (L"rule-engine-ed25519-" +
+                               std::to_wstring(std::chrono::steady_clock::now().time_since_epoch().count()) + L"-" +
+                               std::to_wstring(GetCurrentThreadId()) + L".seed");
+
+                const auto caller_sid = current_user_sid_text();
+                auto sddl = L"O:" + caller_sid + L"D:P(A;;FA;;;" + caller_sid + L")(A;;FA;;;SY)(A;;FA;;;BA)";
+                if (expose_to_everyone) {
+                    sddl += L"(A;;GR;;;WD)";
+                }
+                PSECURITY_DESCRIPTOR raw_descriptor {};
+                REQUIRE(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1,
+                                                                             &raw_descriptor, nullptr) != 0);
+                REQUIRE(raw_descriptor != nullptr);
+                SECURITY_ATTRIBUTES attributes {
+                    .nLength = sizeof(SECURITY_ATTRIBUTES),
+                    .lpSecurityDescriptor = raw_descriptor,
+                    .bInheritHandle = FALSE,
+                };
+                TestHandle file;
+                file.value = CreateFileW(path.c_str(), GENERIC_WRITE, 0U, &attributes, CREATE_NEW,
+                                         FILE_ATTRIBUTE_NORMAL, nullptr);
+                LocalFree(raw_descriptor);
+                REQUIRE(file.value != INVALID_HANDLE_VALUE);
+                DWORD written {};
+                REQUIRE(WriteFile(file.value, seed.data(), static_cast<DWORD>(seed.size()), &written, nullptr) != 0);
+                REQUIRE(written == static_cast<DWORD>(seed.size()));
+            }
+
+            ~TemporarySigningKeyFile() {
+                std::error_code ignored;
+                std::filesystem::remove(path, ignored);
+            }
+
+            TemporarySigningKeyFile(const TemporarySigningKeyFile &) = delete;
+            TemporarySigningKeyFile &operator=(const TemporarySigningKeyFile &) = delete;
+
+            [[nodiscard]] std::string reference() const { return "file:" + path.generic_string(); }
+        };
+#endif
+
+        struct UnreachableSigningKeyProvider final: SigningKeyProvider {
+            std::size_t calls {};
+
+            std::expected<std::unique_ptr<Ed25519Signer>, PackagingError>
+            open_ed25519(const std::string_view) override {
+                ++calls;
+                return std::unexpected(PackagingError {
+                    .code = PackagingErrorCode::signing_key_unavailable,
+                    .message = "test provider must not be reached",
+                    .subject = std::nullopt,
+                });
+            }
+        };
 
         SourcePackManifest manifest() {
             return SourcePackManifest {
@@ -208,6 +325,13 @@ namespace rule_engine::python::packaging {
             const auto encoded = encode_canonical_source_pack(fixture.archive);
             REQUIRE(encoded.has_value());
             return *encoded;
+        }
+
+        SourcePackArchive unsigned_archive() {
+            auto fixture = make_signed_archive();
+            std::erase_if(fixture.archive.entries,
+                          [](const ArchiveEntry &entry) { return entry.path == "META-INF/signature.json"; });
+            return std::move(fixture.archive);
         }
 
         SourcePackManifest pack_manifest(std::string pack_id) {
@@ -756,6 +880,192 @@ namespace rule_engine::python::packaging {
         auto trailing = *first;
         trailing.push_back(std::byte {0});
         REQUIRE_FALSE(decode_canonical_source_pack(trailing).has_value());
+    }
+
+    TEST_CASE("offline source-pack signing rejects malformed or already-signed input before key access") {
+        const SourcePackSigningRequest request {
+            .signer_reference = "file:C:/must-not-be-opened.seed",
+            .requested_key_id = std::nullopt,
+        };
+
+        SECTION("malformed indexed payload") {
+            auto archive = unsigned_archive();
+            const auto source = std::ranges::find(archive.entries, "src/acme/rules.py", &ArchiveEntry::path);
+            REQUIRE(source != archive.entries.end());
+            source->bytes.push_back(std::byte {'x'});
+            UnreachableSigningKeyProvider provider;
+
+            const auto signed_pack = sign_canonical_source_pack(archive, request, provider);
+
+            REQUIRE_FALSE(signed_pack.has_value());
+            REQUIRE(signed_pack.error().code == PackagingErrorCode::entry_size_mismatch);
+            REQUIRE(provider.calls == 0U);
+        }
+
+        SECTION("existing signature envelope") {
+            auto fixture = make_signed_archive();
+            UnreachableSigningKeyProvider provider;
+
+            const auto signed_pack = sign_canonical_source_pack(fixture.archive, request, provider);
+
+            REQUIRE_FALSE(signed_pack.has_value());
+            REQUIRE(signed_pack.error().code == PackagingErrorCode::invalid_signature_envelope);
+            REQUIRE(provider.calls == 0U);
+        }
+    }
+
+    TEST_CASE("file Ed25519 provider rejects unknown relative malformed and exposed key references") {
+#ifndef _WIN32
+        SKIP("Windows OpenSSL 3 file signer is unavailable on this platform");
+#else
+        OpenSsl3FileEd25519KeyProvider provider;
+
+        SECTION("unknown provider") {
+            const auto opened = provider.open_ed25519("pkcs11:token=ci");
+            REQUIRE_FALSE(opened.has_value());
+            REQUIRE(opened.error().code == PackagingErrorCode::signing_key_reference_invalid);
+            REQUIRE_FALSE(opened.error().subject.has_value());
+        }
+
+        SECTION("relative file") {
+            const auto opened = provider.open_ed25519("file:relative.seed");
+            REQUIRE_FALSE(opened.has_value());
+            REQUIRE(opened.error().code == PackagingErrorCode::signing_key_reference_invalid);
+            REQUIRE_FALSE(opened.error().subject.has_value());
+        }
+
+        SECTION("alternate data stream") {
+            const auto opened = provider.open_ed25519("file:C:/key.seed:hidden");
+            REQUIRE_FALSE(opened.has_value());
+            REQUIRE(opened.error().code == PackagingErrorCode::signing_key_reference_invalid);
+            REQUIRE_FALSE(opened.error().subject.has_value());
+        }
+
+        SECTION("wrong seed size") {
+            const auto short_seed = repeated_bytes(31U, std::byte {0x41});
+            const TemporarySigningKeyFile key_file {short_seed, false};
+            const auto opened = provider.open_ed25519(key_file.reference());
+            REQUIRE_FALSE(opened.has_value());
+            REQUIRE(opened.error().code == PackagingErrorCode::signing_key_unavailable);
+            REQUIRE_FALSE(opened.error().subject.has_value());
+        }
+
+        SECTION("file grants access to Everyone") {
+            const auto seed = repeated_bytes(32U, std::byte {0x42});
+            const TemporarySigningKeyFile key_file {seed, true};
+            const auto opened = provider.open_ed25519(key_file.reference());
+            REQUIRE_FALSE(opened.has_value());
+            REQUIRE(opened.error().code == PackagingErrorCode::signing_key_permissions);
+            REQUIRE_FALSE(opened.error().subject.has_value());
+        }
+#endif
+    }
+
+    TEST_CASE("OpenSSL 3 signs the canonical pack message deterministically without serializing private material") {
+#ifndef _WIN32
+        SKIP("Windows OpenSSL 3 file signer is unavailable on this platform");
+#else
+        if (!shared_runtime().runtime) {
+            if (!shared_runtime().staging_failure.empty()) {
+                FAIL_CHECK(shared_runtime().staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << shared_runtime().unavailable_reason);
+            return;
+        }
+        // This is the published RFC 8032 test seed, never production key material.
+        const auto seed = hex_bytes("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+        const auto public_key = hex_bytes("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+        const auto expected_key_id = "sha256:" + sha256_hex(public_key);
+        const TemporarySigningKeyFile key_file {seed, false};
+        OpenSsl3FileEd25519KeyProvider provider;
+        provider.crypto_library = shared_runtime().runtime->crypto_library;
+        const SourcePackSigningRequest request {
+            .signer_reference = key_file.reference(),
+            .requested_key_id = expected_key_id,
+        };
+        const auto archive = unsigned_archive();
+
+        const auto first = sign_canonical_source_pack(archive, request, provider);
+        const auto second = sign_canonical_source_pack(archive, request, provider);
+
+        REQUIRE(first.has_value());
+        REQUIRE(second.has_value());
+        const auto first_encoded = encode_canonical_source_pack(*first);
+        const auto second_encoded = encode_canonical_source_pack(*second);
+        REQUIRE(first_encoded.has_value());
+        REQUIRE(second_encoded.has_value());
+        REQUIRE(*first_encoded == *second_encoded);
+        const auto signature_entry = std::ranges::find(first->entries, "META-INF/signature.json", &ArchiveEntry::path);
+        REQUIRE(signature_entry != first->entries.end());
+        const auto envelope = parse_canonical_signature_envelope(text(signature_entry->bytes));
+        REQUIRE(envelope.has_value());
+        REQUIRE(envelope->key_id == expected_key_id);
+        const auto expected_signature = hex_bytes("fffbef6e470a36bdc839be96cca94f9e2917a016e22bcb7f1cddb31f9ba90c8f"
+                                                  "c2123643d9f8e64f2d212514216c176c01b114c44d5f043c843366ff761dc10c");
+        REQUIRE(envelope->signature == expected_signature);
+
+        REQUIRE(std::search(first_encoded->begin(), first_encoded->end(), seed.begin(), seed.end()) ==
+                first_encoded->end());
+        const auto reference_bytes = bytes(request.signer_reference);
+        REQUIRE(std::search(first_encoded->begin(), first_encoded->end(), reference_bytes.begin(),
+                            reference_bytes.end()) == first_encoded->end());
+
+        TrustPolicy policy {
+            .mode = TrustMode::production,
+            .allow_unsigned_packs = false,
+            .allow_unsigned_generators = false,
+            .signers = {TrustedSigner {
+                .key_id = expected_key_id,
+                .public_key = public_key,
+                .allowed_pack_prefixes = {"com.acme."},
+                .revoked = false,
+            }},
+        };
+        OpenSsl3Ed25519Verifier verifier;
+        verifier.crypto_library = shared_runtime().runtime->crypto_library;
+        REQUIRE(verify_and_load_source_pack(*first, policy, verifier).has_value());
+
+        auto signature_tamper = *first;
+        const auto tampered_signature_entry =
+            std::ranges::find(signature_tamper.entries, "META-INF/signature.json", &ArchiveEntry::path);
+        REQUIRE(tampered_signature_entry != signature_tamper.entries.end());
+        auto tampered_envelope = parse_canonical_signature_envelope(text(tampered_signature_entry->bytes));
+        REQUIRE(tampered_envelope.has_value());
+        tampered_envelope->signature.front() ^= std::byte {1};
+        tampered_signature_entry->bytes = bytes(canonical_signature_envelope(*tampered_envelope));
+        const auto signature_rejected = verify_and_load_source_pack(signature_tamper, policy, verifier);
+        REQUIRE_FALSE(signature_rejected.has_value());
+        REQUIRE(signature_rejected.error().code == PackagingErrorCode::signature_invalid);
+
+        auto message_tamper = *first;
+        const auto tampered_source =
+            std::ranges::find(message_tamper.entries, "src/acme/rules.py", &ArchiveEntry::path);
+        const auto tampered_index =
+            std::ranges::find(message_tamper.entries, "META-INF/index.json", &ArchiveEntry::path);
+        REQUIRE(tampered_source != message_tamper.entries.end());
+        REQUIRE(tampered_index != message_tamper.entries.end());
+        tampered_source->bytes.front() ^= std::byte {1};
+        auto parsed_index = parse_canonical_index(text(tampered_index->bytes));
+        REQUIRE(parsed_index.has_value());
+        const auto source_index =
+            std::ranges::find(parsed_index->entries, "src/acme/rules.py", &SourceIndexEntry::path);
+        REQUIRE(source_index != parsed_index->entries.end());
+        source_index->sha256 = sha256_hex(tampered_source->bytes);
+        tampered_index->bytes = bytes(canonical_index(*parsed_index));
+        const auto message_rejected = verify_and_load_source_pack(message_tamper, policy, verifier);
+        REQUIRE_FALSE(message_rejected.has_value());
+        REQUIRE(message_rejected.error().code == PackagingErrorCode::signature_invalid);
+
+        auto mismatched_request = request;
+        mismatched_request.requested_key_id = "sha256:" + std::string(64U, '0');
+        const auto mismatch = sign_canonical_source_pack(archive, mismatched_request, provider);
+        REQUIRE_FALSE(mismatch.has_value());
+        REQUIRE(mismatch.error().code == PackagingErrorCode::signing_key_mismatch);
+        REQUIRE_FALSE(mismatch.error().subject.has_value());
+        REQUIRE(mismatch.error().message.find(key_file.reference()) == std::string::npos);
+        REQUIRE(mismatch.error().message.find(hex_text(seed)) == std::string::npos);
+#endif
     }
 
     TEST_CASE("OpenSSL 3 backend verifies the RFC 8032 Ed25519 vector from an explicit runtime path") {
