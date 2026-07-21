@@ -394,6 +394,22 @@ TEST_CASE("server configuration parser bounds hostile input and duplicate state"
     REQUIRE_FALSE(unsafe_renewal.has_value());
     CHECK(unsafe_renewal.error().code == "SRV-CONFIG-LISTENER-BOUNDS");
 
+    auto slow_handshake = development_config(temporary);
+    replace_once(slow_handshake, "listener.handshake_timeout_ms = 5000",
+                 "listener.handshake_timeout_ms = 19000");
+    const auto unsafe_handshake = parse_server_config(slow_handshake);
+    REQUIRE_FALSE(unsafe_handshake.has_value());
+    CHECK(unsafe_handshake.error().code == "SRV-CONFIG-LISTENER-BOUNDS");
+
+    auto overflowing_window = development_config(temporary);
+    replace_once(overflowing_window, "node.lease_duration_ms = 30000",
+                 "node.lease_duration_ms = 9223372036854775807");
+    replace_once(overflowing_window, "node.lease_renew_interval_ms = 10000",
+                 "node.lease_renew_interval_ms = 9223372036854775307");
+    const auto unsafe_overflow = parse_server_config(overflowing_window);
+    REQUIRE_FALSE(unsafe_overflow.has_value());
+    CHECK(unsafe_overflow.error().code == "SRV-CONFIG-LISTENER-BOUNDS");
+
     auto unbounded_service = development_config(temporary);
     replace_once(unbounded_service, "service.maximum_memory_bytes = 134217728",
                  "service.maximum_memory_bytes = 1024");
@@ -660,13 +676,14 @@ namespace {
         std::uint64_t fence {9U};
         std::size_t persists {};
         std::size_t closes {};
+        bool return_invalid_session {};
 
         [[nodiscard]] std::expected<tools::ResidentAgentSession, proto::ProtocolError>
         establish(const proto::AuthenticatedPeer &peer, const proto::AgentHelloMessage &hello,
                   std::stop_token) noexcept override {
             return tools::ResidentAgentSession {.authenticated_peer = peer,
                                                 .session = py::SessionId {"session:test"},
-                                                .session_fence = fence,
+                                                .session_fence = return_invalid_session ? 0U : fence,
                                                 .agent_epoch = hello.agent_epoch,
                                                 .acknowledged_through = 0U,
                                                 .credit = {.bytes = 64U * py::kibibyte,
@@ -877,6 +894,26 @@ TEST_CASE("resident agent service consumes framed bytes and ACKs only a durable 
     CHECK(state->shutdown);
 }
 
+TEST_CASE("resident agent service closes an established session that fails value validation") {
+    AllowTrust trust;
+    DurableFakeAgentBackend agents;
+    agents.return_invalid_session = true;
+    RejectAdmin admin;
+    tools::ResidentApplicationService service {test_service_limits(), trust, agents, admin};
+    auto state = std::make_shared<FakeChannelState>();
+    enqueue_protocol(state, agent_hello_envelope());
+
+    service.run({.role = tools::ResidentSessionRole::agent,
+                 .peer = {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:test"}},
+                 .channel = std::make_unique<FakeByteChannel>(state)},
+                {});
+
+    CHECK(agents.closes == 1U);
+    CHECK(agents.persists == 0U);
+    CHECK(state->protocol_output.empty());
+    CHECK(state->shutdown);
+}
+
 TEST_CASE("resident agent service rejects a stale inner fence without persistence or ACK") {
     AllowTrust trust;
     DurableFakeAgentBackend agents;
@@ -892,6 +929,7 @@ TEST_CASE("resident agent service rejects a stale inner fence without persistenc
                 {});
 
     CHECK(agents.persists == 0U);
+    CHECK(agents.closes == 1U);
     REQUIRE(state->protocol_output.size() == 3U);
     const auto nack = proto::decode_frame(state->protocol_output.back());
     REQUIRE(nack);
@@ -915,6 +953,7 @@ TEST_CASE("resident agent service rejects a mismatched fact schema before persis
                 {});
 
     CHECK(agents.persists == 0U);
+    CHECK(agents.closes == 1U);
     REQUIRE(state->protocol_output.size() == 3U);
     const auto nack = proto::decode_frame(state->protocol_output.back());
     REQUIRE(nack);

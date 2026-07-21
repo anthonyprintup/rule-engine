@@ -202,6 +202,13 @@ namespace rule_engine::python::tools {
             void cancel(const protocol_v2::WorkLeaseMessage &, std::span<const RequestId>) noexcept override {}
         };
 
+        struct AgentSessionCloser {
+            IResidentAgentBackend &backend;
+            ResidentAgentSession &session;
+
+            ~AgentSessionCloser() { backend.close(session); }
+        };
+
         [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
         validate_result(const std::map<std::string, protocol_v2::WorkLeaseMessage, std::less<>> &outstanding,
                         const protocol_v2::WorkResultMessage &result) {
@@ -666,7 +673,11 @@ namespace rule_engine::python::tools {
             return;
         }
         auto session = agents_.establish(job.peer, hello, cancellation);
-        if (!session || session->authenticated_peer.tenant != job.peer.tenant ||
+        if (!session) {
+            return;
+        }
+        const AgentSessionCloser close_session {.backend = agents_, .session = *session};
+        if (session->authenticated_peer.tenant != job.peer.tenant ||
             session->authenticated_peer.peer != job.peer.peer || session->session.empty() ||
             session->session_fence == 0U || session->agent_epoch != hello.agent_epoch ||
             session->acknowledged_through >= hello.next_sequence ||
@@ -682,7 +693,6 @@ namespace rule_engine::python::tools {
             protocol_v2::ProtocolLimits {.maximum_frame_bytes = limits_.maximum_frame_bytes,
                                          .maximum_sequence_gap = 1U});
         if (!gate) {
-            agents_.close(*session);
             return;
         }
         const protocol_v2::ServerHelloMessage welcome {
@@ -700,7 +710,6 @@ namespace rule_engine::python::tools {
                 server_envelope(*session, "server:" + session->session.value + ":hello", welcome),
                 bounded_deadline(session_deadline), cancellation);
             !sent) {
-            agents_.close(*session);
             return;
         }
 
@@ -710,7 +719,6 @@ namespace rule_engine::python::tools {
                                                  static_cast<std::size_t>(hello.receive_limit.messages)});
         auto work = agents_.take_work(*session, peer_work_limit, cancellation);
         if (!work || work->size() > peer_work_limit) {
-            agents_.close(*session);
             return;
         }
         std::uint64_t server_sequence {};
@@ -726,7 +734,6 @@ namespace rule_engine::python::tools {
             IgnoreCancel cancel;
             auto valid = runtime::ProtocolV2ProviderResponsePort::create(lease, cancel);
             if (!valid || outstanding.contains(lease.work_id) || outstanding.size() >= limits_.maximum_inflight_work_per_session) {
-                agents_.close(*session);
                 return;
             }
             const auto message_id = "server:" + session->session.value + ":work:" + std::to_string(server_sequence);
@@ -735,14 +742,12 @@ namespace rule_engine::python::tools {
                 outbound, protocol_v2::ProtocolLimits {.maximum_frame_bytes = limits_.maximum_frame_bytes});
             if (!measured || sent_work_bytes > peer_byte_limit ||
                 measured->size() > peer_byte_limit - sent_work_bytes) {
-                agents_.close(*session);
                 return;
             }
             sent_work_bytes += measured->size();
             if (auto sent = job.channel->send_protocol(outbound,
                                                        bounded_deadline(session_deadline), cancellation);
                 !sent) {
-                agents_.close(*session);
                 return;
             }
             outstanding.emplace(lease.work_id, std::move(lease));
@@ -789,7 +794,6 @@ namespace rule_engine::python::tools {
                         static_cast<void>(job.channel->send_protocol(
                             server_envelope(*session, "server:" + session->session.value + ":nack", nack),
                             bounded_deadline(session_deadline), cancellation));
-                        agents_.close(*session);
                         return;
                     }
                 }
@@ -809,12 +813,10 @@ namespace rule_engine::python::tools {
                     static_cast<void>(job.channel->send_protocol(
                         server_envelope(*session, "server:" + session->session.value + ":nack", nack),
                         bounded_deadline(session_deadline), cancellation));
-                    agents_.close(*session);
                     return;
                 }
                 auto settled = gate->mark_durable(contiguous->sequence);
                 if (!settled || *settled != durable->acknowledged_through) {
-                    agents_.close(*session);
                     return;
                 }
                 session->acknowledged_through = *settled;
@@ -829,12 +831,10 @@ namespace rule_engine::python::tools {
                         server_envelope(*session, "server:" + session->session.value + ":ack", ack),
                         bounded_deadline(session_deadline), cancellation);
                     !sent) {
-                    agents_.close(*session);
                     return;
                 }
             }
         }
-        agents_.close(*session);
     }
 
     void ResidentApplicationService::run_admin(ResidentSessionJob &job,

@@ -173,6 +173,10 @@ overload closes the newly authenticated connection. Its configured application
 memory reservation covers owned frame/session reservations, not OS socket
 buffers, TLS-library allocations, allocator overhead, or backend-internal
 caches, so deployments still need a measured process/container memory limit.
+The lease renewal interval plus the complete blocking listener window (TCP
+accept timeout and TLS handshake timeout) must be strictly shorter than the
+node lease duration; configuration validation computes this without overflowing
+the duration representation.
 
 The current default store composition deliberately advertises zero work and
 zero durable-message credit because it cannot atomically commit an agent body

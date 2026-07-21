@@ -1651,11 +1651,20 @@ final activation flip; other control-plane operations remain CLI/backend work.
             config.listener.write_timeout <= std::chrono::milliseconds::zero() ||
             config.listener.write_timeout > std::chrono::minutes {5} || config.listener.backlog == 0U ||
             config.listener.backlog > 4'096U || config.listener.maximum_consecutive_failures == 0U ||
-            config.listener.maximum_consecutive_failures > 1'024U || !config.listener.require_hard_resolver_bounds ||
-            config.lease_renew_interval + config.listener.accept_timeout >= config.lease_duration) {
+            config.listener.maximum_consecutive_failures > 1'024U || !config.listener.require_hard_resolver_bounds) {
             return std::unexpected(
                 config_error("SRV-CONFIG-LISTENER-BOUNDS",
                              "listener timeouts, backlog, failure bound, or hard-resolver policy is invalid"));
+        }
+        auto lease_window_remaining = config.lease_duration.count();
+        for (const auto blocking_interval : {config.lease_renew_interval, config.listener.accept_timeout,
+                                             config.listener.handshake_timeout}) {
+            if (blocking_interval.count() <= 0 || blocking_interval.count() >= lease_window_remaining) {
+                return std::unexpected(config_error(
+                    "SRV-CONFIG-LISTENER-BOUNDS",
+                    "lease renewal plus listener accept and TLS handshake bounds must be shorter than the lease"));
+            }
+            lease_window_remaining -= blocking_interval.count();
         }
         if (auto service = validate_resident_service_limits(config.service); !service ||
             config.service.maximum_session_duration > config.lease_duration ||
