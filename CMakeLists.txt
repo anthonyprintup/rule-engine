@@ -23,13 +23,6 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-if(MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
-    foreach(flag_var CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE CMAKE_CXX_FLAGS_RELWITHDEBINFO)
-        string(REPLACE "/EHsc" "" ${flag_var} "${${flag_var}}")
-        string(REPLACE "/GR" "" ${flag_var} "${${flag_var}}")
-    endforeach()
-endif()
-
 include(CTest)
 include(FetchContent)
 
@@ -66,6 +59,26 @@ if(BUILD_TESTING)
         GIT_TAG fa43b77429ba76c462b1898d6cd2f2d7a9416b14
     )
     FetchContent_MakeAvailable(Catch2)
+endif()
+
+# Keep the host compiler's exception/RTTI defaults for third-party dependencies
+# and Catch2. Rule Engine production targets opt out through project_options;
+# the MSVC defaults are removed in this directory so the opt-out is not an
+# override warning. Optimizer-owned dependencies temporarily restore these
+# captured values in their own subdirectory.
+if(MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    foreach(
+        flag_var
+        CMAKE_CXX_FLAGS
+        CMAKE_CXX_FLAGS_DEBUG
+        CMAKE_CXX_FLAGS_RELEASE
+        CMAKE_CXX_FLAGS_RELWITHDEBINFO
+        CMAKE_CXX_FLAGS_MINSIZEREL
+    )
+        set("RULE_ENGINE_DEPENDENCY_${flag_var}" "${${flag_var}}")
+        string(REPLACE "/EHsc" "" ${flag_var} "${${flag_var}}")
+        string(REPLACE "/GR" "" ${flag_var} "${${flag_var}}")
+    endforeach()
 endif()
 
 add_library(rule_engine_project_options INTERFACE)
@@ -121,6 +134,17 @@ target_compile_options(
             /arch:AVX2
             /EHs-c-
             /GR-
+            /wd4530
+        >
+)
+
+add_library(rule_engine_test_options INTERFACE)
+target_compile_options(
+    rule_engine_test_options
+    INTERFACE
+        $<$<OR:$<COMPILE_LANG_AND_ID:CXX,MSVC>,$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>>>:
+            /EHsc
+            /GR
         >
 )
 
@@ -137,12 +161,17 @@ endif()
 add_library(rule_engine_python_contract src/python/contract.cpp)
 add_library(rule_engine::python_contract ALIAS rule_engine_python_contract)
 target_include_directories(rule_engine_python_contract PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(rule_engine_python_contract PUBLIC rule_engine::project_options)
+target_compile_features(rule_engine_python_contract PUBLIC cxx_std_23)
+target_link_libraries(rule_engine_python_contract PRIVATE rule_engine::project_options)
 
 add_library(rule_engine_python_engine src/python/engine.cpp)
 add_library(rule_engine::python_engine ALIAS rule_engine_python_engine)
 target_include_directories(rule_engine_python_engine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(rule_engine_python_engine PUBLIC rule_engine::python_contract)
+target_link_libraries(
+    rule_engine_python_engine
+    PUBLIC rule_engine::python_contract
+    PRIVATE rule_engine::project_options
+)
 
 add_subdirectory(src/python/packaging)
 add_subdirectory(src/python/compiler)
@@ -166,6 +195,7 @@ if(BUILD_TESTING)
         rule_engine_python_contract_tests
         PRIVATE
             rule_engine::python_contract
+            rule_engine_test_options
             Catch2::Catch2WithMain
     )
     target_compile_options(
@@ -181,6 +211,7 @@ if(BUILD_TESTING)
         rule_engine_python_engine_tests
         PRIVATE
             rule_engine::python_engine
+            rule_engine_test_options
             Catch2::Catch2WithMain
     )
     target_compile_options(
@@ -205,6 +236,7 @@ if(BUILD_TESTING)
             rule_engine::python_compiler
             rule_engine::python_vm
             rule_engine::python_cluster
+            rule_engine_test_options
             Catch2::Catch2WithMain
     )
     target_compile_options(

@@ -15,8 +15,9 @@ target_include_directories(rule_engine_python_effects PUBLIC "${CMAKE_SOURCE_DIR
 target_link_libraries(
     rule_engine_python_effects
     PUBLIC
-        rule_engine::project_options
         rule_engine::python_contract
+    PRIVATE
+        rule_engine::project_options
 )
 
 if(BUILD_TESTING)
@@ -25,6 +26,7 @@ if(BUILD_TESTING)
         rule_engine_python_effects_tests
         PRIVATE
             rule_engine::python_effects
+            rule_engine_test_options
             Catch2::Catch2WithMain
     )
     target_compile_options(

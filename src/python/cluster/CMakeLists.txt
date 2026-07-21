@@ -23,6 +23,7 @@ target_link_libraries(
     rule_engine_python_cluster
     PUBLIC
         rule_engine::python_contract
+    PRIVATE
         rule_engine::project_options
 )
 
@@ -53,6 +54,7 @@ if(BUILD_TESTING)
         rule_engine_python_cluster_tests
         PRIVATE
             rule_engine::python_cluster
+            rule_engine_test_options
             Catch2::Catch2WithMain
     )
     target_compile_options(

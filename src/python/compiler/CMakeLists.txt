@@ -12,6 +12,8 @@ target_link_libraries(
     PUBLIC
         rule_engine::python_contract
         rule_engine::python_packaging
+    PRIVATE
+        rule_engine::project_options
 )
 
 if(BUILD_TESTING)
@@ -21,6 +23,7 @@ if(BUILD_TESTING)
         PRIVATE
             rule_engine::python_compiler
             rule_engine::python_vm
+            rule_engine_test_options
             Catch2::Catch2WithMain
     )
     file(

@@ -15,6 +15,7 @@ target_link_libraries(
     rule_engine_python_packaging
     PUBLIC
         rule_engine::python_contract
+    PRIVATE
         rule_engine::project_options
 )
 if(WIN32)
@@ -22,7 +23,10 @@ if(WIN32)
 endif()
 
 add_executable(rule_engine_python_runtime_stager runtime_stager_main.cpp)
-target_link_libraries(rule_engine_python_runtime_stager PRIVATE rule_engine::python_packaging)
+target_link_libraries(
+    rule_engine_python_runtime_stager
+    PRIVATE rule_engine::python_packaging rule_engine::project_options
+)
 
 set(python_worker_script "${CMAKE_CURRENT_SOURCE_DIR}/rule_engine_python_worker.py")
 set(staged_python_worker_script "${CMAKE_CURRENT_BINARY_DIR}/rule_engine_python_worker.py")
@@ -102,6 +106,7 @@ target_link_libraries(
     rule_engine_python_packaging_tests
     PRIVATE
         rule_engine::python_packaging
+        rule_engine_test_options
         Catch2::Catch2WithMain
 )
 if(WIN32)

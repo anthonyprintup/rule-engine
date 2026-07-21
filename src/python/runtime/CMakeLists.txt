@@ -6,6 +6,7 @@ target_link_libraries(
     PUBLIC
         rule_engine::python_engine
         rule_engine::python_effects
+    PRIVATE
         rule_engine::project_options
 )
 
@@ -18,6 +19,7 @@ target_link_libraries(
         rule_engine::python_runtime
         rule_engine::python_cluster
         rule_engine::python_protocol
+    PRIVATE
         rule_engine::project_options
 )
 
@@ -30,6 +32,7 @@ if(BUILD_TESTING)
         rule_engine_python_runtime_integration_tests
         PRIVATE
             rule_engine::python_runtime_adapters
+            rule_engine_test_options
             Catch2::Catch2WithMain
     )
     target_compile_options(
