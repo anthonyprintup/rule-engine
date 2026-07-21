@@ -48,6 +48,7 @@ namespace rule_engine::python {
             return std::unexpected(std::move(session.error()));
         }
         return EvaluationHandle {.pack = active_pack_,
+                                 .invocation = invocation,
                                  .session = std::move(*session),
                                  .terminal_result = std::nullopt,
                                  .dispatched_requests = {},
@@ -97,16 +98,31 @@ namespace rule_engine::python {
 
     std::expected<TransactionReceipt, EngineError> RuntimeEngine::commit(EvaluationHandle &evaluation,
                                                                          EventEnvelope input, CursorAdvance cursor,
-                                                                         std::vector<EventEnvelope> emitted_events,
                                                                          const std::uint64_t fence_token) {
         if (evaluation.committed) {
             return std::unexpected(EngineError {.code = EngineErrorCode::already_committed,
                                                 .message = "evaluation was already committed",
-                                                .store = std::nullopt});
+                                                .store = std::nullopt,
+                                                .event = std::nullopt});
         }
         if (!evaluation.terminal_result.has_value()) {
-            return std::unexpected(EngineError {
-                .code = EngineErrorCode::not_terminal, .message = "evaluation is not terminal", .store = std::nullopt});
+            return std::unexpected(EngineError {.code = EngineErrorCode::not_terminal,
+                                                .message = "evaluation is not terminal",
+                                                .store = std::nullopt,
+                                                .event = std::nullopt});
+        }
+
+        std::vector<EventEnvelope> emitted_events;
+        if (!evaluation.terminal_result->committed_events.empty()) {
+            auto projected = project_committed_events(input, evaluation.invocation, evaluation.pack->schemas,
+                                                      evaluation.terminal_result->committed_events);
+            if (!projected) {
+                return std::unexpected(EngineError {.code = EngineErrorCode::event_projection_failure,
+                                                    .message = projected.error().message,
+                                                    .store = std::nullopt,
+                                                    .event = std::move(projected.error())});
+            }
+            emitted_events = std::move(*projected);
         }
 
         RuntimeTransaction transaction {
@@ -135,7 +151,8 @@ namespace rule_engine::python {
         if (!receipt) {
             return std::unexpected(EngineError {.code = EngineErrorCode::store_failure,
                                                 .message = receipt.error().message,
-                                                .store = std::move(receipt.error())});
+                                                .store = std::move(receipt.error()),
+                                                .event = std::nullopt});
         }
         evaluation.committed = true;
         return std::move(*receipt);

@@ -66,6 +66,20 @@ namespace rule_engine::python::vm {
             return true;
         }
 
+        [[nodiscard]] bool valid_event_operand(const FactValue &value) {
+            if (!value.valid()) {
+                return false;
+            }
+            const auto *record = std::get_if<FactRecord>(&value.node->data);
+            if (record == nullptr || record->schema.value != python_event_operand_schema_v1 ||
+                record->fields.size() != 2U || record->fields[0].field_id != 1U || record->fields[1].field_id != 2U) {
+                return false;
+            }
+            const auto schema = record_text_field(value, python_event_operand_schema_v1, 1U);
+            const auto schema_hash = record_text_field(value, python_event_operand_schema_v1, 2U);
+            return schema.has_value() && !schema->empty() && schema_hash.has_value() && !schema_hash->empty();
+        }
+
         [[nodiscard]] std::optional<std::string> fact_text(const FactValue &value) {
             if (!value.valid()) {
                 return std::nullopt;
@@ -155,6 +169,7 @@ namespace rule_engine::python::vm {
                 case VmErrorCode::capability_budget_exhausted: return "PYVM4011";
                 case VmErrorCode::state_budget_exhausted: return "PYVM4013";
                 case VmErrorCode::effect_budget_exhausted: return "PYVM4012";
+                case VmErrorCode::event_budget_exhausted: return "PYVM4014";
                 case VmErrorCode::invalid_bytecode: return "PYVM1001";
                 case VmErrorCode::invalid_host_response: return "PYVM3001";
                 case VmErrorCode::canceled: return "PYVM4002";
@@ -232,6 +247,14 @@ namespace rule_engine::python::vm {
                                   FactRecordField {.field_id = 1U, .value = text_fact(std::move(namespace_name))},
                                   FactRecordField {.field_id = 2U, .value = text_fact(std::move(key))},
                                   FactRecordField {.field_id = 3U, .value = text_fact(std::move(schema.value))},
+                              });
+    }
+
+    FactValue make_event_operand(SchemaId schema, std::string schema_hash) {
+        return operand_record(python_event_operand_schema_v1,
+                              {
+                                  FactRecordField {.field_id = 1U, .value = text_fact(std::move(schema.value))},
+                                  FactRecordField {.field_id = 2U, .value = text_fact(std::move(schema_hash))},
                               });
     }
 
@@ -321,6 +344,7 @@ namespace rule_engine::python::vm {
 
         struct TransactionMark {
             std::size_t journal_size {};
+            std::size_t event_journal_size {};
             std::vector<StateMutation> state_mutations;
             std::unordered_map<std::string, StateEntry> state_overlay;
         };
@@ -343,12 +367,15 @@ namespace rule_engine::python::vm {
         std::unordered_map<std::string, CachedCapabilityResponse> capability_responses;
         std::vector<EffectIntent> journal;
         std::vector<EffectIntent> journal_updates;
+        std::vector<EventIntent> event_journal;
+        std::vector<EventIntent> event_journal_updates;
         std::vector<TransactionMark> transaction_marks;
         std::unordered_map<std::string, StateEntry> state_values;
         std::unordered_map<std::string, StateEntry> state_overlay;
         std::vector<StateMutation> state_mutations;
         std::unordered_set<std::string> charged_state_keys;
         std::size_t emitted_journal {};
+        std::size_t emitted_event_journal {};
         VmCounters counters;
         RecoveryCounters recovery;
         VmCounters tier_counters;
@@ -356,6 +383,7 @@ namespace rule_engine::python::vm {
         HandlerConfiguration handlers;
         std::optional<bool> candidate_verdict;
         std::vector<EffectIntent> candidate_journal;
+        std::vector<EventIntent> candidate_events;
         std::vector<StateMutation> candidate_state;
         std::vector<FaultFrame> fault_frames;
         bool retry_used {};
@@ -375,6 +403,9 @@ namespace rule_engine::python::vm {
         bool active_step {};
         std::uint64_t request_sequence {};
         std::uint64_t effect_sequence {};
+        std::uint64_t event_sequence {};
+        std::uint32_t event_intents_charged {};
+        std::size_t event_bytes_charged {};
         std::optional<VmStepState> terminal_state;
         std::optional<EvaluationResult> terminal_result;
         StructuredTasks tasks;
@@ -456,6 +487,8 @@ namespace rule_engine::python::vm {
                 .state_bytes = counters.state_bytes,
                 .effect_intents = counters.effect_intents,
                 .effect_bytes = counters.effect_bytes,
+                .event_intents = counters.event_intents,
+                .event_bytes = counters.event_bytes,
                 .recorder_events = counters.recorder_events,
                 .recorder_bytes = counters.recorder_bytes,
             };
@@ -655,6 +688,11 @@ namespace rule_engine::python::vm {
             return IntentId {"vm:" + invocation.invocation.value + ":effect:" + std::to_string(effect_sequence)};
         }
 
+        [[nodiscard]] IntentId next_event_intent_id() {
+            ++event_sequence;
+            return deterministic_event_intent_id(invocation.root_event, invocation.invocation, event_sequence);
+        }
+
         void rollback_journal_from(const std::size_t first) {
             for (std::size_t index = first; index < journal.size(); ++index) {
                 if (journal[index].disposition != EffectDisposition::pending) {
@@ -663,6 +701,18 @@ namespace rule_engine::python::vm {
                 journal[index].disposition = EffectDisposition::rolled_back;
                 if (index < emitted_journal) {
                     journal_updates.push_back(journal[index]);
+                }
+            }
+        }
+
+        void rollback_event_journal_from(const std::size_t first) {
+            for (std::size_t index = first; index < event_journal.size(); ++index) {
+                if (event_journal[index].disposition != EventDisposition::pending) {
+                    continue;
+                }
+                event_journal[index].disposition = EventDisposition::rolled_back;
+                if (index < emitted_event_journal) {
+                    event_journal_updates.push_back(event_journal[index]);
                 }
             }
         }
@@ -687,6 +737,8 @@ namespace rule_engine::python::vm {
             target.effect_bytes += source.effect_bytes;
             target.recorder_events += source.recorder_events;
             target.recorder_bytes += source.recorder_bytes;
+            target.event_intents += source.event_intents;
+            target.event_bytes += source.event_bytes;
             target.active_time += source.active_time;
         }
 
@@ -730,10 +782,12 @@ namespace rule_engine::python::vm {
             frames.clear();
             pending.reset();
             journal.clear();
+            event_journal.clear();
             transaction_marks.clear();
             state_overlay.clear();
             state_mutations.clear();
             emitted_journal = 0U;
+            emitted_event_journal = 0U;
             active_service_calls = 0U;
             tasks = StructuredTasks {};
             root_group = 0U;
@@ -796,6 +850,7 @@ namespace rule_engine::python::vm {
                                                                EvaluationOutcome::faulted,
                 .verdict = std::nullopt,
                 .committed_effects = {},
+                .committed_events = {},
                 .state_mutations = {},
                 .fault =
                     FaultChain {.frames = fault_frames, .double_fault = double_fault, .triple_fault = triple_fault},
@@ -813,7 +868,8 @@ namespace rule_engine::python::vm {
                    code == VmErrorCode::frame_budget_exhausted || code == VmErrorCode::loop_budget_exhausted ||
                    code == VmErrorCode::elapsed_budget_exhausted || code == VmErrorCode::fact_budget_exhausted ||
                    code == VmErrorCode::capability_budget_exhausted || code == VmErrorCode::state_budget_exhausted ||
-                   code == VmErrorCode::effect_budget_exhausted || code == VmErrorCode::canceled;
+                   code == VmErrorCode::effect_budget_exhausted || code == VmErrorCode::event_budget_exhausted ||
+                   code == VmErrorCode::canceled;
         }
 
         [[nodiscard]] static bool author_exception(const VmErrorCode code) noexcept {
@@ -834,7 +890,9 @@ namespace rule_engine::python::vm {
             record_fault(std::move(fault));
             ++recovery.double_faults;
             rollback_journal_from(0U);
+            rollback_event_journal_from(0U);
             candidate_journal.clear();
+            candidate_events.clear();
             candidate_state.clear();
             if (!handlers.on_double_fault.has_value()) {
                 ++recovery.triple_faults;
@@ -901,6 +959,7 @@ namespace rule_engine::python::vm {
             record_fault(std::move(fault));
             ++recovery.primary_faults;
             rollback_journal_from(0U);
+            rollback_event_journal_from(0U);
             state_mutations.clear();
             state_overlay.clear();
             if (requested_state == VmStepState::canceled) {
@@ -940,11 +999,22 @@ namespace rule_engine::python::vm {
                 intent.disposition = EffectDisposition::committed;
                 committed.push_back(std::move(intent));
             }
+            std::vector<EventIntent> committed_events;
+            committed_events.reserve(candidate_events.size());
+            for (auto intent : candidate_events) {
+                if (intent.disposition != EventDisposition::pending &&
+                    intent.disposition != EventDisposition::committed) {
+                    continue;
+                }
+                intent.disposition = EventDisposition::committed;
+                committed_events.push_back(std::move(intent));
+            }
             const auto verdict = candidate_verdict.value_or(false);
             EvaluationResult result {
                 .outcome = verdict ? EvaluationOutcome::match : EvaluationOutcome::no_match,
                 .verdict = verdict,
                 .committed_effects = std::move(committed),
+                .committed_events = std::move(committed_events),
                 .state_mutations = candidate_state,
                 .fault = std::nullopt,
             };
@@ -986,6 +1056,7 @@ namespace rule_engine::python::vm {
                                                        .span = std::nullopt});
                 }
                 candidate_journal.insert(candidate_journal.end(), journal.begin(), journal.end());
+                candidate_events.insert(candidate_events.end(), event_journal.begin(), event_journal.end());
                 return finalize_candidate();
             }
 
@@ -999,6 +1070,7 @@ namespace rule_engine::python::vm {
                     auto replacement = heap.truthy(value);
                     candidate_verdict = replacement.value_or(false);
                     candidate_journal = journal;
+                    candidate_events = event_journal;
                     candidate_state.clear();
                 } else if (decision.has_value() && decision->starts_with("retry_once")) {
                     if (retry_used) {
@@ -1031,16 +1103,19 @@ namespace rule_engine::python::vm {
                 }
                 candidate_verdict = *verdict;
                 candidate_journal = journal;
+                candidate_events = event_journal;
                 candidate_state = state_mutations;
             }
 
             if (!transaction_marks.empty()) {
                 const auto &root_mark = transaction_marks.front();
                 rollback_journal_from(root_mark.journal_size);
+                rollback_event_journal_from(root_mark.event_journal_size);
                 state_mutations = root_mark.state_mutations;
                 state_overlay = root_mark.state_overlay;
                 transaction_marks.clear();
                 candidate_journal = journal;
+                candidate_events = event_journal;
                 candidate_state = state_mutations;
             }
             if (handlers.finalizer.has_value()) {
@@ -1065,6 +1140,7 @@ namespace rule_engine::python::vm {
                 .state_requests = {},
                 .history_requests = {},
                 .journal_delta = {},
+                .event_journal_delta = {},
                 .recorder_delta = {},
                 .yielded_value = std::nullopt,
                 .result = std::nullopt,
@@ -1088,6 +1164,17 @@ namespace rule_engine::python::vm {
             if (!journal_updates.empty()) {
                 step.journal_delta.insert(step.journal_delta.end(), journal_updates.begin(), journal_updates.end());
                 journal_updates.clear();
+            }
+            if (emitted_event_journal < event_journal.size()) {
+                step.event_journal_delta.insert(
+                    step.event_journal_delta.end(),
+                    event_journal.begin() + static_cast<std::ptrdiff_t>(emitted_event_journal), event_journal.end());
+                emitted_event_journal = event_journal.size();
+            }
+            if (!event_journal_updates.empty()) {
+                step.event_journal_delta.insert(step.event_journal_delta.end(), event_journal_updates.begin(),
+                                                event_journal_updates.end());
+                event_journal_updates.clear();
             }
             step.yielded_value = yielded;
             step.result = result;
@@ -1764,6 +1851,100 @@ namespace rule_engine::python::vm {
                                                 .dry_run = true},
                 .disposition = EffectDisposition::pending,
                 .idempotency_key = invocation.execution.value + ":" + id.value,
+            });
+            ++frame.pc;
+            return std::nullopt;
+        }
+
+        [[nodiscard]] std::optional<VmError> append_event(const Instruction &instruction, Frame &frame) {
+            if (instruction.immediate >= pack.constants.size() || !register_valid(frame, instruction.operand_a) ||
+                !valid_event_operand(pack.constants[instruction.immediate]) || invocation.root_event.empty()) {
+                return VmError {.code = VmErrorCode::invalid_bytecode,
+                                .message = "emit_event operand or root-event context is invalid",
+                                .span = instruction.span};
+            }
+            const auto schema_text =
+                record_text_field(pack.constants[instruction.immediate], python_event_operand_schema_v1, 1U);
+            const auto schema_hash =
+                record_text_field(pack.constants[instruction.immediate], python_event_operand_schema_v1, 2U);
+            const auto schema = SchemaId {*schema_text};
+            const auto descriptor = std::ranges::find(pack.schemas.descriptors, schema, &SchemaDescriptor::id);
+            if (descriptor == pack.schemas.descriptors.end() || descriptor->kind != SchemaKind::event ||
+                descriptor->canonical_hash != *schema_hash) {
+                return VmError {.code = VmErrorCode::invalid_bytecode,
+                                .message = "emit_event schema operand does not match the active event descriptor",
+                                .span = instruction.span};
+            }
+            if (event_intents_charged >= invocation.budget.normal.event_intents ||
+                event_bytes_charged > invocation.budget.normal.event_bytes) {
+                return VmError {.code = VmErrorCode::event_budget_exhausted,
+                                .message = "balanced.v1 event intent budget exhausted",
+                                .span = instruction.span};
+            }
+
+            const auto record_schema = heap.record_schema(frame.registers[instruction.operand_a]);
+            const auto record_fields = heap.record_fields(frame.registers[instruction.operand_a]);
+            if (!record_schema || !record_fields || *record_schema != schema) {
+                return VmError {.code = VmErrorCode::type_error,
+                                .message = "telemetry.emit payload is not a record of the declared event schema",
+                                .span = instruction.span};
+            }
+            DataLabel label;
+            for (const auto &field : *record_fields) {
+                const auto schema_field = std::ranges::find(descriptor->fields, field.field_id, &SchemaField::field_id);
+                if (schema_field == descriptor->fields.end() ||
+                    std::ranges::any_of(schema_field->label.categories,
+                                        [](const std::string &category) { return category.empty(); })) {
+                    return VmError {.code = VmErrorCode::type_error,
+                                    .message = "telemetry.emit payload field is absent from its event schema",
+                                    .span = instruction.span};
+                }
+                label = join_labels(label, schema_field->label);
+            }
+
+            const auto remaining = invocation.budget.normal.event_bytes - event_bytes_charged;
+            auto payload = heap.freeze(frame.registers[instruction.operand_a], std::move(label),
+                                       FreezeLimits {.maximum_bytes = remaining,
+                                                     .maximum_items = 100'000U,
+                                                     .maximum_depth = invocation.budget.normal.event_maximum_depth});
+            if (!payload) {
+                const auto code = payload.error().code == FreezeErrorCode::schema_mismatch ?
+                                      VmErrorCode::type_error :
+                                      VmErrorCode::event_budget_exhausted;
+                return VmError {.code = code,
+                                .message = "event payload failed boundary freezing: " + payload.error().message,
+                                .span = instruction.span};
+            }
+            if (auto valid = ValueHeap::validate_schema(payload->value, schema, &pack.schemas); !valid) {
+                return VmError {.code = VmErrorCode::type_error,
+                                .message = "event payload failed schema validation: " + valid.error().message,
+                                .span = instruction.span};
+            }
+            const auto bytes = fact_size(payload->value);
+            if (bytes == std::numeric_limits<std::size_t>::max() || bytes > remaining) {
+                return VmError {.code = VmErrorCode::event_budget_exhausted,
+                                .message = "balanced.v1 event payload budget exhausted",
+                                .span = instruction.span};
+            }
+
+            ++event_intents_charged;
+            event_bytes_charged += bytes;
+            auto &phase_counter = current_counters();
+            ++phase_counter.event_intents;
+            phase_counter.event_bytes += bytes;
+            const auto id = next_event_intent_id();
+            event_journal.push_back(EventIntent {
+                .id = id,
+                .root_event = invocation.root_event,
+                .invocation = invocation.invocation,
+                .owner = function(frame).id,
+                .binding = invocation.binding,
+                .sequence = event_sequence,
+                .schema = schema,
+                .schema_hash = *schema_hash,
+                .payload = std::move(*payload),
+                .span = instruction.span,
+                .disposition = EventDisposition::pending,
             });
             ++frame.pc;
             return std::nullopt;
@@ -2594,9 +2775,20 @@ namespace rule_engine::python::vm {
                             return fail(*fault);
                         }
                         break;
+                    case Opcode::emit_event:
+                        if (forced_cleanup_active) {
+                            return fail(VmError {.code = VmErrorCode::event_budget_exhausted,
+                                                 .message = "hard cleanup cannot emit events",
+                                                 .span = instruction.span});
+                        }
+                        if (const auto fault = append_event(instruction, frame); fault.has_value()) {
+                            return fail(*fault);
+                        }
+                        break;
                     case Opcode::begin_transaction:
                         transaction_marks.push_back(TransactionMark {
                             .journal_size = journal.size(),
+                            .event_journal_size = event_journal.size(),
                             .state_mutations = state_mutations,
                             .state_overlay = state_overlay,
                         });
@@ -2618,6 +2810,7 @@ namespace rule_engine::python::vm {
                                                  .span = instruction.span});
                         }
                         rollback_journal_from(transaction_marks.back().journal_size);
+                        rollback_event_journal_from(transaction_marks.back().event_journal_size);
                         state_mutations = std::move(transaction_marks.back().state_mutations);
                         state_overlay = std::move(transaction_marks.back().state_overlay);
                         transaction_marks.pop_back();
@@ -2802,6 +2995,8 @@ namespace rule_engine::python::vm {
 
     std::size_t RegisterVmSession::journal_size() const noexcept { return impl_->journal.size(); }
 
+    std::size_t RegisterVmSession::event_journal_size() const noexcept { return impl_->event_journal.size(); }
+
     std::size_t RegisterVmSession::state_mutation_count() const noexcept { return impl_->state_mutations.size(); }
 
     std::expected<FrozenValue, FreezeError> RegisterVmSession::freeze_value(const PyValue value) const {
@@ -2814,6 +3009,7 @@ namespace rule_engine::python::vm {
             return std::unexpected(std::move(verified.error()));
         }
         DiagnosticSet diagnostics;
+        bool emits_events {};
         for (const auto &function : pack.functions) {
             for (const auto &instruction : function.instructions) {
                 if (instruction.opcode == Opcode::delete_state &&
@@ -2821,11 +3017,18 @@ namespace rule_engine::python::vm {
                     diagnostics.push_back(diagnostic(
                         "PYVM0010", "delete_state constant is not a canonical state operand", instruction.span));
                 }
+                emits_events = emits_events || instruction.opcode == Opcode::emit_event;
             }
         }
         if (invocation.execution.empty() || invocation.invocation.empty() || invocation.binding.empty() ||
             !invocation.subject.valid()) {
             diagnostics.push_back(diagnostic("PYVM0001", "VM invocation identity or subject is invalid"));
+        }
+        if (emits_events &&
+            (invocation.root_event.empty() || invocation.budget.normal.event_intents == 0U ||
+             invocation.budget.normal.event_bytes == 0U || invocation.budget.normal.event_maximum_depth == 0U)) {
+            diagnostics.push_back(
+                diagnostic("PYVM0011", "event-emitting invocation lacks a root event or positive event budgets"));
         }
         const auto binding = std::ranges::find(pack.bindings, invocation.binding, &OperatorBinding::id);
         if (binding == pack.bindings.end()) {

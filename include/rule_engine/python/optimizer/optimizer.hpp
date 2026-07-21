@@ -47,6 +47,7 @@ namespace rule_engine::python::optimizer {
         certificate_reads_history,
         certificate_calls_services,
         certificate_emits_effects,
+        certificate_emits_events,
         certificate_has_logical_reads,
         certificate_has_no_pure_prefix,
         no_transform_requested,
@@ -127,6 +128,8 @@ namespace rule_engine::python::optimizer {
         std::uint64_t state_bytes {};
         std::uint64_t effect_intents {};
         std::uint64_t effect_bytes {};
+        std::uint64_t event_intents {};
+        std::uint64_t event_bytes {};
         std::uint64_t recorder_events {};
         std::uint64_t recorder_bytes {};
 
@@ -148,6 +151,7 @@ namespace rule_engine::python::optimizer {
         fact_reads,
         logical_reads,
         ordered_effects,
+        ordered_events,
         state,
         recorder,
         fault,

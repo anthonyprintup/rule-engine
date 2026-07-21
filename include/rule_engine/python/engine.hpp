@@ -15,6 +15,7 @@ namespace rule_engine::python {
         invocation_rejected,
         not_terminal,
         already_committed,
+        event_projection_failure,
         store_failure,
     };
 
@@ -22,10 +23,12 @@ namespace rule_engine::python {
         EngineErrorCode code {};
         std::string message;
         std::optional<StoreError> store;
+        std::optional<EventProjectionError> event;
     };
 
     struct EvaluationHandle {
         std::shared_ptr<const CompiledPack> pack;
+        VmInvocation invocation;
         std::unique_ptr<VmSession> session;
         std::optional<EvaluationResult> terminal_result;
         std::set<std::string> dispatched_requests;
@@ -40,10 +43,8 @@ namespace rule_engine::python {
         activate(const VerifiedRulePack &pack, const SchemaCatalog &schemas, const OperatorBindings &bindings);
         [[nodiscard]] std::expected<EvaluationHandle, DiagnosticSet> start(const VmInvocation &invocation);
         [[nodiscard]] VmStep advance(EvaluationHandle &evaluation, HostResponses responses);
-        [[nodiscard]] std::expected<TransactionReceipt, EngineError> commit(EvaluationHandle &evaluation,
-                                                                            EventEnvelope input, CursorAdvance cursor,
-                                                                            std::vector<EventEnvelope> emitted_events,
-                                                                            std::uint64_t fence_token);
+        [[nodiscard]] std::expected<TransactionReceipt, EngineError>
+        commit(EvaluationHandle &evaluation, EventEnvelope input, CursorAdvance cursor, std::uint64_t fence_token);
 
         [[nodiscard]] const std::shared_ptr<const CompiledPack> &active_pack() const noexcept { return active_pack_; }
 

@@ -152,8 +152,10 @@ namespace {
                                    const std::uint64_t expected_cursor, const std::uint64_t fence,
                                    const std::uint64_t state_version, const bool with_effects = false,
                                    const bool with_emitted_event = false) {
+        auto input = event(event_id, expected_cursor + 1);
         std::vector<StateMutation> state {state_mutation(state_version, "sha256:state-" + event_id)};
         std::vector<EffectIntent> journal;
+        std::vector<EventIntent> event_journal;
         std::vector<OutboxRecord> outbox;
         if (with_effects) {
             journal.push_back(effect("intent-" + event_id));
@@ -167,17 +169,43 @@ namespace {
         }
         std::vector<EventEnvelope> emitted;
         if (with_emitted_event) {
-            emitted.push_back(event("emitted-" + event_id, expected_cursor + 1));
+            const auto intent_id = deterministic_event_intent_id(input.id, InvocationId {"invocation-1"}, 1U);
+            event_journal.push_back(EventIntent {
+                .id = intent_id,
+                .root_event = input.id,
+                .invocation = InvocationId {"invocation-1"},
+                .owner = ExecutableId {"executable-1"},
+                .binding = BindingId {"binding-1"},
+                .sequence = 1U,
+                .schema = SchemaId {"event/process/v1"},
+                .schema_hash = "sha256:event-process-v1",
+                .payload = frozen("sha256:emitted-" + event_id, "emitted-" + event_id),
+                .span = source_span(),
+                .disposition = EventDisposition::committed,
+            });
+            emitted.push_back(EventEnvelope {
+                .id = EventId {intent_id.value},
+                .schema = event_journal.front().schema,
+                .tenant = input.tenant,
+                .peer = input.peer,
+                .subject = input.subject,
+                .producer_unix_ms = input.ingest_unix_ms,
+                .ingest_unix_ms = input.ingest_unix_ms,
+                .label = event_journal.front().payload.label,
+                .causation = input.id,
+                .payload = event_journal.front().payload,
+            });
         }
         EvaluationResult evaluation {
             .outcome = EvaluationOutcome::match,
             .verdict = true,
             .committed_effects = journal,
+            .committed_events = event_journal,
             .state_mutations = state,
             .fault = std::nullopt,
         };
         return RuntimeTransaction {
-            .input = event(event_id, expected_cursor + 1),
+            .input = std::move(input),
             .cursor =
                 CursorAdvance {
                     .consumer = consumer,
@@ -428,12 +456,16 @@ namespace {
         });
         REQUIRE(history.has_value());
         REQUIRE(history->size() == 2);
-        REQUIRE(history->front().id == EventId {"contract-event"});
+        REQUIRE(std::ranges::find(*history, EventId {"contract-event"}, &EventEnvelope::id) != history->end());
 
         const auto snapshot = store.inspect();
         REQUIRE(snapshot.has_value());
         REQUIRE(snapshot->events.size() == 2);
         REQUIRE(snapshot->state.size() == 1);
+        REQUIRE(snapshot->results.size() == 1);
+        REQUIRE(snapshot->results.front().evaluation.committed_events.size() == 1);
+        REQUIRE(snapshot->results.front().evaluation.committed_events.front().id ==
+                proposed.evaluation.committed_events.front().id);
         REQUIRE(snapshot->journal.size() == 1);
         REQUIRE(snapshot->outbox.size() == 1);
         REQUIRE(snapshot->receipts.size() == 1);
@@ -1157,7 +1189,8 @@ namespace {
         const auto committed = store.transact_event(proposed);
         REQUIRE(committed.has_value());
         REQUIRE(committed->committed_cursor == 1);
-        REQUIRE(committed->emitted_events == std::vector<EventId> {EventId {"emitted-event-1"}});
+        REQUIRE(committed->emitted_events ==
+                std::vector<EventId> {EventId {proposed.evaluation.committed_events.front().id.value}});
         REQUIRE(committed->outbox_intents == std::vector<IntentId> {IntentId {"intent-event-1"}});
 
         const auto snapshot = store.snapshot();
@@ -1181,6 +1214,13 @@ namespace {
         REQUIRE_FALSE(rejected.has_value());
         REQUIRE(rejected.error().code == StoreErrorCode::constraint_violation);
         REQUIRE(store.snapshot().results.size() == 1);
+
+        auto injected = transaction("event-injected", "peer:alpha", 1, 1, 1);
+        injected.emitted_events.push_back(event("caller-controlled", 2));
+        const auto arbitrary_event = store.transact_event(injected);
+        REQUIRE_FALSE(arbitrary_event.has_value());
+        REQUIRE(arbitrary_event.error().code == StoreErrorCode::constraint_violation);
+        REQUIRE(store.snapshot().events.size() == 2);
     }
 
     TEST_CASE("runtime store rollback CAS and stale fence failures publish nothing") {

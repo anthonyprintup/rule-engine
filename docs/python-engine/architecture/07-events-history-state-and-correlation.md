@@ -86,6 +86,39 @@ An emitted event inherits the root event and records its immediate parent, produ
 
 Correlation subscriptions and correlation-to-correlation emissions form a statically compiled directed graph. Activation rejects a graph cycle, including cycles introduced through embedded source dependencies. Runtime also enforces the operator profile's maximum derived-event depth as defense in depth. Reaching the depth cap faults the emitting invocation and rolls back its journal; it never publishes a partial chain.
 
+### 4.4 Implemented transactional emission path
+
+The current runtime represents `telemetry.emit` at the verified-bytecode seam
+as an ordered `EventIntent`, not as an `EventEnvelope` supplied by a caller.
+Each intent pins an active event schema ID/hash and contains a frozen labeled
+record, source span, root event, invocation, owner, binding, sequence, and final
+disposition. The VM owns creation, identity, ordering, charging, and rollback.
+Neither the rule pack, parser worker, provider, nor runtime caller can submit a
+prebuilt durable envelope through the engine or resident-orchestrator API.
+
+After a clean VM attempt, the resident C++ coordinator calls the pure
+`project_committed_events` boundary. It independently checks committed
+disposition, deterministic identity, strict ordering, schema kind/hash,
+payload shape, labels, bytes, depth, and invocation/root ownership. It then
+materializes envelopes in journal order, inheriting tenant, peer, subject, and
+root causation from the authenticated input. The same projected vector and the
+committed intent journal enter `RuntimeTransaction`; every store adapter
+cross-checks them before publishing. The evaluation codec is explicitly
+versioned and persists the intent journal with the result.
+
+An MVCC conflict discards that complete transaction. A fresh VM attempt uses
+the same root and invocation identity, so it reproduces the same intent IDs;
+only the successful proposal becomes visible. Diagnostic replay performs the
+same deterministic projection for comparison but never calls the store or a
+consumer. Event emission is therefore a commit-time data projection, not an
+effect dispatch.
+
+The implemented envelope currently records one root `causation` field and
+inherits the root ingest timestamp for both emitted timestamps because the
+store API has no commit-clock assignment. Immediate-parent/depth metadata and
+source-level `EventRecord` construction/lowering remain the explicit residual
+described in `LIMITATIONS.md`.
+
 ## 5. Correlation declarations and scheduling
 
 ### 5.1 Static subscription
@@ -209,7 +242,7 @@ An MVCC mismatch never merges or overwrites another execution. The coordinator d
 
 Logical external requests have canonical replay keys containing their call site, occurrence index, typed arguments, subject, route/schema, and policy version. A retry may consume only responses in the sealed bundle. If changed state makes it reach a new fact, service, or history request that did not occur originally, evaluation ends as `FAULTED(StateConflictReplayDiverged)` rather than observing a different external world.
 
-The limit is three executions total: the original plus two transparent retries. Another MVCC conflict yields `FAULTED(StateConflict)`. A retry is a fresh VM session but inherits the evaluation-owned remaining elapsed, active-CPU, instruction, loop/yield, provider, service, history, state, effect, and recorder budgets; it does not multiply `balanced.v1`. The resident accepts an attempt only after validating and overflow-safely accumulating its mandatory VM usage snapshot. Live heap, frame depth, and concurrent-service limits remain per-attempt peaks, while separately specified finalizer/fault/cleanup executors retain their dedicated caps. Logical heap allocation is aggregated for audit and overflow detection, but `balanced.v1` has no distinct cumulative allocation ceiling; see L-029. Each attempt is recorded; only the committed attempt's state and ordinary effects survive.
+The limit is three executions total: the original plus two transparent retries. Another MVCC conflict yields `FAULTED(StateConflict)`. A retry is a fresh VM session but inherits the evaluation-owned remaining elapsed, active-CPU, instruction, loop/yield, provider, service, history, state, effect, event, and recorder budgets; it does not multiply `balanced.v1`. The resident accepts an attempt only after validating and overflow-safely accumulating its mandatory VM usage snapshot. Live heap, frame depth, and concurrent-service limits remain per-attempt peaks, while separately specified finalizer/fault/cleanup executors retain their dedicated caps. Logical heap allocation is aggregated for audit and overflow detection, but `balanced.v1` has no distinct cumulative allocation ceiling; see L-029. Each attempt is recorded; only the committed attempt's state, event intents, and ordinary effects survive.
 
 ```mermaid
 sequenceDiagram

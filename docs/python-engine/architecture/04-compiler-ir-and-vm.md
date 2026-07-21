@@ -401,6 +401,45 @@ binding and finalizer bare re-raise are rejected. Full Python observability at
 that boundary requires unwind records that carry handler-scope exits. These
 limitations and revisit conditions are recorded as L-028.
 
+### 5.10 Typed custom-event emission opcode
+
+Custom event emission is an engine-owned journal operation. The verified
+`emit_event` instruction has one exact form:
+
+| Field | Contract |
+|---|---|
+| `operand_a` | Initialized register containing the payload record. |
+| `immediate` | Constant-pool index of a `rule-engine.vm.event-operand.v1` record containing the event schema ID and its exact canonical schema hash. |
+| `destination` / `operand_b` | Reserved and required to be zero. |
+| successor | The next instruction only; emission never suspends or dispatches. |
+
+The verifier requires the operand to name an active `SchemaKind::event`
+descriptor whose canonical hash exactly matches the operand. It rejects an
+uninitialized payload register, malformed/reserved fields, an undeclared
+schema, or an optimization certificate that claims the body does not emit
+events.
+
+At execution, the VM validates the record against that descriptor, derives its
+label from the schema fields, and deep-freezes it before appending an
+`EventIntent`. The intent identity is a collision-free, length-prefixed
+encoding of `(root_event_id, invocation_id, monotonic_event_sequence)`. Nested
+effect transactions share one ordering domain and one transaction mark with
+the event journal. Rollback truncates both journals; count and byte charges are
+cumulative and are never refunded. Python exceptions, failed finalization,
+cancellation, and hard faults leave no committed event intent. Finalizer and
+hard-cleanup code cannot use this opcode.
+
+`balanced.v1` caps an invocation at 256 event intents, 2 MiB of cumulative
+frozen event payload, and depth 64. Count, bytes, item traversal, cycle checks,
+and schema checks occur before journal mutation. A limit failure is the typed
+unsuppressible `event_budget_exhausted` VM fault.
+
+The opcode creates no durable envelope and calls no event consumer. On clean
+terminal completion, only `EvaluationResult::committed_events` is eligible for
+server projection. Optimizer shadow comparison treats ordered event intents
+and event resource counters as committable observations; an event-emitting
+certificate conservatively selects the exact VM.
+
 ## 6. Independent bytecode verification
 
 The verifier is a separate component that consumes serialized bytecode rather than compiler-internal objects. Activation requires successful verification.
@@ -505,7 +544,7 @@ VmSession owns:
 - instruction pointer and unwind/exception state;
 - generator/coroutine and deterministic task scheduler state;
 - logical-read ledger and outstanding host requests;
-- state snapshot/write set and effect journal;
+- state snapshot/write set plus effect and event journals;
 - label/control context;
 - flight recorder;
 - replay captures;

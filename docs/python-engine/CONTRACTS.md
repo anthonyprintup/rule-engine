@@ -33,7 +33,7 @@ These contracts are frozen by the F0 commit. Lanes may depend on them but must n
 
 ## VM and host
 
-- `VmSession` owns frames, registers, heap, hash seed, logical-read ledger, task groups, state/effect journal, flight recorder, and captured replay inputs.
+- `VmSession` owns frames, registers, heap, hash seed, logical-read ledger, task groups, state/effect/event journals, flight recorder, and captured replay inputs.
 - `VmSession::step(HostResponses) -> VmStep` returns one of: yielded, waiting for facts, waiting for capabilities, complete, faulted, quarantined, or canceled.
 - `VmSession::resource_usage() -> VmResourceUsage` is mandatory. The resident validates it before commit and uses checked cumulative normal-executor totals to derive every transparent retry's remaining profile; live heap, frames, and concurrent services remain per-attempt peaks.
 - A suspended session resumes at its instruction; it never restarts the entrypoint.
@@ -55,6 +55,8 @@ These contracts are frozen by the F0 commit. Lanes may depend on them but must n
 
 ## Events, state, and storage
 
+- `EventIntent` is the VM-owned, ordered, frozen proposal produced by verified `emit_event`; its deterministic identity is derived from root event, invocation, and sequence. It is not durable or dispatchable by itself.
+- `project_committed_events` revalidates the successful attempt's intents against the active event schema catalog and authenticated root, then materializes durable envelopes without I/O. Store adapters require exact intent/envelope correspondence.
 - Event envelopes contain stable event/schema IDs, tenant, peer/subject, producer and ingest timestamps, labels, causation, and typed payload.
 - `IRuntimeStore::transact_event` atomically commits input event/cursor, state CAS, result, emitted events, retention, journal, outbox, and audit records.
 - Correlation state is keyed by executable, correlation binding, and canonical group key.
@@ -82,6 +84,7 @@ These contracts are frozen by the F0 commit. Lanes may depend on them but must n
 | History queries / rows / bytes | 16 / 10,000 / 16 MiB |
 | State keys / combined read-write bytes | 256 / 1 MiB |
 | Effect intents / frozen payload bytes | 256 / 2 MiB |
+| Event intents / frozen payload bytes / depth | 256 / 2 MiB / 64 |
 | Flight recorder | 25,000 events / 4 MiB, head-and-tail |
 
 Compile and ingest limits are 16 MiB source closure, 1,000,000 AST nodes, 100,000 concrete generated bindings, 64 MiB generator arguments/inputs, a 512 MiB/15 s Python worker, and 100,000 items/16 MiB per authoritative nested snapshot. Finalizer/`on_fault` receives 100,000 instructions, 50 ms active, 2 s elapsed, 2 MiB heap, 8 handler-safe service calls, and 64 intents; `on_double_fault` receives 25,000 instructions, 1 s elapsed, 512 KiB heap, and diagnostic/quarantine capabilities only; forced cleanup receives 25,000 instructions and 500 ms elapsed. Hard exhaustion is an unsuppressible VM control fault. Any change creates a new named profile version rather than redefining `balanced.v1`.

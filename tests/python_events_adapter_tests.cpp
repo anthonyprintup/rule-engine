@@ -74,6 +74,7 @@ namespace {
                     .outcome = outcome,
                     .verdict = std::nullopt,
                     .committed_effects = {},
+                    .committed_events = {},
                     .state_mutations = {},
                     .fault = std::nullopt,
                 },

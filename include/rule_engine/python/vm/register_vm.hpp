@@ -52,6 +52,9 @@ namespace rule_engine::python::vm {
     // - write_state: immediate names a state operand constant and operand_a is the value register.
     // - delete_state: immediate names a state operand constant; all register operands are zero.
     // - append_effect: immediate names a Unicode effect-kind constant and operand_a is the payload register.
+    // - emit_event: immediate names a canonical event operand record containing the event schema ID and exact
+    //   descriptor hash; operand_a is the record payload register. destination and operand_b are zero. Execution
+    //   appends a typed frozen intent to the VM-owned journal; it never dispatches or writes a durable event.
     // ExceptionRegionKind::handler routes faults to handler_instruction (a catch-all body, reraise, or the
     // first match_exception filter) and requires cleanup_instruction == handler_instruction.
     // ExceptionRegionKind::cleanup routes every exit through cleanup_instruction and resumes Python exceptions
@@ -61,6 +64,7 @@ namespace rule_engine::python::vm {
     [[nodiscard]] FactValue make_capability_operand(CapabilityId capability, SchemaId request_schema,
                                                     SchemaId response_schema = {});
     [[nodiscard]] FactValue make_state_operand(std::string namespace_name, std::string key, SchemaId schema);
+    [[nodiscard]] FactValue make_event_operand(SchemaId schema, std::string schema_hash);
     [[nodiscard]] FactValue make_handler_metadata(ExecutableId entrypoint, std::optional<ExecutableId> finalizer,
                                                   std::optional<ExecutableId> on_fault,
                                                   std::optional<ExecutableId> on_double_fault);
@@ -84,6 +88,8 @@ namespace rule_engine::python::vm {
         std::size_t effect_bytes {};
         std::uint32_t recorder_events {};
         std::size_t recorder_bytes {};
+        std::uint32_t event_intents {};
+        std::size_t event_bytes {};
         std::chrono::nanoseconds active_time {};
     };
 
@@ -152,6 +158,7 @@ namespace rule_engine::python::vm {
         [[nodiscard]] HeapStats heap_stats() const noexcept;
         [[nodiscard]] std::size_t logical_read_count() const noexcept;
         [[nodiscard]] std::size_t journal_size() const noexcept;
+        [[nodiscard]] std::size_t event_journal_size() const noexcept;
         [[nodiscard]] std::size_t state_mutation_count() const noexcept;
         [[nodiscard]] std::expected<FrozenValue, FreezeError> freeze_value(PyValue value) const;
 

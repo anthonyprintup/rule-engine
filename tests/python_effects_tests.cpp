@@ -142,6 +142,7 @@ namespace {
             .outcome = verdict ? EvaluationOutcome::match : EvaluationOutcome::no_match,
             .verdict = verdict,
             .committed_effects = std::move(effects),
+            .committed_events = {},
             .state_mutations = {},
             .fault = std::nullopt,
         };
@@ -875,6 +876,7 @@ namespace {
                 .outcome = outcome,
                 .verdict = std::nullopt,
                 .committed_effects = {},
+                .committed_events = {},
                 .state_mutations = {StateMutation {.owner = root_owner.executable,
                                                    .namespace_name = "candidate",
                                                    .key = "discard-me",

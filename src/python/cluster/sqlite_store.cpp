@@ -262,6 +262,9 @@ namespace rule_engine::python::cluster {
         }
 
         std::expected<void, StoreError> validate_shape(const RuntimeTransaction &transaction) {
+            if (const auto valid = serialization::validate(transaction); !valid) {
+                return std::unexpected(shape_error(valid.error().message));
+            }
             if (transaction.input.id.empty() || transaction.input.schema.empty() || transaction.input.tenant.empty() ||
                 transaction.input.peer.empty() || !transaction.input.payload.value.valid() ||
                 transaction.input.payload.canonical_digest.empty()) {

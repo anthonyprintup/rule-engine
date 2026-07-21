@@ -13,6 +13,7 @@ namespace rule_engine::python {
 
     inline constexpr std::string_view python_ast_schema_v1 = "rule-engine.ast/1";
     inline constexpr std::string_view python_static_compiler_abi_v1 = "python-3.14.6/static-compiler-v1";
+    inline constexpr std::string_view python_event_operand_schema_v1 = "rule-engine.vm.event-operand.v1";
 
     enum struct SchemaKind : std::uint8_t {
         model,
@@ -125,6 +126,7 @@ namespace rule_engine::python {
         reraise,
         unwind_jump,
         leave_except,
+        emit_event,
     };
 
     // Closed, engine-owned exception classes understood by the bytecode verifier and VM.
@@ -178,6 +180,7 @@ namespace rule_engine::python {
         bool reads_history {};
         bool calls_services {};
         bool emits_effects {};
+        bool emits_events {};
         std::vector<std::string> logical_facts;
         std::vector<std::uint32_t> pure_false_prefix_exits;
         std::string semantic_hash;

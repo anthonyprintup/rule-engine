@@ -2,6 +2,8 @@
 
 #include "rule_engine/python/contract/subject.hpp"
 
+#include "serialization.hpp"
+
 #include <algorithm>
 #include <limits>
 #include <set>
@@ -72,6 +74,22 @@ namespace rule_engine::python::cluster {
             append_field(result, effect.idempotency_key);
         }
 
+        void append_event_intent(std::string &result, const EventIntent &event) {
+            append_field(result, event.id.value);
+            append_field(result, event.root_event.value);
+            append_field(result, event.invocation.value);
+            append_field(result, event.owner.value);
+            append_field(result, event.binding.value);
+            append_number(result, event.sequence);
+            append_field(result, event.schema.value);
+            append_field(result, event.schema_hash);
+            append_frozen(result, event.payload);
+            append_field(result, event.span.source.value);
+            append_number(result, event.span.begin_byte);
+            append_number(result, event.span.end_byte);
+            append_number(result, static_cast<std::uint8_t>(event.disposition));
+        }
+
         void append_event(std::string &result, const EventEnvelope &event) {
             append_field(result, event.id.value);
             append_field(result, event.schema.value);
@@ -105,6 +123,13 @@ namespace rule_engine::python::cluster {
             return result;
         }
 
+        std::string event_intent_signature(const std::vector<EventIntent> &events) {
+            std::string result;
+            append_number(result, events.size());
+            for (const auto &event : events) { append_event_intent(result, event); }
+            return result;
+        }
+
         bool valid_frozen(const FrozenValue &value) { return value.value.valid() && !value.canonical_digest.empty(); }
 
         std::uint64_t saturating_add(const std::uint64_t left, const std::uint64_t right) {
@@ -118,7 +143,7 @@ namespace rule_engine::python::cluster {
 
     std::string InMemoryRuntimeStore::transaction_signature(const RuntimeTransaction &transaction) {
         std::string result;
-        append_field(result, "runtime-transaction-v1");
+        append_field(result, "runtime-transaction-v2");
         append_event(result, transaction.input);
         append_field(result, transaction.cursor.consumer);
         append_number(result, transaction.cursor.expected_position);
@@ -144,6 +169,7 @@ namespace rule_engine::python::cluster {
         }
         append_field(result, state_signature(transaction.evaluation.state_mutations));
         append_field(result, effect_signature(transaction.evaluation.committed_effects));
+        append_field(result, event_intent_signature(transaction.evaluation.committed_events));
         append_field(result, state_signature(transaction.state));
         append_number(result, transaction.emitted_events.size());
         for (const auto &event : transaction.emitted_events) { append_event(result, event); }
@@ -163,6 +189,9 @@ namespace rule_engine::python::cluster {
     std::expected<void, StoreError>
     InMemoryRuntimeStore::validate_transaction_locked(const RuntimeTransaction &transaction,
                                                       const std::string_view) const {
+        if (const auto valid = serialization::validate(transaction); !valid) {
+            return std::unexpected(store_error(StoreErrorCode::constraint_violation, valid.error().message));
+        }
         if (transaction.input.id.empty() || transaction.input.schema.empty() || transaction.input.tenant.empty() ||
             transaction.input.peer.empty() || !valid_frozen(transaction.input.payload)) {
             return std::unexpected(

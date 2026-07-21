@@ -28,6 +28,9 @@ namespace rule_engine::python {
         std::size_t state_bytes {};
         std::uint32_t effect_intents {};
         std::size_t effect_bytes {};
+        std::uint32_t event_intents {};
+        std::size_t event_bytes {};
+        std::uint32_t event_maximum_depth {};
         std::uint32_t recorder_events {};
         std::size_t recorder_bytes {};
     };
@@ -86,6 +89,9 @@ namespace rule_engine::python {
                    .state_bytes = 1 * mebibyte,
                    .effect_intents = 256,
                    .effect_bytes = 2 * mebibyte,
+                   .event_intents = 256,
+                   .event_bytes = 2 * mebibyte,
+                   .event_maximum_depth = 64,
                    .recorder_events = 25'000,
                    .recorder_bytes = 4 * mebibyte},
         .finalizer_or_fault = {.elapsed = std::chrono::seconds {2},

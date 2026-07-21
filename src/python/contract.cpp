@@ -4,6 +4,8 @@
 #include <array>
 #include <charconv>
 #include <deque>
+#include <limits>
+#include <ranges>
 #include <set>
 #include <string>
 #include <string_view>
@@ -110,6 +112,256 @@ namespace rule_engine::python {
             return std::nullopt;
         }
 
+        struct EventOperand {
+            SchemaId schema;
+            std::string schema_hash;
+        };
+
+        [[nodiscard]] std::optional<std::string> fact_text(const FactValue &value) {
+            if (!value.valid()) {
+                return std::nullopt;
+            }
+            const auto *text = std::get_if<UnicodeValue>(&value.node->data);
+            return text == nullptr ? std::nullopt : std::optional<std::string> {text->utf8};
+        }
+
+        [[nodiscard]] std::optional<EventOperand> decode_event_operand(const FactValue &value) {
+            if (!value.valid()) {
+                return std::nullopt;
+            }
+            const auto *record = std::get_if<FactRecord>(&value.node->data);
+            if (record == nullptr || record->schema.value != python_event_operand_schema_v1 ||
+                record->fields.size() != 2U || record->fields[0].field_id != 1U || record->fields[1].field_id != 2U) {
+                return std::nullopt;
+            }
+            auto schema = fact_text(record->fields[0].value);
+            auto schema_hash = fact_text(record->fields[1].value);
+            if (!schema || schema->empty() || !schema_hash || schema_hash->empty()) {
+                return std::nullopt;
+            }
+            return EventOperand {.schema = SchemaId {std::move(*schema)}, .schema_hash = std::move(*schema_hash)};
+        }
+
+        [[nodiscard]] bool canonical_label(const DataLabel &label) {
+            return std::ranges::is_sorted(label.categories) &&
+                   std::ranges::adjacent_find(label.categories) == label.categories.end() &&
+                   std::ranges::none_of(label.categories, [](const std::string &category) { return category.empty(); });
+        }
+
+        [[nodiscard]] EventProjectionError projection_error(const EventProjectionErrorCode code, std::string message,
+                                                            std::optional<SourceSpan> span = std::nullopt) {
+            return EventProjectionError {.code = code, .message = std::move(message), .span = std::move(span)};
+        }
+
+        struct EventPayloadValidation {
+            std::size_t bytes {};
+            std::set<const FactNode *> path;
+        };
+
+        [[nodiscard]] std::expected<void, EventProjectionError>
+        charge_event_bytes(EventPayloadValidation &state, const std::size_t amount, const std::size_t maximum,
+                           const std::optional<SourceSpan> &span) {
+            if (amount > maximum || state.bytes > maximum - amount) {
+                return std::unexpected(projection_error(EventProjectionErrorCode::budget_exhausted,
+                                                        "event payload byte budget is exhausted", span));
+            }
+            state.bytes += amount;
+            return {};
+        }
+
+        [[nodiscard]] std::expected<void, EventProjectionError>
+        validate_event_value(const FactValue &value, EventPayloadValidation &state, const std::size_t maximum_bytes,
+                             const std::uint32_t maximum_depth, const std::uint32_t depth,
+                             const std::optional<SourceSpan> &span) {
+            if (!value.valid()) {
+                return std::unexpected(projection_error(EventProjectionErrorCode::invalid_payload,
+                                                        "event payload contains an empty value", span));
+            }
+            if (depth > maximum_depth) {
+                return std::unexpected(projection_error(EventProjectionErrorCode::budget_exhausted,
+                                                        "event payload depth budget is exhausted", span));
+            }
+            if (!state.path.insert(value.node.get()).second) {
+                return std::unexpected(projection_error(EventProjectionErrorCode::invalid_payload,
+                                                        "event payload contains a cycle", span));
+            }
+            const auto erase_path = [&state, &value] { state.path.erase(value.node.get()); };
+            auto charged = charge_event_bytes(state, 1U, maximum_bytes, span);
+            if (!charged) {
+                erase_path();
+                return charged;
+            }
+
+            const auto &data = value.node->data;
+            std::size_t scalar_bytes {};
+            if (const auto *integer = std::get_if<IntegerValue>(&data); integer != nullptr) {
+                scalar_bytes = integer->decimal.size();
+            } else if (std::holds_alternative<double>(data)) {
+                scalar_bytes = sizeof(double);
+            } else if (const auto *text = std::get_if<UnicodeValue>(&data); text != nullptr) {
+                scalar_bytes = text->utf8.size();
+            } else if (const auto *bytes = std::get_if<BytesValue>(&data); bytes != nullptr) {
+                scalar_bytes = bytes->bytes.size();
+            } else if (const auto *enumeration = std::get_if<EnumValue>(&data); enumeration != nullptr) {
+                scalar_bytes = enumeration->schema.value.size() + enumeration->member.size();
+            }
+            if (scalar_bytes != 0U) {
+                charged = charge_event_bytes(state, scalar_bytes, maximum_bytes, span);
+                erase_path();
+                return charged;
+            }
+
+            const auto validate_child = [&](const FactValue &child) {
+                return validate_event_value(child, state, maximum_bytes, maximum_depth, depth + 1U, span);
+            };
+            if (const auto *list = std::get_if<FactList>(&data); list != nullptr) {
+                for (const auto &item : list->items) {
+                    if (auto valid = validate_child(item); !valid) {
+                        erase_path();
+                        return valid;
+                    }
+                }
+            } else if (const auto *map = std::get_if<FactMap>(&data); map != nullptr) {
+                for (const auto &entry : map->entries) {
+                    if (auto valid = validate_child(entry.key); !valid) {
+                        erase_path();
+                        return valid;
+                    }
+                    if (auto valid = validate_child(entry.value); !valid) {
+                        erase_path();
+                        return valid;
+                    }
+                }
+            } else if (const auto *record = std::get_if<FactRecord>(&data); record != nullptr) {
+                if (record->schema.empty()) {
+                    erase_path();
+                    return std::unexpected(projection_error(EventProjectionErrorCode::invalid_payload,
+                                                            "event payload record schema is empty", span));
+                }
+                if (auto schema_bytes = charge_event_bytes(state, record->schema.value.size(), maximum_bytes, span);
+                    !schema_bytes) {
+                    erase_path();
+                    return schema_bytes;
+                }
+                std::uint32_t previous {};
+                for (const auto &field : record->fields) {
+                    if (field.field_id == 0U || field.field_id <= previous) {
+                        erase_path();
+                        return std::unexpected(projection_error(EventProjectionErrorCode::invalid_payload,
+                                                                "event record fields are not canonical", span));
+                    }
+                    previous = field.field_id;
+                    if (auto field_bytes = charge_event_bytes(state, sizeof(field.field_id), maximum_bytes, span);
+                        !field_bytes) {
+                        erase_path();
+                        return field_bytes;
+                    }
+                    if (auto valid = validate_child(field.value); !valid) {
+                        erase_path();
+                        return valid;
+                    }
+                }
+            }
+            erase_path();
+            return {};
+        }
+
+        [[nodiscard]] bool primitive_schema_matches(const FactValue &value, const SchemaId &schema) {
+            const auto &data = value.node->data;
+            const auto &id = schema.value;
+            if (id == "any") {
+                return true;
+            }
+            if (id == "none" || id == "null") {
+                return std::holds_alternative<std::monostate>(data);
+            }
+            if (id == "bool" || id == "boolean") {
+                return std::holds_alternative<bool>(data);
+            }
+            if (id == "int" || id == "integer") {
+                return std::holds_alternative<IntegerValue>(data);
+            }
+            if (id == "float") {
+                return std::holds_alternative<double>(data);
+            }
+            if (id == "str" || id == "string" || id == "text" || id == "unicode") {
+                return std::holds_alternative<UnicodeValue>(data);
+            }
+            if (id == "bytes") {
+                return std::holds_alternative<BytesValue>(data);
+            }
+            if (id == "list") {
+                return std::holds_alternative<FactList>(data);
+            }
+            if (id == "map") {
+                return std::holds_alternative<FactMap>(data);
+            }
+            return false;
+        }
+
+        [[nodiscard]] std::expected<void, EventProjectionError>
+        validate_event_schema(const FactValue &value, const SchemaId &expected, const SchemaCatalog &schemas,
+                              const std::optional<SourceSpan> &span) {
+            if (!value.valid() || expected.empty()) {
+                return std::unexpected(projection_error(EventProjectionErrorCode::invalid_schema,
+                                                        "event boundary schema or value is empty", span));
+            }
+            if (primitive_schema_matches(value, expected)) {
+                return {};
+            }
+            if (const auto *enumeration = std::get_if<EnumValue>(&value.node->data); enumeration != nullptr) {
+                if (enumeration->schema == expected) {
+                    return {};
+                }
+                return std::unexpected(projection_error(EventProjectionErrorCode::invalid_schema,
+                                                        "event enum schema does not match its descriptor", span));
+            }
+            const auto *record = std::get_if<FactRecord>(&value.node->data);
+            if (record == nullptr || record->schema != expected) {
+                return std::unexpected(projection_error(EventProjectionErrorCode::invalid_schema,
+                                                        "event record schema does not match its descriptor", span));
+            }
+            const auto descriptor = std::ranges::find(schemas.descriptors, expected, &SchemaDescriptor::id);
+            if (descriptor == schemas.descriptors.end()) {
+                return std::unexpected(projection_error(EventProjectionErrorCode::invalid_schema,
+                                                        "event payload references an absent schema", span));
+            }
+            for (const auto &schema_field : descriptor->fields) {
+                const auto field = std::ranges::find(record->fields, schema_field.field_id, &FactRecordField::field_id);
+                if (field == record->fields.end()) {
+                    if (!schema_field.optional) {
+                        return std::unexpected(projection_error(
+                            EventProjectionErrorCode::invalid_schema,
+                            "event payload is missing required field " + std::to_string(schema_field.field_id), span));
+                    }
+                    continue;
+                }
+                if (auto valid = validate_event_schema(field->value, schema_field.type, schemas, span); !valid) {
+                    return valid;
+                }
+            }
+            for (const auto &field : record->fields) {
+                if (std::ranges::find(descriptor->fields, field.field_id, &SchemaField::field_id) ==
+                    descriptor->fields.end()) {
+                    return std::unexpected(projection_error(
+                        EventProjectionErrorCode::invalid_schema,
+                        "event payload contains unknown field " + std::to_string(field.field_id), span));
+                }
+            }
+            return {};
+        }
+
+        [[nodiscard]] DataLabel event_payload_label(const FactRecord &record, const SchemaDescriptor &descriptor) {
+            DataLabel result;
+            for (const auto &field : record.fields) {
+                const auto schema_field = std::ranges::find(descriptor.fields, field.field_id, &SchemaField::field_id);
+                if (schema_field != descriptor.fields.end()) {
+                    result = join_labels(result, schema_field->label);
+                }
+            }
+            return result;
+        }
+
     } // namespace
 
     std::string canonical_schema_hash(const std::string_view canonical_descriptor) {
@@ -171,8 +423,8 @@ namespace rule_engine::python {
             return true;
         }
         return response.returned_schema ==
-               std::optional<SchemaIdentity> {SchemaIdentity {.id = request.expected_schema,
-                                                               .canonical_hash = request.expected_schema_hash}};
+               std::optional<SchemaIdentity> {
+                   SchemaIdentity {.id = request.expected_schema, .canonical_hash = request.expected_schema_hash}};
     }
 
     DataLabel join_labels(const DataLabel &left, const DataLabel &right) {
@@ -198,6 +450,16 @@ namespace rule_engine::python {
 
     FactValue make_fact(FactData data) {
         return FactValue {.node = std::make_shared<const FactNode>(FactNode {.data = std::move(data)})};
+    }
+
+    IntentId deterministic_event_intent_id(const EventId &root_event, const InvocationId &invocation,
+                                           const std::uint64_t sequence) {
+        std::string identity;
+        append_token(identity, "event-intent-v1");
+        append_token(identity, root_event.value);
+        append_token(identity, invocation.value);
+        append_token(identity, std::to_string(sequence));
+        return IntentId {std::move(identity)};
     }
 
     bool SubjectKey::valid() const noexcept {
@@ -267,7 +529,7 @@ namespace rule_engine::python {
             }
             for (std::size_t index = 0; index < function.instructions.size(); ++index) {
                 const auto &instruction = function.instructions[index];
-                if (std::to_underlying(instruction.opcode) > std::to_underlying(Opcode::leave_except)) {
+                if (std::to_underlying(instruction.opcode) > std::to_underlying(Opcode::emit_event)) {
                     diagnostics.push_back(bytecode_error("PYC0109", "instruction opcode is unknown", instruction.span));
                     continue;
                 }
@@ -280,7 +542,7 @@ namespace rule_engine::python {
                     instruction.opcode == Opcode::commit_transaction ||
                     instruction.opcode == Opcode::rollback_transaction || instruction.opcode == Opcode::delete_state ||
                     instruction.opcode == Opcode::reraise || instruction.opcode == Opcode::unwind_jump ||
-                    instruction.opcode == Opcode::leave_except;
+                    instruction.opcode == Opcode::leave_except || instruction.opcode == Opcode::emit_event;
                 if (instruction.destination >= function.register_count && !has_no_destination) {
                     diagnostics.push_back(bytecode_error("PYC0103", "instruction destination register is out of range",
                                                          instruction.span));
@@ -356,6 +618,33 @@ namespace rule_engine::python {
                             malformed_reserved();
                         }
                         break;
+                    case Opcode::emit_event: {
+                        if (!register_valid(instruction.operand_a)) {
+                            malformed_register();
+                        }
+                        if (instruction.destination != 0U || instruction.operand_b != 0U) {
+                            malformed_reserved();
+                        }
+                        if (instruction.immediate >= pack.constants.size()) {
+                            diagnostics.push_back(bytecode_error("PYC0115", "emit_event constant index is out of range",
+                                                                 instruction.span));
+                            break;
+                        }
+                        const auto operand = decode_event_operand(pack.constants[instruction.immediate]);
+                        if (!operand) {
+                            diagnostics.push_back(bytecode_error(
+                                "PYC0115", "emit_event requires a canonical event schema operand", instruction.span));
+                            break;
+                        }
+                        const auto descriptor =
+                            std::ranges::find(pack.schemas.descriptors, operand->schema, &SchemaDescriptor::id);
+                        if (descriptor == pack.schemas.descriptors.end() || descriptor->kind != SchemaKind::event ||
+                            descriptor->canonical_hash.empty() || descriptor->canonical_hash != operand->schema_hash) {
+                            diagnostics.push_back(bytecode_error(
+                                "PYC0115", "emit_event operand does not pin an active event schema", instruction.span));
+                        }
+                        break;
+                    }
                     case Opcode::load_current_exception:
                         if (instruction.operand_a != 0U || instruction.operand_b != 0U || instruction.immediate != 0U) {
                             malformed_reserved();
@@ -580,7 +869,8 @@ namespace rule_engine::python {
                     case Opcode::load_subscript:
                     case Opcode::store_subscript:
                     case Opcode::delete_state:
-                    case Opcode::load_current_exception: add(pc + 1U); break;
+                    case Opcode::load_current_exception:
+                    case Opcode::emit_event: add(pc + 1U); break;
                     case Opcode::leave_except: add(pc + 1U); break;
                     default: break;
                 }
@@ -727,10 +1017,19 @@ namespace rule_engine::python {
                     bytecode_error("PYC0200", "optimizer certificate references an unknown executable"));
             }
             if (certificate.transitively_pure &&
-                (certificate.emits_effects || certificate.reads_state || certificate.reads_history ||
-                 certificate.calls_services || certificate.may_fault || certificate.recorder_observable)) {
+                (certificate.emits_effects || certificate.emits_events || certificate.reads_state ||
+                 certificate.reads_history || certificate.calls_services || certificate.may_fault ||
+                 certificate.recorder_observable)) {
                 diagnostics.push_back(
                     bytecode_error("PYC0201", "pure optimizer certificate contradicts its effect summary"));
+            }
+            const auto function = std::ranges::find(pack.functions, certificate.executable, &BytecodeFunction::id);
+            if (function != pack.functions.end() &&
+                std::ranges::any_of(
+                    function->instructions,
+                    [](const Instruction &instruction) { return instruction.opcode == Opcode::emit_event; }) &&
+                !certificate.emits_events) {
+                diagnostics.push_back(bytecode_error("PYC0202", "optimizer certificate omits a direct event emission"));
             }
         }
 
@@ -738,6 +1037,87 @@ namespace rule_engine::python {
             return std::unexpected(std::move(diagnostics));
         }
         return {};
+    }
+
+    std::expected<std::vector<EventEnvelope>, EventProjectionError>
+    project_committed_events(const EventEnvelope &root, const VmInvocation &invocation, const SchemaCatalog &schemas,
+                             const std::span<const EventIntent> intents, const EventProjectionLimits &limits) {
+        if (root.id.empty() || root.tenant.empty() || root.peer.empty() || invocation.invocation.empty() ||
+            invocation.binding.empty() || invocation.root_event != root.id || limits.maximum_intents == 0U ||
+            limits.maximum_bytes == 0U || limits.maximum_depth == 0U) {
+            return std::unexpected(projection_error(EventProjectionErrorCode::invalid_context,
+                                                    "event projection context or limits are invalid"));
+        }
+        if (intents.size() > limits.maximum_intents) {
+            return std::unexpected(
+                projection_error(EventProjectionErrorCode::budget_exhausted, "event intent count budget is exhausted"));
+        }
+
+        EventPayloadValidation payload_state;
+        std::vector<EventEnvelope> projected;
+        projected.reserve(intents.size());
+        std::uint64_t previous_sequence {};
+        std::set<std::string, std::less<>> identities;
+        for (const auto &intent : intents) {
+            if (intent.disposition != EventDisposition::committed) {
+                return std::unexpected(projection_error(EventProjectionErrorCode::invalid_identity,
+                                                        "only committed event intents may be projected", intent.span));
+            }
+            if (intent.root_event != root.id || intent.invocation != invocation.invocation ||
+                intent.binding != invocation.binding || intent.owner.empty() || intent.sequence == 0U ||
+                intent.id != deterministic_event_intent_id(root.id, invocation.invocation, intent.sequence) ||
+                !identities.insert(intent.id.value).second) {
+                return std::unexpected(projection_error(EventProjectionErrorCode::invalid_identity,
+                                                        "event intent identity does not match its invocation",
+                                                        intent.span));
+            }
+            if (intent.sequence <= previous_sequence) {
+                return std::unexpected(projection_error(EventProjectionErrorCode::invalid_order,
+                                                        "event intent sequence is not strictly increasing",
+                                                        intent.span));
+            }
+            previous_sequence = intent.sequence;
+
+            const auto descriptor = std::ranges::find(schemas.descriptors, intent.schema, &SchemaDescriptor::id);
+            if (descriptor == schemas.descriptors.end() || descriptor->kind != SchemaKind::event ||
+                descriptor->canonical_hash.empty() || descriptor->canonical_hash != intent.schema_hash) {
+                return std::unexpected(projection_error(EventProjectionErrorCode::invalid_schema,
+                                                        "event intent does not pin an active event schema",
+                                                        intent.span));
+            }
+            if (intent.payload.canonical_digest.empty() || !canonical_label(intent.payload.label)) {
+                return std::unexpected(projection_error(EventProjectionErrorCode::invalid_payload,
+                                                        "event payload digest or label is not canonical", intent.span));
+            }
+            if (auto valid = validate_event_value(intent.payload.value, payload_state, limits.maximum_bytes,
+                                                  limits.maximum_depth, 0U, intent.span);
+                !valid) {
+                return std::unexpected(valid.error());
+            }
+            if (auto valid = validate_event_schema(intent.payload.value, intent.schema, schemas, intent.span); !valid) {
+                return std::unexpected(valid.error());
+            }
+            const auto *record = std::get_if<FactRecord>(&intent.payload.value.node->data);
+            if (record == nullptr || intent.payload.label != event_payload_label(*record, *descriptor)) {
+                return std::unexpected(projection_error(EventProjectionErrorCode::invalid_payload,
+                                                        "event payload label does not match its schema fields",
+                                                        intent.span));
+            }
+
+            projected.push_back(EventEnvelope {
+                .id = EventId {intent.id.value},
+                .schema = intent.schema,
+                .tenant = root.tenant,
+                .peer = root.peer,
+                .subject = root.subject,
+                .producer_unix_ms = root.ingest_unix_ms,
+                .ingest_unix_ms = root.ingest_unix_ms,
+                .label = intent.payload.label,
+                .causation = root.id,
+                .payload = intent.payload,
+            });
+        }
+        return projected;
     }
 
 } // namespace rule_engine::python

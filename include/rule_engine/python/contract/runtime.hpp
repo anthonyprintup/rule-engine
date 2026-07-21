@@ -17,6 +17,8 @@ namespace rule_engine::python {
 
     enum struct EffectDisposition : std::uint8_t { pending, committed, rolled_back, suppressed, dry_run };
 
+    enum struct EventDisposition : std::uint8_t { pending, committed, rolled_back };
+
     struct EffectPolicySnapshot {
         std::string policy_id;
         std::string policy_digest;
@@ -37,6 +39,26 @@ namespace rule_engine::python {
         EffectDisposition disposition {EffectDisposition::pending};
         std::string idempotency_key;
     };
+
+    // A typed, frozen event proposal owned by one VM invocation. It is not a
+    // durable event and must never be dispatched directly. The server projects
+    // only committed intents from the successful store attempt.
+    struct EventIntent {
+        IntentId id;
+        EventId root_event;
+        InvocationId invocation;
+        ExecutableId owner;
+        BindingId binding;
+        std::uint64_t sequence {};
+        SchemaId schema;
+        std::string schema_hash;
+        FrozenValue payload;
+        SourceSpan span;
+        EventDisposition disposition {EventDisposition::pending};
+    };
+
+    [[nodiscard]] IntentId deterministic_event_intent_id(const EventId &root_event, const InvocationId &invocation,
+                                                         std::uint64_t sequence);
 
     struct StateReadRequest {
         RequestId request_id;
@@ -126,6 +148,7 @@ namespace rule_engine::python {
         EvaluationOutcome outcome {EvaluationOutcome::faulted};
         std::optional<bool> verdict;
         std::vector<EffectIntent> committed_effects;
+        std::vector<EventIntent> committed_events;
         std::vector<StateMutation> state_mutations;
         std::optional<FaultChain> fault;
     };
@@ -148,6 +171,7 @@ namespace rule_engine::python {
         std::vector<StateReadRequest> state_requests;
         std::vector<HistoryRequest> history_requests;
         std::vector<EffectIntent> journal_delta;
+        std::vector<EventIntent> event_journal_delta;
         std::vector<RecorderEvent> recorder_delta;
         std::optional<PyValue> yielded_value;
         std::optional<EvaluationResult> result;
@@ -178,6 +202,8 @@ namespace rule_engine::python {
         std::size_t state_bytes {};
         std::uint32_t effect_intents {};
         std::size_t effect_bytes {};
+        std::uint32_t event_intents {};
+        std::size_t event_bytes {};
         std::uint32_t recorder_events {};
         std::size_t recorder_bytes {};
     };
@@ -191,6 +217,7 @@ namespace rule_engine::python {
     struct VmInvocation {
         ExecutionId execution;
         InvocationId invocation;
+        EventId root_event;
         BindingId binding;
         SubjectKey subject;
         BudgetProfile budget {balanced_v1};

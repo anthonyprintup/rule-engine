@@ -30,6 +30,7 @@ namespace rule_engine::python::vm {
         capability_budget_exhausted,
         state_budget_exhausted,
         effect_budget_exhausted,
+        event_budget_exhausted,
         invalid_bytecode,
         invalid_host_response,
         canceled,

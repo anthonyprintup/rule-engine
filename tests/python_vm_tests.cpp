@@ -65,6 +65,7 @@ namespace {
         return VmInvocation {
             .execution = ExecutionId {"execution"},
             .invocation = InvocationId {"invocation"},
+            .root_event = EventId {"root-event"},
             .binding = BindingId {"binding"},
             .subject = subject(),
             .budget = budget,
@@ -126,6 +127,46 @@ namespace {
         const auto *boolean = std::get_if<bool>(&value.value.node->data);
         REQUIRE(boolean != nullptr);
         return *boolean;
+    }
+
+    [[nodiscard]] SchemaDescriptor alert_schema() {
+        return SchemaDescriptor {
+            .id = SchemaId {"alert.v1"},
+            .kind = SchemaKind::event,
+            .qualified_name = "rules.Alert",
+            .canonical_hash = "sha256:alert-v1",
+            .fields =
+                {
+                    SchemaField {
+                        .field_id = 1U,
+                        .name = "message",
+                        .type = SchemaId {"text"},
+                        .optional = false,
+                        .label = DataLabel {.classification = Classification::sensitive, .categories = {"identity"}}},
+                    SchemaField {.field_id = 2U,
+                                 .name = "active",
+                                 .type = SchemaId {"bool"},
+                                 .optional = false,
+                                 .label = DataLabel {}},
+                },
+        };
+    }
+
+    [[nodiscard]] FactValue alert_record(std::string message = "detected", const bool active = true) {
+        return make_fact(FactRecord {
+            .schema = SchemaId {"alert.v1"},
+            .fields =
+                {
+                    FactRecordField {.field_id = 1U, .value = text(std::move(message))},
+                    FactRecordField {.field_id = 2U, .value = make_fact(active)},
+                },
+        });
+    }
+
+    [[nodiscard]] CompiledPack event_pack(std::vector<FactValue> constants, std::vector<Instruction> instructions) {
+        auto pack = pack_with(std::move(constants), {function("rule.main", 2U, std::move(instructions))});
+        pack.schemas = SchemaCatalog {.descriptors = {alert_schema()}, .canonical_hash = "sha256:event-schemas"};
+        return pack;
     }
 
     [[nodiscard]] VmStep run_internal(RegisterVmSession &session, VmStep current) {
@@ -721,6 +762,193 @@ TEST_CASE("fact suspension resumes the exact PC without duplicate reads or inten
     CHECK(complete.journal_delta.empty());
     CHECK(session->logical_read_count() == 1U);
     CHECK(session->journal_size() == 1U);
+}
+
+TEST_CASE("typed event intents are deterministic frozen labeled and VM-journaled without dispatch") {
+    const auto pack =
+        event_pack({alert_record(), make_event_operand(SchemaId {"alert.v1"}, "sha256:alert-v1"), make_fact(true)},
+                   {
+                       instruction(Opcode::load_const, 0U, 0U, 0U, 0U, 10U),
+                       instruction(Opcode::emit_event, 0U, 0U, 0U, 1U, 11U),
+                       instruction(Opcode::load_const, 1U, 0U, 0U, 2U, 12U),
+                       instruction(Opcode::return_value, 0U, 1U, 0U, 0U, 13U),
+                   });
+    const auto execute = [&] {
+        auto session = start(pack);
+        auto completed = session->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        REQUIRE(completed.event_journal_delta.size() == 1U);
+        REQUIRE(completed.result->committed_events.size() == 1U);
+        CHECK(session->event_journal_size() == 1U);
+        CHECK(session->counters().event_intents == 1U);
+        CHECK(session->counters().event_bytes > 0U);
+        return std::pair {completed.event_journal_delta.front(), completed.result->committed_events.front()};
+    };
+
+    const auto first = execute();
+    const auto second = execute();
+    CHECK(first.first.disposition == EventDisposition::pending);
+    CHECK(first.second.disposition == EventDisposition::committed);
+    CHECK(first.second.id == deterministic_event_intent_id(EventId {"root-event"}, InvocationId {"invocation"}, 1U));
+    CHECK(first.second.id == second.second.id);
+    CHECK(first.second.sequence == 1U);
+    CHECK(first.second.root_event == EventId {"root-event"});
+    CHECK(first.second.schema == SchemaId {"alert.v1"});
+    CHECK(first.second.schema_hash == "sha256:alert-v1");
+    CHECK(first.second.payload.canonical_digest == second.second.payload.canonical_digest);
+    CHECK(first.second.payload.label ==
+          DataLabel {.classification = Classification::sensitive, .categories = {"identity"}});
+}
+
+TEST_CASE("event journal rolls back nested transactions and uncaught exceptions") {
+    SECTION("inner rollback preserves only the outer event") {
+        const auto pack = event_pack({alert_record(), make_event_operand(SchemaId {"alert.v1"}, "sha256:alert-v1"),
+                                      make_fact(true), text("audit")},
+                                     {
+                                         instruction(Opcode::begin_transaction, 0U, 0U, 0U, 0U, 20U),
+                                         instruction(Opcode::load_const, 0U, 0U, 0U, 0U, 21U),
+                                         instruction(Opcode::emit_event, 0U, 0U, 0U, 1U, 22U),
+                                         instruction(Opcode::append_effect, 0U, 0U, 0U, 3U, 23U),
+                                         instruction(Opcode::begin_transaction, 0U, 0U, 0U, 0U, 24U),
+                                         instruction(Opcode::emit_event, 0U, 0U, 0U, 1U, 25U),
+                                         instruction(Opcode::append_effect, 0U, 0U, 0U, 3U, 26U),
+                                         instruction(Opcode::rollback_transaction, 0U, 0U, 0U, 0U, 27U),
+                                         instruction(Opcode::commit_transaction, 0U, 0U, 0U, 0U, 28U),
+                                         instruction(Opcode::load_const, 1U, 0U, 0U, 2U, 29U),
+                                         instruction(Opcode::return_value, 0U, 1U, 0U, 0U, 30U),
+                                     });
+        auto session = start(pack);
+        const auto completed = session->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        REQUIRE(completed.result->committed_events.size() == 1U);
+        REQUIRE(completed.result->committed_effects.size() == 1U);
+        CHECK(completed.result->committed_events.front().sequence == 1U);
+        REQUIRE(completed.event_journal_delta.size() == 2U);
+        CHECK(completed.event_journal_delta[1].sequence == 2U);
+        CHECK(completed.event_journal_delta[1].disposition == EventDisposition::rolled_back);
+        REQUIRE(completed.journal_delta.size() == 2U);
+        CHECK(completed.journal_delta[1].disposition == EffectDisposition::rolled_back);
+    }
+
+    SECTION("uncaught exception exposes no committed event") {
+        const auto pack = event_pack(
+            {alert_record(), make_event_operand(SchemaId {"alert.v1"}, "sha256:alert-v1"), text("boom")},
+            {
+                instruction(Opcode::load_const, 0U, 0U, 0U, 0U, 30U),
+                instruction(Opcode::emit_event, 0U, 0U, 0U, 1U, 31U),
+                instruction(Opcode::load_const, 1U, 0U, 0U, 2U, 32U),
+                instruction(Opcode::raise_fault, 0U, 1U, 0U, std::to_underlying(PythonFaultKind::value_error), 33U),
+            });
+        auto session = start(pack);
+        const auto faulted = session->step({});
+        REQUIRE(faulted.state == VmStepState::faulted);
+        REQUIRE(faulted.result.has_value());
+        CHECK(faulted.result->committed_events.empty());
+        REQUIRE(faulted.event_journal_delta.size() == 1U);
+        CHECK(faulted.event_journal_delta.front().disposition == EventDisposition::rolled_back);
+    }
+}
+
+TEST_CASE("event opcode rejects malformed schemas values and hard budget exhaustion") {
+    SECTION("verifier rejects a noncanonical event operand") {
+        const auto pack =
+            event_pack({alert_record(), text("alert.v1")}, {
+                                                               instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                                                               instruction(Opcode::emit_event, 0U, 0U, 0U, 1U),
+                                                           });
+        const auto verified = verify_bytecode(pack);
+        REQUIRE_FALSE(verified.has_value());
+        CHECK(std::ranges::any_of(verified.error(), [](const Diagnostic &item) { return item.code == "PYC0115"; }));
+    }
+
+    SECTION("payload schema mismatch faults before journaling") {
+        const auto malformed = make_fact(FactRecord {
+            .schema = SchemaId {"alert.v1"},
+            .fields = {FactRecordField {.field_id = 1U, .value = make_fact(true)},
+                       FactRecordField {.field_id = 2U, .value = make_fact(true)}},
+        });
+        const auto pack =
+            event_pack({malformed, make_event_operand(SchemaId {"alert.v1"}, "sha256:alert-v1"), make_fact(true)},
+                       {
+                           instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                           instruction(Opcode::emit_event, 0U, 0U, 0U, 1U),
+                           instruction(Opcode::load_const, 1U, 0U, 0U, 2U),
+                           instruction(Opcode::return_value, 0U, 1U),
+                       });
+        auto session = start(pack);
+        const auto faulted = session->step({});
+        REQUIRE(faulted.state == VmStepState::faulted);
+        CHECK(session->event_journal_size() == 0U);
+        CHECK(faulted.result->committed_events.empty());
+    }
+
+    SECTION("count budget is not refunded by rollback") {
+        auto budget = balanced_v1;
+        budget.normal.event_intents = 1U;
+        const auto pack =
+            event_pack({alert_record(), make_event_operand(SchemaId {"alert.v1"}, "sha256:alert-v1"), make_fact(true)},
+                       {
+                           instruction(Opcode::begin_transaction),
+                           instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                           instruction(Opcode::emit_event, 0U, 0U, 0U, 1U),
+                           instruction(Opcode::rollback_transaction),
+                           instruction(Opcode::emit_event, 0U, 0U, 0U, 1U),
+                           instruction(Opcode::load_const, 1U, 0U, 0U, 2U),
+                           instruction(Opcode::return_value, 0U, 1U),
+                       });
+        auto session = start(pack, invocation(budget));
+        const auto faulted = session->step({});
+        REQUIRE(faulted.state == VmStepState::faulted);
+        REQUIRE(faulted.result->fault.has_value());
+        CHECK(faulted.result->fault->frames.back().code == "PYVM4014");
+        CHECK(faulted.result->committed_events.empty());
+        CHECK(session->counters().event_intents == 1U);
+    }
+
+    SECTION("byte and depth budgets fail closed") {
+        FactValue nested = make_fact(FactList {});
+        for (std::uint32_t depth = 0U; depth < 4U; ++depth) {
+            nested = make_fact(FactList {.items = {std::move(nested)}});
+        }
+        const auto deep_record = make_fact(FactRecord {
+            .schema = SchemaId {"deep.v1"},
+            .fields = {FactRecordField {.field_id = 1U, .value = std::move(nested)}},
+        });
+        auto pack = pack_with(
+            {std::move(deep_record), make_event_operand(SchemaId {"deep.v1"}, "sha256:deep-v1"), make_fact(true)},
+            {function("rule.main", 2U,
+                      {
+                          instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                          instruction(Opcode::emit_event, 0U, 0U, 0U, 1U),
+                          instruction(Opcode::load_const, 1U, 0U, 0U, 2U),
+                          instruction(Opcode::return_value, 0U, 1U),
+                      })});
+        pack.schemas = SchemaCatalog {
+            .descriptors = {SchemaDescriptor {
+                .id = SchemaId {"deep.v1"},
+                .kind = SchemaKind::event,
+                .qualified_name = "rules.Deep",
+                .canonical_hash = "sha256:deep-v1",
+                .fields = {SchemaField {
+                    .field_id = 1U, .name = "items", .type = SchemaId {"list"}, .optional = false, .label = {}}}}},
+            .canonical_hash = "sha256:deep-schemas",
+        };
+        auto depth_budget = balanced_v1;
+        depth_budget.normal.event_maximum_depth = 2U;
+        auto depth_session = start(pack, invocation(depth_budget));
+        const auto depth_fault = depth_session->step({});
+        REQUIRE(depth_fault.state == VmStepState::faulted);
+        CHECK(depth_fault.result->fault->frames.back().code == "PYVM4014");
+
+        auto byte_budget = balanced_v1;
+        byte_budget.normal.event_bytes = 1U;
+        auto byte_session = start(pack, invocation(byte_budget));
+        const auto byte_fault = byte_session->step({});
+        REQUIRE(byte_fault.state == VmStepState::faulted);
+        CHECK(byte_fault.result->fault->frames.back().code == "PYVM4014");
+    }
 }
 
 TEST_CASE("capability suspension freezes arguments and correlates its response") {

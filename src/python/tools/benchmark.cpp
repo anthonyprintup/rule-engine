@@ -195,6 +195,7 @@ Options:
             return {
                 .execution = ExecutionId {"benchmark-execution-" + std::to_string(index + 1U)},
                 .invocation = InvocationId {"benchmark-invocation-" + std::to_string(index + 1U)},
+                .root_event = EventId {"benchmark-root-" + std::to_string(index + 1U)},
                 .binding = BindingId {std::string {binding_name}},
                 .subject = synthetic_subject(index),
                 .budget = balanced_v1,
@@ -240,6 +241,8 @@ Options:
                 .state_bytes = static_cast<std::uint64_t>(counters.state_bytes),
                 .effect_intents = counters.effect_intents,
                 .effect_bytes = static_cast<std::uint64_t>(counters.effect_bytes),
+                .event_intents = counters.event_intents,
+                .event_bytes = static_cast<std::uint64_t>(counters.event_bytes),
                 .recorder_events = 0U,
                 .recorder_bytes = 0U,
             };
@@ -283,6 +286,7 @@ Options:
                         .outcome = EvaluationOutcome::no_match,
                         .verdict = false,
                         .committed_effects = {},
+                        .committed_events = {},
                         .state_mutations = {},
                         .fault = std::nullopt,
                     },
@@ -614,8 +618,9 @@ Options:
             if (!completed.fact_requests.empty() || !completed.scan_requests.empty() ||
                 !completed.capability_requests.empty() || !completed.state_requests.empty() ||
                 !completed.history_requests.empty() || !completed.journal_delta.empty() ||
-                !completed.recorder_delta.empty() || (*session)->logical_read_count() != 0U ||
-                (*session)->journal_size() != 0U || (*session)->state_mutation_count() != 0U) {
+                !completed.event_journal_delta.empty() || !completed.recorder_delta.empty() ||
+                (*session)->logical_read_count() != 0U || (*session)->journal_size() != 0U ||
+                (*session)->event_journal_size() != 0U || (*session)->state_mutation_count() != 0U) {
                 return std::unexpected(
                     benchmark_error(ExitCode::internal_invariant_failed, "BENCH-CERTIFICATE-CONTRADICTION",
                                     "validated pure-false bytecode produced an observable interaction"));
@@ -643,6 +648,7 @@ Options:
                         .outcome = EvaluationOutcome::no_match,
                         .verdict = false,
                         .committed_effects = {},
+                        .committed_events = {},
                         .state_mutations = {},
                         .fault = std::nullopt,
                     },

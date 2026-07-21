@@ -64,6 +64,8 @@ namespace rule_engine::python::runtime {
                 !within(usage.state_keys, limit.state_keys) || !within(usage.state_bytes, limit.state_bytes) ||
                 !within(usage.effect_intents, limit.effect_intents) ||
                 !within(usage.effect_bytes, limit.effect_bytes) ||
+                !within(usage.event_intents, limit.event_intents) ||
+                !within(usage.event_bytes, limit.event_bytes) ||
                 !within(usage.recorder_events, limit.recorder_events) ||
                 !within(usage.recorder_bytes, limit.recorder_bytes)) {
                 return std::unexpected(
@@ -98,6 +100,8 @@ namespace rule_engine::python::runtime {
                 !checked_add(total.state_bytes, attempt.state_bytes) ||
                 !checked_add(total.effect_intents, attempt.effect_intents) ||
                 !checked_add(total.effect_bytes, attempt.effect_bytes) ||
+                !checked_add(total.event_intents, attempt.event_intents) ||
+                !checked_add(total.event_bytes, attempt.event_bytes) ||
                 !checked_add(total.recorder_events, attempt.recorder_events) ||
                 !checked_add(total.recorder_bytes, attempt.recorder_bytes)) {
                 return std::unexpected(runtime_error(ResidentRuntimeErrorCode::invalid_resource_usage,
@@ -148,6 +152,8 @@ namespace rule_engine::python::runtime {
             normal.state_bytes = remaining(original.normal.state_bytes, usage.state_bytes);
             normal.effect_intents = remaining(original.normal.effect_intents, usage.effect_intents);
             normal.effect_bytes = remaining(original.normal.effect_bytes, usage.effect_bytes);
+            normal.event_intents = remaining(original.normal.event_intents, usage.event_intents);
+            normal.event_bytes = remaining(original.normal.event_bytes, usage.event_bytes);
             normal.recorder_events = remaining(original.normal.recorder_events, usage.recorder_events);
             normal.recorder_bytes = remaining(original.normal.recorder_bytes, usage.recorder_bytes);
             return result;
@@ -345,6 +351,7 @@ namespace rule_engine::python::runtime {
                 normal_budget.active_cpu.count() < 0 || normal_budget.maximum_service_deadline.count() < 0 ||
                 request.input.id.empty() || request.input.tenant.empty() || request.input.peer.empty() ||
                 request.input.peer != request.invocation.subject.peer ||
+                request.invocation.root_event != request.input.id ||
                 request.cursor.consumer != work.serial_domain ||
                 request.cursor.expected_position == std::numeric_limits<std::uint64_t>::max() ||
                 request.cursor.new_position != request.cursor.expected_position + 1U ||
@@ -706,7 +713,8 @@ namespace rule_engine::python::runtime {
         }
 
         [[nodiscard]] std::expected<RuntimeTransaction, ResidentRuntimeError>
-        make_transaction(const ResidentEvaluationRequest &request, const EvaluationResult &result) {
+        make_transaction(const ResidentEvaluationRequest &request, const EvaluationResult &result,
+                         const SchemaCatalog &schemas) {
             auto durable = result;
             durable.committed_effects.clear();
             durable.committed_effects.reserve(result.committed_effects.size());
@@ -720,12 +728,23 @@ namespace rule_engine::python::runtime {
                 }
             }
 
+            std::vector<EventEnvelope> emitted_events;
+            if (!durable.committed_events.empty()) {
+                auto projected =
+                    project_committed_events(request.input, request.invocation, schemas, durable.committed_events);
+                if (!projected) {
+                    return std::unexpected(runtime_error(ResidentRuntimeErrorCode::event_projection_failure,
+                                                         "event projection failed: " + projected.error().message));
+                }
+                emitted_events = std::move(*projected);
+            }
+
             RuntimeTransaction transaction {
                 .input = request.input,
                 .cursor = request.cursor,
                 .evaluation = durable,
                 .state = durable.state_mutations,
-                .emitted_events = request.emitted_events,
+                .emitted_events = std::move(emitted_events),
                 .journal = durable.committed_effects,
                 .outbox = {},
                 .fence_token = request.work.fence,
@@ -811,7 +830,7 @@ namespace rule_engine::python::runtime {
 
         std::uint64_t host_turns {};
         VmResourceUsage resource_usage;
-        std::chrono::nanoseconds reported_elapsed;
+        std::chrono::nanoseconds reported_elapsed {};
         const auto refresh_elapsed = [&] {
             resource_usage.elapsed = std::max(
                 reported_elapsed, evaluation_elapsed(evaluation_started, request.invocation.budget.normal.elapsed));
@@ -840,6 +859,7 @@ namespace rule_engine::python::runtime {
                                 .outcome = EvaluationOutcome::canceled,
                                 .verdict = std::nullopt,
                                 .committed_effects = {},
+                                .committed_events = {},
                                 .state_mutations = {},
                                 .fault = std::nullopt,
                             },
@@ -948,7 +968,7 @@ namespace rule_engine::python::runtime {
                 return std::unexpected(accounted.error());
             }
 
-            auto transaction = make_transaction(request, *terminal);
+            auto transaction = make_transaction(request, *terminal, evaluation->pack->schemas);
             if (!transaction) {
                 return std::unexpected(transaction.error());
             }
@@ -997,6 +1017,7 @@ namespace rule_engine::python::runtime {
                             .outcome = EvaluationOutcome::canceled,
                             .verdict = std::nullopt,
                             .committed_effects = {},
+                            .committed_events = {},
                             .state_mutations = {},
                             .fault = std::nullopt,
                         },

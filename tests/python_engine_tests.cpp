@@ -160,6 +160,7 @@ namespace {
         return VmInvocation {
             .execution = ExecutionId {"execution"},
             .invocation = InvocationId {"invocation"},
+            .root_event = EventId {"event-1"},
             .binding = BindingId {"binding"},
             .subject = subject(),
         };
@@ -201,9 +202,8 @@ namespace {
         REQUIRE(complete.state == VmStepState::complete);
         REQUIRE(evaluation->terminal_result->outcome == EvaluationOutcome::match);
 
-        auto receipt =
-            engine.commit(*evaluation, input_event(),
-                          CursorAdvance {.consumer = "rules", .expected_position = 4, .new_position = 5}, {}, 9);
+        auto receipt = engine.commit(*evaluation, input_event(),
+                                     CursorAdvance {.consumer = "rules", .expected_position = 4, .new_position = 5}, 9);
         REQUIRE(receipt.has_value());
         REQUIRE(store.transaction.has_value());
         REQUIRE(store.transaction->fence_token == 9);
@@ -211,7 +211,7 @@ namespace {
         REQUIRE(store.transaction->outbox.size() == 1);
         REQUIRE(store.transaction->outbox.front().idempotency_key == "idempotency-1");
 
-        const auto duplicate = engine.commit(*evaluation, input_event(), {}, {}, 9);
+        const auto duplicate = engine.commit(*evaluation, input_event(), {}, 9);
         REQUIRE_FALSE(duplicate.has_value());
         REQUIRE(duplicate.error().code == EngineErrorCode::already_committed);
     }
@@ -233,7 +233,7 @@ namespace {
         REQUIRE(engine.activate(verified_pack(), {}, {}).has_value());
         auto evaluation = engine.start(invocation());
         REQUIRE(evaluation.has_value());
-        const auto premature = engine.commit(*evaluation, input_event(), {}, {}, 1);
+        const auto premature = engine.commit(*evaluation, input_event(), {}, 1);
         REQUIRE_FALSE(premature.has_value());
         REQUIRE(premature.error().code == EngineErrorCode::not_terminal);
         REQUIRE_FALSE(store.transaction.has_value());
@@ -255,7 +255,7 @@ namespace {
         static_cast<void>(engine.advance(*evaluation, {}));
         static_cast<void>(engine.advance(*evaluation, {}));
 
-        const auto result = engine.commit(*evaluation, input_event(), {}, {}, 1);
+        const auto result = engine.commit(*evaluation, input_event(), {}, 1);
         REQUIRE_FALSE(result.has_value());
         REQUIRE(result.error().code == EngineErrorCode::store_failure);
         REQUIRE(result.error().store->retryable);

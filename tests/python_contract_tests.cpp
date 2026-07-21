@@ -163,6 +163,7 @@ namespace {
             .reads_history = false,
             .calls_services = false,
             .emits_effects = true,
+            .emits_events = false,
             .logical_facts = {},
             .pure_false_prefix_exits = {},
             .semantic_hash = "sha256:certificate",

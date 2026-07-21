@@ -3086,6 +3086,7 @@ namespace rule_engine::python::compiler {
                 .reads_history = false,
                 .calls_services = false,
                 .emits_effects = false,
+                .emits_events = false,
                 .logical_facts = std::move(logical_facts),
                 .pure_false_prefix_exits = {},
                 .semantic_hash = {},
@@ -3100,9 +3101,10 @@ namespace rule_engine::python::compiler {
                         continue;
                     }
                     const auto callee = compiled.optimization_certificates[instruction.immediate];
-                    const auto before = std::make_tuple(
-                        caller.transitively_pure, caller.recorder_observable, caller.may_fault, caller.reads_state,
-                        caller.reads_history, caller.calls_services, caller.emits_effects, caller.logical_facts);
+                    const auto before =
+                        std::make_tuple(caller.transitively_pure, caller.recorder_observable, caller.may_fault,
+                                        caller.reads_state, caller.reads_history, caller.calls_services,
+                                        caller.emits_effects, caller.emits_events, caller.logical_facts);
                     caller.transitively_pure = caller.transitively_pure && callee.transitively_pure;
                     caller.recorder_observable = caller.recorder_observable || callee.recorder_observable;
                     caller.may_fault = caller.may_fault || callee.may_fault;
@@ -3110,14 +3112,16 @@ namespace rule_engine::python::compiler {
                     caller.reads_history = caller.reads_history || callee.reads_history;
                     caller.calls_services = caller.calls_services || callee.calls_services;
                     caller.emits_effects = caller.emits_effects || callee.emits_effects;
+                    caller.emits_events = caller.emits_events || callee.emits_events;
                     caller.logical_facts.insert(caller.logical_facts.end(), callee.logical_facts.begin(),
                                                 callee.logical_facts.end());
                     std::ranges::sort(caller.logical_facts);
                     caller.logical_facts.erase(std::ranges::unique(caller.logical_facts).begin(),
                                                caller.logical_facts.end());
-                    const auto after = std::make_tuple(
-                        caller.transitively_pure, caller.recorder_observable, caller.may_fault, caller.reads_state,
-                        caller.reads_history, caller.calls_services, caller.emits_effects, caller.logical_facts);
+                    const auto after =
+                        std::make_tuple(caller.transitively_pure, caller.recorder_observable, caller.may_fault,
+                                        caller.reads_state, caller.reads_history, caller.calls_services,
+                                        caller.emits_effects, caller.emits_events, caller.logical_facts);
                     changed = changed || before != after;
                 }
             }
@@ -3338,6 +3342,7 @@ namespace rule_engine::python::compiler {
                     case Opcode::yield_value:
                     case Opcode::write_state:
                     case Opcode::append_effect:
+                    case Opcode::emit_event:
                     case Opcode::begin_transaction:
                     case Opcode::commit_transaction:
                     case Opcode::rollback_transaction:
@@ -3401,7 +3406,8 @@ namespace rule_engine::python::compiler {
                     case Opcode::yield_value:
                     case Opcode::await_fact:
                     case Opcode::await_capability:
-                    case Opcode::append_effect: require_initialized(instruction.operand_a); break;
+                    case Opcode::append_effect:
+                    case Opcode::emit_event: require_initialized(instruction.operand_a); break;
                     case Opcode::binary_op:
                     case Opcode::compare:
                     case Opcode::load_subscript:

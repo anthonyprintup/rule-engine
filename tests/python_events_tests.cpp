@@ -2,6 +2,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -83,6 +84,135 @@ namespace {
             .scope = "correlation-group",
             .key = "image:C:/game.exe",
         };
+    }
+
+    SchemaCatalog projection_schemas() {
+        return SchemaCatalog {
+            .descriptors = {SchemaDescriptor {
+                .id = SchemaId {"custom.alert/v1"},
+                .kind = SchemaKind::event,
+                .qualified_name = "rules.CustomAlert",
+                .canonical_hash = "sha256:custom-alert-v1",
+                .fields = {SchemaField {.field_id = 1U,
+                                        .name = "message",
+                                        .type = SchemaId {"text"},
+                                        .optional = false,
+                                        .label = security_label()}},
+            }},
+            .canonical_hash = "sha256:projection-schemas",
+        };
+    }
+
+    VmInvocation projection_invocation() {
+        return VmInvocation {
+            .execution = ExecutionId {"execution-a"},
+            .invocation = InvocationId {"invocation-a"},
+            .root_event = EventId {"root-a"},
+            .binding = BindingId {"binding-a"},
+            .subject = SubjectKey {.peer = PeerId {"peer-a"},
+                                   .descriptor = SchemaId {"process/v1"},
+                                   .identity = {{.field_id = 1U, .value = std::uint64_t {7U}}},
+                                   .parent = {}},
+        };
+    }
+
+    EventIntent projection_intent(const std::uint64_t sequence) {
+        return EventIntent {
+            .id = deterministic_event_intent_id(EventId {"root-a"}, InvocationId {"invocation-a"}, sequence),
+            .root_event = EventId {"root-a"},
+            .invocation = InvocationId {"invocation-a"},
+            .owner = ExecutableId {"rules.emit"},
+            .binding = BindingId {"binding-a"},
+            .sequence = sequence,
+            .schema = SchemaId {"custom.alert/v1"},
+            .schema_hash = "sha256:custom-alert-v1",
+            .payload = record_value("custom.alert/v1", "digest:event-" + std::to_string(sequence), security_label()),
+            .span = SourceSpan {.source = SourceId {"rules.py"}, .begin_byte = 10U, .end_byte = 11U},
+            .disposition = EventDisposition::committed,
+        };
+    }
+
+    TEST_CASE("committed event projection is pure ordered causal and deterministic") {
+        const auto root = event("root-a", "input/v1", "input.payload/v1", 100U, 110U);
+        const auto invocation = projection_invocation();
+        const std::vector intents {projection_intent(1U), projection_intent(3U)};
+
+        const auto first = project_committed_events(root, invocation, projection_schemas(), intents);
+        const auto second = project_committed_events(root, invocation, projection_schemas(), intents);
+
+        REQUIRE(first.has_value());
+        REQUIRE(second.has_value());
+        REQUIRE(first->size() == 2U);
+        CHECK(first->front().id == EventId {intents.front().id.value});
+        CHECK(first->back().id == EventId {intents.back().id.value});
+        CHECK(first->front().causation == EventId {"root-a"});
+        CHECK(first->front().tenant == root.tenant);
+        CHECK(first->front().peer == root.peer);
+        CHECK(first->front().producer_unix_ms == root.ingest_unix_ms);
+        CHECK(first->front().payload.canonical_digest == second->front().payload.canonical_digest);
+        CHECK(first->front().label == security_label());
+    }
+
+    TEST_CASE("event projection rejects malformed identity order schema payload and budgets") {
+        const auto root = event("root-a", "input/v1", "input.payload/v1", 100U, 110U);
+        const auto invocation = projection_invocation();
+
+        SECTION("identity and order") {
+            auto wrong_identity = projection_intent(1U);
+            wrong_identity.id = IntentId {"forged"};
+            const std::array intents {wrong_identity};
+            const auto rejected = project_committed_events(root, invocation, projection_schemas(), intents);
+            REQUIRE_FALSE(rejected.has_value());
+            CHECK(rejected.error().code == EventProjectionErrorCode::invalid_identity);
+
+            const std::array reversed {projection_intent(2U), projection_intent(1U)};
+            const auto out_of_order = project_committed_events(root, invocation, projection_schemas(), reversed);
+            REQUIRE_FALSE(out_of_order.has_value());
+            CHECK(out_of_order.error().code == EventProjectionErrorCode::invalid_order);
+        }
+
+        SECTION("schema hash and field type") {
+            auto wrong_hash = projection_intent(1U);
+            wrong_hash.schema_hash = "sha256:other";
+            const std::array intents {wrong_hash};
+            const auto rejected = project_committed_events(root, invocation, projection_schemas(), intents);
+            REQUIRE_FALSE(rejected.has_value());
+            CHECK(rejected.error().code == EventProjectionErrorCode::invalid_schema);
+
+            auto wrong_value = projection_intent(1U);
+            wrong_value.payload.value = make_fact(FactRecord {
+                .schema = SchemaId {"custom.alert/v1"},
+                .fields = {{.field_id = 1U, .value = make_fact(true)}},
+            });
+            const std::array malformed {wrong_value};
+            const auto value_rejected = project_committed_events(root, invocation, projection_schemas(), malformed);
+            REQUIRE_FALSE(value_rejected.has_value());
+            CHECK(value_rejected.error().code == EventProjectionErrorCode::invalid_schema);
+        }
+
+        SECTION("label disposition and count") {
+            auto wrong_label = projection_intent(1U);
+            wrong_label.payload.label = public_label();
+            const std::array intents {wrong_label};
+            const auto label_rejected = project_committed_events(root, invocation, projection_schemas(), intents);
+            REQUIRE_FALSE(label_rejected.has_value());
+            CHECK(label_rejected.error().code == EventProjectionErrorCode::invalid_payload);
+
+            auto pending = projection_intent(1U);
+            pending.disposition = EventDisposition::pending;
+            const std::array pending_intents {pending};
+            const auto pending_rejected =
+                project_committed_events(root, invocation, projection_schemas(), pending_intents);
+            REQUIRE_FALSE(pending_rejected.has_value());
+            CHECK(pending_rejected.error().code == EventProjectionErrorCode::invalid_identity);
+
+            const std::array too_many {projection_intent(1U), projection_intent(2U)};
+            const auto budget_rejected = project_committed_events(
+                root, invocation, projection_schemas(), too_many,
+                EventProjectionLimits {.maximum_intents = 1U, .maximum_bytes = 1U * mebibyte, .maximum_depth = 8U});
+            REQUIRE_FALSE(budget_rejected.has_value());
+            CHECK(budget_rejected.error().code == EventProjectionErrorCode::budget_exhausted);
+        }
     }
 
     TEST_CASE("typed event admission validates schema labels and causation") {

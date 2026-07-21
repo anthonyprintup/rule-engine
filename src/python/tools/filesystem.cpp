@@ -540,6 +540,7 @@ namespace rule_engine::python::tools {
                 case certificate_reads_history: return "executable reads history";
                 case certificate_calls_services: return "executable calls services";
                 case certificate_emits_effects: return "executable emits effects";
+                case certificate_emits_events: return "executable emits events";
                 case certificate_has_logical_reads: return "executable has logical fact reads";
                 case certificate_has_no_pure_prefix: return "certificate has no pure prefix";
                 case no_transform_requested: return "no transform requested";

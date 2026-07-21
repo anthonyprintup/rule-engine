@@ -13,6 +13,7 @@ namespace rule_engine::python::cluster::serialization {
     namespace {
 
         constexpr std::uint32_t magic = 0x31534552U;
+        constexpr std::uint8_t evaluation_wire_version = 0xe2U;
         constexpr std::size_t maximum_bytes = 64U * 1024U * 1024U;
         constexpr std::uint32_t maximum_collection = 100'000U;
         constexpr std::uint32_t maximum_depth = 64U;
@@ -489,6 +490,36 @@ namespace rule_engine::python::cluster::serialization {
             };
         }
 
+        void write_event_intent(Writer &writer, const EventIntent &event) {
+            write_id(writer, event.id);
+            write_id(writer, event.root_event);
+            write_id(writer, event.invocation);
+            write_id(writer, event.owner);
+            write_id(writer, event.binding);
+            writer.number(event.sequence);
+            write_id(writer, event.schema);
+            writer.string(event.schema_hash);
+            write_frozen(writer, event.payload);
+            write_span(writer, event.span);
+            writer.u8(static_cast<std::uint8_t>(event.disposition));
+        }
+
+        EventIntent read_event_intent(Reader &reader) {
+            return EventIntent {
+                .id = read_id<IntentId>(reader),
+                .root_event = read_id<EventId>(reader),
+                .invocation = read_id<InvocationId>(reader),
+                .owner = read_id<ExecutableId>(reader),
+                .binding = read_id<BindingId>(reader),
+                .sequence = reader.number<std::uint64_t>(),
+                .schema = read_id<SchemaId>(reader),
+                .schema_hash = reader.string(),
+                .payload = read_frozen(reader),
+                .span = read_span(reader),
+                .disposition = static_cast<EventDisposition>(reader.u8()),
+            };
+        }
+
         void write_fault(Writer &writer, const FaultChain &fault) {
             writer.number(static_cast<std::uint32_t>(fault.frames.size()));
             for (const auto &frame : fault.frames) {
@@ -517,6 +548,7 @@ namespace rule_engine::python::cluster::serialization {
         }
 
         void write_evaluation(Writer &writer, const EvaluationResult &evaluation) {
+            writer.u8(evaluation_wire_version);
             writer.u8(static_cast<std::uint8_t>(evaluation.outcome));
             writer.boolean(evaluation.verdict.has_value());
             if (evaluation.verdict) {
@@ -524,6 +556,8 @@ namespace rule_engine::python::cluster::serialization {
             }
             writer.number(static_cast<std::uint32_t>(evaluation.committed_effects.size()));
             for (const auto &effect : evaluation.committed_effects) { write_effect(writer, effect); }
+            writer.number(static_cast<std::uint32_t>(evaluation.committed_events.size()));
+            for (const auto &event : evaluation.committed_events) { write_event_intent(writer, event); }
             writer.number(static_cast<std::uint32_t>(evaluation.state_mutations.size()));
             for (const auto &state : evaluation.state_mutations) { write_state(writer, state); }
             writer.boolean(evaluation.fault.has_value());
@@ -533,9 +567,13 @@ namespace rule_engine::python::cluster::serialization {
         }
 
         EvaluationResult read_evaluation(Reader &reader) {
+            if (reader.u8() != evaluation_wire_version && reader.error.empty()) {
+                reader.error = "serialized evaluation version is unsupported";
+            }
             EvaluationResult result {.outcome = static_cast<EvaluationOutcome>(reader.u8()),
                                      .verdict = std::nullopt,
                                      .committed_effects = {},
+                                     .committed_events = {},
                                      .state_mutations = {},
                                      .fault = std::nullopt};
             if (reader.boolean()) {
@@ -545,6 +583,11 @@ namespace rule_engine::python::cluster::serialization {
             result.committed_effects.reserve(count);
             for (std::uint32_t index = 0; index < count; ++index) {
                 result.committed_effects.push_back(read_effect(reader));
+            }
+            count = reader.count();
+            result.committed_events.reserve(count);
+            for (std::uint32_t index = 0; index < count; ++index) {
+                result.committed_events.push_back(read_event_intent(reader));
             }
             count = reader.count();
             result.state_mutations.reserve(count);
@@ -728,9 +771,45 @@ namespace rule_engine::python::cluster::serialization {
                 return std::unexpected(CodecError {.message = "evaluation and transaction effects disagree"});
             }
         }
+        if (value.evaluation.committed_events.size() != value.emitted_events.size()) {
+            return std::unexpected(CodecError {.message = "evaluation and transaction event sizes disagree"});
+        }
+        std::uint64_t previous_event_sequence {};
+        for (std::size_t index = 0; index < value.emitted_events.size(); ++index) {
+            const auto &intent = value.evaluation.committed_events[index];
+            const auto &event = value.emitted_events[index];
+            Writer intent_payload;
+            Writer event_payload;
+            Writer root_subject;
+            Writer event_subject;
+            write_frozen(intent_payload, intent.payload);
+            write_frozen(event_payload, event.payload);
+            root_subject.boolean(value.input.subject.has_value());
+            event_subject.boolean(event.subject.has_value());
+            if (value.input.subject) {
+                write_subject(root_subject, *value.input.subject, 0U);
+            }
+            if (event.subject) {
+                write_subject(event_subject, *event.subject, 0U);
+            }
+            if (intent.disposition != EventDisposition::committed || intent.root_event != value.input.id ||
+                intent.invocation.empty() || intent.owner.empty() || intent.binding.empty() || intent.sequence == 0U ||
+                intent.sequence <= previous_event_sequence || intent.schema.empty() || intent.schema_hash.empty() ||
+                intent.id != deterministic_event_intent_id(value.input.id, intent.invocation, intent.sequence) ||
+                event.id != EventId {intent.id.value} || event.schema != intent.schema ||
+                event.tenant != value.input.tenant || event.peer != value.input.peer || !root_subject.valid() ||
+                !event_subject.valid() || root_subject.bytes != event_subject.bytes ||
+                event.producer_unix_ms != value.input.ingest_unix_ms ||
+                event.ingest_unix_ms != value.input.ingest_unix_ms || event.label != intent.payload.label ||
+                event.causation != value.input.id || !intent_payload.valid() || !event_payload.valid() ||
+                intent_payload.bytes != event_payload.bytes) {
+                return std::unexpected(CodecError {.message = "evaluation and transaction events disagree"});
+            }
+            previous_event_sequence = intent.sequence;
+        }
         if (value.evaluation.outcome == EvaluationOutcome::canceled &&
-            (!value.state.empty() || !value.emitted_events.empty() || !value.journal.empty() ||
-             !value.outbox.empty())) {
+            (!value.evaluation.committed_events.empty() || !value.state.empty() || !value.emitted_events.empty() ||
+             !value.journal.empty() || !value.outbox.empty())) {
             return std::unexpected(CodecError {.message = "canceled evaluation contains committed effects"});
         }
         return {};

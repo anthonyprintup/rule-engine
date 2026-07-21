@@ -55,6 +55,9 @@ namespace rule_engine::python::optimizer {
             if (certificate.emits_effects) {
                 return ExactFallbackReason::certificate_emits_effects;
             }
+            if (certificate.emits_events) {
+                return ExactFallbackReason::certificate_emits_events;
+            }
             if (certificate.may_fault) {
                 return ExactFallbackReason::certificate_may_fault;
             }
@@ -97,6 +100,14 @@ namespace rule_engine::python::optimizer {
                    same_frozen_value(left.payload, right.payload) && left.span == right.span &&
                    same_policy(left.policy, right.policy) && left.disposition == right.disposition &&
                    left.idempotency_key == right.idempotency_key;
+        }
+
+        [[nodiscard]] bool same_event(const EventIntent &left, const EventIntent &right) noexcept {
+            return left.id == right.id && left.root_event == right.root_event && left.invocation == right.invocation &&
+                   left.owner == right.owner && left.binding == right.binding && left.sequence == right.sequence &&
+                   left.schema == right.schema && left.schema_hash == right.schema_hash &&
+                   same_frozen_value(left.payload, right.payload) && left.span == right.span &&
+                   left.disposition == right.disposition;
         }
 
         [[nodiscard]] bool same_optional_frozen_value(const std::optional<FrozenValue> &left,
@@ -348,6 +359,17 @@ namespace rule_engine::python::optimizer {
                              .dimension = ShadowParityDimension::ordered_effects,
                              .exact_count = exact.evaluation.committed_effects.size(),
                              .optimized_count = optimized.evaluation.committed_effects.size(),
+                             .first_difference_index = difference,
+                         });
+        }
+        if (const auto difference = first_difference(std::span {exact.evaluation.committed_events},
+                                                     std::span {optimized.evaluation.committed_events}, same_event);
+            difference.has_value()) {
+            add_mismatch(report, limits,
+                         RedactedShadowMismatch {
+                             .dimension = ShadowParityDimension::ordered_events,
+                             .exact_count = exact.evaluation.committed_events.size(),
+                             .optimized_count = optimized.evaluation.committed_events.size(),
                              .first_difference_index = difference,
                          });
         }

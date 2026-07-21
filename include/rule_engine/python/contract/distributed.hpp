@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <expected>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,34 @@ namespace rule_engine::python {
         std::optional<EventId> causation;
         FrozenValue payload;
     };
+
+    struct EventProjectionLimits {
+        std::uint32_t maximum_intents {balanced_v1.normal.event_intents};
+        std::size_t maximum_bytes {balanced_v1.normal.event_bytes};
+        std::uint32_t maximum_depth {balanced_v1.normal.event_maximum_depth};
+    };
+
+    enum struct EventProjectionErrorCode : std::uint8_t {
+        invalid_context,
+        invalid_identity,
+        invalid_order,
+        invalid_schema,
+        invalid_payload,
+        budget_exhausted,
+    };
+
+    struct EventProjectionError {
+        EventProjectionErrorCode code {EventProjectionErrorCode::invalid_payload};
+        std::string message;
+        std::optional<SourceSpan> span;
+    };
+
+    // Validates the committed VM journal again at the server boundary and
+    // deterministically materializes durable envelopes. This function is pure:
+    // it performs no store write, dispatch, clock read, or external call.
+    [[nodiscard]] std::expected<std::vector<EventEnvelope>, EventProjectionError>
+    project_committed_events(const EventEnvelope &root, const VmInvocation &invocation, const SchemaCatalog &schemas,
+                             std::span<const EventIntent> intents, const EventProjectionLimits &limits = {});
 
     struct CursorAdvance {
         std::string consumer;

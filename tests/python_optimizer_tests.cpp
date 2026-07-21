@@ -50,6 +50,7 @@ namespace {
             .reads_history = false,
             .calls_services = false,
             .emits_effects = false,
+            .emits_events = false,
             .logical_facts = {},
             .pure_false_prefix_exits = {3, 9},
             .semantic_hash = "sha256:rule-one",
@@ -189,6 +190,8 @@ namespace {
                  [](OptimizationCertificate &certificate) { certificate.calls_services = true; });
         add_case(ExactFallbackReason::certificate_emits_effects,
                  [](OptimizationCertificate &certificate) { certificate.emits_effects = true; });
+        add_case(ExactFallbackReason::certificate_emits_events,
+                 [](OptimizationCertificate &certificate) { certificate.emits_events = true; });
         add_case(ExactFallbackReason::certificate_recorder_observable,
                  [](OptimizationCertificate &certificate) { certificate.recorder_observable = true; });
         add_case(ExactFallbackReason::certificate_reads_history,
@@ -298,6 +301,17 @@ namespace {
                                                                            .dry_run = false},
                                            .disposition = EffectDisposition::committed,
                                            .idempotency_key = "intent-key"}},
+                    .committed_events = {{.id = IntentId {"event-intent-1"},
+                                          .root_event = EventId {"root-event"},
+                                          .invocation = InvocationId {"invocation-1"},
+                                          .owner = ExecutableId {"rule.one"},
+                                          .binding = BindingId {"binding.one"},
+                                          .sequence = 1,
+                                          .schema = SchemaId {"alert/v1"},
+                                          .schema_hash = "sha256:alert-v1",
+                                          .payload = frozen("sha256:event"),
+                                          .span = source_span(),
+                                          .disposition = EventDisposition::committed}},
                     .state_mutations = {{.owner = ExecutableId {"rule.one"},
                                          .namespace_name = "binding.one",
                                          .key = "counter",
@@ -327,7 +341,9 @@ namespace {
                                .value_digest = "sha256:value"}},
             .recorder =
                 {{.sequence = 1, .kind = "branch", .span = source_span(), .label = DataLabel {}, .summary = "taken"}},
-            .resources = SemanticResourceCounters {.instructions = 100, .logical_facts = 1, .effect_intents = 1},
+            .resources =
+                SemanticResourceCounters {
+                    .instructions = 100, .logical_facts = 1, .effect_intents = 1, .event_intents = 1},
             .diagnostics = {{.code = "RuleFault",
                              .severity = DiagnosticSeverity::error,
                              .message = "secret diagnostic",
@@ -340,6 +356,7 @@ namespace {
                     .outcome = EvaluationOutcome::no_match,
                     .verdict = false,
                     .committed_effects = {},
+                    .committed_events = {},
                     .state_mutations = {},
                     .fault = std::nullopt,
                 },
@@ -355,18 +372,18 @@ namespace {
         CHECK_FALSE(mismatch.equivalent);
         CHECK(mismatch.exact_result_is_only_committable);
         CHECK(mismatch.disable_optimized_executable);
-        CHECK(mismatch.mismatch_dimension_count == 10);
-        CHECK(mismatch.mismatches.size() == 10);
+        CHECK(mismatch.mismatch_dimension_count == 11);
+        CHECK(mismatch.mismatches.size() == 11);
         CHECK_FALSE(mismatch.mismatch_data_truncated);
         std::vector<ShadowParityDimension> mismatch_dimensions;
         std::ranges::transform(mismatch.mismatches, std::back_inserter(mismatch_dimensions),
                                &RedactedShadowMismatch::dimension);
-        CHECK(mismatch_dimensions == std::vector {ShadowParityDimension::outcome, ShadowParityDimension::verdict,
-                                                  ShadowParityDimension::fact_reads,
-                                                  ShadowParityDimension::logical_reads,
-                                                  ShadowParityDimension::ordered_effects, ShadowParityDimension::state,
-                                                  ShadowParityDimension::recorder, ShadowParityDimension::fault,
-                                                  ShadowParityDimension::budgets, ShadowParityDimension::diagnostics});
+        CHECK(mismatch_dimensions ==
+              std::vector {ShadowParityDimension::outcome, ShadowParityDimension::verdict,
+                           ShadowParityDimension::fact_reads, ShadowParityDimension::logical_reads,
+                           ShadowParityDimension::ordered_effects, ShadowParityDimension::ordered_events,
+                           ShadowParityDimension::state, ShadowParityDimension::recorder, ShadowParityDimension::fault,
+                           ShadowParityDimension::budgets, ShadowParityDimension::diagnostics});
 
         const auto parity = compare_shadow_execution(exact, exact);
         CHECK(parity.equivalent);
@@ -397,9 +414,22 @@ namespace {
         CHECK(effect_order_mismatch.mismatches.front().dimension == ShadowParityDimension::ordered_effects);
         CHECK(effect_order_mismatch.mismatches.front().first_difference_index == 0);
 
+        auto ordered_events = exact;
+        auto second_event = ordered_events.evaluation.committed_events.front();
+        second_event.id = IntentId {"event-intent-2"};
+        second_event.sequence = 2;
+        ordered_events.evaluation.committed_events.push_back(second_event);
+        auto reordered_events = ordered_events;
+        std::ranges::swap(reordered_events.evaluation.committed_events[0],
+                          reordered_events.evaluation.committed_events[1]);
+        const auto event_order_mismatch = compare_shadow_execution(ordered_events, reordered_events);
+        REQUIRE(event_order_mismatch.mismatches.size() == 1);
+        CHECK(event_order_mismatch.mismatches.front().dimension == ShadowParityDimension::ordered_events);
+        CHECK(event_order_mismatch.mismatches.front().first_difference_index == 0);
+
         const auto limited =
             compare_shadow_execution(exact, optimized, ShadowParityLimits {.maximum_mismatch_records = 2});
-        CHECK(limited.mismatch_dimension_count == 10);
+        CHECK(limited.mismatch_dimension_count == 11);
         CHECK(limited.mismatches.size() == 2);
         CHECK(limited.mismatch_data_truncated);
     }
@@ -522,6 +552,7 @@ namespace {
                         .outcome = verdict ? EvaluationOutcome::match : EvaluationOutcome::no_match,
                         .verdict = verdict,
                         .committed_effects = {},
+                        .committed_events = {},
                         .state_mutations = {},
                         .fault = std::nullopt,
                     },

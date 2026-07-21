@@ -251,6 +251,7 @@ TEST_CASE("static Python AST compiles, executes in the register VM, and commits 
     auto evaluation = engine.start(VmInvocation {
         .execution = ExecutionId {"execution-1"},
         .invocation = InvocationId {"invocation-1"},
+        .root_event = EventId {"event-1"},
         .binding = BindingId {"binding-1"},
         .subject = subject(),
         .budget = balanced_v1,
@@ -273,7 +274,7 @@ TEST_CASE("static Python AST compiles, executes in the register VM, and commits 
                                            .expected_position = 0U,
                                            .new_position = 1U,
                                        },
-                                       {}, 1U);
+                                       1U);
     REQUIRE(receipt.has_value());
     CHECK(receipt->input == EventId {"event-1"});
     CHECK(receipt->committed_cursor == 1U);

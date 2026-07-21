@@ -53,6 +53,33 @@ namespace {
         return std::move(*frozen);
     }
 
+    [[nodiscard]] FrozenValue emitted_payload() {
+        return FrozenValue {
+            .value = make_fact(FactRecord {
+                .schema = SchemaId {"custom.alert/v1"},
+                .fields = {{.field_id = 1U, .value = make_fact(UnicodeValue {.utf8 = "detected"})}},
+            }),
+            .label = DataLabel {.classification = Classification::internal, .categories = {"security"}},
+            .canonical_digest = "sha256:custom-alert-payload",
+        };
+    }
+
+    [[nodiscard]] EventIntent emitted_intent(const bool malformed = false) {
+        return EventIntent {
+            .id = deterministic_event_intent_id(EventId {"event-1"}, InvocationId {"invocation-1"}, 1U),
+            .root_event = EventId {"event-1"},
+            .invocation = InvocationId {"invocation-1"},
+            .owner = ExecutableId {"rule"},
+            .binding = BindingId {"binding-1"},
+            .sequence = 1U,
+            .schema = SchemaId {"custom.alert/v1"},
+            .schema_hash = malformed ? "sha256:forged" : "sha256:custom-alert-v1",
+            .payload = emitted_payload(),
+            .span = source_span(),
+            .disposition = EventDisposition::committed,
+        };
+    }
+
     [[nodiscard]] FactRequest fact_request() {
         return {
             .request_id = RequestId {"request:fact:1"},
@@ -235,6 +262,8 @@ namespace {
         cancellation,
         constant,
         capabilities,
+        events,
+        malformed_events,
     };
 
     struct ScriptedSession final: VmSession {
@@ -304,6 +333,12 @@ namespace {
                     }
                     return {.state = VmStepState::faulted,
                             .result = EvaluationResult {.outcome = EvaluationOutcome::faulted}};
+                case SessionScenario::events:
+                case SessionScenario::malformed_events: {
+                    auto result = clean_result();
+                    result.committed_events.push_back(emitted_intent(scenario == SessionScenario::malformed_events));
+                    return {.state = VmStepState::complete, .result = std::move(result)};
+                }
                 case SessionScenario::constant: return {.state = VmStepState::complete, .result = clean_result()};
                 default:
                     return {.state = VmStepState::faulted,
@@ -337,6 +372,22 @@ namespace {
             .source_digest = SourceDigest {"sha256:source"},
             .compiler_abi = std::string {python_static_compiler_abi_v1},
             .semantic_hash = "sha256:semantic",
+            .schemas =
+                SchemaCatalog {
+                    .descriptors = {SchemaDescriptor {
+                        .id = SchemaId {"custom.alert/v1"},
+                        .kind = SchemaKind::event,
+                        .qualified_name = "rules.CustomAlert",
+                        .canonical_hash = "sha256:custom-alert-v1",
+                        .fields = {SchemaField {.field_id = 1U,
+                                                .name = "message",
+                                                .type = SchemaId {"text"},
+                                                .optional = false,
+                                                .label = DataLabel {.classification = Classification::internal,
+                                                                    .categories = {"security"}}}},
+                    }},
+                    .canonical_hash = "sha256:runtime-schemas",
+                },
             .constants = {make_fact(true)},
             .functions = {BytecodeFunction {
                 .id = ExecutableId {"rule"},
@@ -599,6 +650,7 @@ namespace {
                 .committed_cursor = transaction.cursor.new_position,
             };
             for (const auto &row : transaction.outbox) { receipt.outbox_intents.push_back(row.intent); }
+            for (const auto &event : transaction.emitted_events) { receipt.emitted_events.push_back(event.id); }
             return receipt;
         }
     };
@@ -633,6 +685,7 @@ namespace {
                 VmInvocation {
                     .execution = ExecutionId {"execution-1"},
                     .invocation = InvocationId {"invocation-1"},
+                    .root_event = EventId {"event-1"},
                     .binding = BindingId {"binding-1"},
                     .subject = subject(),
                     .budget = std::move(budget),
@@ -756,6 +809,8 @@ TEST_CASE("MVCC retries inherit cumulative normal budgets while attempt peaks an
         .state_bytes = 19U,
         .effect_intents = 2U,
         .effect_bytes = 23U,
+        .event_intents = 4U,
+        .event_bytes = 27U,
         .recorder_events = 3U,
         .recorder_bytes = 29U,
     };
@@ -788,6 +843,8 @@ TEST_CASE("MVCC retries inherit cumulative normal budgets while attempt peaks an
     CHECK(remaining.normal.state_bytes == request.invocation.budget.normal.state_bytes - 19U);
     CHECK(remaining.normal.effect_intents == request.invocation.budget.normal.effect_intents - 2U);
     CHECK(remaining.normal.effect_bytes == request.invocation.budget.normal.effect_bytes - 23U);
+    CHECK(remaining.normal.event_intents == request.invocation.budget.normal.event_intents - 4U);
+    CHECK(remaining.normal.event_bytes == request.invocation.budget.normal.event_bytes - 27U);
     CHECK(remaining.normal.recorder_events == request.invocation.budget.normal.recorder_events - 3U);
     CHECK(remaining.normal.recorder_bytes == request.invocation.budget.normal.recorder_bytes - 29U);
     CHECK(remaining.normal.frames == request.invocation.budget.normal.frames);
@@ -800,9 +857,31 @@ TEST_CASE("MVCC retries inherit cumulative normal budgets while attempt peaks an
     CHECK(result->resource_usage.instructions == 14U);
     CHECK(result->resource_usage.elapsed >= 4ms);
     CHECK(result->resource_usage.logical_heap_allocation_bytes == 128U);
+    CHECK(result->resource_usage.event_intents == 8U);
+    CHECK(result->resource_usage.event_bytes == 54U);
     CHECK(result->resource_usage.peak_frames == 2U);
     CHECK(result->resource_usage.peak_live_heap_bytes == 32U);
     CHECK(result->resource_usage.peak_active_service_calls == 2U);
+}
+
+TEST_CASE("resident runtime resets cumulative elapsed accounting for each evaluation") {
+    Fixture fixture {SessionScenario::constant};
+    fixture.vm.reported_usages = {
+        VmResourceUsage {.elapsed = 59min},
+        VmResourceUsage {},
+    };
+    ResidentRuntime runtime {fixture.vm_driver, fixture.ports(), fixture.control, fixture.transactions};
+
+    const auto first = runtime.evaluate(evaluation_request());
+    const auto second = runtime.evaluate(evaluation_request());
+
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    REQUIRE(fixture.vm.invocations.size() == 2U);
+    CHECK(fixture.vm.invocations[0].budget.normal.elapsed > 30min);
+    CHECK(fixture.vm.invocations[1].budget.normal.elapsed > 30min);
+    CHECK(first->resource_usage.elapsed >= 59min);
+    CHECK(second->resource_usage.elapsed < 1min);
 }
 
 TEST_CASE("resident runtime rejects over-budget and overflowing VM usage before commit") {
@@ -913,6 +992,73 @@ TEST_CASE("resident runtime commits only durable effects and projects only eligi
     CHECK(std::ranges::none_of(result->candidate->journal, [](const EffectIntent &intent) {
         return intent.id == IntentId {"intent:rolled-back"};
     }));
+}
+
+TEST_CASE("resident runtime projects only the successful MVCC attempt event journal") {
+    Fixture fixture {SessionScenario::events};
+    fixture.transactions.conflicts_remaining = 1U;
+    fixture.vm.reported_usages = {
+        VmResourceUsage {.event_intents = 1U, .event_bytes = 31U},
+        VmResourceUsage {.event_intents = 1U, .event_bytes = 31U},
+    };
+    ResidentRuntime runtime {fixture.vm_driver, fixture.ports(), fixture.control, fixture.transactions};
+
+    const auto result = runtime.evaluate(evaluation_request());
+
+    REQUIRE(result.has_value());
+    REQUIRE(result->committed());
+    CHECK(result->attempts == 2U);
+    CHECK(fixture.vm.starts == 2U);
+    CHECK(fixture.vm.invocations[1].budget.normal.event_intents == balanced_v1.normal.event_intents - 1U);
+    CHECK(fixture.vm.invocations[1].budget.normal.event_bytes == balanced_v1.normal.event_bytes - 31U);
+    CHECK(result->resource_usage.event_intents == 2U);
+    CHECK(result->resource_usage.event_bytes == 62U);
+    REQUIRE(fixture.transactions.proposals.size() == 2U);
+    REQUIRE(fixture.transactions.proposals[0].emitted_events.size() == 1U);
+    REQUIRE(fixture.transactions.proposals[1].emitted_events.size() == 1U);
+    CHECK(fixture.transactions.proposals[0].emitted_events.front().id ==
+          fixture.transactions.proposals[1].emitted_events.front().id);
+    CHECK(fixture.transactions.proposals[1].emitted_events.front().causation == EventId {"event-1"});
+    CHECK(fixture.transactions.proposals[1].emitted_events.front().schema == SchemaId {"custom.alert/v1"});
+    REQUIRE(result->transaction.has_value());
+    REQUIRE(result->transaction->emitted_events.size() == 1U);
+    CHECK(result->transaction->emitted_events.front() ==
+          EventId {deterministic_event_intent_id(EventId {"event-1"}, InvocationId {"invocation-1"}, 1U).value});
+    CHECK(fixture.providers.fact_dispatches == 0U);
+    CHECK(fixture.capabilities.dispatches == 0U);
+    CHECK(fixture.history.dispatches == 0U);
+    CHECK(fixture.engine_provider.fact_dispatches == 0U);
+}
+
+TEST_CASE("resident event replay remains dispatch-free and never commits") {
+    Fixture fixture {SessionScenario::events};
+    ResidentRuntime runtime {fixture.vm_driver, fixture.ports(), fixture.control, fixture.transactions};
+    auto request = evaluation_request();
+    request.mode = ExecutionMode::replay;
+
+    const auto replayed = runtime.evaluate(std::move(request));
+
+    REQUIRE(replayed.has_value());
+    CHECK_FALSE(replayed->committed());
+    REQUIRE(replayed->candidate.has_value());
+    REQUIRE(replayed->candidate->emitted_events.size() == 1U);
+    CHECK(fixture.transactions.commits == 0U);
+    CHECK(fixture.providers.fact_dispatches == 0U);
+    CHECK(fixture.capabilities.dispatches == 0U);
+    CHECK(fixture.history.dispatches == 0U);
+    CHECK(fixture.engine_provider.fact_dispatches == 0U);
+}
+
+TEST_CASE("resident runtime rejects malformed VM event intents before store commit") {
+    Fixture fixture {SessionScenario::malformed_events};
+    ResidentRuntime runtime {fixture.vm_driver, fixture.ports(), fixture.control, fixture.transactions};
+
+    const auto rejected = runtime.evaluate(evaluation_request());
+
+    REQUIRE_FALSE(rejected.has_value());
+    CHECK(rejected.error().code == ResidentRuntimeErrorCode::event_projection_failure);
+    CHECK(fixture.transactions.commits == 0U);
+    CHECK(fixture.transactions.proposals.empty());
 }
 
 TEST_CASE("resident runtime cancels outstanding host work and never commits a canceled VM") {

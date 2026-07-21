@@ -147,7 +147,6 @@ namespace rule_engine::python::runtime {
         VmInvocation invocation;
         EventEnvelope input;
         CursorAdvance cursor;
-        std::vector<EventEnvelope> emitted_events;
         effects::ExecutionMode mode {effects::ExecutionMode::live};
         std::vector<CapturedHostInput> replay_inputs;
         // State is refreshed on each live MVCC attempt. Diagnostic replay names
@@ -159,6 +158,7 @@ namespace rule_engine::python::runtime {
         invalid_work,
         start_failed,
         invalid_vm_step,
+        event_projection_failure,
         port_failure,
         invalid_response,
         replay_input_missing,
