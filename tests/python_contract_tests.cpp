@@ -7,6 +7,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -282,6 +283,117 @@ namespace {
                 "PYC0108");
         rejects(Instruction {.opcode = static_cast<Opcode>(std::numeric_limits<std::uint16_t>::max()), .span = span()},
                 "PYC0109");
+    }
+
+    TEST_CASE("bytecode verifier validates typed handlers and cleanup continuations") {
+        auto valid = minimal_pack();
+        valid.functions.front().register_count = 3U;
+        valid.functions.front().instructions = {
+            {.opcode = Opcode::raise_fault,
+             .destination = 0U,
+             .operand_a = 0U,
+             .operand_b = 0U,
+             .immediate = std::to_underlying(PythonFaultKind::value_error),
+             .span = span()},
+            {.opcode = Opcode::unwind_jump,
+             .destination = 0U,
+             .operand_a = 0U,
+             .operand_b = 0U,
+             .immediate = 8U,
+             .span = span()},
+            {.opcode = Opcode::leave_try, .span = span()},
+            {.opcode = Opcode::reraise, .span = span()},
+            {.opcode = Opcode::match_exception,
+             .destination = 1U,
+             .operand_a = 7U,
+             .operand_b = 5U,
+             .immediate = std::to_underlying(PythonFaultKind::arithmetic_error),
+             .span = span()},
+            {.opcode = Opcode::match_exception,
+             .destination = 1U,
+             .operand_a = 7U,
+             .operand_b = 6U,
+             .immediate = std::to_underlying(PythonFaultKind::value_error),
+             .span = span()},
+            {.opcode = Opcode::reraise, .span = span()},
+            {.opcode = Opcode::load_current_exception, .destination = 2U, .span = span()},
+            {.opcode = Opcode::return_value, .destination = 0U, .operand_a = 0U, .span = span()},
+        };
+        valid.functions.front().exception_regions = {
+            ExceptionRegion {.begin_instruction = 0U,
+                             .end_instruction = 1U,
+                             .handler_instruction = 4U,
+                             .cleanup_instruction = 4U,
+                             .kind = ExceptionRegionKind::handler},
+            ExceptionRegion {.begin_instruction = 1U,
+                             .end_instruction = 2U,
+                             .handler_instruction = 3U,
+                             .cleanup_instruction = 2U,
+                             .kind = ExceptionRegionKind::cleanup},
+        };
+        REQUIRE(verify_bytecode(valid).has_value());
+
+        SECTION("partially overlapping protected intervals are rejected") {
+            auto malformed = valid;
+            malformed.functions.front().exception_regions = {
+                ExceptionRegion {.begin_instruction = 0U,
+                                 .end_instruction = 3U,
+                                 .handler_instruction = 4U,
+                                 .cleanup_instruction = 4U},
+                ExceptionRegion {.begin_instruction = 2U,
+                                 .end_instruction = 4U,
+                                 .handler_instruction = 6U,
+                                 .cleanup_instruction = 6U},
+            };
+            const auto result = verify_bytecode(malformed);
+            REQUIRE_FALSE(result.has_value());
+            CHECK(std::ranges::any_of(result.error(), [](const auto &item) { return item.code == "PYC0111"; }));
+        }
+
+        SECTION("filter continuation cycles are rejected") {
+            auto malformed = minimal_pack();
+            malformed.functions.front().register_count = 2U;
+            malformed.functions.front().instructions = {
+                {.opcode = Opcode::raise_fault, .operand_a = 0U, .span = span()},
+                {.opcode = Opcode::match_exception,
+                 .destination = 1U,
+                 .operand_a = 3U,
+                 .operand_b = 1U,
+                 .immediate = std::to_underlying(PythonFaultKind::type_error),
+                 .span = span()},
+                {.opcode = Opcode::reraise, .span = span()},
+                {.opcode = Opcode::return_value, .operand_a = 0U, .span = span()},
+            };
+            malformed.functions.front().exception_regions = {
+                ExceptionRegion {.begin_instruction = 0U,
+                                 .end_instruction = 1U,
+                                 .handler_instruction = 1U,
+                                 .cleanup_instruction = 1U},
+            };
+            const auto result = verify_bytecode(malformed);
+            REQUIRE_FALSE(result.has_value());
+            CHECK(std::ranges::any_of(result.error(), [](const auto &item) { return item.code == "PYC0112"; }));
+        }
+
+        SECTION("ordinary fallthrough cannot bypass finally") {
+            auto malformed = minimal_pack();
+            malformed.functions.front().instructions = {
+                {.opcode = Opcode::load_const, .destination = 0U, .span = span()},
+                {.opcode = Opcode::return_value, .operand_a = 0U, .span = span()},
+                {.opcode = Opcode::leave_try, .span = span()},
+                {.opcode = Opcode::reraise, .span = span()},
+            };
+            malformed.functions.front().exception_regions = {
+                ExceptionRegion {.begin_instruction = 0U,
+                                 .end_instruction = 1U,
+                                 .handler_instruction = 3U,
+                                 .cleanup_instruction = 2U,
+                                 .kind = ExceptionRegionKind::cleanup},
+            };
+            const auto result = verify_bytecode(malformed);
+            REQUIRE_FALSE(result.has_value());
+            CHECK(std::ranges::any_of(result.error(), [](const auto &item) { return item.code == "PYC0114"; }));
+        }
     }
 
 } // namespace

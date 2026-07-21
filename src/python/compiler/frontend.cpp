@@ -2348,15 +2348,15 @@ namespace rule_engine::python::compiler {
                         if (!index.sequence(*statement, "finalbody").empty()) {
                             diagnostics.push_back(make_diagnostic(
                                 "PY-NYI-FINALLY-LOWERING",
-                                "finally requires unwind-reason metadata absent from the F0 bytecode contract",
-                                statement->span));
+                                "finally lowering is not implemented by the current AST compiler", statement->span));
                             continue;
                         }
                         const auto handlers = index.sequence(*statement, "handlers");
                         if (handlers.size() != 1U || index.reference(*handlers.front(), "type") != nullptr ||
                             index.string(*handlers.front(), "name").has_value()) {
                             diagnostics.push_back(make_diagnostic(
-                                "PY-NYI-EXCEPTION-FILTER", "F0 lowers exactly one unbound catch-all except handler",
+                                "PY-NYI-EXCEPTION-FILTER",
+                                "the current AST compiler lowers exactly one unbound catch-all except handler",
                                 statement->span));
                             continue;
                         }
@@ -2473,7 +2473,8 @@ namespace rule_engine::python::compiler {
                 }
                 for (const auto &region : function.exception_regions) {
                     output << "exception:" << region.begin_instruction << ':' << region.end_instruction << ':'
-                           << region.handler_instruction << ':' << region.cleanup_instruction << '\n';
+                           << region.handler_instruction << ':' << region.cleanup_instruction << ':'
+                           << static_cast<unsigned int>(region.kind) << '\n';
                 }
             }
             for (const auto &requirement : requirements) {
@@ -2847,6 +2848,7 @@ namespace rule_engine::python::compiler {
                     case Opcode::get_iter:
                     case Opcode::iter_next:
                     case Opcode::load_subscript:
+                    case Opcode::load_current_exception:
                         if (instruction.destination < normal.size()) {
                             normal[instruction.destination] = true;
                         }
@@ -2864,10 +2866,16 @@ namespace rule_engine::python::compiler {
                     case Opcode::commit_transaction:
                     case Opcode::rollback_transaction:
                     case Opcode::store_subscript:
-                    case Opcode::delete_state: break;
+                    case Opcode::delete_state:
+                    case Opcode::match_exception:
+                    case Opcode::reraise:
+                    case Opcode::unwind_jump:
+                    case Opcode::leave_except: break;
                     default: std::unreachable();
                 }
                 if (instruction.opcode == Opcode::jump) {
+                    merge_state(instruction.immediate, normal);
+                } else if (instruction.opcode == Opcode::unwind_jump) {
                     merge_state(instruction.immediate, normal);
                 } else if (instruction.opcode == Opcode::jump_if_false) {
                     merge_state(instruction.immediate, normal);
@@ -2875,18 +2883,24 @@ namespace rule_engine::python::compiler {
                 } else if (instruction.opcode == Opcode::iter_next) {
                     merge_state(instruction.immediate, *states[pc]);
                     merge_state(pc + 1U, normal);
-                } else if (instruction.opcode != Opcode::return_value && instruction.opcode != Opcode::raise_fault) {
+                } else if (instruction.opcode == Opcode::match_exception) {
+                    auto matching = normal;
+                    if (instruction.destination < matching.size()) {
+                        matching[instruction.destination] = true;
+                    }
+                    merge_state(instruction.operand_a, matching);
+                    merge_state(instruction.operand_b, *states[pc]);
+                } else if (instruction.opcode != Opcode::return_value && instruction.opcode != Opcode::raise_fault &&
+                           instruction.opcode != Opcode::reraise) {
                     merge_state(pc + 1U, normal);
                 }
                 for (const auto &region : function.exception_regions) {
                     if (pc < region.begin_instruction || pc >= region.end_instruction) {
                         continue;
                     }
-                    auto exceptional = *states[pc];
-                    if (instruction.destination < exceptional.size()) {
-                        exceptional[instruction.destination] = true;
-                    }
-                    merge_state(region.handler_instruction, exceptional);
+                    merge_state(region.kind == ExceptionRegionKind::cleanup ? region.cleanup_instruction :
+                                                                              region.handler_instruction,
+                                *states[pc]);
                 }
             }
             for (std::size_t pc = 0; pc < states.size(); ++pc) {
@@ -2951,6 +2965,11 @@ namespace rule_engine::python::compiler {
                     case Opcode::begin_transaction:
                     case Opcode::commit_transaction:
                     case Opcode::rollback_transaction: break;
+                    case Opcode::load_current_exception:
+                    case Opcode::match_exception:
+                    case Opcode::reraise:
+                    case Opcode::unwind_jump:
+                    case Opcode::leave_except: break;
                     default: std::unreachable();
                 }
             }

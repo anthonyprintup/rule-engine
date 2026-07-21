@@ -114,6 +114,25 @@ namespace rule_engine::python {
         load_subscript,
         store_subscript,
         delete_state,
+        load_current_exception,
+        match_exception,
+        reraise,
+        unwind_jump,
+        leave_except,
+    };
+
+    // Closed, engine-owned exception classes understood by the bytecode verifier and VM.
+    // `exception` is a catch-all filter and is not a concrete raise kind.
+    enum struct PythonFaultKind : std::uint8_t {
+        value_error,
+        type_error,
+        arithmetic_error,
+        exception,
+    };
+
+    enum struct ExceptionRegionKind : std::uint8_t {
+        handler,
+        cleanup,
     };
 
     struct Instruction {
@@ -130,6 +149,7 @@ namespace rule_engine::python {
         std::uint32_t end_instruction {};
         std::uint32_t handler_instruction {};
         std::uint32_t cleanup_instruction {};
+        ExceptionRegionKind kind {ExceptionRegionKind::handler};
     };
 
     struct BytecodeFunction {

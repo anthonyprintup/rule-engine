@@ -1660,7 +1660,13 @@ namespace rule_engine::python::vm {
                 break;
             case ValueKind::unicode: size = std::get<Impl::UnicodeStorage>((*source)->payload).codepoints.size(); break;
             case ValueKind::bytes: size = std::get<Impl::BytesStorage>((*source)->payload).bytes.size(); break;
-            default: return std::unexpected(error(VmErrorCode::engine_fault, "iterator source has an invalid kind"));
+            case ValueKind::none:
+            case ValueKind::boolean:
+            case ValueKind::integer:
+            case ValueKind::floating:
+            case ValueKind::record:
+            case ValueKind::iterator:
+                return std::unexpected(error(VmErrorCode::engine_fault, "iterator source has an invalid kind"));
         }
         return state.index >= size;
     }
@@ -1694,7 +1700,12 @@ namespace rule_engine::python::vm {
                 result = allocate_integer(std::to_string(std::to_integer<unsigned int>(byte)));
                 break;
             }
-            default: break;
+            case ValueKind::none:
+            case ValueKind::boolean:
+            case ValueKind::integer:
+            case ValueKind::floating:
+            case ValueKind::record:
+            case ValueKind::iterator: break;
         }
         if (!result) {
             return result;

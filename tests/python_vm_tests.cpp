@@ -1099,6 +1099,243 @@ TEST_CASE("author exceptions cross call frames into caller handlers") {
     CHECK(session->counters().peak_frames == 2U);
 }
 
+TEST_CASE("typed exception filters are ordered and bare re-raise reaches the enclosing handler") {
+    auto body = function(
+        "rule.main", 5U,
+        {
+            instruction(Opcode::load_const, 0U, 0U, 0U, 0U, 0U),
+            instruction(Opcode::get_iter, 1U, 0U, 0U, 0U, 1U),
+            instruction(Opcode::load_const, 2U, 0U, 0U, 1U, 2U),
+            instruction(Opcode::return_value, 0U, 2U, 0U, 0U, 3U),
+            instruction(Opcode::match_exception, 2U, 7U, 5U, std::to_underlying(PythonFaultKind::arithmetic_error), 4U),
+            instruction(Opcode::reraise, 0U, 0U, 0U, 0U, 5U),
+            instruction(Opcode::reraise, 0U, 0U, 0U, 0U, 6U),
+            instruction(Opcode::load_const, 3U, 0U, 0U, 1U, 7U),
+            instruction(Opcode::return_value, 0U, 3U, 0U, 0U, 8U),
+            instruction(Opcode::match_exception, 2U, 11U, 10U, std::to_underlying(PythonFaultKind::exception), 9U),
+            instruction(Opcode::reraise, 0U, 0U, 0U, 0U, 10U),
+            instruction(Opcode::load_current_exception, 4U, 0U, 0U, 0U, 11U),
+            instruction(Opcode::leave_except, 0U, 0U, 0U, 0U, 12U),
+            instruction(Opcode::load_const, 3U, 0U, 0U, 2U, 13U),
+            instruction(Opcode::return_value, 0U, 3U, 0U, 0U, 14U),
+        });
+    body.exception_regions = {
+        ExceptionRegion {.begin_instruction = 0U,
+                         .end_instruction = 6U,
+                         .handler_instruction = 9U,
+                         .cleanup_instruction = 9U,
+                         .kind = ExceptionRegionKind::handler},
+        ExceptionRegion {.begin_instruction = 1U,
+                         .end_instruction = 2U,
+                         .handler_instruction = 4U,
+                         .cleanup_instruction = 4U,
+                         .kind = ExceptionRegionKind::handler},
+    };
+    auto pack = pack_with({integer("7"), make_fact(false), make_fact(true)}, {std::move(body)});
+    auto session = start(pack);
+    const auto complete = run_internal(*session, session->step({}));
+    REQUIRE(complete.state == VmStepState::complete);
+    REQUIRE(complete.result.has_value());
+    CHECK(complete.result->verdict == true);
+}
+
+TEST_CASE("leaving a nested handler restores the enclosing current exception") {
+    auto body = function(
+        "rule.main", 6U,
+        {
+            instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+            instruction(Opcode::raise_fault, 0U, 0U, 0U, std::to_underlying(PythonFaultKind::value_error)),
+            instruction(Opcode::return_value, 0U, 0U),
+            instruction(Opcode::match_exception, 0U, 5U, 4U, std::to_underlying(PythonFaultKind::value_error)),
+            instruction(Opcode::reraise),
+            instruction(Opcode::load_const, 1U, 0U, 0U, 1U),
+            instruction(Opcode::get_iter, 2U, 1U),
+            instruction(Opcode::return_value, 0U, 0U),
+            instruction(Opcode::reraise),
+            instruction(Opcode::match_exception, 2U, 11U, 10U, std::to_underlying(PythonFaultKind::type_error)),
+            instruction(Opcode::reraise),
+            instruction(Opcode::load_current_exception, 3U),
+            instruction(Opcode::leave_except),
+            instruction(Opcode::load_current_exception, 4U),
+            instruction(Opcode::load_const, 5U, 0U, 0U, 0U),
+            instruction(Opcode::compare, 4U, 4U, 5U, static_cast<std::uint32_t>(CompareOperation::equal)),
+            instruction(Opcode::leave_except),
+            instruction(Opcode::return_value, 0U, 4U),
+        });
+    body.exception_regions = {
+        ExceptionRegion {.begin_instruction = 1U,
+                         .end_instruction = 2U,
+                         .handler_instruction = 3U,
+                         .cleanup_instruction = 3U,
+                         .kind = ExceptionRegionKind::handler},
+        ExceptionRegion {.begin_instruction = 6U,
+                         .end_instruction = 7U,
+                         .handler_instruction = 9U,
+                         .cleanup_instruction = 9U,
+                         .kind = ExceptionRegionKind::handler},
+    };
+    auto pack = pack_with({text("outer"), integer("7")}, {std::move(body)});
+    auto session = start(pack);
+    const auto complete = run_internal(*session, session->step({}));
+    REQUIRE(complete.state == VmStepState::complete);
+    REQUIRE(complete.result.has_value());
+    CHECK(complete.result->verdict == true);
+}
+
+TEST_CASE("nested finally continuations execute exactly once for jump return and exception") {
+    SECTION("jump leaving only the inner region resumes return through the outer region") {
+        auto body = function("rule.main", 1U,
+                             {
+                                 instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                                 instruction(Opcode::unwind_jump, 0U, 0U, 0U, 4U),
+                                 instruction(Opcode::append_effect, 0U, 0U, 0U, 1U),
+                                 instruction(Opcode::leave_try),
+                                 instruction(Opcode::return_value, 0U, 0U),
+                                 instruction(Opcode::reraise),
+                                 instruction(Opcode::append_effect, 0U, 0U, 0U, 2U),
+                                 instruction(Opcode::leave_try),
+                                 instruction(Opcode::reraise),
+                             });
+        body.exception_regions = {
+            ExceptionRegion {.begin_instruction = 0U,
+                             .end_instruction = 6U,
+                             .handler_instruction = 8U,
+                             .cleanup_instruction = 6U,
+                             .kind = ExceptionRegionKind::cleanup},
+            ExceptionRegion {.begin_instruction = 1U,
+                             .end_instruction = 2U,
+                             .handler_instruction = 5U,
+                             .cleanup_instruction = 2U,
+                             .kind = ExceptionRegionKind::cleanup},
+        };
+        auto pack = pack_with({make_fact(true), text("inner"), text("outer")}, {std::move(body)});
+        auto session = start(pack);
+        const auto complete = session->step({});
+        REQUIRE(complete.state == VmStepState::complete);
+        REQUIRE(complete.result.has_value());
+        CHECK(complete.result->verdict == true);
+        CHECK(complete.result->committed_effects.size() == 2U);
+        CHECK(session->counters().instructions == 7U);
+    }
+
+    SECTION("exception propagation preserves its source through both cleanup regions") {
+        auto body = function(
+            "rule.main", 2U,
+            {
+                instruction(Opcode::load_const, 0U, 0U, 0U, 0U, 10U),
+                instruction(Opcode::raise_fault, 0U, 0U, 0U, std::to_underlying(PythonFaultKind::value_error), 11U),
+                instruction(Opcode::append_effect, 0U, 0U, 0U, 1U, 12U),
+                instruction(Opcode::leave_try, 0U, 0U, 0U, 0U, 13U),
+                instruction(Opcode::reraise, 0U, 0U, 0U, 0U, 14U),
+                instruction(Opcode::append_effect, 0U, 0U, 0U, 2U, 15U),
+                instruction(Opcode::leave_try, 0U, 0U, 0U, 0U, 16U),
+                instruction(Opcode::load_const, 1U, 0U, 0U, 3U, 17U),
+                instruction(Opcode::reraise, 0U, 0U, 0U, 0U, 18U),
+            });
+        body.exception_regions = {
+            ExceptionRegion {.begin_instruction = 0U,
+                             .end_instruction = 5U,
+                             .handler_instruction = 8U,
+                             .cleanup_instruction = 5U,
+                             .kind = ExceptionRegionKind::cleanup},
+            ExceptionRegion {.begin_instruction = 1U,
+                             .end_instruction = 2U,
+                             .handler_instruction = 4U,
+                             .cleanup_instruction = 2U,
+                             .kind = ExceptionRegionKind::cleanup},
+        };
+        auto pack = pack_with({text("boom"), text("inner"), text("outer"), make_fact(false)}, {std::move(body)});
+        auto session = start(pack);
+        const auto faulted = session->step({});
+        REQUIRE(faulted.state == VmStepState::faulted);
+        REQUIRE(faulted.result.has_value());
+        REQUIRE(faulted.result->fault.has_value());
+        REQUIRE_FALSE(faulted.result->fault->frames.empty());
+        CHECK(faulted.result->fault->frames.front().span.begin_byte == 11U);
+        CHECK(session->journal_size() == 2U);
+        CHECK(session->counters().instructions == 8U);
+    }
+}
+
+TEST_CASE("a secondary Python fault in finally replaces a pending return") {
+    auto body =
+        function("rule.main", 5U,
+                 {
+                     instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                     instruction(Opcode::return_value, 0U, 0U),
+                     instruction(Opcode::load_const, 1U, 0U, 0U, 1U),
+                     instruction(Opcode::get_iter, 2U, 1U),
+                     instruction(Opcode::leave_try),
+                     instruction(Opcode::reraise),
+                     instruction(Opcode::match_exception, 2U, 8U, 7U, std::to_underlying(PythonFaultKind::type_error)),
+                     instruction(Opcode::reraise),
+                     instruction(Opcode::load_current_exception, 3U),
+                     instruction(Opcode::leave_except),
+                     instruction(Opcode::load_const, 4U, 0U, 0U, 2U),
+                     instruction(Opcode::return_value, 0U, 4U),
+                 });
+    body.exception_regions = {
+        ExceptionRegion {.begin_instruction = 0U,
+                         .end_instruction = 2U,
+                         .handler_instruction = 5U,
+                         .cleanup_instruction = 2U,
+                         .kind = ExceptionRegionKind::cleanup},
+        ExceptionRegion {.begin_instruction = 2U,
+                         .end_instruction = 6U,
+                         .handler_instruction = 6U,
+                         .cleanup_instruction = 6U,
+                         .kind = ExceptionRegionKind::handler},
+    };
+    auto pack = pack_with({make_fact(true), integer("7"), make_fact(false)}, {std::move(body)});
+    auto session = start(pack);
+    const auto complete = run_internal(*session, session->step({}));
+    REQUIRE(complete.state == VmStepState::complete);
+    REQUIRE(complete.result.has_value());
+    CHECK(complete.result->verdict == false);
+}
+
+TEST_CASE("cleanup suspension dispatches one host request and resumes the same unwind") {
+    auto body = function("rule.main", 2U,
+                         {
+                             instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                             instruction(Opcode::unwind_jump, 0U, 0U, 0U, 5U),
+                             instruction(Opcode::await_fact, 1U, 0U, 0U, 1U),
+                             instruction(Opcode::leave_try),
+                             instruction(Opcode::reraise),
+                             instruction(Opcode::return_value, 0U, 0U),
+                         });
+    body.exception_regions = {
+        ExceptionRegion {.begin_instruction = 0U,
+                         .end_instruction = 2U,
+                         .handler_instruction = 4U,
+                         .cleanup_instruction = 2U,
+                         .kind = ExceptionRegionKind::cleanup},
+    };
+    auto pack = pack_with(
+        {make_fact(true), make_fact_operand(FactRoute {.provider = "process", .fact = "cleanup"}, SchemaId {"bool"})},
+        {std::move(body)});
+    auto session = start(pack);
+    const auto waiting = session->step({});
+    REQUIRE(waiting.state == VmStepState::waiting_for_facts);
+    REQUIRE(waiting.fact_requests.size() == 1U);
+
+    const auto still_waiting = session->step({});
+    REQUIRE(still_waiting.state == VmStepState::waiting_for_facts);
+    CHECK(still_waiting.fact_requests.empty());
+
+    HostResponses response;
+    response.facts.push_back(FactResponse {.request_id = waiting.fact_requests.front().request_id,
+                                           .subject = waiting.fact_requests.front().subject,
+                                           .status = FactTerminalStatus::value,
+                                           .value = make_fact(true),
+                                           .diagnostic = std::nullopt});
+    const auto complete = session->step(std::move(response));
+    REQUIRE(complete.state == VmStepState::complete);
+    REQUIRE(complete.result.has_value());
+    CHECK(complete.result->verdict == true);
+    CHECK(session->logical_read_count() == 1U);
+}
+
 TEST_CASE("return unwind runs every nested cleanup exactly once") {
     auto body = function("rule.main", 1U,
                          {
@@ -1106,11 +1343,18 @@ TEST_CASE("return unwind runs every nested cleanup exactly once") {
                              instruction(Opcode::return_value, 0U, 0U),
                              instruction(Opcode::leave_try),
                              instruction(Opcode::leave_try),
+                             instruction(Opcode::reraise),
                          });
-    body.exception_regions.push_back(ExceptionRegion {
-        .begin_instruction = 0U, .end_instruction = 2U, .handler_instruction = 3U, .cleanup_instruction = 3U});
-    body.exception_regions.push_back(ExceptionRegion {
-        .begin_instruction = 1U, .end_instruction = 2U, .handler_instruction = 2U, .cleanup_instruction = 2U});
+    body.exception_regions.push_back(ExceptionRegion {.begin_instruction = 0U,
+                                                      .end_instruction = 2U,
+                                                      .handler_instruction = 4U,
+                                                      .cleanup_instruction = 3U,
+                                                      .kind = ExceptionRegionKind::cleanup});
+    body.exception_regions.push_back(ExceptionRegion {.begin_instruction = 1U,
+                                                      .end_instruction = 2U,
+                                                      .handler_instruction = 4U,
+                                                      .cleanup_instruction = 2U,
+                                                      .kind = ExceptionRegionKind::cleanup});
     auto pack = pack_with({make_fact(true)}, {std::move(body)});
     auto session = start(pack);
     const auto complete = session->step({});
@@ -1122,13 +1366,16 @@ TEST_CASE("hard faults run cross-frame cleanup but remain unsuppressible") {
     auto main = function("rule.main", 1U,
                          {
                              instruction(Opcode::call, 0U, 0U, 0U, 1U),
-                             instruction(Opcode::return_value, 0U, 0U),
+                             instruction(Opcode::unwind_jump, 0U, 0U, 0U, 4U),
                              instruction(Opcode::leave_try),
-                             instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                             instruction(Opcode::reraise),
                              instruction(Opcode::return_value, 0U, 0U),
                          });
-    main.exception_regions.push_back(ExceptionRegion {
-        .begin_instruction = 0U, .end_instruction = 1U, .handler_instruction = 3U, .cleanup_instruction = 2U});
+    main.exception_regions.push_back(ExceptionRegion {.begin_instruction = 0U,
+                                                      .end_instruction = 2U,
+                                                      .handler_instruction = 3U,
+                                                      .cleanup_instruction = 2U,
+                                                      .kind = ExceptionRegionKind::cleanup});
     auto pack = pack_with(
         {
             make_fact(true),
@@ -1155,22 +1402,67 @@ TEST_CASE("hard faults run cross-frame cleanup but remain unsuppressible") {
     CHECK(session->recovery_counters().finalizer_or_fault.instructions == 0U);
 }
 
+TEST_CASE("cleanup code cannot replace an unsuppressible hard fault") {
+    auto main = function("rule.main", 1U,
+                         {
+                             instruction(Opcode::call, 0U, 0U, 0U, 1U),
+                             instruction(Opcode::unwind_jump, 0U, 0U, 0U, 5U),
+                             instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                             instruction(Opcode::return_value, 0U, 0U),
+                             instruction(Opcode::reraise),
+                             instruction(Opcode::return_value, 0U, 0U),
+                         });
+    main.exception_regions = {
+        ExceptionRegion {.begin_instruction = 0U,
+                         .end_instruction = 2U,
+                         .handler_instruction = 4U,
+                         .cleanup_instruction = 2U,
+                         .kind = ExceptionRegionKind::cleanup},
+    };
+    auto pack = pack_with({make_fact(true)}, {
+                                                 std::move(main),
+                                                 function("helper", 1U, {instruction(Opcode::jump, 0U, 0U, 0U, 0U)}),
+                                             });
+    auto budget = balanced_v1;
+    budget.normal.instructions = 2U;
+    auto session = start(pack, invocation(budget));
+    const auto quarantined = run_internal(*session, session->step({}));
+    REQUIRE(quarantined.state == VmStepState::quarantined);
+    REQUIRE(quarantined.result.has_value());
+    REQUIRE(quarantined.result->fault.has_value());
+    CHECK(quarantined.result->fault->double_fault);
+    CHECK(quarantined.result->fault->triple_fault);
+    CHECK(session->recovery_counters().forced_cleanup.instructions == 2U);
+}
+
 TEST_CASE("deployment cancellation is unsuppressible while a fact is pending") {
+    auto body = function("rule.main", 1U,
+                         {
+                             instruction(Opcode::await_fact, 0U, 0U, 0U, 0U),
+                             instruction(Opcode::unwind_jump, 0U, 0U, 0U, 4U),
+                             instruction(Opcode::leave_try),
+                             instruction(Opcode::reraise),
+                             instruction(Opcode::return_value, 0U, 0U),
+                         });
+    body.exception_regions = {
+        ExceptionRegion {.begin_instruction = 0U,
+                         .end_instruction = 2U,
+                         .handler_instruction = 3U,
+                         .cleanup_instruction = 2U,
+                         .kind = ExceptionRegionKind::cleanup},
+    };
     auto pack = pack_with({make_fact_operand(FactRoute {.provider = "process", .fact = "name"}, SchemaId {"text"})},
-                          {function("rule.main", 1U,
-                                    {
-                                        instruction(Opcode::await_fact, 0U, 0U, 0U, 0U),
-                                        instruction(Opcode::return_value, 0U, 0U),
-                                    })});
+                          {std::move(body)});
     auto session = start(pack);
     REQUIRE(session->step({}).state == VmStepState::waiting_for_facts);
     HostResponses cancel;
     cancel.cancel = true;
-    const auto canceled = session->step(std::move(cancel));
+    const auto canceled = run_internal(*session, session->step(std::move(cancel)));
     REQUIRE(canceled.state == VmStepState::canceled);
     REQUIRE(canceled.result.has_value());
     CHECK(canceled.result->outcome == EvaluationOutcome::canceled);
     CHECK(canceled.result->committed_effects.empty());
+    CHECK(session->recovery_counters().forced_cleanup.instructions == 1U);
 }
 
 TEST_CASE("instruction frame loop and elapsed limits are hard pre-operation faults") {
@@ -1305,15 +1597,18 @@ TEST_CASE("generator send throw and close resume only the suspended continuation
                              {
                                  instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
                                  instruction(Opcode::yield_value, 1U, 0U),
-                                 instruction(Opcode::return_value, 0U, 1U),
+                                 instruction(Opcode::unwind_jump, 0U, 0U, 0U, 5U),
                                  instruction(Opcode::leave_try),
-                                 instruction(Opcode::load_const, 1U, 0U, 0U, 1U),
+                                 instruction(Opcode::reraise),
                                  instruction(Opcode::return_value, 0U, 1U),
                              },
                              true);
-        body.exception_regions.push_back(ExceptionRegion {
-            .begin_instruction = 1U, .end_instruction = 2U, .handler_instruction = 4U, .cleanup_instruction = 3U});
-        auto pack = pack_with({integer("7"), make_fact(true)}, {std::move(body)});
+        body.exception_regions.push_back(ExceptionRegion {.begin_instruction = 1U,
+                                                          .end_instruction = 3U,
+                                                          .handler_instruction = 4U,
+                                                          .cleanup_instruction = 3U,
+                                                          .kind = ExceptionRegionKind::cleanup});
+        auto pack = pack_with({integer("7")}, {std::move(body)});
         auto session = start(pack);
         REQUIRE(session->step({}).state == VmStepState::yielded);
         auto closed = run_internal(*session, session->close_generator());

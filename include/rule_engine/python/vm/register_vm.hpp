@@ -36,12 +36,27 @@ namespace rule_engine::python::vm {
     // - call: immediate is the function index, operand_a is the first argument register,
     //   and operand_b is the argument count.
     // - return/yield/raise: operand_a is the value register.
+    //   raise immediate is a concrete PythonFaultKind (zero is value_error).
+    // - load_current_exception: destination receives the active exception value; all other operands are zero.
+    // - match_exception: an exception-filter node. immediate is PythonFaultKind, destination receives the
+    //   exception value on a match, operand_a is the matching handler target, and operand_b is the next
+    //   filter node (or reraise terminator). Filters are evaluated in linked order.
+    // - reraise: propagate the frame's active exception; all operands are zero.
+    // - leave_except: pop the active handler exception and restore any enclosing handler exception;
+    //   all operands are zero. Normal handler exits must execute it before joining non-handler control flow.
+    // - unwind_jump: immediate is an absolute normal/break/continue target. The VM runs every cleanup region
+    //   exited by that edge, from inner to outer, before reaching the target; all register operands are zero.
     // - await_fact: immediate names a fact operand constant; the invocation subject is used.
     // - await_capability: immediate names a capability operand constant and operand_a is the argument register.
     // - read_state: immediate names a state operand constant.
     // - write_state: immediate names a state operand constant and operand_a is the value register.
     // - delete_state: immediate names a state operand constant; all register operands are zero.
     // - append_effect: immediate names a Unicode effect-kind constant and operand_a is the payload register.
+    // ExceptionRegionKind::handler routes faults to handler_instruction (a catch-all body, reraise, or the
+    // first match_exception filter) and requires cleanup_instruction == handler_instruction.
+    // ExceptionRegionKind::cleanup routes every exit through cleanup_instruction and resumes Python exceptions
+    // at a reraise handler_instruction. Cleanup code terminates with leave_try. Protected regions must be
+    // disjoint or properly nested; ordinary control-flow edges may not jump out of a cleanup region.
     [[nodiscard]] FactValue make_fact_operand(FactRoute route, SchemaId expected_schema);
     [[nodiscard]] FactValue make_capability_operand(CapabilityId capability, SchemaId request_schema,
                                                     SchemaId response_schema = {});
