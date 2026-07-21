@@ -35,6 +35,7 @@ namespace rule_engine::python::tools {
         std::vector<std::string> operands;
         std::map<std::string, std::string, std::less<>> options;
         OutputFormat format {OutputFormat::text};
+        std::string config_path;
         std::string request_id;
         std::string reason;
         bool wait {};
