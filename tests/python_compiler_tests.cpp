@@ -222,6 +222,48 @@ namespace {
         }
     };
 
+    std::vector<std::byte> as_bytes(const std::string_view text) {
+        const auto raw = std::as_bytes(std::span {text.data(), text.size()});
+        return {raw.begin(), raw.end()};
+    }
+
+    std::string as_text(const std::span<const std::byte> bytes) {
+        return {reinterpret_cast<const char *>(bytes.data()), bytes.size()};
+    }
+
+    bool replace_once(std::string &text, const std::string_view needle, const std::string_view replacement) {
+        const auto position = text.find(needle);
+        if (position == std::string::npos) {
+            return false;
+        }
+        text.replace(position, needle.size(), replacement);
+        return true;
+    }
+
+    std::expected<packaging::WorkerResponse, packaging::PackagingError>
+    exact_worker_response(const packaging::PrivatePythonRuntime &runtime, const std::filesystem::path &temporary_root,
+                          const VerifiedRulePack &rule_pack) {
+        const auto &source = rule_pack.sources.front();
+        packaging::WindowsJobWorkerLauncher launcher;
+        launcher.temporary_root = temporary_root;
+        packaging::WorkerClient client {.runtime = runtime, .launcher = launcher, .limits = {}};
+        return client.invoke(packaging::WorkerRequest {
+            .protocol = packaging::python_worker_protocol_v1,
+            .request_id = RequestId {"compiler-json-test"},
+            .mode = packaging::WorkerMode::static_parse,
+            .runtime = packaging::official_windows_cpython_3146(),
+            .payload =
+                packaging::OpaqueWorkerPayload {
+                    .schema = std::string {packaging::static_source_schema_v1},
+                    .source = source.id,
+                    .source_digest = source.digest,
+                    .bytes = as_bytes(source.utf8),
+                },
+            .hash_seed = 0U,
+            .generator_execution_authorized = false,
+        });
+    }
+
     std::vector<std::string> diagnostic_signatures(const DiagnosticSet &diagnostics) {
         std::vector<std::string> result;
         result.reserve(diagnostics.size());
@@ -362,38 +404,11 @@ namespace {
             WARN("SKIPPED: " << shared_runtime().unavailable_reason);
             return;
         }
-        const auto rule_pack = pack();
-        auto worker_envelope = envelope(constant_rule_nodes(false));
-        worker_envelope.source_digest = rule_pack.sources.front().digest;
-        const auto ast_payload = encode_ast_envelope(worker_envelope);
-        REQUIRE(ast_payload.has_value());
-        const auto response_frame = packaging::encode_worker_response_frame(packaging::WorkerResponse {
-            .protocol = packaging::python_worker_protocol_v1,
-            .request_id = RequestId {"compiler-ast:1:0"},
-            .mode = packaging::WorkerMode::static_parse,
-            .runtime_version = packaging::official_windows_cpython_3146().python_version,
-            .runtime_artifact_sha256 = packaging::official_windows_cpython_3146().artifact_sha256,
-            .status = packaging::WorkerResponseStatus::ok,
-            .payload =
-                packaging::OpaqueWorkerPayload {
-                    .schema = std::string {packaging::static_ast_schema_v1},
-                    .source = SourceId {std::string {source_name}},
-                    .source_digest = rule_pack.sources.front().digest,
-                    .bytes = *ast_payload,
-                },
-        });
-        REQUIRE(response_frame.has_value());
-
-        QueueLauncher launcher;
-        launcher.results.push_back(packaging::WorkerProcessResult {
-            .exit_code = 0,
-            .crashed = false,
-            .timed_out = false,
-            .output_limited = false,
-            .process_tree_terminated = true,
-            .stdout_bytes = *response_frame,
-            .stderr_excerpt = {},
-        });
+        const auto rule_pack = pack("@rule(\"com.example.constant\")\n"
+                                    "def constant_rule() -> bool:\n"
+                                    "    return False\n");
+        packaging::WindowsJobWorkerLauncher launcher;
+        launcher.temporary_root = shared_runtime().temporary_parent;
         packaging::WorkerClient client {.runtime = *shared_runtime().runtime, .launcher = launcher, .limits = {}};
         WorkerAstEnvelopeProvider provider {client};
         StaticPackCompiler compiler {provider};
@@ -409,7 +424,6 @@ namespace {
         REQUIRE(function.instructions.size() == 2U);
         REQUIRE(function.instructions[0].opcode == Opcode::load_const);
         REQUIRE(function.instructions[1].opcode == Opcode::return_value);
-        REQUIRE(launcher.calls == 1U);
 
         auto bounded_invocation = invocation();
         bounded_invocation.budget.normal.elapsed = std::chrono::seconds {1};
@@ -424,6 +438,181 @@ namespace {
         REQUIRE(completed.result->verdict == false);
         REQUIRE((*session)->counters().instructions == function.instructions.size());
         REQUIRE((*session)->counters().loop_iterations_and_yields == 0U);
+    }
+
+    TEST_CASE("exact worker AST JSON rejects noncanonical and adversarial envelopes deterministically") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+        const auto rule_pack = pack("@rule(\"com.example.constant\")\n"
+                                    "def constant_rule() -> bool:\n"
+                                    "    return False\n");
+        const auto response = exact_worker_response(*runtime.runtime, runtime.temporary_parent, rule_pack);
+        REQUIRE(response.has_value());
+        const auto &source = rule_pack.sources.front();
+        const auto decoded =
+            decode_worker_ast_json(response->payload.bytes, rule_pack, source, response->payload.source_digest);
+        INFO((decoded.has_value() ? std::string {} : diagnostic_text(decoded.error())));
+        REQUIRE(decoded.has_value());
+
+        const auto canonical = as_text(response->payload.bytes);
+        const auto reject = [&](const std::string_view name, std::string mutated, const std::string_view code) {
+            INFO(name);
+            const auto result = decode_worker_ast_json(as_bytes(mutated), rule_pack, source, source.digest);
+            REQUIRE_FALSE(result.has_value());
+            REQUIRE(result.error().front().code == code);
+        };
+
+        auto wrong_schema = canonical;
+        REQUIRE(replace_once(wrong_schema, "\"schema\":\"rule-engine.ast/1\"", "\"schema\":\"rule-engine.ast/2\""));
+        reject("wrong schema", std::move(wrong_schema), "PY-AST-VERSION");
+
+        auto duplicate_top_level = canonical;
+        REQUIRE(replace_once(duplicate_top_level, "\"format\":1", "\"format\":1,\"format\":1"));
+        reject("duplicate top-level field", std::move(duplicate_top_level), "PY-AST-JSON-FIELD");
+
+        auto out_of_order = canonical;
+        REQUIRE(replace_once(out_of_order, "\"format\":1,\"schema\":\"rule-engine.ast/1\"",
+                             "\"schema\":\"rule-engine.ast/1\",\"format\":1"));
+        reject("out-of-order top-level field", std::move(out_of_order), "PY-AST-JSON-FIELD");
+
+        auto unknown_node_field = canonical;
+        REQUIRE(replace_once(unknown_node_field, "\"fields\":{\"body\":", "\"fields\":{\"unexpected\":null,\"body\":"));
+        reject("unknown node field", std::move(unknown_node_field), "PY-AST-JSON-FIELD");
+
+        auto duplicate_node_field = canonical;
+        REQUIRE(replace_once(duplicate_node_field, "\"fields\":{\"body\":", "\"fields\":{\"body\":null,\"body\":"));
+        reject("duplicate node field", std::move(duplicate_node_field), "PY-AST-JSON-FIELD");
+
+        auto oversized_name = canonical;
+        const auto long_field = "\"fields\":{\"" + std::string(129U, 'x') + "\":null,";
+        REQUIRE(replace_once(oversized_name, "\"fields\":{", long_field));
+        reject("oversized field name", std::move(oversized_name), "PY-AST-LIMIT");
+
+        auto excessive_depth = canonical;
+        const auto nested = "\"type_ignores\":" + std::string(maximum_ast_depth + 8U, '[') + "null" +
+                            std::string(maximum_ast_depth + 8U, ']');
+        REQUIRE(replace_once(excessive_depth, "\"type_ignores\":[]", nested));
+        reject("excessive nesting", std::move(excessive_depth), "PY-AST-DEPTH");
+
+        auto huge_span_number = canonical;
+        REQUIRE(
+            replace_once(huge_span_number, "\"col\":0", "\"col\":999999999999999999999999999999999999999999999999"));
+        reject("overflowing span number", std::move(huge_span_number), "PY-AST-LIMIT");
+
+        auto huge_token_number = canonical;
+        REQUIRE(replace_once(huge_token_number, "\"end\":[0,0]",
+                             "\"end\":[999999999999999999999999999999999999999999999999,0]"));
+        reject("overflowing token number", std::move(huge_token_number), "PY-AST-LIMIT");
+
+        auto invalid_base64 = canonical;
+        const auto base64 = invalid_base64.find("\"wtf8_base64\":\"");
+        REQUIRE(base64 != std::string::npos);
+        const auto value_begin = base64 + std::string_view {"\"wtf8_base64\":\""}.size();
+        REQUIRE(value_begin < invalid_base64.size());
+        invalid_base64[value_begin] = '*';
+        reject("invalid tagged string", std::move(invalid_base64), "PY-AST-JSON");
+
+        auto invalid_wtf8 = canonical;
+        const auto wtf8 = invalid_wtf8.find("\"wtf8_base64\":\"");
+        REQUIRE(wtf8 != std::string::npos);
+        const auto wtf8_begin = wtf8 + std::string_view {"\"wtf8_base64\":\""}.size();
+        const auto wtf8_end = invalid_wtf8.find('"', wtf8_begin);
+        REQUIRE(wtf8_end != std::string::npos);
+        invalid_wtf8.replace(wtf8_begin, wtf8_end - wtf8_begin, "_w");
+        reject("invalid WTF-8 string", std::move(invalid_wtf8), "PY-AST-STRING");
+
+        auto wrong_worker = canonical;
+        REQUIRE(replace_once(wrong_worker, "\"unicode\":\"16.0.0\"", "\"unicode\":\"15.1.0\""));
+        reject("wrong worker identity", std::move(wrong_worker), "PY-AST-RUNTIME");
+
+        auto truncated = canonical;
+        truncated.pop_back();
+        reject("truncated envelope", std::move(truncated), "PY-AST-JSON");
+
+        const auto digest_mismatch =
+            decode_worker_ast_json(response->payload.bytes, rule_pack, source, SourceDigest {"sha256:mismatch"});
+        REQUIRE_FALSE(digest_mismatch.has_value());
+        REQUIRE(digest_mismatch.error().front().code == "PY-AST-SOURCE");
+
+        const std::vector<std::byte> oversized(maximum_ast_payload_bytes + 1U);
+        const auto oversized_result = decode_worker_ast_json(oversized, rule_pack, source, source.digest);
+        REQUIRE_FALSE(oversized_result.has_value());
+        REQUIRE(oversized_result.error().front().code == "PY-AST-LIMIT");
+    }
+
+    TEST_CASE("exact worker fact rule compiles and resumes through the register VM") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+        const auto rule_pack = pack("from rule_engine import Model, provider_fact, rule\n"
+                                    "\n"
+                                    "class Process(Model):\n"
+                                    "    is_signed: bool = provider_fact(route=\"process.is_signed\")\n"
+                                    "\n"
+                                    "@rule(\"com.example.unsigned\")\n"
+                                    "def unsigned(process: Process) -> bool:\n"
+                                    "    return not process.is_signed\n");
+        packaging::WindowsJobWorkerLauncher launcher;
+        launcher.temporary_root = runtime.temporary_parent;
+        packaging::WorkerClient client {.runtime = *runtime.runtime, .launcher = launcher, .limits = {}};
+        WorkerAstEnvelopeProvider provider {client};
+        StaticPackCompiler compiler {provider};
+
+        const OperatorBindings bindings {binding("com.example.unsigned")};
+        const auto compiled = compiler.compile(rule_pack, {}, bindings);
+        INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
+        REQUIRE(compiled.has_value());
+        REQUIRE(compiled->functions.size() == 1U);
+        const auto &function = compiled->functions.front();
+        REQUIRE(function.parameter_count == 1U);
+        REQUIRE(function.register_count == 3U);
+        REQUIRE(function.instructions.size() == 3U);
+        CHECK(function.instructions[0].opcode == Opcode::await_fact);
+        CHECK(function.instructions[0].destination == 1U);
+        CHECK(function.instructions[0].operand_a == 0U);
+        CHECK(function.instructions[0].immediate == 0U);
+        CHECK(function.instructions[1].opcode == Opcode::unary_op);
+        CHECK(function.instructions[1].destination == 2U);
+        CHECK(function.instructions[1].operand_a == 1U);
+        CHECK(function.instructions[1].immediate == 0U);
+        CHECK(function.instructions[2].opcode == Opcode::return_value);
+        CHECK(function.instructions[2].destination == 2U);
+        CHECK(function.instructions[2].operand_a == 2U);
+
+        auto session = vm::RegisterVmSession::create(*compiled, invocation());
+        REQUIRE(session.has_value());
+        const auto waiting = (*session)->step({});
+        REQUIRE(waiting.state == VmStepState::waiting_for_facts);
+        REQUIRE(waiting.fact_requests.size() == 1U);
+        const auto still_waiting = (*session)->step({});
+        REQUIRE(still_waiting.state == VmStepState::waiting_for_facts);
+        REQUIRE(still_waiting.fact_requests.empty());
+
+        HostResponses response;
+        response.facts.push_back(FactResponse {
+            .request_id = waiting.fact_requests.front().request_id,
+            .subject = waiting.fact_requests.front().subject,
+            .status = FactTerminalStatus::value,
+            .value = make_fact(false),
+            .diagnostic = std::nullopt,
+        });
+        const auto completed = (*session)->step(std::move(response));
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        REQUIRE(completed.result->verdict == true);
     }
 
     TEST_CASE("UTF-8 source spans are byte offsets and never split a code point") {

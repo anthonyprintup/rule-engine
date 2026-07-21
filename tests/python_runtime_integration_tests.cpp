@@ -310,7 +310,7 @@ namespace {
             .pack = PackId {"pack"},
             .version = PackVersion {"1"},
             .source_digest = SourceDigest {"sha256:source"},
-            .compiler_abi = "python-3.14.6/static-compiler-v1",
+            .compiler_abi = std::string {python_static_compiler_abi_v1},
             .semantic_hash = "sha256:semantic",
             .constants = {make_fact(true)},
             .functions = {BytecodeFunction {

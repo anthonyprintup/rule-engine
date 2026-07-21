@@ -102,10 +102,8 @@ namespace rule_engine::python::compiler {
                     worker_error("PY-WORKER", "private Python parser worker failed: " + response.error().message,
                                  SourceSpan {.source = source.id, .begin_byte = 0U, .end_byte = 0U})});
             }
-            auto source_pack = pack;
-            source_pack.sources = {source};
-            source_pack.closure_digest = source.digest;
-            auto decoded = decode_ast_envelope(response->payload.bytes, source_pack);
+            auto decoded =
+                decode_worker_ast_json(response->payload.bytes, pack, source, response->payload.source_digest);
             if (!decoded) {
                 return std::unexpected(std::move(decoded.error()));
             }
