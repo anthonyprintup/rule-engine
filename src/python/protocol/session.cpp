@@ -245,6 +245,18 @@ namespace rule_engine::python::protocol_v2 {
         });
     }
 
+    void AgentSessionState::disconnect() noexcept {
+        for (auto &record : pending_) {
+            release_in_flight(record);
+            record.in_flight = false;
+        }
+        session_.reset();
+        session_fence_ = 0;
+        last_server_sequence_ = 0;
+        credit_ = {};
+        accepted_work_.clear();
+    }
+
     std::expected<void, ProtocolError> AgentSessionState::validate_server_message(const SessionId &session,
                                                                                   const PeerId &peer,
                                                                                   const std::uint64_t fence,

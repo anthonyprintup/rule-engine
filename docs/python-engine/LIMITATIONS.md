@@ -145,3 +145,11 @@ Every entry records impact, rationale, mitigation, observability, and revisit co
 - **Mitigation:** Retain the old namespace for the rollback window, fence new-generation writes during rollback, and require an explicit forward repair before reactivation.
 - **Observability:** Activation audits report namespace selection, migrated/warmed keys, rollback eligibility, and discarded new-generation work.
 - **Revisit:** A pack may supply a separately reviewed reverse migration, but it is never inferred.
+
+## L-021 — Socket orchestration is not a complete network service runtime
+
+- **Impact:** The default system DNS resolver cannot guarantee a hard wall-clock deadline once the operating system's `getaddrinfo` call is in flight. The current connection facade permits one synchronous operation at a time, listener binds are numeric, the listener does not own a multi-worker scheduler, and TLS `close_notify` is best-effort.
+- **Rationale:** Standalone Asio delegates name resolution to the platform resolver, whose cancellation behavior is platform-dependent. This slice owns bounded socket/TLS/session primitives rather than server thread-pool policy, service lifecycle, or a cross-platform asynchronous DNS implementation.
+- **Mitigation:** Production configuration can set `require_hard_resolver_bounds` and inject an `IEndpointResolver` that advertises and implements hard deadline and cancellation bounds; the dialer fails closed before resolution otherwise. Callers serialize connection operations, resolve listener names before binding, supply bounded accept workers externally, and always close the socket after bounded best-effort TLS shutdown.
+- **Observability:** Record resolver implementation/capability, configured and elapsed resolve/connect/handshake/read/write deadlines, endpoint/address attempts, cancellations, accept-worker saturation, and TLS shutdown outcome.
+- **Revisit:** Replace the system resolver with a proven cross-platform cancelable DNS backend and add an owned bounded session scheduler when production service composition is implemented; strengthen TLS shutdown only if a separately bounded bidirectional close is operationally required.
