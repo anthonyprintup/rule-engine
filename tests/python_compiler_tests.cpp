@@ -293,6 +293,35 @@ namespace {
         };
     }
 
+    std::vector<AstNode> direct_fact_rule_nodes() {
+        return {
+            node(1, "Module",
+                 {field("body", ast_sequence({ast_reference(2)})), field("type_ignores", ast_sequence({}))}),
+            node(2, "FunctionDef",
+                 {field("name", ast_string("unsigned")), field("args", ast_reference(3)),
+                  field("body", ast_sequence({ast_reference(10)})),
+                  field("decorator_list", ast_sequence({ast_reference(4)})), field("returns", ast_reference(7))}),
+            node(3, "arguments",
+                 {field("posonlyargs", ast_sequence({})), field("args", ast_sequence({ast_reference(8)})),
+                  field("vararg", ast_none()), field("kwonlyargs", ast_sequence({})),
+                  field("kw_defaults", ast_sequence({})), field("kwarg", ast_none()),
+                  field("defaults", ast_sequence({}))}),
+            node(4, "Call",
+                 {field("func", ast_reference(5)), field("args", ast_sequence({ast_reference(6)})),
+                  field("keywords", ast_sequence({}))}),
+            node(5, "Name", {field("id", ast_string("rule"))}),
+            node(6, "Constant", {field("value", ast_string("com.example.unsigned"))}),
+            node(7, "Name", {field("id", ast_string("bool"))}),
+            node(8, "arg", {field("arg", ast_string("process")), field("annotation", ast_reference(9))}),
+            node(9, "Name", {field("id", ast_string("Process"))}),
+            node(10, "Return", {field("value", ast_reference(11))}),
+            node(11, "UnaryOp", {field("op", ast_reference(14)), field("operand", ast_reference(12))}),
+            node(12, "Attribute", {field("value", ast_reference(13)), field("attr", ast_string("is_signed"))}),
+            node(13, "Name", {field("id", ast_string("process"))}),
+            node(14, "Not", {}),
+        };
+    }
+
     TEST_CASE("AST envelope is bounded, versioned, and source-bound") {
         const auto rule_pack = pack();
         const auto payload = encode_ast_envelope(envelope(constant_rule_nodes(false)));
@@ -321,7 +350,7 @@ namespace {
         REQUIRE(oversized.error().front().code == "PY-AST-LIMIT");
     }
 
-    TEST_CASE("static pack compiler consumes the exact worker payload contract") {
+    TEST_CASE("static pack compiler consumes the exact worker payload contract", "[compiler-vm-progress]") {
         auto runtime = exact_runtime();
         if (!runtime.runtime) {
             if (!runtime.staging_failure.empty()) {
@@ -370,15 +399,26 @@ namespace {
         INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
         REQUIRE(compiled.has_value());
         REQUIRE(compiled->functions.size() == 1U);
-        REQUIRE(compiled->functions.front().id == ExecutableId {"com.example.constant"});
+        const auto &function = compiled->functions.front();
+        REQUIRE(function.id == ExecutableId {"com.example.constant"});
+        REQUIRE(function.instructions.size() == 2U);
+        REQUIRE(function.instructions[0].opcode == Opcode::load_const);
+        REQUIRE(function.instructions[1].opcode == Opcode::return_value);
         REQUIRE(launcher.calls == 1U);
 
-        auto session = vm::RegisterVmSession::create(*compiled, invocation());
+        auto bounded_invocation = invocation();
+        bounded_invocation.budget.normal.elapsed = std::chrono::seconds {1};
+        bounded_invocation.budget.normal.instructions = function.instructions.size();
+        bounded_invocation.budget.normal.loop_iterations_and_yields = 0U;
+        auto session = vm::RegisterVmSession::create(*compiled, bounded_invocation);
         REQUIRE(session.has_value());
+        REQUIRE((*session)->counters().instructions == 0U);
         const auto completed = (*session)->step({});
         REQUIRE(completed.state == VmStepState::complete);
         REQUIRE(completed.result.has_value());
         REQUIRE(completed.result->verdict == false);
+        REQUIRE((*session)->counters().instructions == function.instructions.size());
+        REQUIRE((*session)->counters().loop_iterations_and_yields == 0U);
     }
 
     TEST_CASE("UTF-8 source spans are byte offsets and never split a code point") {
@@ -549,6 +589,58 @@ namespace {
         REQUIRE(artifact->pack.optimization_certificates.front().logical_facts ==
                 std::vector<std::string> {"process.is_signed"});
         REQUIRE(verify_compiler_output(*artifact).has_value());
+    }
+
+    TEST_CASE("compiled direct subject fact rule resumes to a verdict in the real register VM",
+              "[compiler-vm-progress]") {
+        const auto rule_pack = pack();
+        const auto payload = encode_ast_envelope(envelope(direct_fact_rule_nodes()));
+        REQUIRE(payload.has_value());
+
+        const OperatorBindings bindings {binding("com.example.unsigned")};
+        const auto artifact = StaticCompiler {}.compile(rule_pack, *payload, {}, bindings);
+        INFO((artifact.has_value() ? std::string {} : diagnostic_text(artifact.error())));
+        REQUIRE(artifact.has_value());
+        const auto &function = artifact->pack.functions.front();
+        REQUIRE(function.parameter_count == 1U);
+        REQUIRE(function.register_count == 3U);
+        REQUIRE(function.instructions.size() == 3U);
+        REQUIRE(function.instructions[0].opcode == Opcode::await_fact);
+        REQUIRE(function.instructions[0].destination == 1U);
+        REQUIRE(function.instructions[0].operand_a == 0U);
+        REQUIRE(function.instructions[1].opcode == Opcode::unary_op);
+        REQUIRE(function.instructions[1].destination == 2U);
+        REQUIRE(function.instructions[1].operand_a == 1U);
+        REQUIRE(function.instructions[2].opcode == Opcode::return_value);
+        REQUIRE(function.instructions[2].operand_a == 2U);
+
+        auto bounded_invocation = invocation();
+        bounded_invocation.budget.normal.elapsed = std::chrono::seconds {1};
+        bounded_invocation.budget.normal.instructions = function.instructions.size();
+        bounded_invocation.budget.normal.loop_iterations_and_yields = 0U;
+        auto session = vm::RegisterVmSession::create(artifact->pack, bounded_invocation);
+        INFO((session.has_value() ? std::string {} : diagnostic_text(session.error())));
+        REQUIRE(session.has_value());
+        REQUIRE((*session)->counters().instructions == 0U);
+        const auto waiting = (*session)->step({});
+        REQUIRE(waiting.state == VmStepState::waiting_for_facts);
+        REQUIRE(waiting.fact_requests.size() == 1U);
+        REQUIRE((*session)->counters().instructions == 1U);
+
+        HostResponses response;
+        response.facts.push_back(FactResponse {
+            .request_id = waiting.fact_requests.front().request_id,
+            .subject = waiting.fact_requests.front().subject,
+            .status = FactTerminalStatus::value,
+            .value = make_fact(false),
+            .diagnostic = std::nullopt,
+        });
+        const auto completed = (*session)->step(std::move(response));
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        REQUIRE(completed.result->verdict == true);
+        REQUIRE((*session)->counters().instructions == function.instructions.size());
+        REQUIRE((*session)->counters().loop_iterations_and_yields == 0U);
     }
 
     TEST_CASE("compiler operand constants are accepted by the real register VM") {
