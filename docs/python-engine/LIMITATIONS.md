@@ -233,3 +233,43 @@ Every entry records impact, rationale, mitigation, observability, and revisit co
 - **Mitigation:** `IResidentAgentBackend::persist` may succeed only after the body and cumulative receipt are durable. The service validates hello/capability/session/work/result identities, restricts live TCP delivery to the next contiguous durable sequence, sends transient NACK on unavailable persistence, and never advances ACK. An injected durable backend is exercised end to end with canonical application bytes. Admin denial is tested before any activation-store read or mutation.
 - **Observability:** Startup help identifies the zero-work/no-ACK production composition. Session failures retain stable protocol error classes; scheduler snapshots expose accepted, queued, active, rejected, and stopping state. Operators can distinguish queue overload, stale fence, malformed frame, authorization denial, and unavailable receipt persistence.
 - **Revisit:** Add PostgreSQL/SQLite `peer_sessions`, `agent_receipts`, snapshot staging, and atomic work-result receipt transactions together with the activated event scheduler. Then wire the remaining typed admin operations and the CLI transport. The configured memory bound covers owned application reservations; OS socket buffers, TLS-library allocations, allocator overhead, and backend-internal memory require separate process/container limits and measurement.
+
+## L-032 — The built-in signing adapter is Windows raw-seed only
+
+- **Impact:** The shipped signer reads one raw 32-byte Ed25519 seed from a protected local Windows file. It does not implement PEM/PKCS#8, HSM, KMS, PKCS#11, remote signing, key generation, backup, rotation, or ceremony. The seed lifetime remains caller/process managed; it is cleansed after use but is not held in guaranteed page-locked memory. The selected OpenSSL DLL is absolute and version-checked but is not independently hash-pinned by the signer. Strict DACL rules can reject legitimate enterprise ACL variants.
+- **Rationale:** A small fail-closed offline adapter establishes interoperable signing without embedding a key-management product or silently accepting ambiguous key encodings and permissions.
+- **Mitigation:** Keep signing offline, protect and monitor the seed outside the repository, validate the derived public-key ID against policy, use an explicit crypto-library path, and supply a separately reviewed `ISigningKeyProvider` for production HSM/KMS ownership.
+- **Observability:** Signing diagnostics expose only the failure class and public key ID; they never log the seed, its contents, or a secret-bearing path.
+- **Revisit:** Add a provider only with explicit key identity, authorization, audit, cancellation, zeroization, rotation, and deterministic-signature contracts plus integration tests for the real device/service.
+
+## L-033 — Filesystem tooling adapters are intentionally narrow
+
+- **Impact:** Atomic no-clobber archive publication depends on a same-directory hard link and fails on filesystems without hard-link support. `--watch` owns cancellation/publication generations but has no platform filesystem-event source, and cancellation is observed between compiler phases rather than forcibly terminating an in-flight parser worker. The standalone admin CLI also lacks the resident admin network adapter.
+- **Rationale:** Portable polling, cross-volume replacement, forced worker interruption, and an authenticated admin client each need separately bounded lifecycle and durability semantics; pretending they are atomic or cancelable would be unsafe.
+- **Mitigation:** Use a local hard-link-capable staging filesystem, invoke checks explicitly from an external watcher, rely on the worker's hard process deadline, and use the tested injected/admin-server interfaces until the client transport is implemented.
+- **Observability:** Tool results distinguish unsupported publication, cancellation generation, worker timeout, and unavailable transport without partially publishing output.
+- **Revisit:** Add platform event adapters, phase-aware worker cancellation, alternative atomic publication protocols, and the authenticated admin transport with failure-injection tests.
+
+## L-034 — Portable and PostgreSQL release qualification is incomplete
+
+- **Impact:** The implementation host qualified Windows only. Linux compilation/packaging/private-runtime behavior, live PostgreSQL 17 linking and migrations, mixed-OS semantic hashes, multi-node failover, and real network/database scale are not proven. The guarded PostgreSQL adapter currently owns one mutexed connection rather than a production pool.
+- **Rationale:** WSL was absent, the available Docker daemon supported Windows containers only, and PostgreSQL client/development tools were unavailable. Required architecture cells cannot be inferred from Windows builds or fakes.
+- **Mitigation:** Keep production-cluster readiness fail-closed, publish the exact qualified/unqualified matrix, and treat SQLite plus the 10,000-peer in-memory model as development/component evidence only.
+- **Observability:** [QUALIFICATION.md](QUALIFICATION.md) records toolchain versions, commands, artifact hashes, benchmark mode flags, and every unrun required cell.
+- **Revisit:** Run the complete architecture matrix on Linux with a separately pinned private runtime, real PostgreSQL 17 HA/TLS, mixed Windows agents, multi-process faults, and live scale; remove this limitation only when those cells pass.
+
+## L-035 — Resident listener composition has bounded but narrow concurrency
+
+- **Impact:** Development configuration can request loopback plaintext, but the resident service currently refuses startup unless both application listeners have authenticated TLS contexts. TCP accept plus TLS handshake is serial in the node loop before a session enters the bounded worker queue. An injected agent backend is asked for one initial work batch per session rather than being continuously polled. The configured memory reservation covers application-owned frame/queue estimates, not total process RSS; OS/OpenSSL/allocator/backend allocations remain outside it. With project exceptions disabled, an unrecoverable thread/allocation failure terminates the process.
+- **Rationale:** The delivered composition uses simple synchronous, deadline-bounded ownership and fails closed where plaintext, continuous scheduling, or whole-process memory guarantees are not implemented.
+- **Mitigation:** Use mTLS even for development, keep accept/handshake deadlines below the validated lease window, bound the queue/workers/session lifetime, apply an external process/container memory limit, and reconnect to obtain later work batches.
+- **Observability:** Stable startup errors identify unavailable plaintext/TLS paths; scheduler counters expose queued/active/rejected sessions and listener failures; process supervision records termination and RSS.
+- **Revisit:** Add an explicitly bounded plaintext development listener if still required, independent accept/handshake workers, continuous durable work notification, and measured allocator/process limits without weakening lease or shutdown guarantees.
+
+## L-036 — Authenticated agents remain the source of fact truth
+
+- **Impact:** A server that intentionally does not possess the scanned file or process memory cannot independently recompute returned fact values, regex match contents, or context bytes. An enrolled but compromised endpoint can therefore lie within a structurally valid, authenticated response.
+- **Rationale:** The trust boundary keeps predicates, bytecode, and verdicts on the server while agents observe endpoint-local data. Shipping the source to the server would change privacy, performance, and ownership assumptions.
+- **Mitigation:** Enforce mTLS enrollment, exact peer/session/request/fence/generation identities, schema ID/hash attestation, route authorization, byte/count/deadline bounds, canonical framing, and durable audit. Treat provider output as an authenticated observation, never as a server-derived proof.
+- **Observability:** Record provider route, schema identity, endpoint/subject incarnation, request and session identities, terminal status, and validation failure class without logging protected contents.
+- **Revisit:** Add independently specified remote attestation, content commitments, or corroborating providers only when the threat model requires stronger evidence than authenticated endpoint observation.

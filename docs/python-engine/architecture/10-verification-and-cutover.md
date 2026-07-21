@@ -2,10 +2,15 @@
 
 ## 1. Purpose and goals
 
-This chapter defines the evidence required to replace the current YARA/Rust
-engine with the Python authoring frontend and C++ runtime. It turns
+This chapter defines the evidence required for the completed source cutover
+from the former YARA/Rust engine to the Python authoring frontend and C++ runtime. It turns
 implementation completion into explicit, reproducible gates and defines the
 only acceptable legacy deletion sequence.
+
+The normative gate remains this chapter. Evidence gathered on the current
+implementation host, including the required cells that could not be run, is in
+[`../QUALIFICATION.md`](../QUALIFICATION.md); an unavailable required cell is
+not a pass.
 
 The goals are:
 

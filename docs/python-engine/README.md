@@ -2,6 +2,11 @@
 
 This directory is the durable product specification for the Python rule engine. It records the intended architecture, the reasoning behind its boundaries, rejected alternatives, verification criteria, and known limitations. C++ remains the semantic authority; Python is a statically checked authoring language and a short-lived parse/generation dependency only.
 
+The normative inputs are the repository trust boundary, the agreed product
+requirements, accepted ADRs, and verified implementation behavior. External
+brainstorming notes are non-normative and do not define language, security,
+runtime, or compatibility contracts.
+
 ## Reading order
 
 1. [`architecture/00-system-context.md`](architecture/00-system-context.md) — ownership, deployment, and end-to-end flows.
@@ -19,8 +24,10 @@ This directory is the durable product specification for the Python rule engine. 
 The frozen cross-component API expectations are in [`CONTRACTS.md`](CONTRACTS.md).
 Consolidated design limitations are in [`LIMITATIONS.md`](LIMITATIONS.md).
 Current verified behavior and unfinished qualification work are recorded in
-[`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md). Build, signing,
-server, agent, and recovery procedures are in [`OPERATIONS.md`](OPERATIONS.md).
+[`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md). The exact local test
+matrix, toolchain, artifact hashes, and explicitly unqualified release cells are
+in [`QUALIFICATION.md`](QUALIFICATION.md). Build, signing, server, agent, and
+recovery procedures are in [`OPERATIONS.md`](OPERATIONS.md).
 The `decisions/` directory contains the eighteen accepted architecture decision
 records and their rejected alternatives.
 

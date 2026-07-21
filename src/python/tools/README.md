@@ -102,6 +102,11 @@ OpenSSL allocator overhead, or backend-internal caches.
   the resident server's narrow authenticated admin listener is linked as
   described above. The offline file signer is currently implemented only on
   Windows; HSM/KMS/PKCS#11 providers remain deployment integrations.
+- The resident listener currently requires mTLS even when development
+  configuration permits loopback plaintext; startup fails closed instead of
+  dereferencing a missing TLS context. Accept and TLS handshake are serialized
+  before bounded worker admission, and an injected agent backend supplies one
+  initial work batch per session.
 - Archive publication uses a same-directory hard link to provide atomic
   no-clobber behavior. Filesystems without hard-link support fail closed.
 - `--watch` coordinates cancellation and publication generations, but a

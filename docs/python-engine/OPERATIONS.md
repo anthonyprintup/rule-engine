@@ -178,6 +178,15 @@ accept timeout and TLS handshake timeout) must be strictly shorter than the
 node lease duration; configuration validation computes this without overflowing
 the duration representation.
 
+`development.allow_loopback_plaintext` is parsed so the configuration schema
+does not need another incompatible revision, but the current resident listener
+does not implement a plaintext application channel and fails startup with
+`SRV-PLAINTEXT-LISTENER-UNAVAILABLE`. Use mTLS for development sessions as well;
+do not treat successful `--validate-config` as proof that plaintext serving is
+available. Listener accept and TLS handshake are serial before admission to the
+bounded worker queue, so their configured deadlines also bound head-of-line
+delay.
+
 The current default store composition deliberately advertises zero work and
 zero durable-message credit because it cannot atomically commit an agent body
 and cumulative receipt. A peer that ignores credit is transiently NACKed and
@@ -279,4 +288,6 @@ concurrent TLS connections or a live database load test.
 
 The complete known-limit record and its revisit conditions are in
 [`LIMITATIONS.md`](LIMITATIONS.md). Current implementation and qualification
-evidence is in [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md).
+status is in [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md), and the
+exact local evidence/unqualified matrix is in
+[`QUALIFICATION.md`](QUALIFICATION.md).

@@ -1,6 +1,6 @@
 # Python Engine Implementation Status
 
-This document separates implemented, verified behavior from the target architecture in this directory. The architecture remains normative design intent; a capability is available only when it appears below with code and test evidence.
+This document separates implemented, verified behavior from the target architecture in this directory. The architecture remains normative design intent; a capability is available only when it appears below with code and test evidence. Exact host, command, artifact, and pass/fail evidence is recorded in [QUALIFICATION.md](QUALIFICATION.md).
 
 ## Implemented and locally verified
 
@@ -39,7 +39,7 @@ Agents do not receive predicates, rule bytecode, or match decisions. They receiv
 - PostgreSQL 17 was unavailable on the implementation host. The driver-enabled branch was warning-clean compiled against the API surface, but real libpq linking, migrations, TLS connections, concurrency, failover, cancellation, and pooling remain unqualified. The current adapter owns one mutexed connection.
 - Runtime and activation state have durable SQLite/PostgreSQL adapters, but `IClusterRuntimeStore` still has no atomic `peer_sessions`/`agent_receipts` transaction and startup has no activated event-to-compiled-pack scheduler. The production agent-session backend therefore establishes a durable fenced lease with zero work and zero durable-message credit; a peer that ignores credit is transiently NACKed and never receives an invented ACK. The tested injected backend seam is the integration point for the missing atomic receipt/work transaction ([L-031](LIMITATIONS.md#l-031--resident-application-composition-cannot-yet-durably-accept-agent-records)).
 - The server-side admin backend is authenticated and authorized, but its wire surface currently exposes only pack snapshot, operation snapshot, and final activation flip. The standalone `rule_engine_admin` client still has no linked network adapter, and stage/drain/fence/rollback/upload/policy operations are not yet encoded on this server wire.
-- Bundled-runtime installation, Linux builds, full package/install smoke tests, fuzzing, fault injection, and production PostgreSQL scale qualification remain final integration gates until recorded otherwise.
+- Windows private-runtime installation, the complete six-executable package graph, relocation/downstream install smoke tests, strict author-SDK checks, deterministic fuzz regression, a 20,000-run ASan/libFuzzer session, and the 10,000-peer in-memory stability model are locally qualified. Linux builds, a Linux private-runtime bundle, live PostgreSQL 17, mixed-OS operation, multi-process crash injection, and production network/database scale remain unqualified; see [QUALIFICATION.md](QUALIFICATION.md).
 - Production-agent limitations remain numeric-only endpoints ([L-022](LIMITATIONS.md#l-022--the-production-windows-agent-accepts-numeric-server-endpoints-only)), serialized in-flight cancellation ([L-023](LIMITATIONS.md#l-023--provider-dispatch-cannot-consume-a-later-cancel-frame-concurrently)), once-per-process initial inventory ([L-024](LIMITATIONS.md#l-024--initial-process-inventory-is-once-per-agent-process)), and no online certificate revocation check ([L-025](LIMITATIONS.md#l-025--agent-certificate-revocation-is-not-checked-online)).
 - Provider schema attestation is exact at the top-level descriptor, but recursive list/map element descriptors and generated provider-catalog integration remain partial ([L-027](LIMITATIONS.md#l-027--provider-container-schemas-and-catalog-generation-are-partial)).
 - Regex match and context contents cannot be independently recomputed by a server that intentionally does not possess the scanned source. The server validates authenticated attribution, identities, permissions, bounds, lengths, pattern membership, and framing; the provider remains the source of fact truth.
@@ -49,16 +49,18 @@ Agents do not receive predicates, rule bytecode, or match decisions. They receiv
 
 The working cutover removes the former parser/compiler/runtime/protocol source,
 Rust bridge, Cargo/cbindgen files, YARA fixtures, legacy tools, and obsolete
-documentation from the active build. A fresh Ninja directory configured with
-clang-cl using only the Python-engine CMake graph completed all 470 build steps
-and passed all 22 registered Python-engine CTest executables serially. The real
-packaging and compiler suites used the SHA-256-verified official CPython 3.14.6
-Windows x64 embeddable archive with isolated-worker flags and no system-Python
-fallback.
+documentation from the active build. On 2026-07-21, clean Windows Debug builds
+passed 37/37 tests under both clang-cl 22.1.4 and MSVC 19.50.35729. A fresh
+disconnected clang-cl Release build with `BUILD_TESTING=OFF` completed 372 build
+steps, installed the complete package with its manifest-validated private
+CPython runtime, and passed `--version` and `--help` smoke checks for all six
+public executables. The exact CPython 3.14.6 archive hash, staged DLL hash,
+SDK checks, 20,000-run fuzzer result, and 10,000-peer counters are preserved in
+[QUALIFICATION.md](QUALIFICATION.md).
 
-This proves the Windows source/build removal gate for the current integration
-snapshot; it does not prove release qualification. Real worker JSON-to-compiler
-interoperability, the missing durable agent-receipt/work-scheduling transaction,
-the remaining admin wire/client operations, complete install packaging,
-Linux/PostgreSQL builds, fuzzing, fault injection, and scale qualification remain
-open and must be recorded above until their tests pass.
+This proves the Windows source/build/package removal gate for the current
+integration snapshot; it does not complete the architecture's release gate.
+The missing durable agent-receipt/work-scheduling transaction, remaining admin
+wire/client operations, Linux and mixed-OS cells, live PostgreSQL, and real
+multi-process/network fault and scale tests remain open and must not be inferred
+from the green Windows-local evidence.
