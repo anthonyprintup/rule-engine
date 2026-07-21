@@ -9,6 +9,18 @@ target_link_libraries(
         rule_engine::project_options
 )
 
+add_library(rule_engine_python_runtime_adapters adapters.cpp)
+add_library(rule_engine::python_runtime_adapters ALIAS rule_engine_python_runtime_adapters)
+target_include_directories(rule_engine_python_runtime_adapters PUBLIC "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(
+    rule_engine_python_runtime_adapters
+    PUBLIC
+        rule_engine::python_runtime
+        rule_engine::python_cluster
+        rule_engine::python_protocol
+        rule_engine::project_options
+)
+
 add_executable(
     rule_engine_python_runtime_integration_tests
     "${CMAKE_SOURCE_DIR}/tests/python_runtime_integration_tests.cpp"
@@ -16,7 +28,7 @@ add_executable(
 target_link_libraries(
     rule_engine_python_runtime_integration_tests
     PRIVATE
-        rule_engine::python_runtime
+        rule_engine::python_runtime_adapters
         Catch2::Catch2WithMain
 )
 target_compile_options(

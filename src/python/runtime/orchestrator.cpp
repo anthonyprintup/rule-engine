@@ -545,28 +545,11 @@ namespace rule_engine::python::runtime {
             return responses;
         }
 
-        [[nodiscard]] std::expected<VmStep, ResidentRuntimeError> direct_step(EvaluationHandle &evaluation,
-                                                                              HostResponses responses) {
-            if (!evaluation.session) {
-                return std::unexpected(
-                    runtime_error(ResidentRuntimeErrorCode::invalid_vm_step, "evaluation has no VM session"));
-            }
-            auto step = evaluation.session->step(std::move(responses));
-            if (terminal_state(step.state)) {
-                if (!terminal_matches_result(step)) {
-                    return std::unexpected(runtime_error(ResidentRuntimeErrorCode::invalid_vm_step,
-                                                         "terminal VM state has no matching evaluation result"));
-                }
-                evaluation.terminal_result = step.result;
-            }
-            return step;
-        }
-
         [[nodiscard]] std::expected<EvaluationResult, ResidentRuntimeError>
-        cancel_evaluation(EvaluationHandle &evaluation, const VmStep &outstanding) {
+        cancel_evaluation(IResidentVmDriver &vm, EvaluationHandle &evaluation, const VmStep &outstanding) {
             HostResponses cancellation;
             cancellation.cancel = true;
-            auto canceled = direct_step(evaluation, std::move(cancellation));
+            auto canceled = vm.step(evaluation, std::move(cancellation));
             if (!canceled || canceled->state != VmStepState::canceled || !canceled->result) {
                 return std::unexpected(runtime_error(ResidentRuntimeErrorCode::cancellation_failed,
                                                      "VM did not terminate through its cancellation path"));
@@ -618,6 +601,27 @@ namespace rule_engine::python::runtime {
 
     } // namespace
 
+    std::expected<EvaluationHandle, DiagnosticSet>
+    DispatchFreeRuntimeEngineDriver::start(const VmInvocation &invocation) {
+        return engine_.start(invocation);
+    }
+
+    std::expected<VmStep, ResidentVmDriverError> DispatchFreeRuntimeEngineDriver::step(EvaluationHandle &evaluation,
+                                                                                       HostResponses responses) {
+        if (!evaluation.session) {
+            return std::unexpected(ResidentVmDriverError {.message = "evaluation has no VM session"});
+        }
+        auto step = evaluation.session->step(std::move(responses));
+        if (terminal_state(step.state)) {
+            if (!terminal_matches_result(step)) {
+                return std::unexpected(
+                    ResidentVmDriverError {.message = "terminal VM state has no matching evaluation result"});
+            }
+            evaluation.terminal_result = step.result;
+        }
+        return step;
+    }
+
     std::expected<TransactionReceipt, StoreError>
     RuntimeStoreTransactionPort::commit(const ResidentWorkIdentity &work,
                                         const RuntimeTransaction &transaction) noexcept {
@@ -631,9 +635,9 @@ namespace rule_engine::python::runtime {
         return store_.transact_event(transaction);
     }
 
-    ResidentRuntime::ResidentRuntime(RuntimeEngine &engine, const HostResponsePorts ports, IWorkControlPort &control,
+    ResidentRuntime::ResidentRuntime(IResidentVmDriver &vm, const HostResponsePorts ports, IWorkControlPort &control,
                                      ITransactionPort &transactions, const ResidentRuntimeOptions options) noexcept:
-        engine_ {engine}, ports_ {ports}, control_ {control}, transactions_ {transactions}, options_ {options} {}
+        vm_ {vm}, ports_ {ports}, control_ {control}, transactions_ {transactions}, options_ {options} {}
 
     std::expected<ResidentEvaluationReceipt, ResidentRuntimeError>
     ResidentRuntime::evaluate(ResidentEvaluationRequest request) {
@@ -682,7 +686,7 @@ namespace rule_engine::python::runtime {
                 }
             }
 
-            auto evaluation = engine_.start(request.invocation);
+            auto evaluation = vm_.start(request.invocation);
             if (!evaluation) {
                 return std::unexpected(ResidentRuntimeError {
                     .code = ResidentRuntimeErrorCode::start_failed,
@@ -691,6 +695,10 @@ namespace rule_engine::python::runtime {
                     .store = std::nullopt,
                     .diagnostics = std::move(evaluation.error()),
                 });
+            }
+            if (!evaluation->pack || evaluation->pack->pack != request.work.pack) {
+                return std::unexpected(runtime_error(ResidentRuntimeErrorCode::invalid_work,
+                                                     "active VM pack does not match the resident work identity"));
             }
 
             HostResponses responses;
@@ -704,10 +712,11 @@ namespace rule_engine::python::runtime {
                 }
                 ++host_turns;
 
-                auto step = direct_step(*evaluation, std::move(responses));
+                auto step = vm_.step(*evaluation, std::move(responses));
                 responses = {};
                 if (!step) {
-                    return std::unexpected(step.error());
+                    return std::unexpected(
+                        runtime_error(ResidentRuntimeErrorCode::invalid_vm_step, std::move(step.error().message)));
                 }
                 last_step = std::move(*step);
                 if (terminal_state(last_step.state)) {
@@ -723,7 +732,7 @@ namespace rule_engine::python::runtime {
                     }
                     if (*control != WorkControlState::current) {
                         cancel_requests(last_step, ports_);
-                        auto canceled = cancel_evaluation(*evaluation, last_step);
+                        auto canceled = cancel_evaluation(vm_, *evaluation, last_step);
                         if (!canceled) {
                             return std::unexpected(canceled.error());
                         }

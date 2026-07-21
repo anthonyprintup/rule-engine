@@ -21,6 +21,11 @@ namespace rule_engine::python::runtime {
     };
 
     struct IProviderResponsePort {
+        IProviderResponsePort() = default;
+        IProviderResponsePort(const IProviderResponsePort &) = default;
+        IProviderResponsePort(IProviderResponsePort &&) = default;
+        IProviderResponsePort &operator=(const IProviderResponsePort &) = default;
+        IProviderResponsePort &operator=(IProviderResponsePort &&) = default;
         virtual ~IProviderResponsePort() = default;
         [[nodiscard]] virtual std::expected<std::vector<FactResponse>, PortError>
         resolve_facts(std::span<const FactRequest> requests) noexcept = 0;
@@ -61,6 +66,9 @@ namespace rule_engine::python::runtime {
         std::string node_id;
         std::string serial_domain;
         PackId pack;
+        // CompiledPack does not currently carry the activation generation.
+        // The resident checks the pack ID; the cluster transaction/work-control
+        // adapters must authoritatively fence this generation.
         std::uint64_t generation {};
         std::uint64_t attempt {};
         std::uint64_t fence {};
@@ -79,6 +87,31 @@ namespace rule_engine::python::runtime {
         virtual ~ITransactionPort() = default;
         [[nodiscard]] virtual std::expected<TransactionReceipt, StoreError>
         commit(const ResidentWorkIdentity &work, const RuntimeTransaction &transaction) noexcept = 0;
+    };
+
+    struct ResidentVmDriverError {
+        std::string message;
+    };
+
+    // The resident orchestrator deliberately depends on a VM-only step surface.
+    // RuntimeEngine::advance also dispatches provider work and therefore must not
+    // be reachable from diagnostic replay or sealed MVCC retries.
+    struct IResidentVmDriver {
+        virtual ~IResidentVmDriver() = default;
+        [[nodiscard]] virtual std::expected<EvaluationHandle, DiagnosticSet> start(const VmInvocation &invocation) = 0;
+        [[nodiscard]] virtual std::expected<VmStep, ResidentVmDriverError> step(EvaluationHandle &evaluation,
+                                                                                HostResponses responses) = 0;
+    };
+
+    struct DispatchFreeRuntimeEngineDriver final: IResidentVmDriver {
+        explicit DispatchFreeRuntimeEngineDriver(RuntimeEngine &engine) noexcept: engine_ {engine} {}
+
+        [[nodiscard]] std::expected<EvaluationHandle, DiagnosticSet> start(const VmInvocation &invocation) override;
+        [[nodiscard]] std::expected<VmStep, ResidentVmDriverError> step(EvaluationHandle &evaluation,
+                                                                        HostResponses responses) override;
+
+    private:
+        RuntimeEngine &engine_;
     };
 
     // Minimal adapter for stores that enforce the serial-domain fence inside
@@ -160,14 +193,14 @@ namespace rule_engine::python::runtime {
     };
 
     struct ResidentRuntime {
-        ResidentRuntime(RuntimeEngine &engine, HostResponsePorts ports, IWorkControlPort &control,
+        ResidentRuntime(IResidentVmDriver &vm, HostResponsePorts ports, IWorkControlPort &control,
                         ITransactionPort &transactions, ResidentRuntimeOptions options = {}) noexcept;
 
         [[nodiscard]] std::expected<ResidentEvaluationReceipt, ResidentRuntimeError>
         evaluate(ResidentEvaluationRequest request);
 
     private:
-        RuntimeEngine &engine_;
+        IResidentVmDriver &vm_;
         HostResponsePorts ports_;
         IWorkControlPort &control_;
         ITransactionPort &transactions_;
