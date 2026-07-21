@@ -105,6 +105,14 @@ namespace rule_engine::python {
         begin_transaction,
         commit_transaction,
         rollback_transaction,
+        build_list,
+        build_tuple,
+        build_dict,
+        get_iter,
+        iter_next,
+        load_subscript,
+        store_subscript,
+        delete_state,
     };
 
     struct Instruction {

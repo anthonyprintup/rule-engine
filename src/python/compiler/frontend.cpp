@@ -1348,23 +1348,19 @@ namespace rule_engine::python::compiler {
                 if (node.kind == "Tuple" || node.kind == "Set") {
                     diagnostics.push_back(make_diagnostic(
                         "PY-NYI-COLLECTION-LOWERING",
-                        node.kind + " requires a distinct runtime value kind absent from the F0 FactValue constants",
-                        node.span));
+                        node.kind + " runtime construction is not lowered by the F0 compiler", node.span));
                     return std::nullopt;
                 }
                 if (node.kind == "Subscript") {
-                    diagnostics.push_back(make_diagnostic(
-                        "PY-NYI-SUBSCRIPT-LOWERING",
-                        "subscription requires a container access opcode absent from the F0 bytecode contract",
-                        node.span));
+                    diagnostics.push_back(make_diagnostic("PY-NYI-SUBSCRIPT-LOWERING",
+                                                          "subscription is not lowered by the F0 compiler", node.span));
                     return std::nullopt;
                 }
                 if (node.kind == "ListComp" || node.kind == "SetComp" || node.kind == "DictComp" ||
                     node.kind == "GeneratorExp") {
-                    diagnostics.push_back(make_diagnostic(
-                        "PY-NYI-COMPREHENSION-LOWERING",
-                        "comprehensions require iterator/container opcodes absent from the F0 bytecode contract",
-                        node.span));
+                    diagnostics.push_back(make_diagnostic("PY-NYI-COMPREHENSION-LOWERING",
+                                                          "comprehensions are not lowered by the F0 compiler",
+                                                          node.span));
                     return std::nullopt;
                 }
                 if (node.kind == "Name") {
@@ -2079,10 +2075,9 @@ namespace rule_engine::python::compiler {
                         continue;
                     }
                     if (statement->kind == "For") {
-                        diagnostics.push_back(make_diagnostic(
-                            "PY-NYI-ITERATION-LOWERING",
-                            "for loops require iterator opcodes that are absent from the F0 bytecode contract",
-                            statement->span));
+                        diagnostics.push_back(make_diagnostic("PY-NYI-ITERATION-LOWERING",
+                                                              "for loops are not lowered by the F0 compiler",
+                                                              statement->span));
                         continue;
                     }
                     if (statement->kind == "TryStar") {
@@ -2589,6 +2584,12 @@ namespace rule_engine::python::compiler {
                     case Opcode::await_fact:
                     case Opcode::await_capability:
                     case Opcode::read_state:
+                    case Opcode::build_list:
+                    case Opcode::build_tuple:
+                    case Opcode::build_dict:
+                    case Opcode::get_iter:
+                    case Opcode::iter_next:
+                    case Opcode::load_subscript:
                         if (instruction.destination < normal.size()) {
                             normal[instruction.destination] = true;
                         }
@@ -2604,13 +2605,18 @@ namespace rule_engine::python::compiler {
                     case Opcode::append_effect:
                     case Opcode::begin_transaction:
                     case Opcode::commit_transaction:
-                    case Opcode::rollback_transaction: break;
+                    case Opcode::rollback_transaction:
+                    case Opcode::store_subscript:
+                    case Opcode::delete_state: break;
                     default: std::unreachable();
                 }
                 if (instruction.opcode == Opcode::jump) {
                     merge_state(instruction.immediate, normal);
                 } else if (instruction.opcode == Opcode::jump_if_false) {
                     merge_state(instruction.immediate, normal);
+                    merge_state(pc + 1U, normal);
+                } else if (instruction.opcode == Opcode::iter_next) {
+                    merge_state(instruction.immediate, *states[pc]);
                     merge_state(pc + 1U, normal);
                 } else if (instruction.opcode != Opcode::return_value && instruction.opcode != Opcode::raise_fault) {
                     merge_state(pc + 1U, normal);
@@ -2651,6 +2657,25 @@ namespace rule_engine::python::compiler {
                     case Opcode::append_effect: require_initialized(instruction.operand_a); break;
                     case Opcode::binary_op:
                     case Opcode::compare:
+                    case Opcode::load_subscript:
+                        require_initialized(instruction.operand_a);
+                        require_initialized(instruction.operand_b);
+                        break;
+                    case Opcode::get_iter:
+                    case Opcode::iter_next: require_initialized(instruction.operand_a); break;
+                    case Opcode::build_list:
+                    case Opcode::build_tuple:
+                        for (std::uint32_t item = 0U; item < instruction.operand_b; ++item) {
+                            require_initialized(instruction.operand_a + item);
+                        }
+                        break;
+                    case Opcode::build_dict:
+                        for (std::uint32_t item = 0U; item < instruction.operand_b * 2U; ++item) {
+                            require_initialized(instruction.operand_a + item);
+                        }
+                        break;
+                    case Opcode::store_subscript:
+                        require_initialized(instruction.destination);
                         require_initialized(instruction.operand_a);
                         require_initialized(instruction.operand_b);
                         break;
@@ -2665,6 +2690,7 @@ namespace rule_engine::python::compiler {
                     case Opcode::leave_try:
                     case Opcode::read_state:
                     case Opcode::write_state:
+                    case Opcode::delete_state:
                     case Opcode::begin_transaction:
                     case Opcode::commit_transaction:
                     case Opcode::rollback_transaction: break;

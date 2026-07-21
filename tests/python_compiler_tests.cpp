@@ -1156,6 +1156,23 @@ namespace {
         REQUIRE_FALSE(uninitialized.has_value());
         REQUIRE(std::ranges::any_of(uninitialized.error(),
                                     [](const Diagnostic &item) { return item.code == "PYC-UNINITIALIZED"; }));
+
+        artifact = StaticCompiler {}.compile(rule_pack, *payload, {}, {});
+        REQUIRE(artifact.has_value());
+        auto &iterator_function = artifact->pack.functions.front();
+        const auto span = iterator_function.instructions.front().span;
+        iterator_function.register_count = 4U;
+        iterator_function.instructions = {
+            {.opcode = Opcode::build_list, .destination = 1U, .operand_a = 0U, .operand_b = 0U, .span = span},
+            {.opcode = Opcode::get_iter, .destination = 2U, .operand_a = 1U, .span = span},
+            {.opcode = Opcode::iter_next, .destination = 3U, .operand_a = 2U, .immediate = 4U, .span = span},
+            {.opcode = Opcode::return_value, .operand_a = 3U, .span = span},
+            {.opcode = Opcode::return_value, .operand_a = 3U, .span = span},
+        };
+        const auto exhausted_value = verify_compiler_output(*artifact);
+        REQUIRE_FALSE(exhausted_value.has_value());
+        REQUIRE(std::ranges::any_of(exhausted_value.error(),
+                                    [](const Diagnostic &item) { return item.code == "PYC-UNINITIALIZED"; }));
     }
 
 } // namespace
