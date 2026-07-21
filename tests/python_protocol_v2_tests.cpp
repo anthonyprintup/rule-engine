@@ -53,6 +53,7 @@ namespace {
             .subject = region_subject(),
             .route = FactRoute {.provider = "windows.memory", .fact = "region.protection"},
             .expected_schema = SchemaId {"protection/v1"},
+            .expected_schema_hash = "sha256:protection-v1",
             .deadline_unix_ms = 5'000,
         };
     }
@@ -126,6 +127,8 @@ namespace {
                 .subject = region_subject(),
                 .status = FactTerminalStatus::value,
                 .value = nested_fact_value(),
+                .returned_schema = SchemaIdentity {.id = SchemaId {"protection/v1"},
+                                                   .canonical_hash = "sha256:protection-v1"},
                 .diagnostic = std::nullopt,
             }},
             .scans = {ScanResponse {
@@ -227,6 +230,7 @@ namespace {
         REQUIRE(decoded_lease.has_value());
         const auto &lease = std::get<WorkLeaseMessage>(decoded_lease->envelope.body);
         REQUIRE(lease.route == "windows.memory");
+        REQUIRE(lease.facts.front().expected_schema_hash == "sha256:protection-v1");
         REQUIRE(canonical_subject_key(lease.facts.front().subject) == canonical_subject_key(region_subject()));
         REQUIRE(lease.scans.front().plan.encoded_pattern == "48 8b ??");
         REQUIRE(lease.scans.front().plan.pattern_ids ==
@@ -238,6 +242,9 @@ namespace {
         REQUIRE(decoded_result.has_value());
         const auto &result = std::get<WorkResultMessage>(decoded_result->envelope.body);
         REQUIRE(result.facts.size() == 1);
+        REQUIRE(result.facts.front().returned_schema ==
+                std::optional<SchemaIdentity> {SchemaIdentity {.id = SchemaId {"protection/v1"},
+                                                               .canonical_hash = "sha256:protection-v1"}});
         REQUIRE(result.scans.front().matches.size() == 2);
         REQUIRE(result.scans.front().mode == ScanResultMode::exact_complete);
         REQUIRE(result.scans.front().matches.front().pattern_id == "pattern-1");
@@ -342,6 +349,28 @@ namespace {
         auto inconsistent_match_length = work_result();
         inconsistent_match_length.scans.front().matches.front().length = 2;
         REQUIRE_FALSE(encode_frame(envelope(inconsistent_match_length, 1)).has_value());
+
+        auto missing_request_hash = work_lease();
+        missing_request_hash.facts.front().expected_schema_hash.clear();
+        REQUIRE_FALSE(encode_frame(envelope(missing_request_hash)).has_value());
+
+        auto missing_returned_schema = work_result();
+        missing_returned_schema.facts.front().returned_schema.reset();
+        REQUIRE_FALSE(encode_frame(envelope(missing_returned_schema, 1)).has_value());
+
+        auto value_with_diagnostic = work_result();
+        value_with_diagnostic.facts.front().diagnostic = Diagnostic {
+            .code = "test.invalid",
+            .severity = DiagnosticSeverity::error,
+            .message = "mixed terminal",
+            .span = std::nullopt,
+            .related = {}};
+        REQUIRE_FALSE(encode_frame(envelope(value_with_diagnostic, 1)).has_value());
+
+        auto non_value_with_schema = work_result();
+        non_value_with_schema.facts.front().status = FactTerminalStatus::unavailable;
+        non_value_with_schema.facts.front().value.reset();
+        REQUIRE_FALSE(encode_frame(envelope(non_value_with_schema, 1)).has_value());
     }
 
     TEST_CASE("transport authentication requires TLS 1.3 mutual identity and operator mapping") {
@@ -582,6 +611,7 @@ namespace {
         std::vector<ScanRequest> scans;
         std::vector<RequestId> canceled;
         ScanBehavior scan_behavior {ScanBehavior::normal};
+        std::optional<SchemaIdentity> fact_schema_override;
 
         [[nodiscard]] std::expected<std::vector<FactResponse>, ProviderDispatchError>
         resolve_facts(const std::span<const FactRequest> requests) noexcept override {
@@ -592,6 +622,9 @@ namespace {
                                                .subject = request.subject,
                                                .status = FactTerminalStatus::value,
                                                .value = nested_fact_value(),
+                                               .returned_schema = fact_schema_override.value_or(SchemaIdentity {
+                                                   .id = request.expected_schema,
+                                                   .canonical_hash = request.expected_schema_hash}),
                                                .diagnostic = std::nullopt});
             }
             return result;
@@ -668,6 +701,13 @@ namespace {
         REQUIRE(result->scans.front().matches.front().pattern_id == "pattern-1");
         REQUIRE(result->scans.front().matches.back().pattern_id == "pattern-2");
         REQUIRE(result->work_id == "work-1");
+
+        provider.fact_schema_override =
+            SchemaIdentity {.id = SchemaId {"protection/v1"}, .canonical_hash = "sha256:wrong-revision"};
+        const auto wrong_schema = router.dispatch(work_lease());
+        REQUIRE_FALSE(wrong_schema.has_value());
+        REQUIRE(wrong_schema.error().code == ProviderDispatchErrorCode::provider_violation);
+        provider.fact_schema_override.reset();
 
         auto missing_pattern_ids = work_lease();
         missing_pattern_ids.scans.front().plan.pattern_ids.clear();

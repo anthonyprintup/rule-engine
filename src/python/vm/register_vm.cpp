@@ -297,6 +297,7 @@ namespace rule_engine::python::vm {
         struct CachedFactResponse {
             FactTerminalStatus status {FactTerminalStatus::failed};
             std::optional<FactValue> value;
+            std::optional<SchemaIdentity> returned_schema;
         };
 
         struct CachedCapabilityResponse {
@@ -1070,19 +1071,17 @@ namespace rule_engine::python::vm {
             if (pending->kind == PendingKind::fact) {
                 const auto &response = responses.facts.front();
                 if (response.request_id != pending->id ||
-                    canonical_subject_key(response.subject) != canonical_subject_key(pending->fact->subject)) {
+                    canonical_subject_key(response.subject) != canonical_subject_key(pending->fact->subject) ||
+                    !fact_response_schema_matches(*pending->fact, response)) {
                     return VmError {.code = VmErrorCode::invalid_host_response,
-                                    .message = "fact response identity does not match its request",
-                                    .span = pending->span};
-                }
-                if ((response.status == FactTerminalStatus::value) != response.value.has_value()) {
-                    return VmError {.code = VmErrorCode::invalid_host_response,
-                                    .message = "fact response value does not match its terminal status",
+                                    .message = "fact response identity, terminal shape, or schema does not match its request",
                                     .span = pending->span};
                 }
                 if (response.status != FactTerminalStatus::value) {
-                    fact_responses.insert_or_assign(
-                        pending->cache_key, CachedFactResponse {.status = response.status, .value = std::nullopt});
+                    fact_responses.insert_or_assign(pending->cache_key,
+                                                    CachedFactResponse {.status = response.status,
+                                                                        .value = std::nullopt,
+                                                                        .returned_schema = std::nullopt});
                     return raise_pending_terminal("fact provider returned terminal status " +
                                                   std::to_string(static_cast<unsigned>(response.status)));
                 }
@@ -1092,8 +1091,10 @@ namespace rule_engine::python::vm {
                                     .message = "fact response failed schema validation: " + schema.error().message,
                                     .span = pending->span};
                 }
-                fact_responses.insert_or_assign(
-                    pending->cache_key, CachedFactResponse {.status = response.status, .value = *response.value});
+                fact_responses.insert_or_assign(pending->cache_key,
+                                                CachedFactResponse {.status = response.status,
+                                                                    .value = *response.value,
+                                                                    .returned_schema = response.returned_schema});
                 const auto bytes = fact_size(*response.value);
                 if (bytes == std::numeric_limits<std::size_t>::max() || bytes > invocation.budget.normal.fact_bytes ||
                     counters.fact_bytes > invocation.budget.normal.fact_bytes - bytes) {
@@ -1235,13 +1236,24 @@ namespace rule_engine::python::vm {
                                 .message = "await_fact constant is not a valid fact operand",
                                 .span = instruction.span};
             }
-            const auto cache_key =
-                canonical_subject_key(invocation.subject) + "\x1f" + *provider + "\x1f" + *fact + "\x1f" + *schema;
+            const auto schema_identity = resolve_schema_identity(pack.schemas, SchemaId {*schema});
+            if (!schema_identity.has_value()) {
+                return VmError {.code = VmErrorCode::invalid_bytecode,
+                                .message = "await_fact schema is absent from the active schema catalog",
+                                .span = instruction.span};
+            }
+            const auto cache_key = canonical_subject_key(invocation.subject) + "\x1f" + *provider + "\x1f" + *fact +
+                                   "\x1f" + *schema + "\x1f" + schema_identity->canonical_hash;
             if (const auto cached = fact_responses.find(cache_key); cached != fact_responses.end()) {
                 if (cached->second.status != FactTerminalStatus::value || !cached->second.value.has_value()) {
                     return raise_author_terminal(instruction,
                                                  "fact provider returned terminal status " +
                                                      std::to_string(static_cast<unsigned>(cached->second.status)));
+                }
+                if (cached->second.returned_schema != schema_identity) {
+                    return VmError {.code = VmErrorCode::engine_fault,
+                                    .message = "cached fact response schema identity drifted",
+                                    .span = instruction.span};
                 }
                 if (auto valid = ValueHeap::validate_schema(*cached->second.value, SchemaId {*schema}, &pack.schemas);
                     !valid) {
@@ -1271,6 +1283,7 @@ namespace rule_engine::python::vm {
                 .subject = invocation.subject,
                 .route = FactRoute {.provider = *provider, .fact = *fact},
                 .expected_schema = SchemaId {*schema},
+                .expected_schema_hash = schema_identity->canonical_hash,
                 .deadline_unix_ms = deadline_after(remaining_elapsed()),
             };
             logical_reads.push_back(id.value + ":" + *provider + ":" + *fact);

@@ -92,6 +92,9 @@ namespace {
 
     [[nodiscard]] proto::WorkLeaseMessage work(const proto::ServerHelloMessage &server,
                                                const std::uint64_t sequence = 1U) {
+        const auto *descriptor =
+            win::find_windows_fact_descriptor(py::SchemaId {"windows.process.v1"}, "process.path");
+        REQUIRE(descriptor != nullptr);
         return proto::WorkLeaseMessage {
             .session = server.session,
             .peer = server.peer,
@@ -104,8 +107,9 @@ namespace {
             .route = "windows",
             .facts = {{.request_id = py::RequestId {"fact:test"},
                        .subject = subject(),
-                       .route = {.provider = "windows", .fact = "process.image-path"},
-                       .expected_schema = py::SchemaId {"schema:test"},
+                       .route = {.provider = "windows", .fact = "process.path"},
+                       .expected_schema = descriptor->value_schema.id,
+                       .expected_schema_hash = descriptor->value_schema.canonical_hash,
                        .deadline_unix_ms = win::unix_time_ms() + 60'000U}},
             .scans = {},
         };
@@ -262,6 +266,7 @@ namespace {
                     .subject = request.subject,
                     .status = py::FactTerminalStatus::unsupported,
                     .value = std::nullopt,
+                    .returned_schema = std::nullopt,
                     .diagnostic = py::Diagnostic {.code = "test.unsupported",
                                                   .severity = py::DiagnosticSeverity::error,
                                                   .message = "fake data-only provider",

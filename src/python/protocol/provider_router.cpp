@@ -18,8 +18,7 @@ namespace rule_engine::python::protocol_v2 {
         }
 
         [[nodiscard]] bool response_status_valid(const FactResponse &response) {
-            return response.status == FactTerminalStatus::value ? response.value.has_value() :
-                                                                  !response.value.has_value();
+            return valid_fact_response_shape(response);
         }
 
         [[nodiscard]] bool scan_status_valid(const ScanResponse &response) {
@@ -92,7 +91,7 @@ namespace rule_engine::python::protocol_v2 {
         for (const auto &request : work.facts) {
             if (request.request_id.empty() || !request_ids.insert(request.request_id.value).second ||
                 !request.subject.valid() || request.subject.peer != work.peer || request.route.provider != work.route ||
-                request.route.fact.empty() || request.expected_schema.empty()) {
+                request.route.fact.empty() || request.expected_schema.empty() || request.expected_schema_hash.empty()) {
                 return std::unexpected(provider_error(ProviderDispatchErrorCode::invalid_request,
                                                       "fact request is not bound to the work route and subject"));
             }
@@ -169,9 +168,10 @@ namespace rule_engine::python::protocol_v2 {
         output.facts.reserve(work.facts.size());
         for (const auto &request : work.facts) {
             auto found = facts_by_id.find(request.request_id.value);
-            if (found == facts_by_id.end() || !same_subject(found->second.subject, request.subject)) {
+            if (found == facts_by_id.end() || !same_subject(found->second.subject, request.subject) ||
+                !fact_response_schema_matches(request, found->second)) {
                 return std::unexpected(provider_error(ProviderDispatchErrorCode::provider_violation,
-                                                      "fact result request or subject does not match"));
+                                                      "fact result request, subject, or schema does not match"));
             }
             output.facts.push_back(std::move(found->second));
         }

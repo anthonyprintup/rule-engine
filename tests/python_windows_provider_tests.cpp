@@ -70,10 +70,15 @@ namespace {
 
     [[nodiscard]] py::FactRequest request(py::SubjectKey subject, std::string route,
                                           const std::uint64_t deadline = 0U) {
+        const auto *descriptor = win::find_windows_fact_descriptor(subject.descriptor, route);
+        const auto fallback = py::resolve_schema_identity(py::SchemaCatalog {}, py::SchemaId {"bool"});
+        REQUIRE(fallback.has_value());
+        const auto schema = descriptor == nullptr ? *fallback : descriptor->value_schema;
         return py::FactRequest {.request_id = py::RequestId {"request:test"},
                                 .subject = std::move(subject),
                                 .route = py::FactRoute {.provider = "windows", .fact = std::move(route)},
-                                .expected_schema = py::SchemaId {"schema:test"},
+                                .expected_schema = schema.id,
+                                .expected_schema_hash = schema.canonical_hash,
                                 .deadline_unix_ms = deadline};
     }
 
@@ -272,30 +277,43 @@ TEST_CASE("Windows fact dispatch returns typed values and typed terminal statuse
     for (const auto route :
          {"process.pid", "process.name", "process.path", "process.architecture", "process.command_line", "process.user",
           "process.token", "process.modules", "process.memory.summary", "process.handles.count"}) {
-        const auto response = win::dispatch_fact(request(subject, route));
+        const auto fact_request = request(subject, route);
+        const auto response = win::dispatch_fact(fact_request);
         INFO(route);
         REQUIRE(response.status == py::FactTerminalStatus::value);
         REQUIRE(response.value.has_value());
         REQUIRE(response.value->valid());
+        REQUIRE(py::fact_response_schema_matches(fact_request, response));
     }
     for (const auto route : {"process.user.sid", "process.user.name", "process.token.elevated", "process.token.type",
                              "process.integrity_level", "process.modules.count", "process.modules.names",
                              "process.memory.regions.count", "process.memory.regions.readable_count",
                              "process.memory.regions", "process.signer.status", "process.signer.is_signed"}) {
-        const auto response = win::dispatch_fact(request(subject, route));
+        const auto fact_request = request(subject, route);
+        const auto response = win::dispatch_fact(fact_request);
         INFO(route);
         REQUIRE(response.status == py::FactTerminalStatus::value);
         REQUIRE(response.value.has_value());
+        REQUIRE(py::fact_response_schema_matches(fact_request, response));
     }
 
     const auto unsupported = win::dispatch_fact(request(subject, "process.evaluate_predicate"));
     REQUIRE(unsupported.status == py::FactTerminalStatus::unsupported);
     REQUIRE_FALSE(unsupported.value.has_value());
+    REQUIRE_FALSE(unsupported.returned_schema.has_value());
     REQUIRE(unsupported.diagnostic.has_value());
 
     const auto timed_out = win::dispatch_fact(request(subject, "process.name", win::unix_time_ms() - 1U));
     REQUIRE(timed_out.status == py::FactTerminalStatus::timed_out);
     REQUIRE_FALSE(timed_out.value.has_value());
+    REQUIRE_FALSE(timed_out.returned_schema.has_value());
+
+    auto wrong_schema = request(subject, "process.pid");
+    wrong_schema.expected_schema_hash = "fnv1a64:0000000000000000";
+    const auto rejected_schema = win::dispatch_fact(wrong_schema);
+    REQUIRE(rejected_schema.status == py::FactTerminalStatus::failed);
+    REQUIRE_FALSE(rejected_schema.value.has_value());
+    REQUIRE_FALSE(rejected_schema.returned_schema.has_value());
 }
 
 TEST_CASE("Windows stale process subjects fail closed rather than aliasing a reused PID") {

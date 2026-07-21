@@ -46,6 +46,7 @@ namespace {
             .subject = subject(),
             .route = {.provider = "process", .fact = "image_name"},
             .expected_schema = SchemaId {"unicode/v1"},
+            .expected_schema_hash = "sha256:unicode-v1",
             .deadline_unix_ms = 1'000U,
         };
     }
@@ -111,6 +112,8 @@ namespace {
                 .subject = request.subject,
                 .status = FactTerminalStatus::value,
                 .value = make_fact(UnicodeValue {.utf8 = "demo.exe"}),
+                .returned_schema = SchemaIdentity {.id = request.expected_schema,
+                                                   .canonical_hash = request.expected_schema_hash},
             });
         }
         for (const auto &request : work.scans) {
@@ -370,6 +373,8 @@ namespace {
                     .subject = request.subject,
                     .status = FactTerminalStatus::value,
                     .value = make_fact(UnicodeValue {.utf8 = "demo.exe"}),
+                    .returned_schema = SchemaIdentity {.id = request.expected_schema,
+                                                       .canonical_hash = request.expected_schema_hash},
                 });
             }
             return result;
@@ -738,6 +743,12 @@ TEST_CASE("protocol-v2 terminal responses are bound to the exact request subject
     const auto subject_rejected = port->admit(wrong_subject);
     REQUIRE_FALSE(subject_rejected.has_value());
     CHECK(subject_rejected.error().code == protocol_v2::ProtocolErrorCode::provider_violation);
+
+    auto wrong_schema = provider_result(work);
+    wrong_schema.facts.front().returned_schema->canonical_hash = "sha256:wrong-revision";
+    const auto schema_rejected = port->admit(wrong_schema);
+    REQUIRE_FALSE(schema_rejected.has_value());
+    CHECK(schema_rejected.error().code == protocol_v2::ProtocolErrorCode::provider_violation);
 
     auto out_of_bounds_scan = provider_result(work);
     ++out_of_bounds_scan.scans.front().matches.front().absolute_address;

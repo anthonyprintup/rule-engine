@@ -40,7 +40,9 @@ These contracts are frozen by the F0 commit. Lanes may depend on them but must n
 
 ## Facts and providers
 
-- `IProviderDispatcher` receives only request ID, typed subject, route, fact/scan request, deadline, and cancellation. It never receives a predicate or authority to decide a rule.
+- `IProviderDispatcher` receives only request ID, typed subject, route, exact expected schema ID and canonical hash, fact/scan request, deadline, and cancellation. It never receives a predicate or authority to decide a rule.
+- `FactResponse` is a closed terminal union. A `value` response contains one valid value, the authoritative returned schema ID/hash, and no diagnostic. Every non-value terminal contains neither a value nor a returned schema identity and may contain one bounded diagnostic. Unknown statuses and every mixed/partial shape are malformed.
+- The request schema identity comes from the active pack catalog. A provider derives the returned identity from its own route catalog rather than echoing the request. Codec, provider router, protocol runtime adapter, resident runtime, and VM reject any value whose returned ID/hash differs from the request before it can become a VM value; the VM then validates the value structure against the active descriptor.
 - Provider batches contain typed values or typed terminal statuses. Schema, subject, request, size, and capability validation happens before a response reaches the VM.
 - Authoritative enumeration uses begin/chunk/commit with generation, count, and digest; visibility changes only on a valid complete commit.
 

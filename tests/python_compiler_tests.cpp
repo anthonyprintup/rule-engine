@@ -618,6 +618,8 @@ namespace {
             .subject = waiting.fact_requests.front().subject,
             .status = FactTerminalStatus::value,
             .value = make_fact(false),
+            .returned_schema = SchemaIdentity {.id = waiting.fact_requests.front().expected_schema,
+                                               .canonical_hash = waiting.fact_requests.front().expected_schema_hash},
             .diagnostic = std::nullopt,
         });
         const auto completed = (*session)->step(std::move(response));
@@ -1089,6 +1091,8 @@ namespace {
             .subject = waiting.fact_requests.front().subject,
             .status = FactTerminalStatus::value,
             .value = make_fact(false),
+            .returned_schema = SchemaIdentity {.id = waiting.fact_requests.front().expected_schema,
+                                               .canonical_hash = waiting.fact_requests.front().expected_schema_hash},
             .diagnostic = std::nullopt,
         });
         const auto completed = (*session)->step(std::move(response));
@@ -1164,6 +1168,8 @@ namespace {
             .subject = fact_wait.fact_requests.front().subject,
             .status = FactTerminalStatus::value,
             .value = make_fact(true),
+            .returned_schema = SchemaIdentity {.id = fact_wait.fact_requests.front().expected_schema,
+                                               .canonical_hash = fact_wait.fact_requests.front().expected_schema_hash},
             .diagnostic = std::nullopt,
         });
         const auto capability_wait = (*session)->step(std::move(fact_response));

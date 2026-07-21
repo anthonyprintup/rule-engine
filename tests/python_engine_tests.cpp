@@ -68,6 +68,7 @@ namespace {
                         .subject = subject(),
                         .route = FactRoute {.provider = "process", .fact = "name"},
                         .expected_schema = SchemaId {"string/v1"},
+                        .expected_schema_hash = "sha256:string-v1",
                         .deadline_unix_ms = 100,
                     }},
                 };

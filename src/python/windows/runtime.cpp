@@ -65,6 +65,7 @@ namespace rule_engine::python::windows {
                 append_token(canonical, request.route.provider);
                 append_token(canonical, request.route.fact);
                 append_token(canonical, request.expected_schema.value);
+                append_token(canonical, request.expected_schema_hash);
                 append_integer(canonical, request.deadline_unix_ms);
             }
             append_integer(canonical, work.scans.size());
@@ -130,6 +131,8 @@ namespace rule_engine::python::windows {
                     request.route.fact.empty() || request.route.fact.size() > limits.maximum_string_bytes ||
                     request.expected_schema.empty() ||
                     request.expected_schema.value.size() > limits.maximum_string_bytes ||
+                    request.expected_schema_hash.empty() ||
+                    request.expected_schema_hash.size() > limits.maximum_string_bytes ||
                     request.deadline_unix_ms == 0U) {
                     return std::unexpected(runtime_error(
                         AgentRuntimeErrorCode::invalid_work,
@@ -172,8 +175,7 @@ namespace rule_engine::python::windows {
 
         [[nodiscard]] bool fact_response_valid(const FactRequest &request, const FactResponse &response) {
             return response.request_id == request.request_id && same_subject(response.subject, request.subject) &&
-                   (response.status == FactTerminalStatus::value ? response.value.has_value() :
-                                                                   !response.value.has_value());
+                   fact_response_schema_matches(request, response);
         }
 
         [[nodiscard]] bool scan_response_valid(const ScanRequest &request, const ScanResponse &response,
@@ -225,6 +227,10 @@ namespace rule_engine::python::windows {
                 if (response.value.has_value()) {
                     add_size(bytes, canonical_provider_value(*response.value).size());
                 }
+                if (response.returned_schema.has_value()) {
+                    add_size(bytes, response.returned_schema->id.value.size());
+                    add_size(bytes, response.returned_schema->canonical_hash.size());
+                }
                 if (response.diagnostic.has_value()) {
                     add_size(bytes, response.diagnostic->code.size());
                     add_size(bytes, response.diagnostic->message.size());
@@ -262,6 +268,7 @@ namespace rule_engine::python::windows {
                                  .subject = request.subject,
                                  .status = FactTerminalStatus::canceled,
                                  .value = std::nullopt,
+                                 .returned_schema = std::nullopt,
                                  .diagnostic = canceled_diagnostic()};
         }
 

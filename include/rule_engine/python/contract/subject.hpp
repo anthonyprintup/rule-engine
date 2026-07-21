@@ -48,6 +48,7 @@ namespace rule_engine::python {
         SubjectKey subject;
         FactRoute route;
         SchemaId expected_schema;
+        std::string expected_schema_hash;
         std::uint64_t deadline_unix_ms {};
     };
 
@@ -87,8 +88,17 @@ namespace rule_engine::python {
         SubjectKey subject;
         FactTerminalStatus status {FactTerminalStatus::failed};
         std::optional<FactValue> value;
+        std::optional<SchemaIdentity> returned_schema;
         std::optional<Diagnostic> diagnostic;
     };
+
+    // FactResponse is a closed terminal union. Value responses carry exactly
+    // one value and the authoritative descriptor identity used to produce it;
+    // every non-value terminal carries neither. Diagnostics are optional only
+    // for non-value terminals.
+    [[nodiscard]] bool valid_fact_response_shape(const FactResponse &response) noexcept;
+    [[nodiscard]] bool fact_response_schema_matches(const FactRequest &request,
+                                                     const FactResponse &response) noexcept;
 
     struct ScanMatch {
         std::uint64_t offset {};

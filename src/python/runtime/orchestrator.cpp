@@ -71,6 +71,7 @@ namespace rule_engine::python::runtime {
             append_component(key, request.route.provider);
             append_component(key, request.route.fact);
             append_component(key, request.expected_schema.value);
+            append_component(key, request.expected_schema_hash);
             return key;
         }
 
@@ -267,10 +268,9 @@ namespace rule_engine::python::runtime {
                                                                                        const FactResponse &response) {
             if (response.request_id != request.request_id ||
                 canonical_subject_key(response.subject) != canonical_subject_key(request.subject) ||
-                (response.status == FactTerminalStatus::value) != response.value.has_value() ||
-                (response.value && !response.value->valid())) {
+                !fact_response_schema_matches(request, response)) {
                 return std::unexpected(runtime_error(ResidentRuntimeErrorCode::invalid_response,
-                                                     "fact response identity or value/status shape is invalid"));
+                                                     "fact response identity, terminal shape, or schema is invalid"));
             }
             return {};
         }

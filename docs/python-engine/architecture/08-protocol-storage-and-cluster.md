@@ -157,10 +157,11 @@ The envelope deliberately omits an authoritative `PeerId`: the accepted TLS iden
 
 - `WorkLease`
   - `WorkId`, `AttemptId`, `WorkFence`, `SessionFence`, pack generation, typed subject, work kind, provider route, bounded request batch, absolute server deadline plus relative remaining duration, and cancellation token ID;
+  - each fact request carries the exact expected schema ID and canonical descriptor hash derived from the active pack catalog;
   - kinds are fact read, scan plan, root inventory, nested enumeration, and explicitly modeled capture;
   - contains no rule expression, predicate, verdict threshold, effect policy, correlation query, or bytecode.
 - `WorkAccepted` or `WorkRejected` reports whether the route/capability can begin. Acceptance does not extend its deadline.
-- `WorkResult` contains the originating session/work identities and fences, typed per-item values or terminal statuses, provider timing, and bounded diagnostics. It is a durable spooled message. On replay, the server first resolves the agent epoch/sequence: an already committed result returns its recorded disposition, while an uncommitted result with a stale originating fence is durably rejected so the work can be reassigned.
+- `WorkResult` contains the originating session/work identities and fences, typed per-item values or terminal statuses, provider timing, and bounded diagnostics. A fact value carries the authoritative returned schema ID/hash from the provider route catalog and no diagnostic. A non-value terminal carries neither a value nor schema identity and may carry a diagnostic. Missing, mixed, unknown, or mismatched shapes are protocol violations. It is a durable spooled message. On replay, the server first resolves the agent epoch/sequence: an already committed result returns its recorded disposition, while an uncommitted result with a stale originating fence is durably rejected so the work can be reassigned.
 - `WorkCancel` is best effort and identifies the attempt/fence. The agent stops promptly where the OS/provider permits and replies with a canceled result. A late result is harmless because the database fence rejects it.
 - `QueueHint` is an ephemeral wake-up instruction requesting the agent to ask for work or refresh an inventory. Losing it is safe because server scheduling and reconciliation remain authoritative.
 
@@ -197,6 +198,8 @@ Negotiation rules:
 7. A capability is usable only if route version, request/response projections, resource bounds, and operator policy all intersect. Required pack capabilities missing on any targeted peer fail activation or make that peer ineligible according to pack policy; optional capability parameters are consistently passed as `None`.
 
 This preserves additive optional evolution while preventing a merely matching name from changing C++ semantics.
+
+For a fact value, negotiation compatibility is necessary but not sufficient. Admission correlates the exact request and subject, compares returned schema ID and hash byte-for-byte with the requested pair, then validates the value against the server's active descriptor. These checks occur before the response enters resident capture or the VM. The provider derives its returned pair from its route catalog; simply reflecting request bytes is not an attestation.
 
 ### 4.5 Session, sequence, reconnect, and spool state machines
 

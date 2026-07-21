@@ -20,6 +20,105 @@
 namespace rule_engine::python::windows {
     namespace {
 
+        struct FactDescriptorSpec {
+            std::string_view subject_schema;
+            std::string_view route;
+            std::string_view value_schema;
+        };
+
+        struct ValueSchemaSpec {
+            std::string_view schema;
+            std::string_view canonical_descriptor;
+        };
+
+        constexpr std::array value_schema_specs {
+            ValueSchemaSpec {process_parent_value_schema,
+                             "windows.process-parent-value.v1|1:int|required|2:optional-int|required"},
+            ValueSchemaSpec {process_user_value_schema,
+                             "windows.process-user-value.v1|1:text|required|2:text|required"},
+            ValueSchemaSpec {process_token_value_schema,
+                             "windows.process-token-value.v1|1:bool|required|2:text|required|3:text|required"},
+            ValueSchemaSpec {process_memory_value_schema,
+                             "windows.process-memory-value.v1|1:int|required|2:int|required|3:int|required|4:int|required"},
+            ValueSchemaSpec {signer_value_schema,
+                             "windows.signer-value.v1|1:text|required|2:bool|required|3:bool|required|4:int|required|"
+                             "5:optional-text|required|6:optional-text|required|7:optional-bytes|required|"
+                             "8:optional-bytes|required"},
+            ValueSchemaSpec {pe_value_schema,
+                             "windows.pe-value.v1|1:bool|required|2-9:optional-int|required|10-16:list|required|"
+                             "17:int|required|18:int|required"},
+        };
+
+        constexpr std::array fact_descriptor_specs {
+            FactDescriptorSpec {process_schema, "process.pid", "int"},
+            FactDescriptorSpec {process_schema, "process.creation_time", "int"},
+            FactDescriptorSpec {process_schema, "process.name", "text"},
+            FactDescriptorSpec {process_schema, "process.thread_count", "int"},
+            FactDescriptorSpec {process_schema, "process.handles.count", "int"},
+            FactDescriptorSpec {process_schema, "process.session_id", "int"},
+            FactDescriptorSpec {process_schema, "process.parent", process_parent_value_schema},
+            FactDescriptorSpec {process_schema, "process.parent.pid", "int"},
+            FactDescriptorSpec {process_schema, "process.path", "text"},
+            FactDescriptorSpec {process_schema, "process.image.path", "text"},
+            FactDescriptorSpec {process_schema, "process.architecture", "text"},
+            FactDescriptorSpec {process_schema, "process.command_line", "text"},
+            FactDescriptorSpec {process_schema, "process.user", process_user_value_schema},
+            FactDescriptorSpec {process_schema, "process.user.sid", "text"},
+            FactDescriptorSpec {process_schema, "process.user.name", "text"},
+            FactDescriptorSpec {process_schema, "process.token", process_token_value_schema},
+            FactDescriptorSpec {process_schema, "process.token.elevated", "bool"},
+            FactDescriptorSpec {process_schema, "process.token.type", "text"},
+            FactDescriptorSpec {process_schema, "process.integrity_level", "text"},
+            FactDescriptorSpec {process_schema, "process.modules", "list"},
+            FactDescriptorSpec {process_schema, "process.modules.count", "int"},
+            FactDescriptorSpec {process_schema, "process.modules.names", "list"},
+            FactDescriptorSpec {process_schema, "process.memory.summary", process_memory_value_schema},
+            FactDescriptorSpec {process_schema, "process.memory.regions.count", "int"},
+            FactDescriptorSpec {process_schema, "process.memory.regions.readable_count", "int"},
+            FactDescriptorSpec {process_schema, "process.memory.regions", "list"},
+            FactDescriptorSpec {process_schema, "process.signer", signer_value_schema},
+            FactDescriptorSpec {process_schema, "process.signer.status", "text"},
+            FactDescriptorSpec {process_schema, "process.signer.is_signed", "bool"},
+            FactDescriptorSpec {process_schema, "process.pe", pe_value_schema},
+            FactDescriptorSpec {image_schema, "image.signer", signer_value_schema},
+            FactDescriptorSpec {image_schema, "image.path", "text"},
+            FactDescriptorSpec {image_schema, "image.volume_serial", "int"},
+            FactDescriptorSpec {image_schema, "image.file_id", "bytes"},
+            FactDescriptorSpec {image_schema, "pe.image", pe_value_schema},
+            FactDescriptorSpec {image_schema, "pe.is_valid", "bool"},
+            FactDescriptorSpec {image_schema, "pe.machine", "int"},
+            FactDescriptorSpec {image_schema, "pe.number_of_sections", "int"},
+            FactDescriptorSpec {image_schema, "pe.entry_point", "int"},
+            FactDescriptorSpec {image_schema, "pe.size_of_image", "int"},
+            FactDescriptorSpec {image_schema, "pe.subsystem", "int"},
+            FactDescriptorSpec {image_schema, "pe.characteristics", "int"},
+            FactDescriptorSpec {image_schema, "pe.dll_characteristics", "int"},
+            FactDescriptorSpec {image_schema, "pe.timestamp", "int"},
+            FactDescriptorSpec {image_schema, "pe.sections", "list"},
+            FactDescriptorSpec {image_schema, "pe.imports", "list"},
+            FactDescriptorSpec {image_schema, "pe.exports", "list"},
+            FactDescriptorSpec {image_schema, "pe.debug_entries", "list"},
+            FactDescriptorSpec {image_schema, "pe.resources", "list"},
+            FactDescriptorSpec {image_schema, "pe.certificates", "list"},
+            FactDescriptorSpec {image_schema, "pe.tls_callbacks", "list"},
+            FactDescriptorSpec {image_schema, "image.size", "int"},
+            FactDescriptorSpec {image_schema, "image.last_write_time", "int"},
+        };
+
+        [[nodiscard]] SchemaIdentity provider_schema_identity(const std::string_view schema) {
+            SchemaId id {std::string {schema}};
+            if (auto builtin = resolve_schema_identity(SchemaCatalog {}, id); builtin.has_value()) {
+                return std::move(*builtin);
+            }
+            const auto descriptor = std::ranges::find(value_schema_specs, schema, &ValueSchemaSpec::schema);
+            const auto canonical = descriptor == value_schema_specs.end() ? schema : descriptor->canonical_descriptor;
+            return SchemaIdentity {
+                .id = std::move(id),
+                .canonical_hash = canonical_schema_hash("rule-engine.windows.fact-value-schema.v1|" +
+                                                        std::string {canonical}),
+            };
+        }
+
         struct UniqueHandle {
             HANDLE value {INVALID_HANDLE_VALUE};
 
@@ -194,6 +293,31 @@ namespace rule_engine::python::windows {
         }
 
     } // namespace
+
+    const std::vector<WindowsFactDescriptor> &windows_fact_catalog() {
+        static const auto catalog = [] {
+            std::vector<WindowsFactDescriptor> result;
+            result.reserve(fact_descriptor_specs.size());
+            for (const auto &descriptor : fact_descriptor_specs) {
+                result.push_back(WindowsFactDescriptor {
+                    .subject_schema = SchemaId {std::string {descriptor.subject_schema}},
+                    .route = std::string {descriptor.route},
+                    .value_schema = provider_schema_identity(descriptor.value_schema),
+                });
+            }
+            return result;
+        }();
+        return catalog;
+    }
+
+    const WindowsFactDescriptor *find_windows_fact_descriptor(const SchemaId &subject_schema,
+                                                               const std::string_view route) {
+        const auto &catalog = windows_fact_catalog();
+        const auto found = std::ranges::find_if(catalog, [&](const WindowsFactDescriptor &descriptor) {
+            return descriptor.subject_schema == subject_schema && descriptor.route == route;
+        });
+        return found == catalog.end() ? nullptr : std::addressof(*found);
+    }
 
     FactTerminalStatus terminal_status(const ProviderErrorCode code) noexcept {
         switch (code) {

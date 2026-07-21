@@ -106,12 +106,20 @@ Canonical serialization is versioned and length-delimited. A SHA-256 digest may 
 ```text
 FactRequest {
   request_id, execution_id, peer_id, session_id, fence,
-  subject_key, fact_id, route, expected_schema_hash,
+  subject_key, fact_id, route, expected_schema_id, expected_schema_hash,
   deadline, cancellation_token
 }
 ```
 
 Requests may be batched only when peer, session, route, deadline class, and negotiated schema permit it. Each result addresses one exact request and is either a validated value or one of these terminal statuses:
+
+```text
+FactResponse =
+  Value { request_id, subject_key, value, returned_schema_id, returned_schema_hash }
+  | Terminal { request_id, subject_key, status, diagnostic? }
+```
+
+This is a closed union. The value arm requires all value and returned-schema fields and forbids a diagnostic. The terminal arm forbids both value and returned-schema fields. Unknown statuses, missing fields, and mixed arms are malformed. The VM obtains the requested identity from the active pack catalog, while the provider obtains the returned identity from its authoritative route descriptor; it must not manufacture proof by copying the request. Exact ID/hash equality is checked at codec, routing, protocol-adapter, resident-runtime, and VM admission boundaries before the value is thawed, followed by structural validation against the active descriptor.
 
 | Wire status | VM exception | Meaning |
 |---|---|---|
@@ -169,8 +177,8 @@ sequenceDiagram
     else "No entry"
         V->>C: "Suspend with exact continuation and FactRequest"
         C->>A: "Batch typed requests by route"
-        A-->>C: "Typed values/statuses only"
-        C->>S: "Validate session, request, schema, size, and label"
+        A-->>C: "Typed value + actual schema ID/hash, or status only"
+        C->>S: "Validate session, request, exact schema identity, shape, size, and label"
         S-->>V: "HostResponses"
         V->>V: "Capture response for replay and resume same PC"
         V->>R: "Return value or raise typed exception"
@@ -247,7 +255,7 @@ On rejection, timeout, cancellation, or disconnect, staged data is discarded, vi
 8. An unreached prefetched fact is unobservable to rule code and logical accounting.
 9. A `MatchSet` is exact and complete or no value is returned.
 10. Agents return typed facts/matches only; C++ computes every decision.
-11. Required schema hashes and capabilities are negotiated before activation; runtime mismatches fail closed.
+11. Required schema IDs/hashes and capabilities are negotiated before activation; every value response independently attests the provider route descriptor and runtime mismatches fail closed before VM exposure.
 
 ## 8. Failure modes and recovery
 

@@ -5,6 +5,7 @@
 #include <charconv>
 #include <set>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -64,7 +65,114 @@ namespace rule_engine::python {
                                .related = {}};
         }
 
+        [[nodiscard]] std::string hexadecimal(std::uint64_t value) {
+            constexpr std::string_view digits = "0123456789abcdef";
+            std::array<char, 16> result {};
+            for (auto index = result.size(); index > 0; --index) {
+                result[index - 1] = digits[value & 0xfU];
+                value >>= 4U;
+            }
+            return std::string {result.data(), result.size()};
+        }
+
+        [[nodiscard]] std::optional<std::string_view> builtin_schema_name(const std::string_view schema) noexcept {
+            if (schema == "none" || schema == "null") {
+                return "none";
+            }
+            if (schema == "bool" || schema == "boolean") {
+                return "bool";
+            }
+            if (schema == "int" || schema == "integer") {
+                return "int";
+            }
+            if (schema == "float") {
+                return "float";
+            }
+            if (schema == "str" || schema == "string" || schema == "text" || schema == "unicode") {
+                return "text";
+            }
+            if (schema == "bytes") {
+                return "bytes";
+            }
+            if (schema == "list") {
+                return "list";
+            }
+            if (schema == "tuple") {
+                return "tuple";
+            }
+            if (schema == "dict") {
+                return "dict";
+            }
+            if (schema == "any") {
+                return "any";
+            }
+            return std::nullopt;
+        }
+
     } // namespace
+
+    std::string canonical_schema_hash(const std::string_view canonical_descriptor) {
+        std::uint64_t value = 1469598103934665603ULL;
+        for (const auto character : canonical_descriptor) {
+            value ^= static_cast<unsigned char>(character);
+            value *= 1099511628211ULL;
+        }
+        return "fnv1a64:" + hexadecimal(value);
+    }
+
+    std::optional<SchemaIdentity> resolve_schema_identity(const SchemaCatalog &catalog, const SchemaId &schema) {
+        if (schema.empty()) {
+            return std::nullopt;
+        }
+        const auto descriptor = std::ranges::find(catalog.descriptors, schema, &SchemaDescriptor::id);
+        if (descriptor != catalog.descriptors.end()) {
+            if (descriptor->canonical_hash.empty()) {
+                return std::nullopt;
+            }
+            return SchemaIdentity {.id = descriptor->id, .canonical_hash = descriptor->canonical_hash};
+        }
+        const auto builtin = builtin_schema_name(schema.value);
+        if (!builtin.has_value()) {
+            return std::nullopt;
+        }
+        return SchemaIdentity {
+            .id = schema,
+            .canonical_hash = canonical_schema_hash("rule-engine.builtin-schema.v1|" + std::string {*builtin}),
+        };
+    }
+
+    bool valid_fact_response_shape(const FactResponse &response) noexcept {
+        if (response.status == FactTerminalStatus::value) {
+            return response.value.has_value() && response.value->valid() && response.returned_schema.has_value() &&
+                   response.returned_schema->valid() && !response.diagnostic.has_value();
+        }
+        const auto known_terminal = [&] {
+            switch (response.status) {
+                case FactTerminalStatus::unavailable:
+                case FactTerminalStatus::unsupported:
+                case FactTerminalStatus::denied:
+                case FactTerminalStatus::timed_out:
+                case FactTerminalStatus::failed:
+                case FactTerminalStatus::canceled: return true;
+                case FactTerminalStatus::value: return false;
+                default: return false;
+            }
+        }();
+        return known_terminal && !response.value.has_value() && !response.returned_schema.has_value();
+    }
+
+    bool fact_response_schema_matches(const FactRequest &request, const FactResponse &response) noexcept {
+        if (!valid_fact_response_shape(response) || request.expected_schema.empty() ||
+            request.expected_schema_hash.empty()) {
+            return false;
+        }
+        if (response.status != FactTerminalStatus::value) {
+            return true;
+        }
+        return response.returned_schema ==
+               std::optional<SchemaIdentity> {SchemaIdentity {.id = request.expected_schema,
+                                                               .canonical_hash = request.expected_schema_hash}};
+    }
 
     DataLabel join_labels(const DataLabel &left, const DataLabel &right) {
         DataLabel result {

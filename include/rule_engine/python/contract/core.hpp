@@ -54,6 +54,14 @@ namespace rule_engine::python {
     using CapabilityId = StrongId<CapabilityIdTag>;
     using TenantId = StrongId<TenantIdTag>;
 
+    struct SchemaIdentity {
+        SchemaId id;
+        std::string canonical_hash;
+
+        [[nodiscard]] bool valid() const noexcept { return !id.empty() && !canonical_hash.empty(); }
+        auto operator<=>(const SchemaIdentity &) const = default;
+    };
+
     struct SourceSpan {
         SourceId source;
         std::uint32_t begin_byte {};

@@ -471,6 +471,45 @@ namespace rule_engine::python::protocol_v2 {
             return result;
         }
 
+        void encode_schema_identity(Writer &writer, const SchemaIdentity &identity) {
+            writer.string_field(1, identity.id.value);
+            writer.string_field(2, identity.canonical_hash);
+        }
+
+        [[nodiscard]] std::expected<SchemaIdentity, ProtocolError> decode_schema_identity(Reader &reader) {
+            SchemaIdentity result;
+            SeenFields seen;
+            while (!reader.eof()) {
+                auto tag = reader.next_tag();
+                if (!tag) {
+                    return std::unexpected(std::move(tag.error()));
+                }
+                if (tag->field > 2) {
+                    if (auto skipped = reader.skip(*tag); !skipped) {
+                        return std::unexpected(std::move(skipped.error()));
+                    }
+                    continue;
+                }
+                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
+                    return std::unexpected(std::move(marked.error()));
+                }
+                auto value = read_string(reader, *tag);
+                if (!value) {
+                    return std::unexpected(std::move(value.error()));
+                }
+                if (tag->field == 1) {
+                    result.id = SchemaId {std::move(*value)};
+                } else {
+                    result.canonical_hash = std::move(*value);
+                }
+            }
+            if (!result.valid()) {
+                return std::unexpected(codec_error(ProtocolErrorCode::schema_mismatch,
+                                                   "schema identity is incomplete", reader.offset));
+            }
+            return result;
+        }
+
         void encode_capability(Writer &writer, const CapabilityAdvertisement &capability) {
             writer.string_field(1, capability.capability.value);
             writer.unsigned_field(2, capability.version);
@@ -1295,9 +1334,11 @@ namespace rule_engine::python::protocol_v2 {
         }
 
         [[nodiscard]] std::expected<void, ProtocolError> encode_fact_request(Writer &writer, const FactRequest &request,
-                                                                             const ProtocolLimits &) {
+                                                                             const ProtocolLimits &limits) {
             if (request.request_id.empty() || !request.subject.valid() || request.route.provider.empty() ||
-                request.route.fact.empty() || request.expected_schema.empty() || request.deadline_unix_ms == 0) {
+                request.route.fact.empty() || request.expected_schema.empty() || request.expected_schema_hash.empty() ||
+                request.expected_schema_hash.size() > limits.maximum_string_bytes ||
+                !valid_utf8(request.expected_schema_hash) || request.deadline_unix_ms == 0) {
                 return std::unexpected(
                     codec_error(ProtocolErrorCode::malformed, "fact request identity is incomplete"));
             }
@@ -1309,6 +1350,7 @@ namespace rule_engine::python::protocol_v2 {
             writer.string_field(4, request.route.fact);
             writer.string_field(5, request.expected_schema.value);
             writer.unsigned_field(6, request.deadline_unix_ms);
+            writer.string_field(7, request.expected_schema_hash);
             return {};
         }
 
@@ -1320,7 +1362,7 @@ namespace rule_engine::python::protocol_v2 {
                 if (!tag) {
                     return std::unexpected(std::move(tag.error()));
                 }
-                if (tag->field > 6) {
+                if (tag->field > 7) {
                     if (auto skipped = reader.skip(*tag); !skipped) {
                         return std::unexpected(std::move(skipped.error()));
                     }
@@ -1358,11 +1400,13 @@ namespace rule_engine::python::protocol_v2 {
                     case 3: result.route.provider = std::move(*text); break;
                     case 4: result.route.fact = std::move(*text); break;
                     case 5: result.expected_schema = SchemaId {std::move(*text)}; break;
+                    case 7: result.expected_schema_hash = std::move(*text); break;
                     default: break;
                 }
             }
             if (result.request_id.empty() || !result.subject.valid() || result.route.provider.empty() ||
-                result.route.fact.empty() || result.expected_schema.empty() || result.deadline_unix_ms == 0) {
+                result.route.fact.empty() || result.expected_schema.empty() || result.expected_schema_hash.empty() ||
+                result.deadline_unix_ms == 0) {
                 return std::unexpected(
                     codec_error(ProtocolErrorCode::malformed, "decoded fact request is incomplete", reader.offset));
             }
@@ -1560,9 +1604,14 @@ namespace rule_engine::python::protocol_v2 {
         [[nodiscard]] std::expected<void, ProtocolError>
         encode_fact_response(Writer &writer, const FactResponse &response, const ProtocolLimits &limits) {
             if (response.request_id.empty() || !response.subject.valid() || !terminal_status_valid(response.status) ||
-                ((response.status == FactTerminalStatus::value) != response.value.has_value())) {
+                !valid_fact_response_shape(response) ||
+                (response.returned_schema.has_value() &&
+                 (response.returned_schema->id.value.size() > limits.maximum_string_bytes ||
+                  response.returned_schema->canonical_hash.size() > limits.maximum_string_bytes ||
+                  !valid_utf8(response.returned_schema->id.value) ||
+                  !valid_utf8(response.returned_schema->canonical_hash)))) {
                 return std::unexpected(
-                    codec_error(ProtocolErrorCode::invalid_value, "fact response status and value do not agree"));
+                    codec_error(ProtocolErrorCode::invalid_value, "fact response terminal shape is invalid"));
             }
             writer.string_field(1, response.request_id.value);
             Writer subject;
@@ -1585,6 +1634,11 @@ namespace rule_engine::python::protocol_v2 {
                 encode_diagnostic(diagnostic, *response.diagnostic);
                 writer.message_field(5, diagnostic);
             }
+            if (response.returned_schema.has_value()) {
+                Writer schema;
+                encode_schema_identity(schema, *response.returned_schema);
+                writer.message_field(6, schema);
+            }
             return {};
         }
 
@@ -1597,7 +1651,7 @@ namespace rule_engine::python::protocol_v2 {
                 if (!tag) {
                     return std::unexpected(std::move(tag.error()));
                 }
-                if (tag->field > 5) {
+                if (tag->field > 6) {
                     if (auto skipped = reader.skip(*tag); !skipped) {
                         return std::unexpected(std::move(skipped.error()));
                     }
@@ -1641,7 +1695,7 @@ namespace rule_engine::python::protocol_v2 {
                         return std::unexpected(std::move(value.error()));
                     }
                     result.value = std::move(*value);
-                } else {
+                } else if (tag->field == 5) {
                     auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
                     if (!nested) {
                         return std::unexpected(std::move(nested.error()));
@@ -1651,10 +1705,20 @@ namespace rule_engine::python::protocol_v2 {
                         return std::unexpected(std::move(diagnostic.error()));
                     }
                     result.diagnostic = std::move(*diagnostic);
+                } else {
+                    auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
+                    if (!nested) {
+                        return std::unexpected(std::move(nested.error()));
+                    }
+                    auto schema = decode_schema_identity(*nested);
+                    if (!schema) {
+                        return std::unexpected(std::move(schema.error()));
+                    }
+                    result.returned_schema = std::move(*schema);
                 }
             }
             if (!status_seen || result.request_id.empty() || !result.subject.valid() ||
-                ((result.status == FactTerminalStatus::value) != result.value.has_value())) {
+                !valid_fact_response_shape(result)) {
                 return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
                                                    "decoded fact response is incomplete", reader.offset));
             }

@@ -38,6 +38,10 @@ namespace {
         };
     }
 
+    [[nodiscard]] SchemaIdentity returned_schema(const FactRequest &request) {
+        return SchemaIdentity {.id = request.expected_schema, .canonical_hash = request.expected_schema_hash};
+    }
+
     [[nodiscard]] CompiledPack pack_with(std::vector<FactValue> constants, std::vector<BytecodeFunction> functions,
                                          const std::string &entry = "rule.main") {
         return CompiledPack {
@@ -658,6 +662,7 @@ TEST_CASE("container allocation and iteration obey hard heap and suspension boun
                                                .subject = waiting.fact_requests.front().subject,
                                                .status = FactTerminalStatus::value,
                                                .value = make_fact(true),
+                                               .returned_schema = returned_schema(waiting.fact_requests.front()),
                                                .diagnostic = std::nullopt});
         const auto completed = session->step(std::move(response));
         REQUIRE(completed.state == VmStepState::complete);
@@ -705,6 +710,7 @@ TEST_CASE("fact suspension resumes the exact PC without duplicate reads or inten
                                            .subject = request.subject,
                                            .status = FactTerminalStatus::value,
                                            .value = make_fact(true),
+                                           .returned_schema = returned_schema(request),
                                            .diagnostic = std::nullopt});
     const auto complete = session->step(std::move(response));
     REQUIRE(complete.state == VmStepState::complete);
@@ -764,6 +770,7 @@ TEST_CASE("invalid host responses fail closed without resuming the continuation"
                                            .subject = waiting.fact_requests.front().subject,
                                            .status = FactTerminalStatus::value,
                                            .value = make_fact(true),
+                                           .returned_schema = returned_schema(waiting.fact_requests.front()),
                                            .diagnostic = std::nullopt});
     const auto faulted = session->step(std::move(response));
     REQUIRE(faulted.state == VmStepState::faulted);
@@ -772,6 +779,33 @@ TEST_CASE("invalid host responses fail closed without resuming the continuation"
     REQUIRE(faulted.result->fault->frames.size() == 1U);
     CHECK(faulted.result->fault->frames.front().code == "PYVM3001");
     CHECK(session->logical_read_count() == 1U);
+}
+
+TEST_CASE("fact schema hash drift is rejected before a value reaches a VM register") {
+    auto pack = pack_with({make_fact_operand(FactRoute {.provider = "process", .fact = "enabled"}, SchemaId {"bool"})},
+                          {function("rule.main", 1U,
+                                    {
+                                        instruction(Opcode::await_fact, 0U, 0U, 0U, 0U),
+                                        instruction(Opcode::return_value, 0U, 0U),
+                                    })});
+    auto session = start(pack);
+    const auto waiting = session->step({});
+    REQUIRE(waiting.fact_requests.size() == 1U);
+    const auto &request = waiting.fact_requests.front();
+
+    HostResponses response;
+    response.facts.push_back(FactResponse {.request_id = request.request_id,
+                                           .subject = request.subject,
+                                           .status = FactTerminalStatus::value,
+                                           .value = make_fact(true),
+                                           .returned_schema = SchemaIdentity {.id = request.expected_schema,
+                                                                              .canonical_hash = "fnv1a64:badbadbadbadbadb"},
+                                           .diagnostic = std::nullopt});
+    const auto faulted = session->step(std::move(response));
+    REQUIRE(faulted.state == VmStepState::faulted);
+    REQUIRE(faulted.result.has_value());
+    REQUIRE(faulted.result->fault.has_value());
+    CHECK(faulted.result->fault->frames.front().code == "PYVM3001");
 }
 
 TEST_CASE("state reads suspend once validate boundaries and preserve read-your-writes") {
@@ -1028,6 +1062,7 @@ TEST_CASE("typed fact terminals enter verifier-approved exception regions") {
                                            .subject = waiting.fact_requests.front().subject,
                                            .status = FactTerminalStatus::denied,
                                            .value = std::nullopt,
+                                           .returned_schema = std::nullopt,
                                            .diagnostic = std::nullopt});
     const auto recovered = session->step(std::move(response));
     REQUIRE(recovered.state == VmStepState::complete);
@@ -1548,6 +1583,7 @@ TEST_CASE("retry_once replays captured fact terminals without a duplicate provid
                                          .subject = waiting.fact_requests.front().subject,
                                          .status = FactTerminalStatus::denied,
                                          .value = std::nullopt,
+                                         .returned_schema = std::nullopt,
                                          .diagnostic = std::nullopt});
     const auto faulted = run_internal(*session, session->step(std::move(denied)));
     REQUIRE(faulted.state == VmStepState::faulted);
@@ -1632,6 +1668,7 @@ TEST_CASE("identical executions produce deterministic requests intents and resul
                                                .subject = request.subject,
                                                .status = FactTerminalStatus::value,
                                                .value = make_fact(true),
+                                               .returned_schema = returned_schema(request),
                                                .diagnostic = std::nullopt});
         return response;
     };

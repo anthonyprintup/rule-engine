@@ -53,8 +53,9 @@ Provider terminals are typed (`not_found`, `unsupported`, `access_denied`, `time
 
 ## Operational and security implications
 
-- Every request binds execution, peer/session/fence, exact subject, fact ID, route, schema hash, deadline, and cancellation.
-- Provider values are untrusted until server-side schema, size, label, and request validation completes.
+- Every request binds execution, peer/session/fence, exact subject, fact ID, route, expected schema ID/hash, deadline, and cancellation.
+- Every value response carries the actual schema ID/hash derived from the provider's route catalog. It is accepted only when that pair exactly equals the active-pack request pair and the value structurally validates against the active descriptor. Non-value terminals carry no value or schema identity. Mixed, incomplete, unknown, or mismatched shapes fail closed before VM exposure.
+- Provider values are untrusted until server-side schema identity, structure, size, label, and request validation completes.
 - Logical and physical provider metrics are separate so speculative work cannot hide operational cost.
 - Sensitive values are never logged by default; trace/retention capture is governed by labels and policy.
 - Late or duplicate responses cannot mutate a canceled/completed session.
@@ -65,7 +66,8 @@ Provider terminals are typed (`not_found`, `unsupported`, `access_denied`, `time
 - Provider caches cannot outlive their descriptor-declared subject generation or source validity.
 - Valid provider failures can fault a rule unless the author handles their typed exceptions.
 - Fact resolution is not an instantaneous snapshot of the operating system; replay guarantees captured engine inputs, not historical OS state.
-- See L-006 and L-010 in [LIMITATIONS.md](../LIMITATIONS.md).
+- Container-valued provider schemas currently attest only the top-level descriptor; recursive element schemas remain incomplete.
+- See L-006, L-010, and L-027 in [LIMITATIONS.md](../LIMITATIONS.md).
 
 ## Evidence and tests
 

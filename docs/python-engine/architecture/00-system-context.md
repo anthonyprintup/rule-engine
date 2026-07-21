@@ -126,7 +126,7 @@ The CPython worker is drawn inside the server deployment boundary but outside th
 | Versioned AST envelope | Fresh parse worker → C++ frontend | Worker owns parser fidelity; C++ owns validation and all semantic interpretation. |
 | `CompiledPack` and verified bytecode | Compiler → activation manager/VM | Compiler owns types, lowering, certificates, and semantic hashes. |
 | `VmStep`/host-response exchange | VM ↔ coordinator runtime host | VM owns continuation and logical execution; host owns validated external completion. |
-| Fact/scan request and response | Coordinator ↔ agent/provider | Coordinator owns requested identity/schema; agent owns measurement only. |
+| Fact/scan request and response | Coordinator ↔ agent/provider | Coordinator owns the requested schema ID/hash; the provider attests the actual route-catalog ID/hash and owns measurement only. Exact equality is required before C++ exposes a value to the VM. |
 | Protocol-v2 session | Server ↔ authenticated Windows agent | Server owns session, lease, fence, and negotiated capability authority. |
 | `EffectJournal` | VM → transactional runtime/store | VM owns reached intent order; store transaction owns durable disposition. |
 | `IRuntimeStore::transact_event` | Coordinator → PostgreSQL/SQLite adapter | Runtime-store contract owns atomic event/cursor/state/result/effect persistence. |
@@ -210,15 +210,17 @@ sequenceDiagram
     participant A as Windows agent
     participant P as Provider / scanner
 
-    V->>C: Need(route, SubjectKey, schema, deadline)
+    V->>C: Need(route, SubjectKey, expected schema ID/hash, deadline)
     C->>A: Fenced typed request; no predicate
     A->>P: Resolve fact or bounded scan plan
-    P-->>A: Typed value / MatchSet / terminal status
+    P-->>A: Typed value + actual schema ID/hash / MatchSet / terminal status
     A-->>C: Sequenced response from durable spool
-    C->>C: Validate session, fence, request, subject, schema, size
+    C->>C: Validate session, fence, request, subject, exact ID/hash, shape, size
     C-->>V: FactValue or typed exception
-    V->>V: Resume exact READ_FACT instruction and decide semantics
+    V->>V: Validate value against active descriptor, resume exact READ_FACT, decide semantics
 ```
+
+The schema hash is descriptor identity, not a value checksum and not provider-controlled metadata. The VM derives the requested pair from the active pack catalog. The Windows provider derives its returned pair independently from the route catalog. A value response missing either half, carrying a diagnostic, or reporting a different pair is rejected before thawing. Non-value terminals deliberately carry no schema identity because they attest no value.
 
 ## Core invariants
 
@@ -338,6 +340,7 @@ Negative consequences:
 - SQLite is development-only (`L-015`).
 - No custom LSP or YARA translator is delivered initially (`L-016`).
 - Cyclic VM graphs cannot cross canonical boundaries (`L-017`).
+- Provider container schemas attest only top-level descriptors and the Windows route catalog is not yet generated from compiler schemas (`L-027`).
 
 ## Required verification
 

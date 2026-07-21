@@ -34,6 +34,13 @@ namespace rule_engine::python::windows {
     inline constexpr std::string_view process_user_value_schema = "windows.process-user-value.v1";
     inline constexpr std::string_view process_token_value_schema = "windows.process-token-value.v1";
     inline constexpr std::string_view process_memory_value_schema = "windows.process-memory-value.v1";
+    inline constexpr std::string_view process_parent_value_schema = "windows.process-parent-value.v1";
+
+    struct WindowsFactDescriptor {
+        SchemaId subject_schema;
+        std::string route;
+        SchemaIdentity value_schema;
+    };
 
     enum struct ProviderErrorCode : std::uint8_t {
         invalid_request,
@@ -95,6 +102,9 @@ namespace rule_engine::python::windows {
 
     [[nodiscard]] FactTerminalStatus terminal_status(ProviderErrorCode code) noexcept;
     [[nodiscard]] Diagnostic provider_diagnostic(const ProviderError &error);
+    [[nodiscard]] const std::vector<WindowsFactDescriptor> &windows_fact_catalog();
+    [[nodiscard]] const WindowsFactDescriptor *find_windows_fact_descriptor(const SchemaId &subject_schema,
+                                                                             std::string_view route);
 
     [[nodiscard]] SubjectKey process_subject(PeerId peer, std::uint32_t pid, std::uint64_t creation_time);
     [[nodiscard]] SubjectKey memory_region_subject(const SubjectKey &process, std::uint64_t allocation_base,

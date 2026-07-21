@@ -1111,6 +1111,46 @@ namespace rule_engine::python::windows {
                 identity);
         }
 
+        [[nodiscard]] bool value_matches_schema(const FactValue &value, const SchemaId &schema) noexcept {
+            if (!value.valid() || schema.empty()) {
+                return false;
+            }
+            const auto &data = value.node->data;
+            const auto id = std::string_view {schema.value};
+            if (id == "any") {
+                return true;
+            }
+            if (id == "none" || id == "null") {
+                return std::holds_alternative<std::monostate>(data);
+            }
+            if (id == "bool" || id == "boolean") {
+                return std::holds_alternative<bool>(data);
+            }
+            if (id == "int" || id == "integer") {
+                return std::holds_alternative<IntegerValue>(data);
+            }
+            if (id == "float") {
+                return std::holds_alternative<double>(data);
+            }
+            if (id == "str" || id == "string" || id == "text" || id == "unicode") {
+                return std::holds_alternative<UnicodeValue>(data);
+            }
+            if (id == "bytes") {
+                return std::holds_alternative<BytesValue>(data);
+            }
+            if (id == "list") {
+                return std::holds_alternative<FactList>(data);
+            }
+            if (id == "map" || id == "dict") {
+                return std::holds_alternative<FactMap>(data);
+            }
+            if (const auto *enumeration = std::get_if<EnumValue>(&data); enumeration != nullptr) {
+                return enumeration->schema == schema;
+            }
+            const auto *record = std::get_if<FactRecord>(&data);
+            return record != nullptr && record->schema == schema;
+        }
+
         [[nodiscard]] std::expected<FrozenValue, ProviderError> resolve_image_fact(const FactRequest &request) {
             auto path = image_path_from_subject(request.subject);
             if (!path) {
@@ -1223,7 +1263,7 @@ namespace rule_engine::python::windows {
                 }
                 return freeze_provider_value(
                     record(
-                        "windows.process-parent-value.v1",
+                        process_parent_value_schema,
                         {{.field_id = 1, .value = integer(static_cast<std::uint64_t>(live->parent_pid))},
                          {.field_id = 2,
                           .value = parent == nullptr ? make_fact(std::monostate {}) : integer(parent->creation_time)}}),
@@ -1453,12 +1493,31 @@ namespace rule_engine::python::windows {
             .subject = request.subject,
             .status = FactTerminalStatus::failed,
             .value = std::nullopt,
+            .returned_schema = std::nullopt,
             .diagnostic = std::nullopt,
         };
         if (request.request_id.empty() || request.route.provider != provider_name || request.route.fact.empty() ||
-            request.expected_schema.empty() || !request.subject.valid()) {
+            request.expected_schema.empty() || request.expected_schema_hash.empty() || !request.subject.valid()) {
             const auto failure = error(ProviderErrorCode::invalid_request, "fact dispatch",
                                        "request identity, route, schema, or subject is invalid");
+            response.status = terminal_status(failure.code);
+            response.diagnostic = provider_diagnostic(failure);
+            return response;
+        }
+
+        const auto *descriptor = find_windows_fact_descriptor(request.subject.descriptor, request.route.fact);
+        if (descriptor == nullptr) {
+            const auto failure =
+                error(ProviderErrorCode::unsupported, "fact dispatch", "fact route has no provider descriptor");
+            response.status = terminal_status(failure.code);
+            response.diagnostic = provider_diagnostic(failure);
+            return response;
+        }
+        const SchemaIdentity requested_schema {.id = request.expected_schema,
+                                               .canonical_hash = request.expected_schema_hash};
+        if (descriptor->value_schema != requested_schema) {
+            const auto failure = error(ProviderErrorCode::invalid_request, "fact dispatch",
+                                       "requested schema identity does not match the provider descriptor");
             response.status = terminal_status(failure.code);
             response.diagnostic = provider_diagnostic(failure);
             return response;
@@ -1484,8 +1543,16 @@ namespace rule_engine::python::windows {
             response.diagnostic = provider_diagnostic(result.error());
             return response;
         }
+        if (result->canonical_digest.empty() || !value_matches_schema(result->value, descriptor->value_schema.id)) {
+            const auto failure = error(ProviderErrorCode::malformed, "fact dispatch",
+                                       "provider value does not match its authoritative descriptor");
+            response.status = terminal_status(failure.code);
+            response.diagnostic = provider_diagnostic(failure);
+            return response;
+        }
         response.status = FactTerminalStatus::value;
         response.value = std::move(result->value);
+        response.returned_schema = descriptor->value_schema;
         return response;
     }
 

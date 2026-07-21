@@ -65,9 +65,9 @@ namespace rule_engine::python::runtime {
 
     // Admits one complete terminal WorkResult for one exact lease and exposes
     // its typed responses through the resident orchestrator's provider port.
-    // Structural/value bounds are checked here. FactResponse carries no schema
-    // hash, so expected-schema validation remains with the C++ schema catalog
-    // and VM contract validator; this adapter does not infer a missing schema.
+    // Structural/value bounds and the exact request/returned schema identity
+    // are checked here. The C++ VM remains responsible for validating the
+    // value against the authoritative descriptor before it is exposed.
     struct ProtocolV2ProviderResponsePort final: IProviderResponsePort {
         [[nodiscard]] static std::expected<ProtocolV2ProviderResponsePort, protocol_v2::ProtocolError>
         create(protocol_v2::WorkLeaseMessage work, IProtocolV2CancelSink &cancel_sink,

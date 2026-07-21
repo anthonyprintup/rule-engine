@@ -284,4 +284,62 @@ namespace {
                 "PYC0109");
     }
 
+    TEST_CASE("fact terminals bind one authoritative schema identity only to value responses") {
+        const auto builtin = resolve_schema_identity(SchemaCatalog {}, SchemaId {"bool"});
+        REQUIRE(builtin.has_value());
+        REQUIRE(builtin->canonical_hash.starts_with("fnv1a64:"));
+
+        const SubjectKey subject {.peer = PeerId {"peer"},
+                                  .descriptor = SchemaId {"process/v1"},
+                                  .identity = {{.field_id = 1U, .value = std::uint64_t {7U}}},
+                                  .parent = nullptr};
+        const FactRequest request {.request_id = RequestId {"fact"},
+                                   .subject = subject,
+                                   .route = {.provider = "windows", .fact = "process.signer.is_signed"},
+                                   .expected_schema = builtin->id,
+                                   .expected_schema_hash = builtin->canonical_hash,
+                                   .deadline_unix_ms = 1U};
+        FactResponse value {.request_id = request.request_id,
+                            .subject = subject,
+                            .status = FactTerminalStatus::value,
+                            .value = make_fact(true),
+                            .returned_schema = *builtin,
+                            .diagnostic = std::nullopt};
+        REQUIRE(valid_fact_response_shape(value));
+        REQUIRE(fact_response_schema_matches(request, value));
+
+        auto wrong_hash = value;
+        wrong_hash.returned_schema->canonical_hash = "fnv1a64:0000000000000000";
+        REQUIRE(valid_fact_response_shape(wrong_hash));
+        REQUIRE_FALSE(fact_response_schema_matches(request, wrong_hash));
+
+        auto missing_schema = value;
+        missing_schema.returned_schema.reset();
+        REQUIRE_FALSE(valid_fact_response_shape(missing_schema));
+
+        auto mixed_value = value;
+        mixed_value.diagnostic = Diagnostic {.code = "mixed",
+                                             .severity = DiagnosticSeverity::error,
+                                             .message = "value plus diagnostic",
+                                             .span = std::nullopt,
+                                             .related = {}};
+        REQUIRE_FALSE(valid_fact_response_shape(mixed_value));
+
+        FactResponse unavailable {.request_id = request.request_id,
+                                  .subject = subject,
+                                  .status = FactTerminalStatus::unavailable,
+                                  .value = std::nullopt,
+                                  .returned_schema = std::nullopt,
+                                  .diagnostic = std::nullopt};
+        REQUIRE(valid_fact_response_shape(unavailable));
+        REQUIRE(fact_response_schema_matches(request, unavailable));
+        unavailable.returned_schema = *builtin;
+        REQUIRE_FALSE(valid_fact_response_shape(unavailable));
+
+        auto unknown_terminal = unavailable;
+        unknown_terminal.returned_schema.reset();
+        unknown_terminal.status = static_cast<FactTerminalStatus>(0xffU);
+        REQUIRE_FALSE(valid_fact_response_shape(unknown_terminal));
+    }
+
 } // namespace

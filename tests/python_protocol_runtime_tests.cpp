@@ -410,6 +410,7 @@ namespace {
             .subject = runtime_subject(),
             .route = FactRoute {.provider = "windows.process", .fact = "process.image"},
             .expected_schema = SchemaId {"unicode/v1"},
+            .expected_schema_hash = "sha256:unicode-v1",
             .deadline_unix_ms = 10'000,
         };
     }
@@ -428,6 +429,7 @@ namespace {
                 .subject = runtime_subject(),
                 .status = FactTerminalStatus::unavailable,
                 .value = std::nullopt,
+                .returned_schema = std::nullopt,
                 .diagnostic = std::nullopt,
             }},
             .scans = {},
@@ -1237,6 +1239,7 @@ namespace {
                         .subject = request.subject,
                         .status = FactTerminalStatus::unavailable,
                         .value = std::nullopt,
+                        .returned_schema = std::nullopt,
                         .diagnostic = std::nullopt,
                     });
                 }

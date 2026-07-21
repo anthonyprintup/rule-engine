@@ -69,7 +69,9 @@ namespace rule_engine::python::runtime {
         [[nodiscard]] bool fact_request_matches(const FactRequest &left, const FactRequest &right) {
             return left.request_id == right.request_id && same_subject(left.subject, right.subject) &&
                    left.route.provider == right.route.provider && left.route.fact == right.route.fact &&
-                   left.expected_schema == right.expected_schema && left.deadline_unix_ms == right.deadline_unix_ms;
+                   left.expected_schema == right.expected_schema &&
+                   left.expected_schema_hash == right.expected_schema_hash &&
+                   left.deadline_unix_ms == right.deadline_unix_ms;
         }
 
         [[nodiscard]] bool scan_request_matches(const ScanRequest &left, const ScanRequest &right) {
@@ -88,8 +90,7 @@ namespace rule_engine::python::runtime {
         }
 
         [[nodiscard]] bool fact_status_valid(const FactResponse &response) {
-            return response.status == FactTerminalStatus::value ? response.value.has_value() :
-                                                                  !response.value.has_value();
+            return valid_fact_response_shape(response);
         }
 
         [[nodiscard]] bool scan_status_valid(const ScanResponse &response) {
@@ -288,7 +289,8 @@ namespace rule_engine::python::runtime {
         for (const auto &request : work.facts) {
             if (request.request_id.empty() || !request_ids.insert(request.request_id.value).second ||
                 !request.subject.valid() || request.subject.peer != work.peer || request.route.provider != work.route ||
-                request.route.fact.empty() || request.expected_schema.empty() || request.deadline_unix_ms == 0U) {
+                request.route.fact.empty() || request.expected_schema.empty() || request.expected_schema_hash.empty() ||
+                request.deadline_unix_ms == 0U) {
                 return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::malformed,
                                                       "fact request is not bound to its work lease"));
             }
@@ -329,7 +331,8 @@ namespace rule_engine::python::runtime {
         for (const auto &response : result.facts) {
             const auto expected = expected_facts_.find(response.request_id.value);
             if (expected == expected_facts_.end() || !same_subject(response.subject, expected->second.subject) ||
-                !fact_status_valid(response) || !facts.emplace(response.request_id.value, response).second) {
+                !fact_status_valid(response) || !fact_response_schema_matches(expected->second, response) ||
+                !facts.emplace(response.request_id.value, response).second) {
                 return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::provider_violation,
                                                       "fact response request, subject, or terminal value is invalid"));
             }

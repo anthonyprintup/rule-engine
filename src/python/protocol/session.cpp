@@ -292,7 +292,7 @@ namespace rule_engine::python::protocol_v2 {
         }
         for (const auto &fact : work.facts) {
             if (!fact.subject.valid() || fact.subject.peer != peer_ || fact.route.provider != work.route ||
-                fact.route.fact.empty() || fact.expected_schema.empty()) {
+                fact.route.fact.empty() || fact.expected_schema.empty() || fact.expected_schema_hash.empty()) {
                 return std::unexpected(session_error(ProtocolErrorCode::malformed,
                                                      "fact work is not bound to its route, subject, and schema"));
             }
