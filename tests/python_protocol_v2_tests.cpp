@@ -127,8 +127,8 @@ namespace {
                 .subject = region_subject(),
                 .status = FactTerminalStatus::value,
                 .value = nested_fact_value(),
-                .returned_schema = SchemaIdentity {.id = SchemaId {"protection/v1"},
-                                                   .canonical_hash = "sha256:protection-v1"},
+                .returned_schema =
+                    SchemaIdentity {.id = SchemaId {"protection/v1"}, .canonical_hash = "sha256:protection-v1"},
                 .diagnostic = std::nullopt,
             }},
             .scans = {ScanResponse {
@@ -243,8 +243,8 @@ namespace {
         const auto &result = std::get<WorkResultMessage>(decoded_result->envelope.body);
         REQUIRE(result.facts.size() == 1);
         REQUIRE(result.facts.front().returned_schema ==
-                std::optional<SchemaIdentity> {SchemaIdentity {.id = SchemaId {"protection/v1"},
-                                                               .canonical_hash = "sha256:protection-v1"}});
+                std::optional<SchemaIdentity> {
+                    SchemaIdentity {.id = SchemaId {"protection/v1"}, .canonical_hash = "sha256:protection-v1"}});
         REQUIRE(result.scans.front().matches.size() == 2);
         REQUIRE(result.scans.front().mode == ScanResultMode::exact_complete);
         REQUIRE(result.scans.front().matches.front().pattern_id == "pattern-1");
@@ -359,12 +359,11 @@ namespace {
         REQUIRE_FALSE(encode_frame(envelope(missing_returned_schema, 1)).has_value());
 
         auto value_with_diagnostic = work_result();
-        value_with_diagnostic.facts.front().diagnostic = Diagnostic {
-            .code = "test.invalid",
-            .severity = DiagnosticSeverity::error,
-            .message = "mixed terminal",
-            .span = std::nullopt,
-            .related = {}};
+        value_with_diagnostic.facts.front().diagnostic = Diagnostic {.code = "test.invalid",
+                                                                     .severity = DiagnosticSeverity::error,
+                                                                     .message = "mixed terminal",
+                                                                     .span = std::nullopt,
+                                                                     .related = {}};
         REQUIRE_FALSE(encode_frame(envelope(value_with_diagnostic, 1)).has_value());
 
         auto non_value_with_schema = work_result();
@@ -618,14 +617,14 @@ namespace {
             facts.assign(requests.begin(), requests.end());
             std::vector<FactResponse> result;
             for (const auto &request : requests) {
-                result.push_back(FactResponse {.request_id = request.request_id,
-                                               .subject = request.subject,
-                                               .status = FactTerminalStatus::value,
-                                               .value = nested_fact_value(),
-                                               .returned_schema = fact_schema_override.value_or(SchemaIdentity {
-                                                   .id = request.expected_schema,
-                                                   .canonical_hash = request.expected_schema_hash}),
-                                               .diagnostic = std::nullopt});
+                result.push_back(
+                    FactResponse {.request_id = request.request_id,
+                                  .subject = request.subject,
+                                  .status = FactTerminalStatus::value,
+                                  .value = nested_fact_value(),
+                                  .returned_schema = fact_schema_override.value_or(SchemaIdentity {
+                                      .id = request.expected_schema, .canonical_hash = request.expected_schema_hash}),
+                                  .diagnostic = std::nullopt});
             }
             return result;
         }

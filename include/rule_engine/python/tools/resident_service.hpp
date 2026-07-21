@@ -51,8 +51,7 @@ namespace rule_engine::python::tools {
         receive_application_frame(std::chrono::steady_clock::time_point deadline,
                                   std::stop_token cancellation) noexcept = 0;
         [[nodiscard]] virtual std::expected<void, protocol_v2::ProtocolError>
-        send_application_frame(std::span<const std::byte> payload,
-                               std::chrono::steady_clock::time_point deadline,
+        send_application_frame(std::span<const std::byte> payload, std::chrono::steady_clock::time_point deadline,
                                std::stop_token cancellation) noexcept = 0;
         virtual void shutdown() noexcept = 0;
     };
@@ -85,12 +84,16 @@ namespace rule_engine::python::tools {
         [[nodiscard]] virtual std::expected<std::vector<protocol_v2::WorkLeaseMessage>, protocol_v2::ProtocolError>
         take_work(const ResidentAgentSession &session, std::size_t limit, std::stop_token cancellation) noexcept = 0;
         [[nodiscard]] virtual std::expected<DurableAgentReceipt, protocol_v2::ProtocolError>
-        persist(const ResidentAgentSession &session, std::uint64_t sequence,
-                const protocol_v2::DurableAgentBody &body, std::stop_token cancellation) noexcept = 0;
+        persist(const ResidentAgentSession &session, std::uint64_t sequence, const protocol_v2::DurableAgentBody &body,
+                std::stop_token cancellation) noexcept = 0;
         virtual void close(const ResidentAgentSession &session) noexcept = 0;
     };
 
-    enum struct ResidentAdminRequestKind : std::uint8_t { pack_snapshot = 1, operation_snapshot = 2, activation_flip = 3 };
+    enum struct ResidentAdminRequestKind : std::uint8_t {
+        pack_snapshot = 1,
+        operation_snapshot = 2,
+        activation_flip = 3
+    };
 
     struct ResidentAdminRequest {
         ResidentAdminRequestKind kind {ResidentAdminRequestKind::pack_snapshot};
@@ -137,7 +140,8 @@ namespace rule_engine::python::tools {
     };
 
     struct AuthorizedResidentAdminBackend final: IResidentAdminBackend {
-        AuthorizedResidentAdminBackend(cluster::IActivationControlStore &store, const IResidentAdminAccessPolicy &policy,
+        AuthorizedResidentAdminBackend(cluster::IActivationControlStore &store,
+                                       const IResidentAdminAccessPolicy &policy,
                                        cluster::IAdminSecurityAuditSink *security_audit = nullptr) noexcept;
 
         [[nodiscard]] ResidentAdminResponse execute(const protocol_v2::AuthenticatedPeer &peer,

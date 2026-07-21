@@ -63,8 +63,7 @@ namespace rule_engine::python::runtime {
                 !within(usage.history_rows, limit.history_rows) || !within(usage.history_bytes, limit.history_bytes) ||
                 !within(usage.state_keys, limit.state_keys) || !within(usage.state_bytes, limit.state_bytes) ||
                 !within(usage.effect_intents, limit.effect_intents) ||
-                !within(usage.effect_bytes, limit.effect_bytes) ||
-                !within(usage.event_intents, limit.event_intents) ||
+                !within(usage.effect_bytes, limit.effect_bytes) || !within(usage.event_intents, limit.event_intents) ||
                 !within(usage.event_bytes, limit.event_bytes) ||
                 !within(usage.recorder_events, limit.recorder_events) ||
                 !within(usage.recorder_bytes, limit.recorder_bytes)) {
@@ -351,8 +350,7 @@ namespace rule_engine::python::runtime {
                 normal_budget.active_cpu.count() < 0 || normal_budget.maximum_service_deadline.count() < 0 ||
                 request.input.id.empty() || request.input.tenant.empty() || request.input.peer.empty() ||
                 request.input.peer != request.invocation.subject.peer ||
-                request.invocation.root_event != request.input.id ||
-                request.cursor.consumer != work.serial_domain ||
+                request.invocation.root_event != request.input.id || request.cursor.consumer != work.serial_domain ||
                 request.cursor.expected_position == std::numeric_limits<std::uint64_t>::max() ||
                 request.cursor.new_position != request.cursor.expected_position + 1U ||
                 request.replay_state_attempt == 0U || request.replay_state_attempt > maximum_mvcc_attempts) {

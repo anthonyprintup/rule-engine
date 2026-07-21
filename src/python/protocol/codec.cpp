@@ -504,8 +504,8 @@ namespace rule_engine::python::protocol_v2 {
                 }
             }
             if (!result.valid()) {
-                return std::unexpected(codec_error(ProtocolErrorCode::schema_mismatch,
-                                                   "schema identity is incomplete", reader.offset));
+                return std::unexpected(
+                    codec_error(ProtocolErrorCode::schema_mismatch, "schema identity is incomplete", reader.offset));
             }
             return result;
         }

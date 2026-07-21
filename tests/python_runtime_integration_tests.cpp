@@ -152,8 +152,8 @@ namespace {
                 .subject = request.subject,
                 .status = FactTerminalStatus::value,
                 .value = make_fact(UnicodeValue {.utf8 = "demo.exe"}),
-                .returned_schema = SchemaIdentity {.id = request.expected_schema,
-                                                   .canonical_hash = request.expected_schema_hash},
+                .returned_schema =
+                    SchemaIdentity {.id = request.expected_schema, .canonical_hash = request.expected_schema_hash},
             });
         }
         for (const auto &request : work.scans) {
@@ -504,8 +504,8 @@ namespace {
                     .subject = request.subject,
                     .status = FactTerminalStatus::value,
                     .value = make_fact(UnicodeValue {.utf8 = "demo.exe"}),
-                    .returned_schema = SchemaIdentity {.id = request.expected_schema,
-                                                       .canonical_hash = request.expected_schema_hash},
+                    .returned_schema =
+                        SchemaIdentity {.id = request.expected_schema, .canonical_hash = request.expected_schema_hash},
                 });
             }
             return result;
@@ -928,10 +928,10 @@ TEST_CASE("real register VM spends one instruction budget across a successful MV
 
     REQUIRE(result.has_value());
     REQUIRE(result->committed());
-    const auto terminal_fault = result->evaluation.fault.has_value() && !result->evaluation.fault->frames.empty() ?
-                                    result->evaluation.fault->frames.front().code + " " +
-                                        result->evaluation.fault->frames.front().message :
-                                    std::string {};
+    const auto terminal_fault =
+        result->evaluation.fault.has_value() && !result->evaluation.fault->frames.empty() ?
+            result->evaluation.fault->frames.front().code + " " + result->evaluation.fault->frames.front().message :
+            std::string {};
     INFO("terminal fault: " << terminal_fault);
     CHECK(result->attempts == 2U);
     CHECK(result->evaluation.outcome == EvaluationOutcome::match);
@@ -961,10 +961,10 @@ TEST_CASE("real register VM faults before work when a conflict leaves exactly ze
 
     REQUIRE(result.has_value());
     REQUIRE(result->committed());
-    const auto terminal_fault = result->evaluation.fault.has_value() && !result->evaluation.fault->frames.empty() ?
-                                    result->evaluation.fault->frames.front().code + " " +
-                                        result->evaluation.fault->frames.front().message :
-                                    std::string {};
+    const auto terminal_fault =
+        result->evaluation.fault.has_value() && !result->evaluation.fault->frames.empty() ?
+            result->evaluation.fault->frames.front().code + " " + result->evaluation.fault->frames.front().message :
+            std::string {};
     INFO("terminal fault: " << terminal_fault);
     CHECK(result->attempts == 2U);
     CHECK(result->evaluation.outcome == EvaluationOutcome::faulted);

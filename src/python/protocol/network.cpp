@@ -418,9 +418,10 @@ namespace rule_engine::python::protocol_v2 {
             .deadline = (std::min) (deadline, deadline_after(impl_->timeouts.read)), .cancellation = cancellation});
     }
 
-    std::expected<void, ProtocolError> TlsPeerConnection::send_application_frame_until(
-        const std::span<const std::byte> payload, const Clock::time_point deadline,
-        const std::stop_token cancellation) noexcept {
+    std::expected<void, ProtocolError>
+    TlsPeerConnection::send_application_frame_until(const std::span<const std::byte> payload,
+                                                    const Clock::time_point deadline,
+                                                    const std::stop_token cancellation) noexcept {
         if (!established()) {
             return std::unexpected(
                 network_error(ProtocolErrorCode::transport_error, "owned TLS connection is not established"));
@@ -430,8 +431,9 @@ namespace rule_engine::python::protocol_v2 {
                                          .cancellation = cancellation});
     }
 
-    std::expected<std::vector<std::byte>, ProtocolError> TlsPeerConnection::receive_application_frame_until(
-        const Clock::time_point deadline, const std::stop_token cancellation) noexcept {
+    std::expected<std::vector<std::byte>, ProtocolError>
+    TlsPeerConnection::receive_application_frame_until(const Clock::time_point deadline,
+                                                       const std::stop_token cancellation) noexcept {
         if (!established()) {
             return std::unexpected(
                 network_error(ProtocolErrorCode::transport_error, "owned TLS connection is not established"));

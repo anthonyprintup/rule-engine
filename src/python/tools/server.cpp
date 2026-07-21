@@ -963,8 +963,8 @@ final activation flip; other control-plane operations remain CLI/backend work.
                 const auto capability = admin_capability(request.operation);
                 const auto tenant_matches = request.resource.tenant == found->principal.home_tenant;
                 const auto pack_matches = request.resource.pack.value.starts_with(found->pack_prefix);
-                const auto allowed = !capability.empty() && found->capabilities.contains(capability) && tenant_matches &&
-                                     pack_matches;
+                const auto allowed =
+                    !capability.empty() && found->capabilities.contains(capability) && tenant_matches && pack_matches;
                 return cluster::AdminAuthorizationDecision {
                     .outcome = allowed ? cluster::AdminAuthorizationOutcome::allowed :
                                          cluster::AdminAuthorizationOutcome::denied,
@@ -988,9 +988,9 @@ final activation flip; other control-plane operations remain CLI/backend work.
             std::unordered_set<std::string> principals;
             for (const auto &line : *lines) {
                 const auto fields = split_fields(line, '\t');
-                if (fields.size() != 7U || !safe_policy_atom(fields[0], 128U) ||
-                    !safe_policy_atom(fields[1], 128U) || !safe_policy_atom(fields[2], 128U) ||
-                    !safe_policy_atom(fields[4], 128U) || !safe_policy_atom(fields[5], 256U)) {
+                if (fields.size() != 7U || !safe_policy_atom(fields[0], 128U) || !safe_policy_atom(fields[1], 128U) ||
+                    !safe_policy_atom(fields[2], 128U) || !safe_policy_atom(fields[4], 128U) ||
+                    !safe_policy_atom(fields[5], 256U)) {
                     return std::unexpected(unavailable("SRV-OPERATOR-BINDING-MALFORMED",
                                                        "operator binding snapshot contains an invalid entry"));
                 }
@@ -1002,8 +1002,8 @@ final activation flip; other control-plane operations remain CLI/backend work.
                 } else if (fields[3] == "pack_signer") {
                     kind = cluster::AdminPrincipalKind::pack_signer;
                 } else {
-                    return std::unexpected(unavailable("SRV-OPERATOR-BINDING-MALFORMED",
-                                                       "operator binding principal kind is invalid"));
+                    return std::unexpected(
+                        unavailable("SRV-OPERATOR-BINDING-MALFORMED", "operator binding principal kind is invalid"));
                 }
                 const auto peer_key = std::string {fields[0]} + '\n' + std::string {fields[1]};
                 if (!peers.insert(peer_key).second || !principals.insert(std::string {fields[2]}).second) {
@@ -1014,7 +1014,8 @@ final activation flip; other control-plane operations remain CLI/backend work.
                 std::set<std::string, std::less<>> named;
                 for (const auto capability : capabilities) {
                     if ((capability != "pack.read" && capability != "operation.read" &&
-                         capability != "pack.activate") || !named.insert(std::string {capability}).second) {
+                         capability != "pack.activate") ||
+                        !named.insert(std::string {capability}).second) {
                         return std::unexpected(unavailable("SRV-OPERATOR-BINDING-MALFORMED",
                                                            "operator binding capability is unknown or duplicated"));
                     }
@@ -1030,8 +1031,8 @@ final activation flip; other control-plane operations remain CLI/backend work.
                 });
             }
             if (policy->bindings.empty()) {
-                return std::unexpected(unavailable("SRV-OPERATOR-BINDING-EMPTY",
-                                                   "operator binding snapshot has no explicit principals"));
+                return std::unexpected(
+                    unavailable("SRV-OPERATOR-BINDING-EMPTY", "operator binding snapshot has no explicit principals"));
             }
             return policy;
         }
@@ -1064,8 +1065,9 @@ final activation flip; other control-plane operations remain CLI/backend work.
             establish(const protocol_v2::AuthenticatedPeer &peer, const protocol_v2::AgentHelloMessage &hello,
                       const std::stop_token cancellation) noexcept override {
                 if (cancellation.stop_requested()) {
-                    return std::unexpected(protocol_v2::ProtocolError {.code = protocol_v2::ProtocolErrorCode::canceled,
-                                                                       .message = "agent session establishment canceled"});
+                    return std::unexpected(
+                        protocol_v2::ProtocolError {.code = protocol_v2::ProtocolErrorCode::canceled,
+                                                    .message = "agent session establishment canceled"});
                 }
                 const auto serial = next_session_.fetch_add(1U, std::memory_order_relaxed) + 1U;
                 const auto session_id = "session:" + node_id_ + ':' + std::to_string(serial);
@@ -1436,8 +1438,7 @@ final activation flip; other control-plane operations remain CLI/backend work.
         const auto maximum_memory_bytes = uint32_value(*entries, "service.maximum_memory_bytes");
         const auto maximum_frame_bytes = uint32_value(*entries, "service.maximum_frame_bytes");
         const auto maximum_messages_per_session = uint32_value(*entries, "service.maximum_messages_per_session");
-        const auto maximum_inflight_work =
-            uint32_value(*entries, "service.maximum_inflight_work_per_session");
+        const auto maximum_inflight_work = uint32_value(*entries, "service.maximum_inflight_work_per_session");
         const auto maximum_session_duration = milliseconds_value(*entries, "service.maximum_session_duration_ms");
         const auto inbound_credit_bytes = uint32_value(*entries, "service.inbound_credit_bytes");
         const auto inbound_credit_messages = uint32_value(*entries, "service.inbound_credit_messages");
@@ -1448,33 +1449,32 @@ final activation flip; other control-plane operations remain CLI/backend work.
             !write_timeout || !listen_backlog || !maximum_consecutive_failures || !worker_threads ||
             !maximum_queued_sessions || !maximum_memory_bytes || !maximum_frame_bytes ||
             !maximum_messages_per_session || !maximum_inflight_work || !maximum_session_duration ||
-            !inbound_credit_bytes || !inbound_credit_messages || !inbound_credit_work ||
-            !inbound_credit_snapshots) {
-            return std::unexpected(!schema_version       ? std::move(schema_version.error()) :
-                                   !processes            ? std::move(processes.error()) :
-                                   !server_major         ? std::move(server_major.error()) :
-                                   !pool_size            ? std::move(pool_size.error()) :
-                                   !lease_duration       ? std::move(lease_duration.error()) :
-                                   !lease_renew_interval ? std::move(lease_renew_interval.error()) :
-                                   !statement_timeout    ? std::move(statement_timeout.error()) :
-                                   !busy_timeout         ? std::move(busy_timeout.error()) :
-                                   !accept_timeout       ? std::move(accept_timeout.error()) :
-                                   !handshake_timeout    ? std::move(handshake_timeout.error()) :
-                                   !read_timeout         ? std::move(read_timeout.error()) :
-                                   !write_timeout        ? std::move(write_timeout.error()) :
-                                   !listen_backlog       ? std::move(listen_backlog.error()) :
+            !inbound_credit_bytes || !inbound_credit_messages || !inbound_credit_work || !inbound_credit_snapshots) {
+            return std::unexpected(!schema_version               ? std::move(schema_version.error()) :
+                                   !processes                    ? std::move(processes.error()) :
+                                   !server_major                 ? std::move(server_major.error()) :
+                                   !pool_size                    ? std::move(pool_size.error()) :
+                                   !lease_duration               ? std::move(lease_duration.error()) :
+                                   !lease_renew_interval         ? std::move(lease_renew_interval.error()) :
+                                   !statement_timeout            ? std::move(statement_timeout.error()) :
+                                   !busy_timeout                 ? std::move(busy_timeout.error()) :
+                                   !accept_timeout               ? std::move(accept_timeout.error()) :
+                                   !handshake_timeout            ? std::move(handshake_timeout.error()) :
+                                   !read_timeout                 ? std::move(read_timeout.error()) :
+                                   !write_timeout                ? std::move(write_timeout.error()) :
+                                   !listen_backlog               ? std::move(listen_backlog.error()) :
                                    !maximum_consecutive_failures ? std::move(maximum_consecutive_failures.error()) :
-                                   !worker_threads ? std::move(worker_threads.error()) :
-                                   !maximum_queued_sessions ? std::move(maximum_queued_sessions.error()) :
-                                   !maximum_memory_bytes ? std::move(maximum_memory_bytes.error()) :
-                                   !maximum_frame_bytes ? std::move(maximum_frame_bytes.error()) :
+                                   !worker_threads               ? std::move(worker_threads.error()) :
+                                   !maximum_queued_sessions      ? std::move(maximum_queued_sessions.error()) :
+                                   !maximum_memory_bytes         ? std::move(maximum_memory_bytes.error()) :
+                                   !maximum_frame_bytes          ? std::move(maximum_frame_bytes.error()) :
                                    !maximum_messages_per_session ? std::move(maximum_messages_per_session.error()) :
-                                   !maximum_inflight_work ? std::move(maximum_inflight_work.error()) :
-                                   !maximum_session_duration ? std::move(maximum_session_duration.error()) :
-                                   !inbound_credit_bytes ? std::move(inbound_credit_bytes.error()) :
-                                   !inbound_credit_messages ? std::move(inbound_credit_messages.error()) :
-                                   !inbound_credit_work ? std::move(inbound_credit_work.error()) :
-                                                           std::move(inbound_credit_snapshots.error()));
+                                   !maximum_inflight_work        ? std::move(maximum_inflight_work.error()) :
+                                   !maximum_session_duration     ? std::move(maximum_session_duration.error()) :
+                                   !inbound_credit_bytes         ? std::move(inbound_credit_bytes.error()) :
+                                   !inbound_credit_messages      ? std::move(inbound_credit_messages.error()) :
+                                   !inbound_credit_work          ? std::move(inbound_credit_work.error()) :
+                                                                   std::move(inbound_credit_snapshots.error()));
         }
         result.schema_version = *schema_version;
         result.node_id = *entry_value<std::string>(*entries, "node.id");
@@ -1657,8 +1657,8 @@ final activation flip; other control-plane operations remain CLI/backend work.
                              "listener timeouts, backlog, failure bound, or hard-resolver policy is invalid"));
         }
         auto lease_window_remaining = config.lease_duration.count();
-        for (const auto blocking_interval : {config.lease_renew_interval, config.listener.accept_timeout,
-                                             config.listener.handshake_timeout}) {
+        for (const auto blocking_interval :
+             {config.lease_renew_interval, config.listener.accept_timeout, config.listener.handshake_timeout}) {
             if (blocking_interval.count() <= 0 || blocking_interval.count() >= lease_window_remaining) {
                 return std::unexpected(config_error(
                     "SRV-CONFIG-LISTENER-BOUNDS",
@@ -1666,8 +1666,8 @@ final activation flip; other control-plane operations remain CLI/backend work.
             }
             lease_window_remaining -= blocking_interval.count();
         }
-        if (auto service = validate_resident_service_limits(config.service); !service ||
-            config.service.maximum_session_duration > config.lease_duration ||
+        if (auto service = validate_resident_service_limits(config.service);
+            !service || config.service.maximum_session_duration > config.lease_duration ||
             config.service.inbound_credit.work_attempts > config.service.maximum_inflight_work_per_session) {
             return std::unexpected(
                 config_error("SRV-CONFIG-SERVICE-BOUNDS",
@@ -1962,8 +1962,8 @@ final activation flip; other control-plane operations remain CLI/backend work.
     std::expected<void, ToolFailure>
     ProductionResidentServerBackend::serve(const ResidentServerContext &context) noexcept {
         if (!impl_->qualified || !impl_->agent_listener || !impl_->admin_listener || !impl_->node_lease ||
-            !impl_->application || !impl_->scheduler ||
-            impl_->runtime_store != std::addressof(context.store) || impl_->peer_trust_policy == nullptr) {
+            !impl_->application || !impl_->scheduler || impl_->runtime_store != std::addressof(context.store) ||
+            impl_->peer_trust_policy == nullptr) {
             return std::unexpected(ToolFailure {
                 .kind = ToolFailureKind::internal_invariant,
                 .code = "SRV-BACKEND-NOT-QUALIFIED",
@@ -1999,8 +1999,7 @@ final activation flip; other control-plane operations remain CLI/backend work.
                 impl_->renew_at = std::chrono::steady_clock::now() + context.config.lease_renew_interval;
             }
 
-            const auto role = impl_->accept_agent ? ResidentSessionRole::agent :
-                                                    ResidentSessionRole::administrator;
+            const auto role = impl_->accept_agent ? ResidentSessionRole::agent : ResidentSessionRole::administrator;
             auto &listener = impl_->accept_agent ? *impl_->agent_listener : *impl_->admin_listener;
             impl_->accept_agent = !impl_->accept_agent;
             auto peer = listener.accept(*impl_->peer_trust_policy, impl_->stop.get_token());

@@ -27,14 +27,13 @@ namespace rule_engine::python::tools {
                    });
         }
 
-        [[nodiscard]] protocol_v2::ProtocolError error(const protocol_v2::ProtocolErrorCode code,
-                                                       std::string message) {
+        [[nodiscard]] protocol_v2::ProtocolError error(const protocol_v2::ProtocolErrorCode code, std::string message) {
             return {.code = code, .message = std::move(message), .byte_offset = 0U};
         }
 
-        [[nodiscard]] std::chrono::steady_clock::time_point bounded_deadline(
-            const std::chrono::steady_clock::time_point session_deadline,
-            const std::chrono::milliseconds operation_timeout = std::chrono::seconds {5}) noexcept {
+        [[nodiscard]] std::chrono::steady_clock::time_point
+        bounded_deadline(const std::chrono::steady_clock::time_point session_deadline,
+                         const std::chrono::milliseconds operation_timeout = std::chrono::seconds {5}) noexcept {
             return (std::min) (session_deadline, std::chrono::steady_clock::now() + operation_timeout);
         }
 
@@ -182,15 +181,15 @@ namespace rule_engine::python::tools {
         }
 
         [[nodiscard]] ResidentAdminResponse rejected_response(const ResidentAdminRequest &request,
-                                                               const cluster::AuthorizedAdminError &failure) {
+                                                              const cluster::AuthorizedAdminError &failure) {
             return {
                 .status = failure.code == cluster::AuthorizedAdminErrorCode::store_failure || failure.retryable ?
                               ResidentAdminResponseStatus::unavailable :
                               ResidentAdminResponseStatus::rejected,
                 .request_id = request.request_id,
                 .code = std::string {admin_error_code(failure.code)},
-                .diagnostic = failure.retryable ? "authorized admin backend unavailable" :
-                                                  "authorized admin request rejected",
+                .diagnostic =
+                    failure.retryable ? "authorized admin backend unavailable" : "authorized admin request rejected",
                 .storage_revision = 0U,
                 .resource_version = 0U,
                 .active_generation = std::nullopt,
@@ -226,8 +225,7 @@ namespace rule_engine::python::tools {
         }
 
         [[nodiscard]] protocol_v2::PeerEnvelope server_envelope(const ResidentAgentSession &session,
-                                                                 std::string message_id,
-                                                                 protocol_v2::MessageBody body) {
+                                                                std::string message_id, protocol_v2::MessageBody body) {
             return {
                 .protocol_major = protocol_v2::major_version,
                 .protocol_minor = protocol_v2::initial_minor_version,
@@ -241,7 +239,8 @@ namespace rule_engine::python::tools {
         }
 
         struct TlsResidentChannel final: IResidentSecureChannel {
-            explicit TlsResidentChannel(protocol_v2::TlsPeerConnection connection): connection_ {std::move(connection)} {}
+            explicit TlsResidentChannel(protocol_v2::TlsPeerConnection connection):
+                connection_ {std::move(connection)} {}
 
             [[nodiscard]] std::expected<protocol_v2::PeerEnvelope, protocol_v2::ProtocolError>
             receive_protocol(const std::chrono::steady_clock::time_point deadline,
@@ -319,8 +318,8 @@ namespace rule_engine::python::tools {
 
     std::expected<std::vector<std::byte>, protocol_v2::ProtocolError>
     encode_resident_admin_request(const ResidentAdminRequest &request, const std::size_t maximum_frame_bytes) {
-        if (maximum_frame_bytes == 0U || !common_admin_request_valid(request) ||
-            !admin_request_shape_valid(request) || request.operation_id.size() > maximum_admin_string_bytes ||
+        if (maximum_frame_bytes == 0U || !common_admin_request_valid(request) || !admin_request_shape_valid(request) ||
+            request.operation_id.size() > maximum_admin_string_bytes ||
             request.idempotency_key.size() > maximum_admin_string_bytes) {
             return std::unexpected(error(protocol_v2::ProtocolErrorCode::malformed, "admin request is invalid"));
         }
@@ -340,7 +339,7 @@ namespace rule_engine::python::tools {
     decode_resident_admin_request(const std::span<const std::byte> payload, const std::size_t maximum_frame_bytes) {
         if (payload.empty() || payload.size() > maximum_frame_bytes) {
             return std::unexpected(error(payload.empty() ? protocol_v2::ProtocolErrorCode::malformed :
-                                                            protocol_v2::ProtocolErrorCode::limit_exceeded,
+                                                           protocol_v2::ProtocolErrorCode::limit_exceeded,
                                          "admin request frame length is invalid"));
         }
         Reader reader {.bytes = payload};
@@ -370,8 +369,7 @@ namespace rule_engine::python::tools {
         };
         auto canonical = encode_resident_admin_request(request, maximum_frame_bytes);
         if (!canonical || *canonical != std::vector<std::byte> {payload.begin(), payload.end()}) {
-            return std::unexpected(
-                error(protocol_v2::ProtocolErrorCode::malformed, "admin request is not canonical"));
+            return std::unexpected(error(protocol_v2::ProtocolErrorCode::malformed, "admin request is not canonical"));
         }
         return request;
     }
@@ -379,10 +377,10 @@ namespace rule_engine::python::tools {
     std::expected<std::vector<std::byte>, protocol_v2::ProtocolError>
     encode_resident_admin_response(const ResidentAdminResponse &response, const std::size_t maximum_frame_bytes) {
         if (maximum_frame_bytes == 0U || response.request_id.empty() ||
-            response.request_id.size() > maximum_admin_string_bytes || response.code.size() > maximum_admin_string_bytes ||
-            response.diagnostic.size() > maximum_admin_string_bytes ||
-            !printable_ascii(response.request_id, false) || !printable_ascii(response.code) ||
-            !printable_ascii(response.diagnostic) ||
+            response.request_id.size() > maximum_admin_string_bytes ||
+            response.code.size() > maximum_admin_string_bytes ||
+            response.diagnostic.size() > maximum_admin_string_bytes || !printable_ascii(response.request_id, false) ||
+            !printable_ascii(response.code) || !printable_ascii(response.diagnostic) ||
             static_cast<std::uint8_t>(response.status) >
                 static_cast<std::uint8_t>(ResidentAdminResponseStatus::unavailable)) {
             return std::unexpected(error(protocol_v2::ProtocolErrorCode::malformed, "admin response is invalid"));
@@ -391,9 +389,9 @@ namespace rule_engine::python::tools {
         const auto flags = static_cast<std::uint8_t>((response.active_generation ? 1U : 0U) |
                                                      (response.previous_active_generation ? 2U : 0U));
         if (!writer.append_u8(1U) || !writer.append_u8(static_cast<std::uint8_t>(response.status)) ||
-            !writer.append_u8(flags) || !writer.append_string(response.request_id) || !writer.append_string(response.code) ||
-            !writer.append_string(response.diagnostic) || !writer.append_u64(response.storage_revision) ||
-            !writer.append_u64(response.resource_version) ||
+            !writer.append_u8(flags) || !writer.append_string(response.request_id) ||
+            !writer.append_string(response.code) || !writer.append_string(response.diagnostic) ||
+            !writer.append_u64(response.storage_revision) || !writer.append_u64(response.resource_version) ||
             !writer.append_u64(response.active_generation.value_or(0U)) ||
             !writer.append_u64(response.previous_active_generation.value_or(0U))) {
             return std::unexpected(
@@ -406,7 +404,7 @@ namespace rule_engine::python::tools {
     decode_resident_admin_response(const std::span<const std::byte> payload, const std::size_t maximum_frame_bytes) {
         if (payload.empty() || payload.size() > maximum_frame_bytes) {
             return std::unexpected(error(payload.empty() ? protocol_v2::ProtocolErrorCode::malformed :
-                                                            protocol_v2::ProtocolErrorCode::limit_exceeded,
+                                                           protocol_v2::ProtocolErrorCode::limit_exceeded,
                                          "admin response frame length is invalid"));
         }
         Reader reader {.bytes = payload};
@@ -433,13 +431,11 @@ namespace rule_engine::python::tools {
             .storage_revision = *storage,
             .resource_version = *resource,
             .active_generation = (*flags & 1U) != 0U ? std::optional<std::uint64_t> {*active} : std::nullopt,
-            .previous_active_generation =
-                (*flags & 2U) != 0U ? std::optional<std::uint64_t> {*previous} : std::nullopt,
+            .previous_active_generation = (*flags & 2U) != 0U ? std::optional<std::uint64_t> {*previous} : std::nullopt,
         };
         auto canonical = encode_resident_admin_response(response, maximum_frame_bytes);
         if (!canonical || *canonical != std::vector<std::byte> {payload.begin(), payload.end()}) {
-            return std::unexpected(
-                error(protocol_v2::ProtocolErrorCode::malformed, "admin response is not canonical"));
+            return std::unexpected(error(protocol_v2::ProtocolErrorCode::malformed, "admin response is not canonical"));
         }
         return response;
     }
@@ -450,7 +446,7 @@ namespace rule_engine::python::tools {
         durable_ {store}, policy_ {policy}, security_audit_ {security_audit} {}
 
     ResidentAdminResponse AuthorizedResidentAdminBackend::execute(const protocol_v2::AuthenticatedPeer &peer,
-                                                                   const ResidentAdminRequest &request) noexcept {
+                                                                  const ResidentAdminRequest &request) noexcept {
         auto principal = policy_.principal_for(peer);
         if (!principal) {
             return rejected_response(request, principal.error());
@@ -487,9 +483,8 @@ namespace rule_engine::python::tools {
                     .diagnostic = {},
                     .storage_revision = 0U,
                     .resource_version = 0U,
-                    .active_generation = *operation ?
-                                             std::optional<std::uint64_t> {(*operation)->target_generation} :
-                                             std::nullopt,
+                    .active_generation =
+                        *operation ? std::optional<std::uint64_t> {(*operation)->target_generation} : std::nullopt,
                     .previous_active_generation = std::nullopt};
         }
         const cluster::AdminApplyRequest apply {
@@ -512,7 +507,8 @@ namespace rule_engine::python::tools {
     }
 
     struct ResidentServiceScheduler::Impl {
-        Impl(ResidentServiceLimits configured, IResidentSessionHandler &target): limits {configured}, handler {target} {}
+        Impl(ResidentServiceLimits configured, IResidentSessionHandler &target):
+            limits {configured}, handler {target} {}
 
         void worker(const std::stop_token cancellation) noexcept {
             while (true) {
@@ -640,9 +636,9 @@ namespace rule_engine::python::tools {
     }
 
     ResidentApplicationService::ResidentApplicationService(ResidentServiceLimits limits,
-                                                             const protocol_v2::ITrustPolicy &peer_trust,
-                                                             IResidentAgentBackend &agents,
-                                                             IResidentAdminBackend &admin) noexcept:
+                                                           const protocol_v2::ITrustPolicy &peer_trust,
+                                                           IResidentAgentBackend &agents,
+                                                           IResidentAdminBackend &admin) noexcept:
         limits_ {limits}, peer_trust_ {peer_trust}, agents_ {agents}, admin_ {admin} {}
 
     void ResidentApplicationService::run(ResidentSessionJob job, const std::stop_token cancellation) noexcept {
@@ -657,8 +653,7 @@ namespace rule_engine::python::tools {
         job.channel->shutdown();
     }
 
-    void ResidentApplicationService::run_agent(ResidentSessionJob &job,
-                                                const std::stop_token cancellation) noexcept {
+    void ResidentApplicationService::run_agent(ResidentSessionJob &job, const std::stop_token cancellation) noexcept {
         const auto session_deadline = std::chrono::steady_clock::now() + limits_.maximum_session_duration;
         auto first = job.channel->receive_protocol(bounded_deadline(session_deadline), cancellation);
         if (!first || !std::holds_alternative<protocol_v2::AgentHelloMessage>(first->body) || first->session ||
@@ -666,9 +661,8 @@ namespace rule_engine::python::tools {
             return;
         }
         const auto &hello = std::get<protocol_v2::AgentHelloMessage>(first->body);
-        if (hello.minimum_minor > protocol_v2::initial_minor_version ||
-            hello.maximum_minor < hello.minimum_minor || hello.agent_epoch.empty() ||
-            hello.agent_epoch != first->agent_epoch || hello.next_sequence == 0U ||
+        if (hello.minimum_minor > protocol_v2::initial_minor_version || hello.maximum_minor < hello.minimum_minor ||
+            hello.agent_epoch.empty() || hello.agent_epoch != first->agent_epoch || hello.next_sequence == 0U ||
             !peer_trust_.authorize_capabilities(job.peer, hello.capabilities)) {
             return;
         }
@@ -715,8 +709,8 @@ namespace rule_engine::python::tools {
 
         std::map<std::string, protocol_v2::WorkLeaseMessage, std::less<>> outstanding;
         const auto peer_work_limit = (std::min) ({limits_.maximum_inflight_work_per_session,
-                                                 static_cast<std::size_t>(hello.receive_limit.work_attempts),
-                                                 static_cast<std::size_t>(hello.receive_limit.messages)});
+                                                  static_cast<std::size_t>(hello.receive_limit.work_attempts),
+                                                  static_cast<std::size_t>(hello.receive_limit.messages)});
         auto work = agents_.take_work(*session, peer_work_limit, cancellation);
         if (!work || work->size() > peer_work_limit) {
             return;
@@ -724,8 +718,8 @@ namespace rule_engine::python::tools {
         std::uint64_t server_sequence {};
         std::size_t sent_work_bytes {};
         constexpr auto maximum_size = (std::numeric_limits<std::size_t>::max)();
-        const auto peer_byte_limit = static_cast<std::size_t>(
-            (std::min) (hello.receive_limit.bytes, static_cast<std::uint64_t>(maximum_size)));
+        const auto peer_byte_limit =
+            static_cast<std::size_t>((std::min) (hello.receive_limit.bytes, static_cast<std::uint64_t>(maximum_size)));
         for (auto &lease : *work) {
             lease.session = session->session;
             lease.peer = job.peer.peer;
@@ -733,7 +727,8 @@ namespace rule_engine::python::tools {
             lease.server_sequence = ++server_sequence;
             IgnoreCancel cancel;
             auto valid = runtime::ProtocolV2ProviderResponsePort::create(lease, cancel);
-            if (!valid || outstanding.contains(lease.work_id) || outstanding.size() >= limits_.maximum_inflight_work_per_session) {
+            if (!valid || outstanding.contains(lease.work_id) ||
+                outstanding.size() >= limits_.maximum_inflight_work_per_session) {
                 return;
             }
             const auto message_id = "server:" + session->session.value + ":work:" + std::to_string(server_sequence);
@@ -745,17 +740,16 @@ namespace rule_engine::python::tools {
                 return;
             }
             sent_work_bytes += measured->size();
-            if (auto sent = job.channel->send_protocol(outbound,
-                                                       bounded_deadline(session_deadline), cancellation);
+            if (auto sent = job.channel->send_protocol(outbound, bounded_deadline(session_deadline), cancellation);
                 !sent) {
                 return;
             }
             outstanding.emplace(lease.work_id, std::move(lease));
         }
 
-        for (std::size_t count = 0U; count < limits_.maximum_messages_per_session &&
-                                    std::chrono::steady_clock::now() < session_deadline &&
-                                    !cancellation.stop_requested();
+        for (std::size_t count = 0U;
+             count < limits_.maximum_messages_per_session && std::chrono::steady_clock::now() < session_deadline &&
+             !cancellation.stop_requested();
              ++count) {
             auto received = job.channel->receive_protocol(bounded_deadline(session_deadline), cancellation);
             if (!received) {
@@ -803,8 +797,8 @@ namespace rule_engine::python::tools {
                                           durable->credit.work_attempts <= limits_.inbound_credit.work_attempts &&
                                           durable->credit.snapshot_chunks <= limits_.inbound_credit.snapshot_chunks;
                 if (!durable || durable->acknowledged_through != contiguous->sequence || !credit_valid) {
-                    const auto reason = durable ? protocol_v2::ProtocolErrorCode::persistence_error :
-                                                  durable.error().code;
+                    const auto reason =
+                        durable ? protocol_v2::ProtocolErrorCode::persistence_error : durable.error().code;
                     const protocol_v2::NackMessage nack {.agent_epoch = session->agent_epoch,
                                                          .sequence = contiguous->sequence,
                                                          .reason = reason,
@@ -824,9 +818,8 @@ namespace rule_engine::python::tools {
                 if (const auto *result = std::get_if<protocol_v2::WorkResultMessage>(&contiguous->body)) {
                     outstanding.erase(result->work_id);
                 }
-                const protocol_v2::AckMessage ack {.agent_epoch = session->agent_epoch,
-                                                   .acknowledged_through = *settled,
-                                                   .credit = durable->credit};
+                const protocol_v2::AckMessage ack {
+                    .agent_epoch = session->agent_epoch, .acknowledged_through = *settled, .credit = durable->credit};
                 if (auto sent = job.channel->send_protocol(
                         server_envelope(*session, "server:" + session->session.value + ":ack", ack),
                         bounded_deadline(session_deadline), cancellation);
@@ -837,12 +830,11 @@ namespace rule_engine::python::tools {
         }
     }
 
-    void ResidentApplicationService::run_admin(ResidentSessionJob &job,
-                                                const std::stop_token cancellation) noexcept {
+    void ResidentApplicationService::run_admin(ResidentSessionJob &job, const std::stop_token cancellation) noexcept {
         const auto session_deadline = std::chrono::steady_clock::now() + limits_.maximum_session_duration;
-        for (std::size_t count = 0U; count < limits_.maximum_messages_per_session &&
-                                    std::chrono::steady_clock::now() < session_deadline &&
-                                    !cancellation.stop_requested();
+        for (std::size_t count = 0U;
+             count < limits_.maximum_messages_per_session && std::chrono::steady_clock::now() < session_deadline &&
+             !cancellation.stop_requested();
              ++count) {
             auto payload = job.channel->receive_application_frame(bounded_deadline(session_deadline), cancellation);
             if (!payload || payload->size() > limits_.maximum_frame_bytes) {
@@ -854,7 +846,8 @@ namespace rule_engine::python::tools {
             }
             auto response = admin_.execute(job.peer, *request);
             auto encoded = encode_resident_admin_response(response, limits_.maximum_frame_bytes);
-            if (!encoded || !job.channel->send_application_frame(*encoded, bounded_deadline(session_deadline), cancellation)) {
+            if (!encoded ||
+                !job.channel->send_application_frame(*encoded, bounded_deadline(session_deadline), cancellation)) {
                 return;
             }
         }

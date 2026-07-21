@@ -101,8 +101,7 @@ namespace rule_engine::python::protocol_v2 {
         [[nodiscard]] std::expected<PeerEnvelope, ProtocolError>
         receive_until(std::chrono::steady_clock::time_point deadline, std::stop_token cancellation = {}) noexcept;
         [[nodiscard]] std::expected<void, ProtocolError>
-        send_application_frame_until(std::span<const std::byte> payload,
-                                     std::chrono::steady_clock::time_point deadline,
+        send_application_frame_until(std::span<const std::byte> payload, std::chrono::steady_clock::time_point deadline,
                                      std::stop_token cancellation = {}) noexcept;
         [[nodiscard]] std::expected<std::vector<std::byte>, ProtocolError>
         receive_application_frame_until(std::chrono::steady_clock::time_point deadline,

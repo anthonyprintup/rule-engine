@@ -1022,13 +1022,13 @@ TEST_CASE("fact schema hash drift is rejected before a value reaches a VM regist
     const auto &request = waiting.fact_requests.front();
 
     HostResponses response;
-    response.facts.push_back(FactResponse {.request_id = request.request_id,
-                                           .subject = request.subject,
-                                           .status = FactTerminalStatus::value,
-                                           .value = make_fact(true),
-                                           .returned_schema = SchemaIdentity {.id = request.expected_schema,
-                                                                              .canonical_hash = "fnv1a64:badbadbadbadbadb"},
-                                           .diagnostic = std::nullopt});
+    response.facts.push_back(FactResponse {
+        .request_id = request.request_id,
+        .subject = request.subject,
+        .status = FactTerminalStatus::value,
+        .value = make_fact(true),
+        .returned_schema = SchemaIdentity {.id = request.expected_schema, .canonical_hash = "fnv1a64:badbadbadbadbadb"},
+        .diagnostic = std::nullopt});
     const auto faulted = session->step(std::move(response));
     REQUIRE(faulted.state == VmStepState::faulted);
     REQUIRE(faulted.result.has_value());

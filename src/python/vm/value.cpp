@@ -1667,8 +1667,7 @@ namespace rule_engine::python::vm {
             case ValueKind::record:
             case ValueKind::iterator:
                 return std::unexpected(error(VmErrorCode::engine_fault, "iterator source has an invalid kind"));
-            default:
-                return std::unexpected(error(VmErrorCode::engine_fault, "iterator source kind is unknown"));
+            default: return std::unexpected(error(VmErrorCode::engine_fault, "iterator source kind is unknown"));
         }
         return state.index >= size;
     }

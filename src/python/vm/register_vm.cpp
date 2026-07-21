@@ -1281,7 +1281,8 @@ namespace rule_engine::python::vm {
                     canonical_subject_key(response.subject) != canonical_subject_key(pending->fact->subject) ||
                     !fact_response_schema_matches(*pending->fact, response)) {
                     return VmError {.code = VmErrorCode::invalid_host_response,
-                                    .message = "fact response identity, terminal shape, or schema does not match its request",
+                                    .message =
+                                        "fact response identity, terminal shape, or schema does not match its request",
                                     .span = pending->span};
                 }
                 if (response.status != FactTerminalStatus::value) {

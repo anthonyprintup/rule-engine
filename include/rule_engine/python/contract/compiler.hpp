@@ -51,7 +51,7 @@ namespace rule_engine::python {
     // complete canonical descriptor, not a value or route name.
     [[nodiscard]] std::string canonical_schema_hash(std::string_view canonical_descriptor);
     [[nodiscard]] std::optional<SchemaIdentity> resolve_schema_identity(const SchemaCatalog &catalog,
-                                                                         const SchemaId &schema);
+                                                                        const SchemaId &schema);
 
     struct OperatorBinding {
         BindingId id;

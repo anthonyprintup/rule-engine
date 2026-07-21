@@ -1,8 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "rule_engine/python/protocol/codec.hpp"
 #include "rule_engine/python/tools/benchmark.hpp"
 #include "rule_engine/python/tools/server.hpp"
-#include "rule_engine/python/protocol/codec.hpp"
 
 #ifndef RULE_ENGINE_PYTHON_SERVER_PATH
 #define RULE_ENGINE_PYTHON_SERVER_PATH ""
@@ -12,9 +12,9 @@
 #define RULE_ENGINE_PYTHON_BENCHMARK_PATH ""
 #endif
 
-#include <chrono>
-#include <atomic>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -23,9 +23,9 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
-#include <thread>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -395,15 +395,13 @@ TEST_CASE("server configuration parser bounds hostile input and duplicate state"
     CHECK(unsafe_renewal.error().code == "SRV-CONFIG-LISTENER-BOUNDS");
 
     auto slow_handshake = development_config(temporary);
-    replace_once(slow_handshake, "listener.handshake_timeout_ms = 5000",
-                 "listener.handshake_timeout_ms = 19000");
+    replace_once(slow_handshake, "listener.handshake_timeout_ms = 5000", "listener.handshake_timeout_ms = 19000");
     const auto unsafe_handshake = parse_server_config(slow_handshake);
     REQUIRE_FALSE(unsafe_handshake.has_value());
     CHECK(unsafe_handshake.error().code == "SRV-CONFIG-LISTENER-BOUNDS");
 
     auto overflowing_window = development_config(temporary);
-    replace_once(overflowing_window, "node.lease_duration_ms = 30000",
-                 "node.lease_duration_ms = 9223372036854775807");
+    replace_once(overflowing_window, "node.lease_duration_ms = 30000", "node.lease_duration_ms = 9223372036854775807");
     replace_once(overflowing_window, "node.lease_renew_interval_ms = 10000",
                  "node.lease_renew_interval_ms = 9223372036854775307");
     const auto unsafe_overflow = parse_server_config(overflowing_window);
@@ -411,8 +409,7 @@ TEST_CASE("server configuration parser bounds hostile input and duplicate state"
     CHECK(unsafe_overflow.error().code == "SRV-CONFIG-LISTENER-BOUNDS");
 
     auto unbounded_service = development_config(temporary);
-    replace_once(unbounded_service, "service.maximum_memory_bytes = 134217728",
-                 "service.maximum_memory_bytes = 1024");
+    replace_once(unbounded_service, "service.maximum_memory_bytes = 134217728", "service.maximum_memory_bytes = 1024");
     const auto unsafe_service = parse_server_config(unbounded_service);
     REQUIRE_FALSE(unsafe_service.has_value());
     CHECK(unsafe_service.error().code == "SRV-CONFIG-SERVICE-BOUNDS");
@@ -639,8 +636,7 @@ namespace {
     struct AllowTrust final: proto::ITrustPolicy {
         [[nodiscard]] std::expected<proto::AuthenticatedPeer, proto::ProtocolError>
         authenticate(const proto::TlsPeerIdentity &) const noexcept override {
-            return proto::AuthenticatedPeer {.tenant = py::TenantId {"tenant:test"},
-                                             .peer = py::PeerId {"peer:test"}};
+            return proto::AuthenticatedPeer {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:test"}};
         }
     };
 
@@ -681,15 +677,13 @@ namespace {
         [[nodiscard]] std::expected<tools::ResidentAgentSession, proto::ProtocolError>
         establish(const proto::AuthenticatedPeer &peer, const proto::AgentHelloMessage &hello,
                   std::stop_token) noexcept override {
-            return tools::ResidentAgentSession {.authenticated_peer = peer,
-                                                .session = py::SessionId {"session:test"},
-                                                .session_fence = return_invalid_session ? 0U : fence,
-                                                .agent_epoch = hello.agent_epoch,
-                                                .acknowledged_through = 0U,
-                                                .credit = {.bytes = 64U * py::kibibyte,
-                                                           .messages = 8U,
-                                                           .work_attempts = 1U,
-                                                           .snapshot_chunks = 1U}};
+            return tools::ResidentAgentSession {
+                .authenticated_peer = peer,
+                .session = py::SessionId {"session:test"},
+                .session_fence = return_invalid_session ? 0U : fence,
+                .agent_epoch = hello.agent_epoch,
+                .acknowledged_through = 0U,
+                .credit = {.bytes = 64U * py::kibibyte, .messages = 8U, .work_attempts = 1U, .snapshot_chunks = 1U}};
         }
 
         [[nodiscard]] std::expected<std::vector<proto::WorkLeaseMessage>, proto::ProtocolError>
@@ -698,15 +692,12 @@ namespace {
         }
 
         [[nodiscard]] std::expected<tools::DurableAgentReceipt, proto::ProtocolError>
-        persist(const tools::ResidentAgentSession &, const std::uint64_t sequence,
-                const proto::DurableAgentBody &, std::stop_token) noexcept override {
+        persist(const tools::ResidentAgentSession &, const std::uint64_t sequence, const proto::DurableAgentBody &,
+                std::stop_token) noexcept override {
             ++persists;
             return tools::DurableAgentReceipt {
                 .acknowledged_through = sequence,
-                .credit = {.bytes = 64U * py::kibibyte,
-                           .messages = 8U,
-                           .work_attempts = 1U,
-                           .snapshot_chunks = 1U},
+                .credit = {.bytes = 64U * py::kibibyte, .messages = 8U, .work_attempts = 1U, .snapshot_chunks = 1U},
             };
         }
 
@@ -714,8 +705,8 @@ namespace {
     };
 
     struct RejectAdmin final: tools::IResidentAdminBackend {
-        [[nodiscard]] tools::ResidentAdminResponse execute(const proto::AuthenticatedPeer &,
-                                                           const tools::ResidentAdminRequest &request) noexcept override {
+        [[nodiscard]] tools::ResidentAdminResponse
+        execute(const proto::AuthenticatedPeer &, const tools::ResidentAdminRequest &request) noexcept override {
             return {.status = tools::ResidentAdminResponseStatus::rejected,
                     .request_id = request.request_id,
                     .code = "TEST-REJECTED",
@@ -735,24 +726,20 @@ namespace {
                 .maximum_messages_per_session = 8U,
                 .maximum_inflight_work_per_session = 1U,
                 .maximum_session_duration = std::chrono::milliseconds {500},
-                .inbound_credit = {.bytes = 64U * py::kibibyte,
-                                   .messages = 8U,
-                                   .work_attempts = 1U,
-                                   .snapshot_chunks = 1U}};
+                .inbound_credit = {
+                    .bytes = 64U * py::kibibyte, .messages = 8U, .work_attempts = 1U, .snapshot_chunks = 1U}};
     }
 
     [[nodiscard]] proto::PeerEnvelope agent_hello_envelope() {
-        const proto::AgentHelloMessage hello {.minimum_minor = proto::initial_minor_version,
-                                              .maximum_minor = proto::initial_minor_version,
-                                              .agent_version = "test",
-                                              .agent_epoch = "epoch:test",
-                                              .next_sequence = 1U,
-                                              .schemas = {},
-                                              .capabilities = {},
-                                              .receive_limit = {.bytes = 1U << 20U,
-                                                                .messages = 8U,
-                                                                .work_attempts = 1U,
-                                                                .snapshot_chunks = 1U}};
+        const proto::AgentHelloMessage hello {
+            .minimum_minor = proto::initial_minor_version,
+            .maximum_minor = proto::initial_minor_version,
+            .agent_version = "test",
+            .agent_epoch = "epoch:test",
+            .next_sequence = 1U,
+            .schemas = {},
+            .capabilities = {},
+            .receive_limit = {.bytes = 1U << 20U, .messages = 8U, .work_attempts = 1U, .snapshot_chunks = 1U}};
         return {.protocol_major = proto::major_version,
                 .protocol_minor = proto::initial_minor_version,
                 .message_id = "agent:hello",
@@ -763,9 +750,9 @@ namespace {
                 .body = hello};
     }
 
-    [[nodiscard]] proto::PeerEnvelope agent_result_envelope(
-        const std::uint64_t inner_fence = 9U,
-        const std::string_view returned_schema_hash = service_schema_hash) {
+    [[nodiscard]] proto::PeerEnvelope
+    agent_result_envelope(const std::uint64_t inner_fence = 9U,
+                          const std::string_view returned_schema_hash = service_schema_hash) {
         const proto::WorkResultMessage result {
             .originating_session = py::SessionId {"session:test"},
             .peer = py::PeerId {"peer:test"},
@@ -778,10 +765,11 @@ namespace {
                        .subject = service_subject(),
                        .status = py::FactTerminalStatus::value,
                        .value = py::make_fact(py::UnicodeValue {.utf8 = "C:/test.exe"}),
-                       .returned_schema = py::SchemaIdentity {
-                           .id = py::SchemaId {"schema:string"},
-                           .canonical_hash = std::string {returned_schema_hash},
-                       },
+                       .returned_schema =
+                           py::SchemaIdentity {
+                               .id = py::SchemaId {"schema:string"},
+                               .canonical_hash = std::string {returned_schema_hash},
+                           },
                        .diagnostic = std::nullopt}},
             .scans = {},
         };
@@ -816,8 +804,7 @@ namespace {
             ++reads;
             return std::optional<py::cluster::AdminOperationRecord> {};
         }
-        [[nodiscard]] std::expected<void, py::StoreError>
-        commit(const py::cluster::ControlPlaneCommit &) override {
+        [[nodiscard]] std::expected<void, py::StoreError> commit(const py::cluster::ControlPlaneCommit &) override {
             ++commits;
             return {};
         }
@@ -850,9 +837,7 @@ namespace {
         std::atomic<std::size_t> entered {};
         void run(tools::ResidentSessionJob job, const std::stop_token cancellation) noexcept override {
             ++entered;
-            while (!cancellation.stop_requested()) {
-                std::this_thread::yield();
-            }
+            while (!cancellation.stop_requested()) { std::this_thread::yield(); }
             if (job.channel) {
                 job.channel->shutdown();
             }
@@ -958,8 +943,7 @@ TEST_CASE("resident agent service rejects a mismatched fact schema before persis
     const auto nack = proto::decode_frame(state->protocol_output.back());
     REQUIRE(nack);
     REQUIRE(std::holds_alternative<proto::NackMessage>(nack->envelope.body));
-    CHECK(std::get<proto::NackMessage>(nack->envelope.body).reason ==
-          proto::ProtocolErrorCode::provider_violation);
+    CHECK(std::get<proto::NackMessage>(nack->envelope.body).reason == proto::ProtocolErrorCode::provider_violation);
     CHECK_FALSE(std::holds_alternative<proto::AckMessage>(nack->envelope.body));
 }
 
@@ -984,8 +968,8 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
     REQUIRE(bytes);
     auto decoded = tools::decode_resident_admin_request(*bytes, 4U * py::kibibyte);
     REQUIRE(decoded);
-    const auto admin_peer = proto::AuthenticatedPeer {.tenant = py::TenantId {"tenant:test"},
-                                                      .peer = py::PeerId {"peer:admin"}};
+    const auto admin_peer =
+        proto::AuthenticatedPeer {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:admin"}};
     const auto response = backend.execute(admin_peer, *decoded);
     CHECK(response.status == tools::ResidentAdminResponseStatus::rejected);
     CHECK(response.code == "ADMIN-UNAUTHORIZED");
@@ -1019,22 +1003,22 @@ TEST_CASE("resident scheduler rejects overload and joins owned workers on shutdo
     auto first = std::make_shared<FakeChannelState>();
     auto second = std::make_shared<FakeChannelState>();
     auto third = std::make_shared<FakeChannelState>();
-    CHECK((*scheduler)->submit({.role = tools::ResidentSessionRole::agent,
-                                .peer = {},
-                                .channel = std::make_unique<FakeByteChannel>(first)}) ==
-          tools::ResidentAdmission::accepted);
+    CHECK((*scheduler)
+              ->submit({.role = tools::ResidentSessionRole::agent,
+                        .peer = {},
+                        .channel = std::make_unique<FakeByteChannel>(first)}) == tools::ResidentAdmission::accepted);
     for (std::size_t attempt = 0U; attempt < 10'000U && handler.entered.load() == 0U; ++attempt) {
         std::this_thread::yield();
     }
     REQUIRE(handler.entered.load() == 1U);
-    CHECK((*scheduler)->submit({.role = tools::ResidentSessionRole::agent,
-                                .peer = {},
-                                .channel = std::make_unique<FakeByteChannel>(second)}) ==
-          tools::ResidentAdmission::accepted);
-    CHECK((*scheduler)->submit({.role = tools::ResidentSessionRole::agent,
-                                .peer = {},
-                                .channel = std::make_unique<FakeByteChannel>(third)}) ==
-          tools::ResidentAdmission::overloaded);
+    CHECK((*scheduler)
+              ->submit({.role = tools::ResidentSessionRole::agent,
+                        .peer = {},
+                        .channel = std::make_unique<FakeByteChannel>(second)}) == tools::ResidentAdmission::accepted);
+    CHECK((*scheduler)
+              ->submit({.role = tools::ResidentSessionRole::agent,
+                        .peer = {},
+                        .channel = std::make_unique<FakeByteChannel>(third)}) == tools::ResidentAdmission::overloaded);
     CHECK(third->shutdown);
 
     (*scheduler)->request_stop();

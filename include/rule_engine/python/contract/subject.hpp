@@ -97,8 +97,7 @@ namespace rule_engine::python {
     // every non-value terminal carries neither. Diagnostics are optional only
     // for non-value terminals.
     [[nodiscard]] bool valid_fact_response_shape(const FactResponse &response) noexcept;
-    [[nodiscard]] bool fact_response_schema_matches(const FactRequest &request,
-                                                     const FactResponse &response) noexcept;
+    [[nodiscard]] bool fact_response_schema_matches(const FactRequest &request, const FactResponse &response) noexcept;
 
     struct ScanMatch {
         std::uint64_t offset {};

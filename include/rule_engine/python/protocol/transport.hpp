@@ -62,8 +62,7 @@ namespace rule_engine::python::protocol_v2 {
         // canonical four-byte network-order frame prefix without interpreting
         // the payload as a protocol-v2 peer envelope.
         [[nodiscard]] std::expected<void, ProtocolError>
-        send_application_frame(std::span<const std::byte> payload,
-                               const TransportOperation &operation = {}) noexcept;
+        send_application_frame(std::span<const std::byte> payload, const TransportOperation &operation = {}) noexcept;
         [[nodiscard]] std::expected<std::vector<std::byte>, ProtocolError>
         receive_application_frame(const TransportOperation &operation = {}) noexcept;
         [[nodiscard]] bool established() const noexcept;

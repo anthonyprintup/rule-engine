@@ -555,7 +555,7 @@ namespace rule_engine::python::protocol_v2 {
 
     std::expected<void, ProtocolError>
     OpenSslTlsSession::send_application_frame(const std::span<const std::byte> payload,
-                                               const TransportOperation &operation) noexcept {
+                                              const TransportOperation &operation) noexcept {
 #if RULE_ENGINE_PROTOCOL_HAS_OPENSSL
         if (!established()) {
             return std::unexpected(
@@ -564,14 +564,16 @@ namespace rule_engine::python::protocol_v2 {
         const auto maximum = impl_->context->configuration.protocol_limits.maximum_frame_bytes;
         if (payload.empty() || payload.size() > maximum ||
             payload.size() > static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())) {
-            return std::unexpected(transport_error(payload.empty() ? ProtocolErrorCode::malformed :
-                                                                      ProtocolErrorCode::limit_exceeded,
-                                                   "TLS application frame length is invalid"));
+            return std::unexpected(
+                transport_error(payload.empty() ? ProtocolErrorCode::malformed : ProtocolErrorCode::limit_exceeded,
+                                "TLS application frame length is invalid"));
         }
         const auto size = static_cast<std::uint32_t>(payload.size());
         const std::array header {
-            static_cast<std::byte>((size >> 24U) & 0xffU), static_cast<std::byte>((size >> 16U) & 0xffU),
-            static_cast<std::byte>((size >> 8U) & 0xffU), static_cast<std::byte>(size & 0xffU),
+            static_cast<std::byte>((size >> 24U) & 0xffU),
+            static_cast<std::byte>((size >> 16U) & 0xffU),
+            static_cast<std::byte>((size >> 8U) & 0xffU),
+            static_cast<std::byte>(size & 0xffU),
         };
         if (auto written = write_all(impl_->ssl, header, operation); !written) {
             return written;
