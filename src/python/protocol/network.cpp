@@ -43,7 +43,7 @@ namespace rule_engine::python::protocol_v2 {
         }
 
         [[nodiscard]] ProtocolError timeout_error(const std::string_view activity) {
-            return network_error(ProtocolErrorCode::transport_error, std::string {activity} + " timed out");
+            return network_error(ProtocolErrorCode::timed_out, std::string {activity} + " timed out");
         }
 
         [[nodiscard]] ProtocolError canceled_error(const std::string_view activity) {

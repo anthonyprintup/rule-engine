@@ -55,7 +55,7 @@ namespace rule_engine::python::protocol_v2 {
                 const auto now = std::chrono::steady_clock::now();
                 if (operation.deadline != std::chrono::steady_clock::time_point::max() && now >= operation.deadline) {
                     return std::unexpected(
-                        transport_error(ProtocolErrorCode::transport_error, std::string {activity} + " timed out"));
+                        transport_error(ProtocolErrorCode::timed_out, std::string {activity} + " timed out"));
                 }
                 auto wait = cancellation_poll;
                 if (operation.deadline != std::chrono::steady_clock::time_point::max()) {
@@ -223,8 +223,7 @@ namespace rule_engine::python::protocol_v2 {
                 }
                 if (operation.deadline != std::chrono::steady_clock::time_point::max() &&
                     std::chrono::steady_clock::now() >= operation.deadline) {
-                    return std::unexpected(
-                        transport_error(ProtocolErrorCode::transport_error, "TLS record write timed out"));
+                    return std::unexpected(transport_error(ProtocolErrorCode::timed_out, "TLS record write timed out"));
                 }
                 std::size_t written {};
                 const auto result = SSL_write_ex(ssl, bytes.data() + offset, bytes.size() - offset, &written);
@@ -254,8 +253,7 @@ namespace rule_engine::python::protocol_v2 {
                 }
                 if (operation.deadline != std::chrono::steady_clock::time_point::max() &&
                     std::chrono::steady_clock::now() >= operation.deadline) {
-                    return std::unexpected(
-                        transport_error(ProtocolErrorCode::transport_error, "TLS record read timed out"));
+                    return std::unexpected(transport_error(ProtocolErrorCode::timed_out, "TLS record read timed out"));
                 }
                 std::size_t received {};
                 const auto result = SSL_read_ex(ssl, bytes.data() + offset, bytes.size() - offset, &received);
@@ -459,7 +457,7 @@ namespace rule_engine::python::protocol_v2 {
             }
             if (operation.deadline != std::chrono::steady_clock::time_point::max() &&
                 std::chrono::steady_clock::now() >= operation.deadline) {
-                return std::unexpected(transport_error(ProtocolErrorCode::transport_error, "TLS handshake timed out"));
+                return std::unexpected(transport_error(ProtocolErrorCode::timed_out, "TLS handshake timed out"));
             }
             const auto result = impl_->context->configuration.role == TlsEndpointRole::server ? SSL_accept(impl_->ssl) :
                                                                                                 SSL_connect(impl_->ssl);

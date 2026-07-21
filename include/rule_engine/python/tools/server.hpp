@@ -1,14 +1,19 @@
 #pragma once
 
+#include "rule_engine/python/cluster/control_plane.hpp"
+#include "rule_engine/python/cluster/readiness.hpp"
 #include "rule_engine/python/cluster/store.hpp"
 #include "rule_engine/python/packaging/runtime.hpp"
-#include "rule_engine/python/protocol/transport.hpp"
+#include "rule_engine/python/packaging/source_pack.hpp"
+#include "rule_engine/python/protocol/network.hpp"
+#include "rule_engine/python/protocol/session.hpp"
 #include "rule_engine/python/tools/common.hpp"
 
 #include <chrono>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -42,6 +47,16 @@ namespace rule_engine::python::tools {
         bool require_crl {};
     };
 
+    struct ServerListenerConfig {
+        std::chrono::milliseconds accept_timeout {1'000};
+        std::chrono::milliseconds handshake_timeout {5'000};
+        std::chrono::milliseconds read_timeout {30'000};
+        std::chrono::milliseconds write_timeout {30'000};
+        std::size_t backlog {128U};
+        std::size_t maximum_consecutive_failures {16U};
+        bool require_hard_resolver_bounds {true};
+    };
+
     struct ServerConfig {
         std::uint32_t schema_version {server_config_schema_version};
         ServerDeploymentMode mode {ServerDeploymentMode::production_cluster};
@@ -52,6 +67,7 @@ namespace rule_engine::python::tools {
         ServerStoreConfig store;
         std::string agent_endpoint;
         std::string admin_endpoint;
+        ServerListenerConfig listener;
         ServerTlsConfig tls;
         std::filesystem::path runtime_root;
         std::filesystem::path pack_registry_path;
@@ -91,25 +107,44 @@ namespace rule_engine::python::tools {
     struct ResidentServerContext {
         const ServerConfig &config;
         cluster::IClusterRuntimeStore &store;
+        cluster::IActivationControlStore &activation_store;
+        const cluster::StoreBackendCapabilities &store_capabilities;
         const packaging::PrivatePythonRuntime &runtime;
-        const protocol_v2::OpenSslTlsContext *tls;
+        const packaging::TrustPolicy &pack_trust_policy;
+        const protocol_v2::ITrustPolicy &peer_trust_policy;
+        protocol_v2::OpenSslTlsContext *agent_tls;
+        protocol_v2::OpenSslTlsContext *admin_tls;
     };
 
-    // Socket acceptance and durable activation hydration belong behind this
-    // seam. The current protocol component exposes TLS for an already-connected
-    // socket but no listener/acceptor, and the store contract exposes no durable
-    // active-generation loader. The production backend therefore fails closed.
+    // The backend seam keeps process tests injectable while production owns the
+    // durable activation, fenced lease, and authenticated listener lifecycle.
     struct ResidentServerBackend {
         virtual ~ResidentServerBackend() = default;
         [[nodiscard]] virtual std::expected<void, ToolFailure>
         qualify_activation(const ResidentServerContext &context) noexcept = 0;
         [[nodiscard]] virtual std::expected<void, ToolFailure> serve(const ResidentServerContext &context) noexcept = 0;
+        virtual void request_stop() noexcept = 0;
     };
 
-    struct UnavailableResidentServerBackend final: ResidentServerBackend {
+    // This slice terminates an authenticated connection without reading
+    // application bytes because the worker/session scheduler is integrated in a
+    // later lane. TLS, trust, durable activation, fencing, and bounded stop are
+    // nevertheless real production paths and fail closed independently.
+    struct ProductionResidentServerBackend final: ResidentServerBackend {
+        ProductionResidentServerBackend();
+        ~ProductionResidentServerBackend() override;
+
+        ProductionResidentServerBackend(const ProductionResidentServerBackend &) = delete;
+        ProductionResidentServerBackend &operator=(const ProductionResidentServerBackend &) = delete;
+
         [[nodiscard]] std::expected<void, ToolFailure>
         qualify_activation(const ResidentServerContext &context) noexcept override;
         [[nodiscard]] std::expected<void, ToolFailure> serve(const ResidentServerContext &context) noexcept override;
+        void request_stop() noexcept override;
+
+    private:
+        struct Impl;
+        std::unique_ptr<Impl> impl_;
     };
 
     [[nodiscard]] std::string_view server_help() noexcept;

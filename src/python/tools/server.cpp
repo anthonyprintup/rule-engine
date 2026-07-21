@@ -2,16 +2,23 @@
 
 #include "rule_engine/python/cluster/configuration.hpp"
 
+#include <asio/ip/address.hpp>
+
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <memory>
 #include <set>
+#include <stop_token>
 #include <string>
+#include <thread>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -23,6 +30,9 @@ namespace rule_engine::python::tools {
         constexpr std::size_t maximum_config_line_bytes = 4U * kibibyte;
         constexpr std::size_t maximum_config_entries = 128U;
         constexpr std::size_t maximum_public_diagnostic_bytes = 2U * kibibyte;
+        constexpr std::size_t maximum_policy_bytes = 1U * mebibyte;
+        constexpr std::size_t maximum_policy_line_bytes = 4U * kibibyte;
+        constexpr std::size_t maximum_policy_entries = 4'096U;
 
         constexpr std::string_view help_text = R"(Usage: rule_engine_server --config PATH [--validate-config]
 
@@ -39,6 +49,9 @@ Required common configuration keys:
   schema.version, deployment.mode, node.id, node.platform_abi,
   node.lease_duration_ms, node.lease_renew_interval_ms, store.backend,
   store.server_processes, listener.agent_endpoint, listener.admin_endpoint,
+  listener.accept_timeout_ms, listener.handshake_timeout_ms,
+  listener.read_timeout_ms, listener.write_timeout_ms, listener.backlog,
+  listener.maximum_consecutive_failures, network.require_hard_resolver_bounds,
   runtime.root, pack.registry_path, bindings.operator_path,
   schemas.catalog_path, profiles.budget_path, profiles.retention_path,
   observability.prometheus_endpoint, observability.json_log_path,
@@ -51,6 +64,15 @@ loopback listener and metrics endpoints. Signed development packs require
 signer/revocation policy; development mTLS also requires peer enrollment.
 Secret values are not accepted inline; PostgreSQL currently supports only
 connection references of the form env:VARIABLE_NAME.
+
+Listener hosts are numeric literals; resident startup performs no DNS lookup.
+Policy snapshots are bounded, versioned tab-separated UTF-8 files. The peer
+snapshot header is rule-engine.peer-enrollment.v1; signer and revocation headers
+are rule-engine.trusted-signers.v1 and rule-engine.revocations.v1.
+
+Known limitation: this integration slice accepts and authenticates TLS peers,
+then closes the connection without reading application bytes. Full protocol
+session and worker scheduling is not yet connected to the resident loop.
 )";
 
         enum struct ValueKind : std::uint8_t { text, integer, boolean };
@@ -132,6 +154,13 @@ connection references of the form env:VARIABLE_NAME.
                 {"store.external_ha_configured", ValueKind::boolean},
                 {"listener.agent_endpoint", ValueKind::text},
                 {"listener.admin_endpoint", ValueKind::text},
+                {"listener.accept_timeout_ms", ValueKind::integer},
+                {"listener.handshake_timeout_ms", ValueKind::integer},
+                {"listener.read_timeout_ms", ValueKind::integer},
+                {"listener.write_timeout_ms", ValueKind::integer},
+                {"listener.backlog", ValueKind::integer},
+                {"listener.maximum_consecutive_failures", ValueKind::integer},
+                {"network.require_hard_resolver_bounds", ValueKind::boolean},
                 {"tls.trust_anchors_pem", ValueKind::text},
                 {"tls.certificate_chain_pem", ValueKind::text},
                 {"tls.private_key_pem", ValueKind::text},
@@ -405,6 +434,12 @@ connection references of the form env:VARIABLE_NAME.
             return host == "127.0.0.1" || host == "::1";
         }
 
+        [[nodiscard]] bool numeric_host(const std::string_view host) noexcept {
+            asio::error_code error;
+            static_cast<void>(asio::ip::make_address(host, error));
+            return !error;
+        }
+
         [[nodiscard]] std::expected<void, ServerConfigError> require_nonempty(const std::filesystem::path &path,
                                                                               const std::string_view key) {
             if (path.empty()) {
@@ -483,27 +518,37 @@ connection references of the form env:VARIABLE_NAME.
 #endif
         }
 
-        [[nodiscard]] std::expected<std::unique_ptr<cluster::IClusterRuntimeStore>, ToolFailure>
-        open_store(const ServerConfig &config, cluster::AuditTrail &audit) {
-            if (config.store.kind == ServerStoreKind::sqlite_dev) {
-                cluster::SqliteDevConfig store_config {
-                    .database_path = config.store.sqlite_path.string(),
-                    .server_processes = config.store.server_processes,
-                    .busy_timeout = config.store.busy_timeout,
-                    .wal = true,
-                    .foreign_keys = true,
-                    .remote_cluster = false,
-                    .high_availability = false,
-                    .deployment_mode = cluster::DeploymentMode::single_node_dev,
-                };
-                auto store = cluster::SqliteRuntimeStore::open(store_config, audit);
-                if (!store) {
-                    return std::unexpected(unavailable("SRV-SQLITE-UNAVAILABLE", store.error().message));
-                }
-                return std::unique_ptr<cluster::IClusterRuntimeStore> {std::move(*store)};
+        struct SensitiveValue {
+            explicit SensitiveValue(std::string input): value {std::move(input)} {}
+            SensitiveValue(SensitiveValue &&) noexcept = default;
+            SensitiveValue &operator=(SensitiveValue &&) noexcept = delete;
+            SensitiveValue(const SensitiveValue &) = delete;
+            SensitiveValue &operator=(const SensitiveValue &) = delete;
+            ~SensitiveValue() { wipe(); }
+
+            void wipe() noexcept {
+                std::ranges::fill(value, '\0');
+                value.clear();
             }
 
-            cluster::PostgreSql17Config store_config {
+            std::string value;
+        };
+
+        [[nodiscard]] cluster::SqliteDevConfig sqlite_store_config(const ServerConfig &config) {
+            return {
+                .database_path = config.store.sqlite_path.string(),
+                .server_processes = config.store.server_processes,
+                .busy_timeout = config.store.busy_timeout,
+                .wal = true,
+                .foreign_keys = true,
+                .remote_cluster = false,
+                .high_availability = false,
+                .deployment_mode = cluster::DeploymentMode::single_node_dev,
+            };
+        }
+
+        [[nodiscard]] cluster::PostgreSql17Config postgresql_store_config(const ServerConfig &config) {
+            return {
                 .connection_reference = config.store.connection_reference,
                 .server_major = config.store.server_major,
                 .server_processes = config.store.server_processes,
@@ -513,14 +558,33 @@ connection references of the form env:VARIABLE_NAME.
                 .external_ha_configured = config.store.external_ha_configured,
                 .deployment_mode = cluster::DeploymentMode::production_cluster,
             };
+        }
+
+        [[nodiscard]] std::expected<SensitiveValue, ToolFailure> resolve_store_connection(const ServerConfig &config) {
+            if (config.store.kind == ServerStoreKind::sqlite_dev) {
+                return SensitiveValue {std::string {}};
+            }
             const auto environment_name = std::string_view {config.store.connection_reference}.substr(4U);
             auto connection = environment_value(environment_name);
             if (!connection || connection->empty()) {
                 return std::unexpected(unavailable("SRV-POSTGRES-SECRET-UNAVAILABLE",
                                                    "PostgreSQL connection reference could not be resolved"));
             }
-            auto store = cluster::PostgreSqlRuntimeStore::open_resolved(store_config, *connection, audit);
-            std::ranges::fill(*connection, '\0');
+            return SensitiveValue {std::move(*connection)};
+        }
+
+        [[nodiscard]] std::expected<std::unique_ptr<cluster::IClusterRuntimeStore>, ToolFailure>
+        open_store(const ServerConfig &config, cluster::AuditTrail &audit, const std::string_view connection) {
+            if (config.store.kind == ServerStoreKind::sqlite_dev) {
+                auto store = cluster::SqliteRuntimeStore::open(sqlite_store_config(config), audit);
+                if (!store) {
+                    return std::unexpected(unavailable("SRV-SQLITE-UNAVAILABLE", store.error().message));
+                }
+                return std::unique_ptr<cluster::IClusterRuntimeStore> {std::move(*store)};
+            }
+
+            auto store =
+                cluster::PostgreSqlRuntimeStore::open_resolved(postgresql_store_config(config), connection, audit);
             if (!store) {
                 return std::unexpected(unavailable(
                     "SRV-POSTGRES-UNAVAILABLE",
@@ -529,31 +593,299 @@ connection references of the form env:VARIABLE_NAME.
             return std::unique_ptr<cluster::IClusterRuntimeStore> {std::move(*store)};
         }
 
+        [[nodiscard]] std::expected<std::unique_ptr<cluster::IActivationControlStore>, ToolFailure>
+        open_activation_store(const ServerConfig &config, const std::string_view connection) {
+            if (config.store.kind == ServerStoreKind::sqlite_dev) {
+                auto store = cluster::SqliteActivationControlStore::open(sqlite_store_config(config));
+                if (!store) {
+                    return std::unexpected(unavailable("SRV-ACTIVATION-SQLITE-UNAVAILABLE", store.error().message));
+                }
+                return std::unique_ptr<cluster::IActivationControlStore> {std::move(*store)};
+            }
+
+            auto store =
+                cluster::PostgreSqlActivationControlStore::open_resolved(postgresql_store_config(config), connection);
+            if (!store) {
+                return std::unexpected(
+                    unavailable("SRV-ACTIVATION-POSTGRES-UNAVAILABLE",
+                                "durable activation connectivity or migrations could not be qualified"));
+            }
+            return std::unique_ptr<cluster::IActivationControlStore> {std::move(*store)};
+        }
+
+        [[nodiscard]] std::expected<std::vector<std::string>, ToolFailure>
+        read_policy_lines(const std::filesystem::path &path, const std::string_view expected_header) {
+            std::error_code size_error;
+            const auto size = std::filesystem::file_size(path, size_error);
+            if (size_error || size == 0U || size > maximum_policy_bytes) {
+                return std::unexpected(unavailable("SRV-TRUST-POLICY-READ",
+                                                   "trust policy snapshot is absent, empty, or larger than one MiB"));
+            }
+            std::ifstream input {path, std::ios::binary};
+            if (!input) {
+                return std::unexpected(
+                    unavailable("SRV-TRUST-POLICY-READ", "trust policy snapshot could not be opened"));
+            }
+            std::string text(static_cast<std::size_t>(size), '\0');
+            input.read(text.data(), static_cast<std::streamsize>(text.size()));
+            if (!input || input.gcount() != static_cast<std::streamsize>(text.size()) ||
+                text.find('\0') != std::string::npos) {
+                return std::unexpected(
+                    unavailable("SRV-TRUST-POLICY-READ", "trust policy snapshot could not be read safely"));
+            }
+
+            std::vector<std::string> lines;
+            std::size_t offset {};
+            std::size_t physical_line {};
+            bool header_seen {};
+            while (offset <= text.size()) {
+                ++physical_line;
+                const auto newline = text.find('\n', offset);
+                const auto line_end = newline == std::string::npos ? text.size() : newline;
+                auto line = std::string_view {text}.substr(offset, line_end - offset);
+                if (!line.empty() && line.back() == '\r') {
+                    line.remove_suffix(1U);
+                }
+                if (line.size() > maximum_policy_line_bytes) {
+                    return std::unexpected(
+                        unavailable("SRV-TRUST-POLICY-LINE-LIMIT", "trust policy snapshot line exceeds four KiB"));
+                }
+                if (!header_seen) {
+                    if (physical_line != 1U || line != expected_header) {
+                        return std::unexpected(
+                            unavailable("SRV-TRUST-POLICY-VERSION", "trust policy snapshot has an unsupported header"));
+                    }
+                    header_seen = true;
+                } else if (!line.empty() && line.front() != '#') {
+                    lines.emplace_back(line);
+                    if (lines.size() > maximum_policy_entries) {
+                        return std::unexpected(
+                            unavailable("SRV-TRUST-POLICY-ENTRY-LIMIT", "trust policy snapshot has too many entries"));
+                    }
+                }
+                if (newline == std::string_view::npos) {
+                    break;
+                }
+                offset = newline + 1U;
+            }
+            return lines;
+        }
+
+        [[nodiscard]] std::vector<std::string_view> split_fields(const std::string_view value, const char separator) {
+            std::vector<std::string_view> fields;
+            std::size_t offset {};
+            while (offset <= value.size()) {
+                const auto next = value.find(separator, offset);
+                const auto end = next == std::string_view::npos ? value.size() : next;
+                fields.push_back(value.substr(offset, end - offset));
+                if (next == std::string_view::npos) {
+                    break;
+                }
+                offset = next + 1U;
+            }
+            return fields;
+        }
+
+        [[nodiscard]] bool safe_policy_atom(const std::string_view value, const std::size_t maximum = 512U) noexcept {
+            return !value.empty() && value.size() <= maximum && std::ranges::all_of(value, [](const char character) {
+                const auto byte = static_cast<unsigned char>(character);
+                return byte >= 0x21U && byte <= 0x7eU && character != '\t';
+            });
+        }
+
+        [[nodiscard]] bool lowercase_hex(const std::string_view value, const std::size_t size) noexcept {
+            return value.size() == size && std::ranges::all_of(value, [](const char character) {
+                       return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
+                   });
+        }
+
+        [[nodiscard]] std::expected<std::vector<std::byte>, ToolFailure>
+        decode_public_key(const std::string_view encoded) {
+            if (!lowercase_hex(encoded, 64U)) {
+                return std::unexpected(unavailable("SRV-TRUST-SIGNER-MALFORMED",
+                                                   "trusted signer public key must be canonical 32-byte hexadecimal"));
+            }
+            std::vector<std::byte> result;
+            result.reserve(32U);
+            const auto nibble = [](const char character) -> std::optional<unsigned char> {
+                if (character >= '0' && character <= '9') {
+                    return static_cast<unsigned char>(character - '0');
+                }
+                if (character >= 'a' && character <= 'f') {
+                    return static_cast<unsigned char>(character - 'a' + 10);
+                }
+                return std::nullopt;
+            };
+            for (std::size_t index = 0U; index < encoded.size(); index += 2U) {
+                const auto high = nibble(encoded[index]);
+                const auto low = nibble(encoded[index + 1U]);
+                if (!high || !low) {
+                    return std::unexpected(
+                        unavailable("SRV-TRUST-SIGNER-MALFORMED", "trusted signer public key is not hexadecimal"));
+                }
+                result.push_back(static_cast<std::byte>((*high << 4U) | *low));
+            }
+            return result;
+        }
+
+        [[nodiscard]] std::expected<packaging::TrustPolicy, ToolFailure>
+        load_pack_trust_policy(const ServerConfig &config) {
+            packaging::TrustPolicy policy {
+                .mode = config.mode == ServerDeploymentMode::production_cluster ? packaging::TrustMode::production :
+                                                                                  packaging::TrustMode::development,
+                .allow_unsigned_packs = config.allow_unsigned_packs,
+                .allow_unsigned_generators = false,
+                .signers = {},
+            };
+            if (config.trusted_signers_path.empty()) {
+                return policy;
+            }
+
+            auto revocation_lines = read_policy_lines(config.revocations_path, "rule-engine.revocations.v1");
+            auto signer_lines = read_policy_lines(config.trusted_signers_path, "rule-engine.trusted-signers.v1");
+            if (!revocation_lines || !signer_lines) {
+                return std::unexpected(!revocation_lines ? std::move(revocation_lines.error()) :
+                                                           std::move(signer_lines.error()));
+            }
+            std::unordered_set<std::string> revoked;
+            for (const auto &line : *revocation_lines) {
+                if (!safe_policy_atom(line, 128U) || !revoked.insert(line).second) {
+                    return std::unexpected(unavailable("SRV-TRUST-REVOCATION-MALFORMED",
+                                                       "revocation snapshot contains an invalid or duplicate key"));
+                }
+            }
+
+            std::unordered_set<std::string> signer_ids;
+            for (const auto &line : *signer_lines) {
+                const auto fields = split_fields(line, '\t');
+                if (fields.size() != 3U || !safe_policy_atom(fields[0], 128U) ||
+                    !signer_ids.insert(std::string {fields[0]}).second) {
+                    return std::unexpected(
+                        unavailable("SRV-TRUST-SIGNER-MALFORMED", "trusted signer snapshot contains an invalid entry"));
+                }
+                auto public_key = decode_public_key(fields[1]);
+                if (!public_key) {
+                    return std::unexpected(std::move(public_key.error()));
+                }
+                auto prefixes = split_fields(fields[2], ',');
+                if (prefixes.empty() || std::ranges::any_of(prefixes, [](const std::string_view prefix) {
+                        return !safe_policy_atom(prefix, 256U);
+                    })) {
+                    return std::unexpected(
+                        unavailable("SRV-TRUST-SIGNER-MALFORMED", "trusted signer pack prefixes are invalid"));
+                }
+                packaging::TrustedSigner signer {
+                    .key_id = std::string {fields[0]},
+                    .public_key = std::move(*public_key),
+                    .allowed_pack_prefixes = {},
+                    .revoked = revoked.contains(std::string {fields[0]}),
+                };
+                signer.allowed_pack_prefixes.reserve(prefixes.size());
+                for (const auto prefix : prefixes) { signer.allowed_pack_prefixes.emplace_back(prefix); }
+                policy.signers.push_back(std::move(signer));
+            }
+            if (std::ranges::any_of(revoked,
+                                    [&signer_ids](const std::string &key) { return !signer_ids.contains(key); })) {
+                return std::unexpected(
+                    unavailable("SRV-TRUST-REVOCATION-UNKNOWN", "revocation snapshot references an unknown signer"));
+            }
+            if (!config.allow_unsigned_packs &&
+                std::ranges::none_of(policy.signers,
+                                     [](const packaging::TrustedSigner &signer) { return !signer.revoked; })) {
+                return std::unexpected(
+                    unavailable("SRV-TRUST-NO-ACTIVE-SIGNER", "signed pack trust policy has no active signer"));
+            }
+            return policy;
+        }
+
+        [[nodiscard]] std::expected<std::vector<protocol_v2::CapabilityPermission>, ToolFailure>
+        parse_capability_permissions(const std::string_view encoded) {
+            std::vector<protocol_v2::CapabilityPermission> result;
+            if (encoded == "-") {
+                return result;
+            }
+            const auto permissions = split_fields(encoded, ';');
+            if (permissions.size() > 256U) {
+                return std::unexpected(
+                    unavailable("SRV-TRUST-PEER-MALFORMED", "peer enrollment contains too many capabilities"));
+            }
+            for (const auto permission : permissions) {
+                const auto fields = split_fields(permission, '|');
+                std::uint32_t maximum_version {};
+                if (fields.size() != 4U || !safe_policy_atom(fields[0], 128U) || !safe_policy_atom(fields[2], 128U) ||
+                    !safe_policy_atom(fields[3], 128U)) {
+                    return std::unexpected(
+                        unavailable("SRV-TRUST-PEER-MALFORMED", "peer capability permission is malformed"));
+                }
+                const auto parsed =
+                    std::from_chars(fields[1].data(), fields[1].data() + fields[1].size(), maximum_version);
+                if (maximum_version == 0U || parsed.ec != std::errc {} ||
+                    parsed.ptr != fields[1].data() + fields[1].size()) {
+                    return std::unexpected(
+                        unavailable("SRV-TRUST-PEER-MALFORMED", "peer capability version is invalid"));
+                }
+                result.push_back({
+                    .capability = CapabilityId {std::string {fields[0]}},
+                    .maximum_version = maximum_version,
+                    .request_schema = SchemaId {std::string {fields[2]}},
+                    .response_schema = SchemaId {std::string {fields[3]}},
+                });
+            }
+            return result;
+        }
+
+        [[nodiscard]] std::expected<std::unique_ptr<protocol_v2::OperatorTrustPolicy>, ToolFailure>
+        load_peer_trust_policy(const ServerConfig &config) {
+            auto policy = std::make_unique<protocol_v2::OperatorTrustPolicy>();
+            if (config.peer_enrollment_path.empty()) {
+                return policy;
+            }
+            auto lines = read_policy_lines(config.peer_enrollment_path, "rule-engine.peer-enrollment.v1");
+            if (!lines) {
+                return std::unexpected(std::move(lines.error()));
+            }
+            std::size_t enabled {};
+            for (const auto &line : *lines) {
+                const auto fields = split_fields(line, '\t');
+                if (fields.size() != 6U || !safe_policy_atom(fields[0], 1'024U) ||
+                    (fields[1] != "-" && !lowercase_hex(fields[1], 64U)) || !safe_policy_atom(fields[2], 128U) ||
+                    !safe_policy_atom(fields[3], 128U) || (fields[4] != "true" && fields[4] != "false")) {
+                    return std::unexpected(
+                        unavailable("SRV-TRUST-PEER-MALFORMED", "peer enrollment snapshot contains an invalid entry"));
+                }
+                auto capabilities = parse_capability_permissions(fields[5]);
+                if (!capabilities) {
+                    return std::unexpected(std::move(capabilities.error()));
+                }
+                const auto disabled = fields[4] == "true";
+                protocol_v2::PeerEnrollment enrollment {
+                    .canonical_uri_san = std::string {fields[0]},
+                    .certificate_sha256 = fields[1] == "-" ? std::string {} : std::string {fields[1]},
+                    .identity = {.tenant = TenantId {std::string {fields[2]}},
+                                 .peer = PeerId {std::string {fields[3]}}},
+                    .disabled = disabled,
+                    .capabilities = std::move(*capabilities),
+                };
+                if (auto enrolled = policy->enroll(std::move(enrollment)); !enrolled) {
+                    return std::unexpected(unavailable("SRV-TRUST-PEER-MALFORMED",
+                                                       "peer enrollment snapshot contains duplicate identities"));
+                }
+                enabled += disabled ? 0U : 1U;
+            }
+            if (!config.allow_loopback_plaintext && enabled == 0U) {
+                return std::unexpected(
+                    unavailable("SRV-TRUST-NO-ACTIVE-PEER", "mTLS peer policy has no active enrollment"));
+            }
+            return policy;
+        }
+
         [[nodiscard]] std::expected<cluster::StoreBackendCapabilities, ToolFailure>
         backend_capabilities(const ServerConfig &config) {
             cluster::StoreBackendConfig selected;
             if (config.store.kind == ServerStoreKind::postgresql17) {
-                selected = cluster::PostgreSql17Config {
-                    .connection_reference = config.store.connection_reference,
-                    .server_major = config.store.server_major,
-                    .server_processes = config.store.server_processes,
-                    .pool_size = config.store.pool_size,
-                    .statement_timeout = config.store.statement_timeout,
-                    .verify_tls_peer = config.store.verify_tls_peer,
-                    .external_ha_configured = config.store.external_ha_configured,
-                    .deployment_mode = cluster::DeploymentMode::production_cluster,
-                };
+                selected = postgresql_store_config(config);
             } else {
-                selected = cluster::SqliteDevConfig {
-                    .database_path = config.store.sqlite_path.string(),
-                    .server_processes = config.store.server_processes,
-                    .busy_timeout = config.store.busy_timeout,
-                    .wal = true,
-                    .foreign_keys = true,
-                    .remote_cluster = false,
-                    .high_availability = false,
-                    .deployment_mode = cluster::DeploymentMode::single_node_dev,
-                };
+                selected = sqlite_store_config(config);
             }
             auto capabilities = cluster::validate_store_backend(selected);
             if (!capabilities) {
@@ -655,6 +987,87 @@ connection references of the form env:VARIABLE_NAME.
             return parsed;
         }
 
+        [[nodiscard]] std::uint64_t now_unix_ms() noexcept {
+            const auto elapsed = std::chrono::system_clock::now().time_since_epoch();
+            return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+        }
+
+        struct ActivationQualification {
+            bool active_generation_compiled {true};
+            bool schemas_compatible {true};
+            bool required_capabilities_available {true};
+        };
+
+        [[nodiscard]] ActivationQualification qualify_control_state(const cluster::DurableControlState &state,
+                                                                    const ServerConfig &config,
+                                                                    const std::uint64_t node_lease_fence) {
+            ActivationQualification result;
+            if (state.packs.empty()) {
+                result.active_generation_compiled = config.allow_empty_activation;
+                result.schemas_compatible = config.allow_empty_activation;
+                result.required_capabilities_available = config.allow_empty_activation;
+                return result;
+            }
+
+            for (const auto &pack : state.packs) {
+                if (pack.resource_version == 0U || pack.assignment_fence == 0U || !pack.active_generation ||
+                    !pack.accepting_assignments || pack.drain_target) {
+                    result.active_generation_compiled = false;
+                    continue;
+                }
+                const auto generation = std::ranges::find_if(state.generations, [&pack](const auto &candidate) {
+                    return candidate.request.pack == pack.pack &&
+                           candidate.request.generation == *pack.active_generation;
+                });
+                if (generation == state.generations.end() || generation->phase != cluster::GenerationPhase::active ||
+                    !generation->request.signature_verified) {
+                    result.active_generation_compiled = false;
+                    continue;
+                }
+                if (!generation->target_nodes.empty() &&
+                    std::ranges::find(generation->target_nodes, config.node_id) == generation->target_nodes.end()) {
+                    result.active_generation_compiled = false;
+                    continue;
+                }
+                if (generation->semantic_hash.empty() || generation->binding_hash.empty() ||
+                    generation->request.state_schema_hash.empty()) {
+                    result.schemas_compatible = false;
+                }
+                const auto report = std::ranges::find_if(generation->reports, [&config](const auto &candidate) {
+                    return candidate.node_id == config.node_id;
+                });
+                if (report == generation->reports.end() || !report->success ||
+                    report->node_lease_fence != node_lease_fence || report->executable_hash.empty() ||
+                    report->semantic_hash != generation->semantic_hash ||
+                    report->binding_hash != generation->binding_hash) {
+                    result.active_generation_compiled = false;
+                    continue;
+                }
+                for (const auto &required : generation->request.required_capability_hashes) {
+                    if (std::ranges::find(report->capability_hashes, required) == report->capability_hashes.end()) {
+                        result.required_capabilities_available = false;
+                    }
+                }
+            }
+            return result;
+        }
+
+        [[nodiscard]] bool pack_trust_ready(const packaging::TrustPolicy &policy) noexcept {
+            return policy.allow_unsigned_packs ||
+                   std::ranges::any_of(policy.signers, [](const packaging::TrustedSigner &signer) {
+                       return !signer.revoked && signer.public_key.size() == 32U && !signer.key_id.empty();
+                   });
+        }
+
+        [[nodiscard]] std::string readiness_failure(const cluster::ReadinessSnapshot &readiness) {
+            std::string message {"resident startup readiness is blocked"};
+            for (const auto &blocker : readiness.blockers) {
+                message += "; ";
+                message += blocker;
+            }
+            return message;
+        }
+
     } // namespace
 
     std::expected<ServerConfig, ServerConfigError> parse_server_config(const std::string_view text) {
@@ -673,6 +1086,13 @@ connection references of the form env:VARIABLE_NAME.
             "store.server_processes",
             "listener.agent_endpoint",
             "listener.admin_endpoint",
+            "listener.accept_timeout_ms",
+            "listener.handshake_timeout_ms",
+            "listener.read_timeout_ms",
+            "listener.write_timeout_ms",
+            "listener.backlog",
+            "listener.maximum_consecutive_failures",
+            "network.require_hard_resolver_bounds",
             "runtime.root",
             "pack.registry_path",
             "bindings.operator_path",
@@ -715,8 +1135,15 @@ connection references of the form env:VARIABLE_NAME.
         const auto lease_renew_interval = milliseconds_value(*entries, "node.lease_renew_interval_ms");
         const auto statement_timeout = milliseconds_value(*entries, "store.statement_timeout_ms", 5'000U);
         const auto busy_timeout = milliseconds_value(*entries, "store.busy_timeout_ms", 5'000U);
+        const auto accept_timeout = milliseconds_value(*entries, "listener.accept_timeout_ms");
+        const auto handshake_timeout = milliseconds_value(*entries, "listener.handshake_timeout_ms");
+        const auto read_timeout = milliseconds_value(*entries, "listener.read_timeout_ms");
+        const auto write_timeout = milliseconds_value(*entries, "listener.write_timeout_ms");
+        const auto listen_backlog = uint32_value(*entries, "listener.backlog");
+        const auto maximum_consecutive_failures = uint32_value(*entries, "listener.maximum_consecutive_failures");
         if (!schema_version || !processes || !server_major || !pool_size || !lease_duration || !lease_renew_interval ||
-            !statement_timeout || !busy_timeout) {
+            !statement_timeout || !busy_timeout || !accept_timeout || !handshake_timeout || !read_timeout ||
+            !write_timeout || !listen_backlog || !maximum_consecutive_failures) {
             return std::unexpected(!schema_version       ? std::move(schema_version.error()) :
                                    !processes            ? std::move(processes.error()) :
                                    !server_major         ? std::move(server_major.error()) :
@@ -724,7 +1151,13 @@ connection references of the form env:VARIABLE_NAME.
                                    !lease_duration       ? std::move(lease_duration.error()) :
                                    !lease_renew_interval ? std::move(lease_renew_interval.error()) :
                                    !statement_timeout    ? std::move(statement_timeout.error()) :
-                                                           std::move(busy_timeout.error()));
+                                   !busy_timeout         ? std::move(busy_timeout.error()) :
+                                   !accept_timeout       ? std::move(accept_timeout.error()) :
+                                   !handshake_timeout    ? std::move(handshake_timeout.error()) :
+                                   !read_timeout         ? std::move(read_timeout.error()) :
+                                   !write_timeout        ? std::move(write_timeout.error()) :
+                                   !listen_backlog       ? std::move(listen_backlog.error()) :
+                                                           std::move(maximum_consecutive_failures.error()));
         }
         result.schema_version = *schema_version;
         result.node_id = *entry_value<std::string>(*entries, "node.id");
@@ -744,6 +1177,14 @@ connection references of the form env:VARIABLE_NAME.
             entry_value<bool>(*entries, "store.external_ha_configured").value_or(false);
         result.agent_endpoint = *entry_value<std::string>(*entries, "listener.agent_endpoint");
         result.admin_endpoint = *entry_value<std::string>(*entries, "listener.admin_endpoint");
+        result.listener.accept_timeout = *accept_timeout;
+        result.listener.handshake_timeout = *handshake_timeout;
+        result.listener.read_timeout = *read_timeout;
+        result.listener.write_timeout = *write_timeout;
+        result.listener.backlog = *listen_backlog;
+        result.listener.maximum_consecutive_failures = *maximum_consecutive_failures;
+        result.listener.require_hard_resolver_bounds =
+            *entry_value<bool>(*entries, "network.require_hard_resolver_bounds");
         result.tls.trust_anchors_pem = entry_value<std::string>(*entries, "tls.trust_anchors_pem").value_or("");
         result.tls.certificate_chain_pem = entry_value<std::string>(*entries, "tls.certificate_chain_pem").value_or("");
         result.tls.private_key_pem = entry_value<std::string>(*entries, "tls.private_key_pem").value_or("");
@@ -867,6 +1308,25 @@ connection references of the form env:VARIABLE_NAME.
             return std::unexpected(config_error(
                 "SRV-CONFIG-ENDPOINT", "agent, admin, and Prometheus endpoints must be valid host:port values"));
         }
+        if (!numeric_host(agent->host) || !numeric_host(admin->host) || !numeric_host(prometheus->host)) {
+            return std::unexpected(config_error("SRV-CONFIG-NUMERIC-ENDPOINT",
+                                                "listener and Prometheus hosts must be numeric address literals"));
+        }
+        if (config.listener.accept_timeout < std::chrono::milliseconds {10} ||
+            config.listener.accept_timeout > std::chrono::seconds {60} ||
+            config.listener.handshake_timeout <= std::chrono::milliseconds::zero() ||
+            config.listener.handshake_timeout > std::chrono::minutes {5} ||
+            config.listener.read_timeout <= std::chrono::milliseconds::zero() ||
+            config.listener.read_timeout > std::chrono::minutes {5} ||
+            config.listener.write_timeout <= std::chrono::milliseconds::zero() ||
+            config.listener.write_timeout > std::chrono::minutes {5} || config.listener.backlog == 0U ||
+            config.listener.backlog > 4'096U || config.listener.maximum_consecutive_failures == 0U ||
+            config.listener.maximum_consecutive_failures > 1'024U || !config.listener.require_hard_resolver_bounds ||
+            config.lease_renew_interval + config.listener.accept_timeout >= config.lease_duration) {
+            return std::unexpected(
+                config_error("SRV-CONFIG-LISTENER-BOUNDS",
+                             "listener timeouts, backlog, failure bound, or hard-resolver policy is invalid"));
+        }
         const std::pair<const std::filesystem::path *, std::string_view> common_paths[] {
             {&config.runtime_root, "runtime.root"},
             {&config.pack_registry_path, "pack.registry_path"},
@@ -947,17 +1407,269 @@ connection references of the form env:VARIABLE_NAME.
         return {};
     }
 
+    struct ProductionResidentServerBackend::Impl {
+        std::stop_source stop;
+        std::optional<protocol_v2::TlsSessionListener> agent_listener;
+        std::optional<protocol_v2::TlsSessionListener> admin_listener;
+        std::optional<cluster::FencedLease> node_lease;
+        cluster::IClusterRuntimeStore *runtime_store {};
+        const protocol_v2::ITrustPolicy *peer_trust_policy {};
+        std::chrono::steady_clock::time_point renew_at {};
+        bool qualified {};
+        bool accept_agent {true};
+
+        ~Impl() {
+            stop.request_stop();
+            if (agent_listener) {
+                agent_listener->cancel();
+            }
+            if (admin_listener) {
+                admin_listener->cancel();
+            }
+            static_cast<void>(release_node_lease());
+        }
+
+        [[nodiscard]] std::expected<void, ToolFailure> release_node_lease() noexcept {
+            if (runtime_store == nullptr || !node_lease) {
+                return {};
+            }
+            auto released = runtime_store->release_lease(*node_lease, now_unix_ms());
+            node_lease.reset();
+            if (!released) {
+                return std::unexpected(
+                    unavailable("SRV-NODE-LEASE-RELEASE", "the fenced node lease could not be released"));
+            }
+            return {};
+        }
+
+        void close_listeners() noexcept {
+            if (agent_listener) {
+                agent_listener->cancel();
+            }
+            if (admin_listener) {
+                admin_listener->cancel();
+            }
+            agent_listener.reset();
+            admin_listener.reset();
+        }
+    };
+
+    ProductionResidentServerBackend::ProductionResidentServerBackend(): impl_ {std::make_unique<Impl>()} {}
+    ProductionResidentServerBackend::~ProductionResidentServerBackend() = default;
+
     std::expected<void, ToolFailure>
-    UnavailableResidentServerBackend::qualify_activation(const ResidentServerContext &) noexcept {
-        return std::unexpected(unavailable(
-            "SRV-ACTIVATION-UNAVAILABLE",
-            "the current runtime-store contract has no durable active-generation loader; startup is fenced"));
+    ProductionResidentServerBackend::qualify_activation(const ResidentServerContext &context) noexcept {
+        if (impl_->qualified || impl_->node_lease || impl_->agent_listener || impl_->admin_listener) {
+            return std::unexpected(ToolFailure {
+                .kind = ToolFailureKind::internal_invariant,
+                .code = "SRV-BACKEND-STATE",
+                .message = "resident backend qualification may run only once",
+                .diagnostics = {},
+            });
+        }
+        if (impl_->stop.stop_requested()) {
+            return std::unexpected(unavailable_transport("SRV-STOPPED", "resident startup was canceled"));
+        }
+        if (context.config.allow_loopback_plaintext || context.agent_tls == nullptr || context.admin_tls == nullptr) {
+            return std::unexpected(unavailable_transport(
+                "SRV-PLAINTEXT-LISTENER-UNAVAILABLE",
+                "the resident listener integration currently requires authenticated TLS, including in development"));
+        }
+        if (auto runtime = packaging::validate_exact_private_runtime(context.runtime); !runtime) {
+            return std::unexpected(unavailable("SRV-RUNTIME-NOT-READY",
+                                               "the exact private Python runtime no longer passes qualification"));
+        }
+
+        const auto runtime_health = context.store.health();
+        const auto control_health = context.activation_store.health();
+        if (!runtime_health.driver_available || !runtime_health.connected || !runtime_health.migrations_compatible ||
+            !control_health.driver_available || !control_health.connected || !control_health.migrations_compatible ||
+            runtime_health.backend != context.store_capabilities.kind ||
+            control_health.backend != context.store_capabilities.kind) {
+            return std::unexpected(
+                unavailable("SRV-STORES-NOT-READY",
+                            "runtime and durable activation stores must share a healthy compatible selected backend"));
+        }
+
+        impl_->runtime_store = std::addressof(context.store);
+        const cluster::LeaseResource resource {.scope = "server-node", .key = context.config.node_id};
+        auto lease = context.store.claim_lease(resource, context.config.node_id, now_unix_ms(),
+                                               static_cast<std::uint64_t>(context.config.lease_duration.count()));
+        if (!lease) {
+            impl_->runtime_store = nullptr;
+            return std::unexpected(
+                unavailable("SRV-NODE-LEASE-UNAVAILABLE", "the durable node lease could not be claimed"));
+        }
+        impl_->node_lease = std::move(*lease);
+        impl_->renew_at = std::chrono::steady_clock::now() + context.config.lease_renew_interval;
+
+        auto control_state = context.activation_store.load_state();
+        if (!control_state) {
+            static_cast<void>(impl_->release_node_lease());
+            return std::unexpected(
+                unavailable("SRV-ACTIVATION-LOAD", "durable active-generation state could not be loaded"));
+        }
+        const auto activation = qualify_control_state(*control_state, context.config, impl_->node_lease->fence);
+        auto current = context.store.lease_is_current(*impl_->node_lease, now_unix_ms());
+        const auto node_lease_current = current && *current;
+
+        protocol_v2::SocketTimeouts timeouts {
+            .resolve = context.config.listener.handshake_timeout,
+            .connect = context.config.listener.handshake_timeout,
+            .accept = context.config.listener.accept_timeout,
+            .handshake = context.config.listener.handshake_timeout,
+            .read = context.config.listener.read_timeout,
+            .write = context.config.listener.write_timeout,
+            .total_dial = context.config.listener.handshake_timeout,
+        };
+        const auto agent_endpoint = parse_endpoint(context.config.agent_endpoint);
+        const auto admin_endpoint = parse_endpoint(context.config.admin_endpoint);
+        if (!agent_endpoint || !admin_endpoint) {
+            static_cast<void>(impl_->release_node_lease());
+            return std::unexpected(ToolFailure {
+                .kind = ToolFailureKind::internal_invariant,
+                .code = "SRV-ENDPOINT-INVARIANT",
+                .message = "validated listener endpoint could not be reconstructed",
+                .diagnostics = {},
+            });
+        }
+        auto agent_listener = protocol_v2::TlsSessionListener::bind(
+            std::move(*context.agent_tls),
+            protocol_v2::TcpEndpoint {.host = agent_endpoint->host, .port = agent_endpoint->port}, timeouts,
+            context.config.listener.backlog);
+        if (!agent_listener) {
+            static_cast<void>(impl_->release_node_lease());
+            return std::unexpected(unavailable_transport("SRV-AGENT-LISTENER-UNAVAILABLE",
+                                                         "the authenticated agent listener could not be bound"));
+        }
+        impl_->agent_listener.emplace(std::move(*agent_listener));
+        auto admin_listener = protocol_v2::TlsSessionListener::bind(
+            std::move(*context.admin_tls),
+            protocol_v2::TcpEndpoint {.host = admin_endpoint->host, .port = admin_endpoint->port}, timeouts,
+            context.config.listener.backlog);
+        if (!admin_listener) {
+            impl_->close_listeners();
+            static_cast<void>(impl_->release_node_lease());
+            return std::unexpected(unavailable_transport("SRV-ADMIN-LISTENER-UNAVAILABLE",
+                                                         "the authenticated admin listener could not be bound"));
+        }
+        impl_->admin_listener.emplace(std::move(*admin_listener));
+
+        const cluster::ReadinessInput readiness_input {
+            .process_responsive = true,
+            .database_reachable = runtime_health.connected && control_health.connected,
+            .backend_driver_ready = runtime_health.driver_available && control_health.driver_available,
+            .migrations_compatible = runtime_health.migrations_compatible && control_health.migrations_compatible,
+            .node_lease_current = node_lease_current,
+            .trust_policy_loaded = pack_trust_ready(context.pack_trust_policy),
+            .retention_profiles_loaded = !context.config.retention_profiles_path.empty(),
+            .active_generation_compiled = activation.active_generation_compiled,
+            .schemas_compatible = activation.schemas_compatible,
+            .required_capabilities_available = activation.required_capabilities_available,
+            .backend = context.store_capabilities,
+        };
+        const auto readiness = cluster::evaluate_readiness(readiness_input, runtime_health);
+        if (!readiness.ready) {
+            impl_->close_listeners();
+            static_cast<void>(impl_->release_node_lease());
+            return std::unexpected(unavailable("SRV-NOT-READY", readiness_failure(readiness)));
+        }
+
+        impl_->peer_trust_policy = std::addressof(context.peer_trust_policy);
+        impl_->qualified = true;
+        return {};
     }
 
-    std::expected<void, ToolFailure> UnavailableResidentServerBackend::serve(const ResidentServerContext &) noexcept {
-        return std::unexpected(unavailable_transport(
-            "SRV-NETWORK-UNAVAILABLE",
-            "protocol v2 exposes TLS for connected sockets but no resident listener/acceptor API"));
+    std::expected<void, ToolFailure>
+    ProductionResidentServerBackend::serve(const ResidentServerContext &context) noexcept {
+        if (!impl_->qualified || !impl_->agent_listener || !impl_->admin_listener || !impl_->node_lease ||
+            impl_->runtime_store != std::addressof(context.store) || impl_->peer_trust_policy == nullptr) {
+            return std::unexpected(ToolFailure {
+                .kind = ToolFailureKind::internal_invariant,
+                .code = "SRV-BACKEND-NOT-QUALIFIED",
+                .message = "resident serving requires successful qualification",
+                .diagnostics = {},
+            });
+        }
+
+        std::size_t consecutive_failures {};
+        while (!impl_->stop.stop_requested()) {
+            if (std::chrono::steady_clock::now() >= impl_->renew_at) {
+                const auto at = now_unix_ms();
+                auto current = context.store.lease_is_current(*impl_->node_lease, at);
+                if (!current || !*current) {
+                    impl_->close_listeners();
+                    static_cast<void>(impl_->release_node_lease());
+                    impl_->qualified = false;
+                    return std::unexpected(
+                        unavailable("SRV-NODE-LEASE-LOST", "the durable node lease is no longer current"));
+                }
+                auto renewed = context.store.renew_lease(
+                    *impl_->node_lease, at, static_cast<std::uint64_t>(context.config.lease_duration.count()));
+                if (!renewed) {
+                    impl_->close_listeners();
+                    static_cast<void>(impl_->release_node_lease());
+                    impl_->qualified = false;
+                    return std::unexpected(
+                        unavailable("SRV-NODE-LEASE-RENEWAL", "the durable node lease could not be renewed"));
+                }
+                impl_->node_lease = std::move(*renewed);
+                impl_->renew_at = std::chrono::steady_clock::now() + context.config.lease_renew_interval;
+            }
+
+            auto &listener = impl_->accept_agent ? *impl_->agent_listener : *impl_->admin_listener;
+            impl_->accept_agent = !impl_->accept_agent;
+            auto peer = listener.accept(*impl_->peer_trust_policy, impl_->stop.get_token());
+            if (peer) {
+                // Authentication is complete before this point. Until the
+                // scheduler lane lands, do not consume any application byte.
+                peer->connection.shutdown();
+                consecutive_failures = 0U;
+                continue;
+            }
+            if (peer.error().code == protocol_v2::ProtocolErrorCode::timed_out) {
+                continue;
+            }
+            if (peer.error().code == protocol_v2::ProtocolErrorCode::unauthenticated) {
+                continue;
+            }
+            if (peer.error().code == protocol_v2::ProtocolErrorCode::canceled && impl_->stop.stop_requested()) {
+                break;
+            }
+            if (peer.error().code == protocol_v2::ProtocolErrorCode::dependency_unavailable) {
+                impl_->close_listeners();
+                static_cast<void>(impl_->release_node_lease());
+                impl_->qualified = false;
+                return std::unexpected(unavailable_transport(
+                    "SRV-LISTENER-DEPENDENCY-UNAVAILABLE", "the authenticated listener dependency became unavailable"));
+            }
+            ++consecutive_failures;
+            if (consecutive_failures >= context.config.listener.maximum_consecutive_failures) {
+                impl_->close_listeners();
+                static_cast<void>(impl_->release_node_lease());
+                impl_->qualified = false;
+                return std::unexpected(unavailable_transport(
+                    "SRV-LISTENER-FAILURE-LIMIT", "the resident listener reached its consecutive failure bound"));
+            }
+        }
+
+        impl_->close_listeners();
+        auto released = impl_->release_node_lease();
+        impl_->qualified = false;
+        if (!released) {
+            return released;
+        }
+        return {};
+    }
+
+    void ProductionResidentServerBackend::request_stop() noexcept {
+        impl_->stop.request_stop();
+        if (impl_->agent_listener) {
+            impl_->agent_listener->cancel();
+        }
+        if (impl_->admin_listener) {
+            impl_->admin_listener->cancel();
+        }
     }
 
     std::string_view server_help() noexcept { return help_text; }
@@ -1022,14 +1734,35 @@ connection references of the form env:VARIABLE_NAME.
         if (!runtime) {
             return failure_output(unavailable("SRV-RUNTIME-UNAVAILABLE", runtime.error().message));
         }
-        auto tls = create_tls(*config);
-        if (!tls) {
-            return failure_output(tls.error());
+        auto pack_trust_policy = load_pack_trust_policy(*config);
+        if (!pack_trust_policy) {
+            return failure_output(pack_trust_policy.error());
+        }
+        auto peer_trust_policy = load_peer_trust_policy(*config);
+        if (!peer_trust_policy) {
+            return failure_output(peer_trust_policy.error());
+        }
+        auto agent_tls = create_tls(*config);
+        if (!agent_tls) {
+            return failure_output(agent_tls.error());
+        }
+        auto admin_tls = create_tls(*config);
+        if (!admin_tls) {
+            return failure_output(admin_tls.error());
         }
         cluster::AuditTrail audit;
-        auto store = open_store(*config, audit);
+        auto connection = resolve_store_connection(*config);
+        if (!connection) {
+            return failure_output(connection.error());
+        }
+        auto store = open_store(*config, audit, connection->value);
         if (!store) {
             return failure_output(store.error());
+        }
+        auto activation_store = open_activation_store(*config, connection->value);
+        connection->wipe();
+        if (!activation_store) {
+            return failure_output(activation_store.error());
         }
         const auto health = (*store)->health();
         if (!health.driver_available || !health.connected || !health.migrations_compatible) {
@@ -1038,21 +1771,24 @@ connection references of the form env:VARIABLE_NAME.
         const ResidentServerContext context {
             .config = *config,
             .store = **store,
+            .activation_store = **activation_store,
+            .store_capabilities = *capabilities,
             .runtime = *runtime,
-            .tls = tls->has_value() ? std::addressof(**tls) : nullptr,
+            .pack_trust_policy = *pack_trust_policy,
+            .peer_trust_policy = **peer_trust_policy,
+            .agent_tls = agent_tls->has_value() ? std::addressof(**agent_tls) : nullptr,
+            .admin_tls = admin_tls->has_value() ? std::addressof(**admin_tls) : nullptr,
         };
-        if (!config->allow_empty_activation) {
-            if (auto active = backend.qualify_activation(context); !active) {
-                return failure_output(active.error());
-            }
+        if (auto active = backend.qualify_activation(context); !active) {
+            return failure_output(active.error());
         }
         if (auto served = backend.serve(context); !served) {
             return failure_output(served.error());
         }
         return {
-            .exit_code = ExitCode::internal_invariant_failed,
+            .exit_code = ExitCode::success,
             .standard_output = {},
-            .standard_error = "SRV-INVARIANT: resident backend returned without a terminal failure\n",
+            .standard_error = {},
         };
     }
 

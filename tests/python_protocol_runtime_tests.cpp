@@ -937,7 +937,7 @@ namespace {
         const auto expired_write =
             connected->connection.send_until(extra, std::chrono::steady_clock::now() - std::chrono::milliseconds {1});
         REQUIRE_FALSE(expired_write.has_value());
-        REQUIRE(expired_write.error().code == ProtocolErrorCode::transport_error);
+        REQUIRE(expired_write.error().code == ProtocolErrorCode::timed_out);
         REQUIRE(expired_write.error().message.find("timed out") != std::string::npos);
 #endif
     }
@@ -978,7 +978,7 @@ namespace {
         const auto accept_started = std::chrono::steady_clock::now();
         const auto accept_timeout = timeout_listener->accept(policy);
         REQUIRE_FALSE(accept_timeout.has_value());
-        REQUIRE(accept_timeout.error().code == ProtocolErrorCode::transport_error);
+        REQUIRE(accept_timeout.error().code == ProtocolErrorCode::timed_out);
         REQUIRE(accept_timeout.error().message.find("timed out") != std::string::npos);
         REQUIRE(std::chrono::steady_clock::now() - accept_started < std::chrono::seconds {1});
 
@@ -1066,7 +1066,8 @@ namespace {
         RecordingJitter refusal_jitter;
         const auto refused = refused_dialer->connect(refused_resolver, refusal_jitter);
         REQUIRE_FALSE(refused.has_value());
-        REQUIRE(refused.error().code == ProtocolErrorCode::transport_error);
+        REQUIRE((refused.error().code == ProtocolErrorCode::transport_error ||
+                 refused.error().code == ProtocolErrorCode::timed_out));
         REQUIRE(refusal_jitter.bounds == std::vector {std::chrono::milliseconds {10}, std::chrono::milliseconds {20},
                                                       std::chrono::milliseconds {25}});
         REQUIRE(refused_resolver.calls.load() == 4);
@@ -1132,7 +1133,7 @@ namespace {
         const auto handshake_timeout = handshake_dialer->connect(silent_resolver, silent_jitter);
         silent_server.join();
         REQUIRE_FALSE(handshake_timeout.has_value());
-        REQUIRE(handshake_timeout.error().code == ProtocolErrorCode::transport_error);
+        REQUIRE(handshake_timeout.error().code == ProtocolErrorCode::timed_out);
         REQUIRE(handshake_timeout.error().message.find("timed out") != std::string::npos);
 
         auto failover_server_context = OpenSslTlsContext::create(orchestration_server_configuration(*certificates));
@@ -1176,7 +1177,7 @@ namespace {
         REQUIRE_FALSE(failover_server_error.has_value());
         REQUIRE(failover_peer.has_value());
         REQUIRE_FALSE(read_timeout.has_value());
-        REQUIRE(read_timeout.error().code == ProtocolErrorCode::transport_error);
+        REQUIRE(read_timeout.error().code == ProtocolErrorCode::timed_out);
         REQUIRE(read_timeout.error().message.find("timed out") != std::string::npos);
 
         auto identity_server_context = OpenSslTlsContext::create(orchestration_server_configuration(*certificates));

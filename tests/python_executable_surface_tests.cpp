@@ -121,6 +121,13 @@ namespace {
                "store.busy_timeout_ms = 5000\n"
                "listener.agent_endpoint = \"127.0.0.1:9443\"\n"
                "listener.admin_endpoint = \"127.0.0.1:9444\"\n"
+               "listener.accept_timeout_ms = 1000\n"
+               "listener.handshake_timeout_ms = 5000\n"
+               "listener.read_timeout_ms = 30000\n"
+               "listener.write_timeout_ms = 30000\n"
+               "listener.backlog = 128\n"
+               "listener.maximum_consecutive_failures = 16\n"
+               "network.require_hard_resolver_bounds = true\n"
                "runtime.root = \"missing-runtime\"\n"
                "pack.registry_path = \"missing-registry\"\n"
                "bindings.operator_path = \"missing-bindings.json\"\n"
@@ -152,6 +159,13 @@ namespace {
                "store.external_ha_configured = true\n"
                "listener.agent_endpoint = \"0.0.0.0:9443\"\n"
                "listener.admin_endpoint = \"127.0.0.1:9444\"\n"
+               "listener.accept_timeout_ms = 1000\n"
+               "listener.handshake_timeout_ms = 5000\n"
+               "listener.read_timeout_ms = 30000\n"
+               "listener.write_timeout_ms = 30000\n"
+               "listener.backlog = 128\n"
+               "listener.maximum_consecutive_failures = 16\n"
+               "network.require_hard_resolver_bounds = true\n"
                "tls.trust_anchors_pem = \"missing-ca.pem\"\n"
                "tls.certificate_chain_pem = \"missing-server.pem\"\n"
                "tls.private_key_pem = \"missing-server-key.pem\"\n"
@@ -204,31 +218,107 @@ TEST_CASE("server executable accepts only its bounded command surface") {
     CHECK(equals_form.standard_error.find("unknown option") != std::string::npos);
 }
 
-TEST_CASE("default resident backend exposes activation and network gaps as stable failures") {
+TEST_CASE("resident backend seam remains injectable and stop-aware") {
     using namespace rule_engine::python;
     using namespace rule_engine::python::tools;
 
+    struct EmptyActivationStore final: cluster::IActivationControlStore {
+        [[nodiscard]] std::expected<cluster::DurableControlState, StoreError> load_state() const override {
+            return cluster::DurableControlState {};
+        }
+        [[nodiscard]] std::expected<std::optional<cluster::AdminOperationRecord>, StoreError>
+        find_operation(std::string_view) const override {
+            return std::optional<cluster::AdminOperationRecord> {};
+        }
+        [[nodiscard]] std::expected<std::optional<cluster::AdminOperationRecord>, StoreError>
+        find_operation_by_idempotency(std::string_view) const override {
+            return std::optional<cluster::AdminOperationRecord> {};
+        }
+        [[nodiscard]] std::expected<void, StoreError> commit(const cluster::ControlPlaneCommit &) override {
+            return {};
+        }
+        [[nodiscard]] std::expected<cluster::ControlPlaneInspection, StoreError> inspect() const override {
+            return cluster::ControlPlaneInspection {};
+        }
+        [[nodiscard]] cluster::RuntimeStoreHealth health() const override {
+            return {.backend = cluster::StoreBackendKind::in_memory_reference,
+                    .driver_available = true,
+                    .connected = true,
+                    .migrations_compatible = true,
+                    .schema_version = 1U,
+                    .server_version = "test",
+                    .detail = {}};
+        }
+    };
+
+    struct InjectedFailureBackend final: ResidentServerBackend {
+        bool stopped {};
+
+        [[nodiscard]] std::expected<void, ToolFailure>
+        qualify_activation(const ResidentServerContext &) noexcept override {
+            return std::unexpected(ToolFailure {.kind = ToolFailureKind::unavailable_dependency,
+                                                .code = "TEST-ACTIVATION",
+                                                .message = "injected activation failure",
+                                                .diagnostics = {}});
+        }
+        [[nodiscard]] std::expected<void, ToolFailure> serve(const ResidentServerContext &) noexcept override {
+            return std::unexpected(ToolFailure {.kind = ToolFailureKind::unavailable_transport,
+                                                .code = "TEST-NETWORK",
+                                                .message = "injected network failure",
+                                                .diagnostics = {}});
+        }
+        void request_stop() noexcept override { stopped = true; }
+    };
+
     cluster::AuditTrail audit;
     cluster::InMemoryRuntimeStore store {audit};
+    EmptyActivationStore activation_store;
     const ServerConfig config;
     const packaging::PrivatePythonRuntime runtime;
+    const cluster::StoreBackendCapabilities capabilities {
+        .kind = cluster::StoreBackendKind::in_memory_reference,
+        .implementation_available = true,
+        .production_allowed = false,
+        .active_active = false,
+        .multi_process = false,
+        .atomic_event_transaction = true,
+        .row_fences = true,
+        .outbox_leases = true,
+        .database_time_leases = false,
+        .required_driver = {},
+        .limitation = {},
+    };
+    const packaging::TrustPolicy pack_trust {
+        .mode = packaging::TrustMode::development,
+        .allow_unsigned_packs = true,
+        .allow_unsigned_generators = false,
+        .signers = {},
+    };
+    const protocol_v2::OperatorTrustPolicy peer_trust;
     const ResidentServerContext context {
         .config = config,
         .store = store,
+        .activation_store = activation_store,
+        .store_capabilities = capabilities,
         .runtime = runtime,
-        .tls = nullptr,
+        .pack_trust_policy = pack_trust,
+        .peer_trust_policy = peer_trust,
+        .agent_tls = nullptr,
+        .admin_tls = nullptr,
     };
-    UnavailableResidentServerBackend backend;
+    InjectedFailureBackend backend;
 
     const auto activation = backend.qualify_activation(context);
     REQUIRE_FALSE(activation.has_value());
-    CHECK(activation.error().code == "SRV-ACTIVATION-UNAVAILABLE");
+    CHECK(activation.error().code == "TEST-ACTIVATION");
     CHECK(exit_code_for(activation.error()) == ExitCode::unavailable);
 
     const auto network = backend.serve(context);
     REQUIRE_FALSE(network.has_value());
-    CHECK(network.error().code == "SRV-NETWORK-UNAVAILABLE");
+    CHECK(network.error().code == "TEST-NETWORK");
     CHECK(exit_code_for(network.error()) == ExitCode::unavailable);
+    backend.request_stop();
+    CHECK(backend.stopped);
 }
 
 TEST_CASE("server configuration parser bounds hostile input and duplicate state") {
@@ -252,6 +342,25 @@ TEST_CASE("server configuration parser bounds hostile input and duplicate state"
     const auto mixed_store = parse_server_config(development_config(temporary) + "store.pool_size = 16\n");
     REQUIRE_FALSE(mixed_store.has_value());
     CHECK(mixed_store.error().code == "SRV-CONFIG-INAPPLICABLE-KEY");
+
+    auto named_listener = development_config(temporary);
+    replace_once(named_listener, "127.0.0.1:9443", "localhost:9443");
+    const auto non_numeric = parse_server_config(named_listener);
+    REQUIRE_FALSE(non_numeric.has_value());
+    CHECK(non_numeric.error().code == "SRV-CONFIG-NUMERIC-ENDPOINT");
+
+    auto soft_resolver = development_config(temporary);
+    replace_once(soft_resolver, "network.require_hard_resolver_bounds = true",
+                 "network.require_hard_resolver_bounds = false");
+    const auto unbounded = parse_server_config(soft_resolver);
+    REQUIRE_FALSE(unbounded.has_value());
+    CHECK(unbounded.error().code == "SRV-CONFIG-LISTENER-BOUNDS");
+
+    auto lease_overlap = development_config(temporary);
+    replace_once(lease_overlap, "listener.accept_timeout_ms = 1000", "listener.accept_timeout_ms = 25000");
+    const auto unsafe_renewal = parse_server_config(lease_overlap);
+    REQUIRE_FALSE(unsafe_renewal.has_value());
+    CHECK(unsafe_renewal.error().code == "SRV-CONFIG-LISTENER-BOUNDS");
 }
 
 TEST_CASE("server validates explicit configuration and fails closed before resident startup") {
