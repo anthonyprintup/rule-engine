@@ -9,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <span>
@@ -62,6 +63,7 @@ namespace {
             .request_specialization = true,
             .request_pruning = true,
             .full_flight_recorder_armed = false,
+            .exact_instruction_count = 10,
         };
     }
 
@@ -152,35 +154,108 @@ namespace {
         CHECK(selected->pruning_enabled);
         CHECK(selected->prunable_false_prefix_exits == std::vector<std::uint32_t> {3, 9});
         CHECK(selected->fallback_reason == ExactFallbackReason::none);
+
+        auto specialization_request = optimization_request();
+        specialization_request.request_pruning = false;
+        const auto specialization = select_optimization(certificates, specialization_request);
+        REQUIRE(specialization.has_value());
+        CHECK_FALSE(specialization->use_exact_bytecode);
+        CHECK(specialization->specialization_enabled);
+        CHECK_FALSE(specialization->pruning_enabled);
+
+        auto pruning_request = optimization_request();
+        pruning_request.request_specialization = false;
+        const auto pruning = select_optimization(certificates, pruning_request);
+        REQUIRE(pruning.has_value());
+        CHECK_FALSE(pruning->use_exact_bytecode);
+        CHECK_FALSE(pruning->specialization_enabled);
+        CHECK(pruning->pruning_enabled);
     }
 
-    TEST_CASE("effectful and full-flight-recorded execution conservatively stays exact") {
-        SECTION("effectful certificate") {
+    TEST_CASE("every observable or uncertain certificate property forces exact VM execution") {
+        struct UnsafeCase {
+            OptimizationCertificate certificate;
+            ExactFallbackReason reason;
+        };
+        std::vector<UnsafeCase> cases;
+        auto add_case = [&cases](const ExactFallbackReason reason, auto mutate) {
             auto certificate = pure_certificate();
-            certificate.transitively_pure = false;
-            certificate.emits_effects = true;
-            const std::vector certificates {certificate};
+            mutate(certificate);
+            cases.push_back(UnsafeCase {.certificate = std::move(certificate), .reason = reason});
+        };
+        add_case(ExactFallbackReason::certificate_reads_state,
+                 [](OptimizationCertificate &certificate) { certificate.reads_state = true; });
+        add_case(ExactFallbackReason::certificate_calls_services,
+                 [](OptimizationCertificate &certificate) { certificate.calls_services = true; });
+        add_case(ExactFallbackReason::certificate_emits_effects,
+                 [](OptimizationCertificate &certificate) { certificate.emits_effects = true; });
+        add_case(ExactFallbackReason::certificate_recorder_observable,
+                 [](OptimizationCertificate &certificate) { certificate.recorder_observable = true; });
+        add_case(ExactFallbackReason::certificate_reads_history,
+                 [](OptimizationCertificate &certificate) { certificate.reads_history = true; });
+        add_case(ExactFallbackReason::certificate_may_fault,
+                 [](OptimizationCertificate &certificate) { certificate.may_fault = true; });
+        add_case(ExactFallbackReason::certificate_has_logical_reads,
+                 [](OptimizationCertificate &certificate) { certificate.logical_facts = {"process.name"}; });
+        add_case(ExactFallbackReason::certificate_not_transitively_pure,
+                 [](OptimizationCertificate &certificate) { certificate.transitively_pure = false; });
 
+        for (const auto &test : cases) {
+            CAPTURE(test.reason);
+            const std::array certificates {test.certificate};
             const auto selected = select_optimization(certificates, optimization_request());
-
             REQUIRE(selected.has_value());
             CHECK(selected->use_exact_bytecode);
             CHECK_FALSE(selected->specialization_enabled);
             CHECK_FALSE(selected->pruning_enabled);
-            CHECK(selected->fallback_reason == ExactFallbackReason::certificate_not_transitively_pure);
+            CHECK(selected->fallback_reason == test.reason);
         }
 
-        SECTION("full recorder policy") {
-            auto request = optimization_request();
-            request.full_flight_recorder_armed = true;
-            const std::vector certificates {pure_certificate()};
+        auto recorder_request = optimization_request();
+        recorder_request.full_flight_recorder_armed = true;
+        const std::array certificates {pure_certificate()};
+        const auto recorder_selection = select_optimization(certificates, recorder_request);
+        REQUIRE(recorder_selection.has_value());
+        CHECK(recorder_selection->use_exact_bytecode);
+        CHECK(recorder_selection->fallback_reason == ExactFallbackReason::recorder_policy_requires_exact);
 
-            const auto selected = select_optimization(certificates, request);
+        const auto missing = select_optimization({}, optimization_request());
+        REQUIRE(missing.has_value());
+        CHECK(missing->use_exact_bytecode);
+        CHECK(missing->fallback_reason == ExactFallbackReason::certificate_missing);
+    }
 
-            REQUIRE(selected.has_value());
-            CHECK(selected->use_exact_bytecode);
-            CHECK(selected->fallback_reason == ExactFallbackReason::recorder_policy_requires_exact);
-        }
+    TEST_CASE("pruning requires canonical in-bounds compiler-certified pure-prefix exits") {
+        auto pruning_request = optimization_request();
+        pruning_request.request_specialization = false;
+
+        auto no_prefix = pure_certificate();
+        no_prefix.pure_false_prefix_exits.clear();
+        auto selected = select_optimization(std::array {no_prefix}, optimization_request());
+        REQUIRE(selected.has_value());
+        CHECK(selected->use_exact_bytecode);
+        CHECK_FALSE(selected->specialization_enabled);
+        CHECK(selected->fallback_reason == ExactFallbackReason::certificate_has_no_pure_prefix);
+        selected = select_optimization(std::array {no_prefix}, pruning_request);
+        REQUIRE(selected.has_value());
+        CHECK(selected->use_exact_bytecode);
+        CHECK(selected->fallback_reason == ExactFallbackReason::certificate_has_no_pure_prefix);
+
+        auto noncanonical = pure_certificate();
+        noncanonical.pure_false_prefix_exits = {9, 3};
+        selected = select_optimization(std::array {noncanonical}, pruning_request);
+        REQUIRE(selected.has_value());
+        CHECK(selected->use_exact_bytecode);
+        CHECK_FALSE(selected->certificate_validated);
+        CHECK(selected->fallback_reason == ExactFallbackReason::certificate_noncanonical);
+
+        auto out_of_bounds = pure_certificate();
+        out_of_bounds.pure_false_prefix_exits = {3, 10};
+        selected = select_optimization(std::array {out_of_bounds}, pruning_request);
+        REQUIRE(selected.has_value());
+        CHECK(selected->use_exact_bytecode);
+        CHECK_FALSE(selected->certificate_validated);
+        CHECK(selected->fallback_reason == ExactFallbackReason::certificate_prefix_out_of_bounds);
     }
 
     TEST_CASE("certificate semantic hash mismatch falls back to exact bytecode") {
@@ -197,7 +272,8 @@ namespace {
         CHECK(selected->fallback_reason == ExactFallbackReason::certificate_semantic_hash_mismatch);
 
         const auto validation = validate_optimization_certificate(certificates.front(), request.executable,
-                                                                  request.expected_executable_semantic_hash);
+                                                                  request.expected_executable_semantic_hash,
+                                                                  request.exact_instruction_count);
         REQUIRE_FALSE(validation.has_value());
         CHECK(validation.error().code == OptimizerErrorCode::certificate_semantic_hash_mismatch);
     }
@@ -234,6 +310,13 @@ namespace {
                                          .double_fault = false,
                                          .triple_fault = false},
                 },
+            .fact_reads = {{.sequence = 1,
+                            .subject_key_digest = "sha256:subject",
+                            .route = FactRoute {.provider = "process", .fact = "signer"},
+                            .schema = SchemaId {"signer/v1"},
+                            .status = FactTerminalStatus::value,
+                            .label = DataLabel {},
+                            .value_digest = "sha256:value"}},
             .logical_reads = {{.sequence = 1,
                                .subject_key_digest = "sha256:subject",
                                .route = FactRoute {.provider = "process", .fact = "signer"},
@@ -245,6 +328,11 @@ namespace {
             .recorder =
                 {{.sequence = 1, .kind = "branch", .span = source_span(), .label = DataLabel {}, .summary = "taken"}},
             .resources = SemanticResourceCounters {.instructions = 100, .logical_facts = 1, .effect_intents = 1},
+            .diagnostics = {{.code = "RuleFault",
+                             .severity = DiagnosticSeverity::error,
+                             .message = "secret diagnostic",
+                             .span = source_span(),
+                             .related = {{.span = source_span(), .message = "secret relation"}}}},
         };
         ShadowExecutionSnapshot optimized {
             .evaluation =
@@ -255,9 +343,11 @@ namespace {
                     .state_mutations = {},
                     .fault = std::nullopt,
                 },
+            .fact_reads = {},
             .logical_reads = {},
             .recorder = {},
             .resources = {},
+            .diagnostics = {},
         };
 
         const auto mismatch = compare_shadow_execution(exact, optimized);
@@ -265,20 +355,204 @@ namespace {
         CHECK_FALSE(mismatch.equivalent);
         CHECK(mismatch.exact_result_is_only_committable);
         CHECK(mismatch.disable_optimized_executable);
-        CHECK(mismatch.mismatch_dimension_count == 8);
-        CHECK(mismatch.mismatches.size() == 8);
+        CHECK(mismatch.mismatch_dimension_count == 10);
+        CHECK(mismatch.mismatches.size() == 10);
         CHECK_FALSE(mismatch.mismatch_data_truncated);
+        std::vector<ShadowParityDimension> mismatch_dimensions;
+        std::ranges::transform(mismatch.mismatches, std::back_inserter(mismatch_dimensions),
+                               &RedactedShadowMismatch::dimension);
+        CHECK(mismatch_dimensions == std::vector {ShadowParityDimension::outcome, ShadowParityDimension::verdict,
+                                                  ShadowParityDimension::fact_reads,
+                                                  ShadowParityDimension::logical_reads,
+                                                  ShadowParityDimension::ordered_effects, ShadowParityDimension::state,
+                                                  ShadowParityDimension::recorder, ShadowParityDimension::fault,
+                                                  ShadowParityDimension::budgets, ShadowParityDimension::diagnostics});
 
         const auto parity = compare_shadow_execution(exact, exact);
         CHECK(parity.equivalent);
         CHECK_FALSE(parity.disable_optimized_executable);
         CHECK(parity.mismatches.empty());
 
+        auto changed_fact = exact;
+        changed_fact.fact_reads.front().value_digest = "sha256:other";
+        const auto fact_mismatch = compare_shadow_execution(exact, changed_fact);
+        REQUIRE(fact_mismatch.mismatches.size() == 1);
+        CHECK(fact_mismatch.mismatches.front().dimension == ShadowParityDimension::fact_reads);
+        auto changed_diagnostic = exact;
+        changed_diagnostic.diagnostics.front().related.front().message = "other";
+        const auto diagnostic_mismatch = compare_shadow_execution(exact, changed_diagnostic);
+        REQUIRE(diagnostic_mismatch.mismatches.size() == 1);
+        CHECK(diagnostic_mismatch.mismatches.front().dimension == ShadowParityDimension::diagnostics);
+        auto ordered_exact = exact;
+        auto second_effect = ordered_exact.evaluation.committed_effects.front();
+        second_effect.id = IntentId {"intent-2"};
+        second_effect.sequence = 2;
+        second_effect.idempotency_key = "intent-key-2";
+        ordered_exact.evaluation.committed_effects.push_back(second_effect);
+        auto reordered_effects = ordered_exact;
+        std::ranges::swap(reordered_effects.evaluation.committed_effects[0],
+                          reordered_effects.evaluation.committed_effects[1]);
+        const auto effect_order_mismatch = compare_shadow_execution(ordered_exact, reordered_effects);
+        REQUIRE(effect_order_mismatch.mismatches.size() == 1);
+        CHECK(effect_order_mismatch.mismatches.front().dimension == ShadowParityDimension::ordered_effects);
+        CHECK(effect_order_mismatch.mismatches.front().first_difference_index == 0);
+
         const auto limited =
             compare_shadow_execution(exact, optimized, ShadowParityLimits {.maximum_mismatch_records = 2});
-        CHECK(limited.mismatch_dimension_count == 8);
+        CHECK(limited.mismatch_dimension_count == 10);
         CHECK(limited.mismatches.size() == 2);
         CHECK(limited.mismatch_data_truncated);
+    }
+
+    TEST_CASE("10000-peer optimizer qualification benchmark is bounded and parity clean") {
+        constexpr std::size_t peer_count = 10'000;
+        constexpr std::size_t maximum_prefixes_per_plan = 2;
+        constexpr std::size_t maximum_patterns_per_plan = 1;
+        constexpr std::size_t maximum_requests_per_peer = 1;
+        constexpr std::size_t maximum_results_per_request = 1;
+
+        const auto pattern = make_byte_pattern("mz", bytes("MZ"));
+        REQUIRE(pattern.has_value());
+        const auto source = bytes("xMZyMZz");
+        const auto certificate = pure_certificate();
+        const std::array certificates {certificate};
+
+        std::size_t qualification_failures {};
+        std::size_t observable_mismatches {};
+        std::size_t total_plans {};
+        std::size_t maximum_prefixes {};
+        std::size_t maximum_patterns {};
+        std::size_t total_requests {};
+        std::size_t maximum_requests {};
+        std::size_t total_results {};
+        std::size_t maximum_results {};
+        std::size_t exact_internal_results {};
+        std::uint64_t deterministic_digest {};
+
+        for (std::size_t peer_index = 0; peer_index < peer_count; ++peer_index) {
+            const auto selection = select_optimization(certificates, optimization_request());
+            if (!selection || selection->use_exact_bytecode || !selection->pruning_enabled ||
+                selection->prunable_false_prefix_exits.size() != 2 || selection->prunable_false_prefix_exits[0] != 3 ||
+                selection->prunable_false_prefix_exits[1] != 9) {
+                ++qualification_failures;
+                continue;
+            }
+            ++total_plans;
+            maximum_prefixes = std::max(maximum_prefixes, selection->prunable_false_prefix_exits.size());
+
+            auto exact_plan = plan_with(*pattern, source.size(), 4);
+            exact_plan.context_bytes_before = 1;
+            exact_plan.context_bytes_after = 1;
+            auto optimized_plan = exact_plan;
+            optimized_plan.result_mode = ScanResultMode::existential;
+            maximum_patterns = std::max(maximum_patterns, optimized_plan.patterns.size());
+
+            auto space = file_space(0, source.size());
+            space.subject_generation = peer_index + 1;
+            const auto exact_matches = execute_scan(space, exact_plan, source);
+            if (!exact_matches || exact_matches->count() != 2) {
+                ++qualification_failures;
+                continue;
+            }
+            exact_internal_results += exact_matches->count();
+
+            const auto peer_suffix = std::to_string(peer_index + 1);
+            ProviderScanRequest provider_request {
+                .request_id = RequestId {"scan-" + peer_suffix},
+                .subject =
+                    SubjectKey {.peer = PeerId {"peer-" + peer_suffix},
+                                .descriptor = SchemaId {"process/v1"},
+                                .identity = {{.field_id = 1, .value = static_cast<std::uint64_t>(peer_index + 1)}},
+                                .parent = {}},
+                .space = space,
+                .plan = optimized_plan,
+                .deadline_unix_ms = 5'000,
+            };
+            const auto wire_request = to_contract_scan_request(provider_request);
+            if (!wire_request) {
+                ++qualification_failures;
+                continue;
+            }
+            ++total_requests;
+            maximum_requests = std::max(maximum_requests, std::size_t {1});
+            const auto restored_request = from_contract_scan_request(*wire_request);
+            if (!restored_request || restored_request->plan.patterns.size() > maximum_patterns_per_plan) {
+                ++qualification_failures;
+                continue;
+            }
+
+            const auto witness = execute_scan(restored_request->space, restored_request->plan, source);
+            if (!witness || witness->count() != 1) {
+                ++qualification_failures;
+                continue;
+            }
+            const auto wire_response = to_contract_scan_response(*restored_request, *witness);
+            if (!wire_response) {
+                ++qualification_failures;
+                continue;
+            }
+            const auto restored_witness = from_contract_scan_response(*restored_request, *wire_response);
+            if (!restored_witness) {
+                ++qualification_failures;
+                continue;
+            }
+            total_results += restored_witness->count();
+            maximum_results = std::max(maximum_results, restored_witness->count());
+
+            const auto verdict = exact_matches->exists();
+            const LogicalReadObservation logical_read {
+                .sequence = 1,
+                .subject_key_digest = "peer-digest-" + peer_suffix,
+                .route = FactRoute {.provider = "scan", .fact = "mz.exists"},
+                .schema = SchemaId {"bool/v1"},
+                .status = FactTerminalStatus::value,
+                .span = source_span(),
+                .label = space.label,
+                .value_digest = verdict ? "bool:true" : "bool:false",
+            };
+            const SemanticResourceCounters semantic_budget {
+                .instructions = 64,
+                .logical_facts = 1,
+                .provider_rounds = 1,
+                .fact_bytes = source.size(),
+            };
+            const ShadowExecutionSnapshot exact_snapshot {
+                .evaluation =
+                    EvaluationResult {
+                        .outcome = verdict ? EvaluationOutcome::match : EvaluationOutcome::no_match,
+                        .verdict = verdict,
+                        .committed_effects = {},
+                        .state_mutations = {},
+                        .fault = std::nullopt,
+                    },
+                .fact_reads = {},
+                .logical_reads = {logical_read},
+                .recorder = {},
+                .resources = semantic_budget,
+                .diagnostics = {},
+            };
+            auto optimized_snapshot = exact_snapshot;
+            optimized_snapshot.evaluation.verdict = restored_witness->exists();
+            optimized_snapshot.evaluation.outcome =
+                restored_witness->exists() ? EvaluationOutcome::match : EvaluationOutcome::no_match;
+            if (!compare_shadow_execution(exact_snapshot, optimized_snapshot).equivalent) {
+                ++observable_mismatches;
+            }
+            deterministic_digest +=
+                static_cast<std::uint64_t>(peer_index + 1) * (restored_witness->matches.front().offset + 1);
+        }
+
+        CHECK(qualification_failures == 0);
+        CHECK(observable_mismatches == 0);
+        CHECK(total_plans == peer_count);
+        CHECK(maximum_prefixes <= maximum_prefixes_per_plan);
+        CHECK(maximum_patterns <= maximum_patterns_per_plan);
+        CHECK(total_requests == peer_count * maximum_requests_per_peer);
+        CHECK(maximum_requests <= maximum_requests_per_peer);
+        CHECK(total_results == peer_count * maximum_results_per_request);
+        CHECK(maximum_results <= maximum_results_per_request);
+        CHECK(exact_internal_results == peer_count * 2);
+        CHECK(deterministic_digest == 100'010'000);
     }
 
     TEST_CASE("typed byte scans return exact deterministic offsets and bounded context") {
