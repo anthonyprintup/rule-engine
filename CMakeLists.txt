@@ -81,6 +81,14 @@ target_compile_options(
 
 enable_testing()
 
+add_test(
+    NAME rule_engine_python_only_source_gate
+    COMMAND
+        "${CMAKE_COMMAND}"
+        -DRULE_ENGINE_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/VerifyPythonOnly.cmake"
+)
+
 add_library(rule_engine_python_contract src/python/contract.cpp)
 add_library(rule_engine::python_contract ALIAS rule_engine_python_contract)
 target_include_directories(rule_engine_python_contract PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
