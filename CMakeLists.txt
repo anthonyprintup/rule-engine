@@ -1,6 +1,22 @@
 cmake_minimum_required(VERSION 3.31)
 project(rule_engine VERSION 1.0.0 LANGUAGES C CXX)
 
+if(WIN32 AND CMAKE_GENERATOR MATCHES "^Ninja")
+    execute_process(
+        COMMAND "${CMAKE_MAKE_PROGRAM}" --version
+        RESULT_VARIABLE rule_engine_ninja_result
+        OUTPUT_VARIABLE rule_engine_ninja_version
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(NOT rule_engine_ninja_result EQUAL 0 OR rule_engine_ninja_version VERSION_LESS 1.13.2)
+        message(FATAL_ERROR
+            "Rule Engine requires Ninja 1.13.2 or newer on Windows; "
+            "older Ninja dyndep handling can assert while building this graph"
+        )
+    endif()
+endif()
+
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 23)

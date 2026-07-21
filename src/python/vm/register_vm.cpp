@@ -254,14 +254,21 @@ namespace rule_engine::python::vm {
 
     struct RegisterVmSession::Impl {
         enum struct ExecutorPhase : std::uint8_t { normal, recovery_retry, finalizer, on_fault, double_fault };
-        enum struct UnwindKind : std::uint8_t { exception, return_value, hard_fault, generator_close };
+        enum struct UnwindKind : std::uint8_t { exception, return_value, jump, hard_fault };
+
+        struct ActiveException {
+            PythonFaultKind kind {PythonFaultKind::value_error};
+            PyValue value;
+            VmErrorCode code {VmErrorCode::value_error};
+            SourceSpan span;
+        };
 
         struct UnwindRecord {
             UnwindKind kind {UnwindKind::exception};
             std::optional<PyValue> value;
+            std::optional<ActiveException> exception;
             std::optional<VmError> fault;
-            std::optional<std::uint32_t> handler_instruction;
-            std::uint32_t destination {};
+            std::optional<std::uint32_t> target_instruction;
             std::uint32_t origin_instruction {};
         };
 
@@ -274,7 +281,8 @@ namespace rule_engine::python::vm {
             GeneratorState generator_state {GeneratorState::running};
             std::optional<std::uint32_t> yield_destination;
             std::optional<UnwindRecord> unwind;
-            std::unordered_set<std::uint32_t> completed_cleanups;
+            std::vector<ActiveException> exception_stack;
+            std::unordered_set<std::size_t> completed_cleanups;
         };
 
         enum struct PendingKind : std::uint8_t { fact, capability, state };
@@ -384,6 +392,18 @@ namespace rule_engine::python::vm {
                     if (heap.valid(value)) {
                         result.push_back(value);
                     }
+                }
+                for (const auto &exception : frame.exception_stack) {
+                    if (heap.valid(exception.value)) {
+                        result.push_back(exception.value);
+                    }
+                }
+                if (frame.unwind.has_value() && frame.unwind->exception.has_value() &&
+                    heap.valid(frame.unwind->exception->value)) {
+                    result.push_back(frame.unwind->exception->value);
+                }
+                if (frame.unwind.has_value() && frame.unwind->value.has_value() && heap.valid(*frame.unwind->value)) {
+                    result.push_back(*frame.unwind->value);
                 }
             }
             return result;
@@ -651,6 +671,7 @@ namespace rule_engine::python::vm {
                                     .generator_state = GeneratorState::running,
                                     .yield_destination = std::nullopt,
                                     .unwind = std::nullopt,
+                                    .exception_stack = {},
                                     .completed_cleanups = {}});
             if (pack.functions[function_index].parameter_count == 1U) {
                 auto subject_value = heap.allocate_none();
@@ -763,7 +784,13 @@ namespace rule_engine::python::vm {
                 auto exception = heap.allocate_unicode(fault.message);
                 if (exception && frames.back().pc < function(frames.back()).instructions.size()) {
                     const auto &current = function(frames.back()).instructions[frames.back().pc];
-                    if (handle_author_fault(current, *exception)) {
+                    discard_pending_exception(frames.back());
+                    frames.back().unwind.reset();
+                    if (handle_author_fault(frames.back().pc,
+                                            ActiveException {.kind = python_fault_kind(code),
+                                                             .value = *exception,
+                                                             .code = code,
+                                                             .span = fault.span.value_or(current.span)})) {
                         return make_step(VmStepState::yielded);
                     }
                 }
@@ -779,8 +806,11 @@ namespace rule_engine::python::vm {
                 return begin_double_fault(std::move(fault));
             }
 
-            if (hard_control_fault(code) && begin_forced_cleanup(fault)) {
-                return make_step(VmStepState::yielded);
+            if (hard_control_fault(code)) {
+                pending.reset();
+                if (begin_forced_cleanup(fault)) {
+                    return make_step(VmStepState::yielded);
+                }
             }
 
             record_fault(std::move(fault));
@@ -1025,7 +1055,12 @@ namespace rule_engine::python::vm {
             if (!exception) {
                 return exception.error();
             }
-            if (!handle_author_fault(faulting, *exception)) {
+            discard_pending_exception(frames.back());
+            frames.back().unwind.reset();
+            if (!handle_author_fault(frames.back().pc, ActiveException {.kind = PythonFaultKind::value_error,
+                                                                        .value = *exception,
+                                                                        .code = VmErrorCode::value_error,
+                                                                        .span = faulting.span})) {
                 return VmError {.code = VmErrorCode::value_error, .message = std::move(message), .span = faulting.span};
             }
             return std::nullopt;
@@ -1683,33 +1718,103 @@ namespace rule_engine::python::vm {
             return std::max<std::uint64_t>(1U, std::max(left_digits, right_digits));
         }
 
-        [[nodiscard]] bool handle_author_fault(const Instruction &instruction, const PyValue value) {
-            auto fault_instruction = frames.back().pc;
-            auto destination = instruction.destination;
+        [[nodiscard]] static PythonFaultKind python_fault_kind(const VmErrorCode code) noexcept {
+            if (code == VmErrorCode::type_error) {
+                return PythonFaultKind::type_error;
+            }
+            if (code == VmErrorCode::arithmetic_error) {
+                return PythonFaultKind::arithmetic_error;
+            }
+            return PythonFaultKind::value_error;
+        }
+
+        [[nodiscard]] static VmErrorCode vm_error_code(const PythonFaultKind kind) noexcept {
+            switch (kind) {
+                case PythonFaultKind::value_error: return VmErrorCode::value_error;
+                case PythonFaultKind::type_error: return VmErrorCode::type_error;
+                case PythonFaultKind::arithmetic_error: return VmErrorCode::arithmetic_error;
+                case PythonFaultKind::exception: return VmErrorCode::value_error;
+                default: return VmErrorCode::engine_fault;
+            }
+        }
+
+        [[nodiscard]] static bool exception_matches(const PythonFaultKind filter,
+                                                    const PythonFaultKind raised) noexcept {
+            return filter == PythonFaultKind::exception || filter == raised;
+        }
+
+        [[nodiscard]] static bool contains_instruction(const ExceptionRegion &region,
+                                                       const std::uint32_t instruction) noexcept {
+            return instruction >= region.begin_instruction && instruction < region.end_instruction;
+        }
+
+        static void discard_pending_exception(Frame &frame) {
+            if (frame.unwind.has_value() && frame.unwind->kind == UnwindKind::exception &&
+                !frame.exception_stack.empty()) {
+                frame.exception_stack.pop_back();
+            }
+        }
+
+        [[nodiscard]] std::optional<std::size_t>
+        next_cleanup(const Frame &frame, const std::uint32_t origin,
+                     const std::optional<std::uint32_t> target = std::nullopt) const {
+            const auto &regions = function(frame).exception_regions;
+            std::optional<std::size_t> selected;
+            for (std::size_t index = 0U; index < regions.size(); ++index) {
+                const auto &region = regions[index];
+                if (region.kind != ExceptionRegionKind::cleanup || !contains_instruction(region, origin) ||
+                    frame.completed_cleanups.contains(index) ||
+                    (target.has_value() && contains_instruction(region, *target))) {
+                    continue;
+                }
+                if (!selected.has_value() ||
+                    region.end_instruction - region.begin_instruction <
+                        regions[*selected].end_instruction - regions[*selected].begin_instruction) {
+                    selected = index;
+                }
+            }
+            return selected;
+        }
+
+        [[nodiscard]] std::optional<std::size_t> next_exception_region(const Frame &frame,
+                                                                       const std::uint32_t origin) const {
+            const auto &regions = function(frame).exception_regions;
+            std::optional<std::size_t> selected;
+            for (std::size_t index = 0U; index < regions.size(); ++index) {
+                const auto &region = regions[index];
+                if (!contains_instruction(region, origin) ||
+                    (region.kind == ExceptionRegionKind::cleanup && frame.completed_cleanups.contains(index))) {
+                    continue;
+                }
+                if (!selected.has_value() ||
+                    region.end_instruction - region.begin_instruction <
+                        regions[*selected].end_instruction - regions[*selected].begin_instruction) {
+                    selected = index;
+                }
+            }
+            return selected;
+        }
+
+        [[nodiscard]] bool handle_author_fault(std::uint32_t fault_instruction, ActiveException exception) {
             while (!frames.empty()) {
                 auto &frame = frames.back();
                 const auto &regions = function(frame).exception_regions;
-                for (auto region = regions.rbegin(); region != regions.rend(); ++region) {
-                    if (fault_instruction < region->begin_instruction || fault_instruction >= region->end_instruction) {
-                        continue;
-                    }
-                    if (region->cleanup_instruction != region->handler_instruction &&
-                        !frame.completed_cleanups.contains(region->cleanup_instruction)) {
-                        frame.completed_cleanups.insert(region->cleanup_instruction);
+                if (const auto selected = next_exception_region(frame, fault_instruction); selected.has_value()) {
+                    const auto &region = regions[*selected];
+                    frame.exception_stack.push_back(exception);
+                    if (region.kind == ExceptionRegionKind::cleanup) {
+                        frame.completed_cleanups.insert(*selected);
                         frame.unwind = UnwindRecord {.kind = UnwindKind::exception,
-                                                     .value = value,
+                                                     .value = std::nullopt,
+                                                     .exception = exception,
                                                      .fault = std::nullopt,
-                                                     .handler_instruction = region->handler_instruction,
-                                                     .destination = destination,
+                                                     .target_instruction = region.handler_instruction,
                                                      .origin_instruction = fault_instruction};
-                        frame.pc = region->cleanup_instruction;
-                        return true;
+                        frame.pc = region.cleanup_instruction;
+                    } else {
+                        frame.unwind.reset();
+                        frame.pc = region.handler_instruction;
                     }
-                    if (destination >= frame.registers.size()) {
-                        return false;
-                    }
-                    frame.registers[destination] = value;
-                    frame.pc = region->handler_instruction;
                     return true;
                 }
                 if (frames.size() == 1U) {
@@ -1718,7 +1823,6 @@ namespace rule_engine::python::vm {
                 const auto child = std::move(frames.back());
                 frames.pop_back();
                 fault_instruction = child.caller_instruction.value_or(frames.back().pc);
-                destination = child.return_register.value_or(0U);
             }
             return false;
         }
@@ -1737,20 +1841,16 @@ namespace rule_engine::python::vm {
             while (!frames.empty()) {
                 auto &frame = frames.back();
                 const auto &regions = function(frame).exception_regions;
-                for (auto region = regions.rbegin(); region != regions.rend(); ++region) {
-                    if (origin_instruction < region->begin_instruction ||
-                        origin_instruction >= region->end_instruction ||
-                        frame.completed_cleanups.contains(region->cleanup_instruction)) {
-                        continue;
-                    }
-                    frame.completed_cleanups.insert(region->cleanup_instruction);
+                if (const auto selected = next_cleanup(frame, origin_instruction); selected.has_value()) {
+                    const auto &region = regions[*selected];
+                    frame.completed_cleanups.insert(*selected);
                     frame.unwind = UnwindRecord {.kind = UnwindKind::hard_fault,
                                                  .value = std::nullopt,
+                                                 .exception = std::nullopt,
                                                  .fault = fault,
-                                                 .handler_instruction = std::nullopt,
-                                                 .destination = 0U,
+                                                 .target_instruction = std::nullopt,
                                                  .origin_instruction = origin_instruction};
-                    frame.pc = region->cleanup_instruction;
+                    frame.pc = region.cleanup_instruction;
                     if (!forced_cleanup_active) {
                         set_forced_cleanup(true);
                         phase_started = std::chrono::steady_clock::now();
@@ -1798,6 +1898,11 @@ namespace rule_engine::python::vm {
                     return fail(VmError {.code = VmErrorCode::invalid_bytecode,
                                          .message = "function reached the end without return",
                                          .span = std::nullopt});
+                }
+                for (std::size_t region = 0U; region < code.exception_regions.size(); ++region) {
+                    if (code.exception_regions[region].begin_instruction == frame.pc) {
+                        frame.completed_cleanups.erase(region);
+                    }
                 }
                 const auto instruction = code.instructions[frame.pc];
                 if (const auto budget_fault = charge_instructions(1U, instruction.span); budget_fault.has_value()) {
@@ -2041,6 +2146,39 @@ namespace rule_engine::python::vm {
                         }
                         frame.pc = instruction.immediate;
                         break;
+                    case Opcode::unwind_jump: {
+                        if (forced_cleanup_active) {
+                            return fail(VmError {.code = VmErrorCode::loop_budget_exhausted,
+                                                 .message = "hard cleanup cannot replace its controlling fault",
+                                                 .span = instruction.span});
+                        }
+                        if (instruction.immediate >= code.instructions.size()) {
+                            return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                                 .message = "unwind jump target is out of range",
+                                                 .span = instruction.span});
+                        }
+                        if (instruction.immediate <= frame.pc) {
+                            if (const auto loop_fault = charge_loop(instruction.span); loop_fault.has_value()) {
+                                return fail(*loop_fault);
+                            }
+                        }
+                        discard_pending_exception(frame);
+                        frame.unwind.reset();
+                        if (const auto cleanup = next_cleanup(frame, frame.pc, instruction.immediate);
+                            cleanup.has_value()) {
+                            frame.completed_cleanups.insert(*cleanup);
+                            frame.unwind = UnwindRecord {.kind = UnwindKind::jump,
+                                                         .value = std::nullopt,
+                                                         .exception = std::nullopt,
+                                                         .fault = std::nullopt,
+                                                         .target_instruction = instruction.immediate,
+                                                         .origin_instruction = frame.pc};
+                            frame.pc = code.exception_regions[*cleanup].cleanup_instruction;
+                            break;
+                        }
+                        frame.pc = instruction.immediate;
+                        break;
+                    }
                     case Opcode::jump_if_false: {
                         if (!register_valid(frame, instruction.operand_a)) {
                             return fail(VmError {.code = VmErrorCode::invalid_bytecode,
@@ -2096,6 +2234,7 @@ namespace rule_engine::python::vm {
                                                 .generator_state = GeneratorState::running,
                                                 .yield_destination = std::nullopt,
                                                 .unwind = std::nullopt,
+                                                .exception_stack = {},
                                                 .completed_cleanups = {}});
                         current_counters().peak_frames =
                             std::max(current_counters().peak_frames, static_cast<std::uint32_t>(frames.size()));
@@ -2114,21 +2253,17 @@ namespace rule_engine::python::vm {
                                                  .span = instruction.span});
                         }
                         const auto value = frame.registers[instruction.operand_a];
-                        const auto cleanup = std::ranges::find_if(
-                            function(frame).exception_regions.rbegin(), function(frame).exception_regions.rend(),
-                            [&](const auto &region) {
-                                return frame.pc >= region.begin_instruction && frame.pc < region.end_instruction &&
-                                       !frame.completed_cleanups.contains(region.cleanup_instruction);
-                            });
-                        if (cleanup != function(frame).exception_regions.rend()) {
-                            frame.completed_cleanups.insert(cleanup->cleanup_instruction);
+                        discard_pending_exception(frame);
+                        frame.unwind.reset();
+                        if (const auto cleanup = next_cleanup(frame, frame.pc); cleanup.has_value()) {
+                            frame.completed_cleanups.insert(*cleanup);
                             frame.unwind = UnwindRecord {.kind = UnwindKind::return_value,
                                                          .value = value,
+                                                         .exception = std::nullopt,
                                                          .fault = std::nullopt,
-                                                         .handler_instruction = std::nullopt,
-                                                         .destination = 0U,
+                                                         .target_instruction = std::nullopt,
                                                          .origin_instruction = frame.pc};
-                            frame.pc = cleanup->cleanup_instruction;
+                            frame.pc = code.exception_regions[*cleanup].cleanup_instruction;
                             break;
                         }
                         const auto destination = frame.return_register;
@@ -2150,12 +2285,79 @@ namespace rule_engine::python::vm {
                                                  .message = "raise reads an uninitialized register",
                                                  .span = instruction.span});
                         }
-                        if (!handle_author_fault(instruction, frame.registers[instruction.operand_a])) {
-                            auto message = heap.unicode_utf8(frame.registers[instruction.operand_a]);
-                            return fail(VmError {.code = VmErrorCode::value_error,
-                                                 .message = message.value_or("uncaught Python fault"),
+                        {
+                            const auto raised_value = frame.registers[instruction.operand_a];
+                            const auto kind = static_cast<PythonFaultKind>(instruction.immediate);
+                            const auto code_value = vm_error_code(kind);
+                            discard_pending_exception(frame);
+                            frame.unwind.reset();
+                            if (!handle_author_fault(frame.pc, ActiveException {.kind = kind,
+                                                                                .value = raised_value,
+                                                                                .code = code_value,
+                                                                                .span = instruction.span})) {
+                                auto message = heap.unicode_utf8(raised_value);
+                                return fail(VmError {.code = code_value,
+                                                     .message = message.value_or("uncaught Python fault"),
+                                                     .span = instruction.span});
+                            }
+                        }
+                        break;
+                    case Opcode::load_current_exception:
+                        if (frame.exception_stack.empty()) {
+                            return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                                 .message = "current-exception access has no active exception",
                                                  .span = instruction.span});
                         }
+                        frame.registers[instruction.destination] = frame.exception_stack.back().value;
+                        ++frame.pc;
+                        break;
+                    case Opcode::match_exception:
+                        if (frame.exception_stack.empty() ||
+                            instruction.immediate > std::to_underlying(PythonFaultKind::exception) ||
+                            instruction.operand_a >= code.instructions.size() ||
+                            instruction.operand_b >= code.instructions.size()) {
+                            return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                                 .message = "exception filter state or encoding is invalid",
+                                                 .span = instruction.span});
+                        }
+                        if (exception_matches(static_cast<PythonFaultKind>(instruction.immediate),
+                                              frame.exception_stack.back().kind)) {
+                            frame.registers[instruction.destination] = frame.exception_stack.back().value;
+                            frame.pc = instruction.operand_a;
+                        } else {
+                            frame.pc = instruction.operand_b;
+                        }
+                        break;
+                    case Opcode::reraise: {
+                        if (forced_cleanup_active) {
+                            return fail(VmError {.code = VmErrorCode::value_error,
+                                                 .message = "hard cleanup attempted to re-raise a Python exception",
+                                                 .span = instruction.span});
+                        }
+                        if (frame.exception_stack.empty()) {
+                            return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                                 .message = "re-raise has no active exception",
+                                                 .span = instruction.span});
+                        }
+                        auto exception = frame.exception_stack.back();
+                        frame.exception_stack.pop_back();
+                        frame.unwind.reset();
+                        if (handle_author_fault(frame.pc, exception)) {
+                            break;
+                        }
+                        auto message = heap.unicode_utf8(exception.value);
+                        return fail(VmError {.code = exception.code,
+                                             .message = message.value_or("uncaught re-raised Python fault"),
+                                             .span = exception.span});
+                    }
+                    case Opcode::leave_except:
+                        if (frame.exception_stack.empty()) {
+                            return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                                 .message = "leave_except has no active handler exception",
+                                                 .span = instruction.span});
+                        }
+                        frame.exception_stack.pop_back();
+                        ++frame.pc;
                         break;
                     case Opcode::enter_try: ++frame.pc; break;
                     case Opcode::leave_try:
@@ -2166,14 +2368,12 @@ namespace rule_engine::python::vm {
                             auto unwind = std::move(*frame.unwind);
                             frame.unwind.reset();
                             if (unwind.kind == UnwindKind::exception) {
-                                if (!unwind.handler_instruction.has_value() || !unwind.value.has_value() ||
-                                    unwind.destination >= frame.registers.size()) {
+                                if (!unwind.target_instruction.has_value() || !unwind.exception.has_value()) {
                                     return fail(VmError {.code = VmErrorCode::engine_fault,
                                                          .message = "exception cleanup continuation is malformed",
                                                          .span = instruction.span});
                                 }
-                                frame.registers[unwind.destination] = *unwind.value;
-                                frame.pc = *unwind.handler_instruction;
+                                frame.pc = *unwind.target_instruction;
                                 break;
                             }
                             if (unwind.kind == UnwindKind::hard_fault) {
@@ -2191,25 +2391,34 @@ namespace rule_engine::python::vm {
                                                                  VmStepState::faulted;
                                 return fail(std::move(*unwind.fault), requested_state);
                             }
-                            if (unwind.kind == UnwindKind::generator_close) {
-                                frame.generator_state = GeneratorState::closed;
-                                return fail(VmError {.code = VmErrorCode::canceled,
-                                                     .message = "generator was closed",
-                                                     .span = instruction.span},
-                                            VmStepState::canceled);
-                            }
-                            const auto cleanup = std::ranges::find_if(
-                                function(frame).exception_regions.rbegin(), function(frame).exception_regions.rend(),
-                                [&](const auto &region) {
-                                    return unwind.origin_instruction >= region.begin_instruction &&
-                                           unwind.origin_instruction < region.end_instruction &&
-                                           !frame.completed_cleanups.contains(region.cleanup_instruction);
-                                });
-                            if (cleanup != function(frame).exception_regions.rend()) {
-                                frame.completed_cleanups.insert(cleanup->cleanup_instruction);
-                                frame.unwind = std::move(unwind);
-                                frame.pc = cleanup->cleanup_instruction;
+                            if (unwind.kind == UnwindKind::jump) {
+                                if (!unwind.target_instruction.has_value()) {
+                                    return fail(VmError {.code = VmErrorCode::engine_fault,
+                                                         .message = "jump cleanup continuation is malformed",
+                                                         .span = instruction.span});
+                                }
+                                if (const auto cleanup =
+                                        next_cleanup(frame, unwind.origin_instruction, *unwind.target_instruction);
+                                    cleanup.has_value()) {
+                                    frame.completed_cleanups.insert(*cleanup);
+                                    frame.unwind = std::move(unwind);
+                                    frame.pc = code.exception_regions[*cleanup].cleanup_instruction;
+                                    break;
+                                }
+                                frame.pc = *unwind.target_instruction;
                                 break;
+                            }
+                            if (const auto cleanup = next_cleanup(frame, unwind.origin_instruction);
+                                cleanup.has_value()) {
+                                frame.completed_cleanups.insert(*cleanup);
+                                frame.unwind = std::move(unwind);
+                                frame.pc = code.exception_regions[*cleanup].cleanup_instruction;
+                                break;
+                            }
+                            if (!unwind.value.has_value()) {
+                                return fail(VmError {.code = VmErrorCode::engine_fault,
+                                                     .message = "return cleanup continuation is malformed",
+                                                     .span = instruction.span});
                             }
                             const auto destination = frame.return_register;
                             const auto value = *unwind.value;
@@ -2257,6 +2466,11 @@ namespace rule_engine::python::vm {
                         }
                         break;
                     case Opcode::await_capability:
+                        if (forced_cleanup_active) {
+                            return fail(VmError {.code = VmErrorCode::capability_budget_exhausted,
+                                                 .message = "hard cleanup cannot request capabilities",
+                                                 .span = instruction.span});
+                        }
                         if (const auto fault = begin_capability(instruction, frame); fault.has_value()) {
                             return fail(*fault);
                         }
@@ -2420,7 +2634,12 @@ namespace rule_engine::python::vm {
                 --frame.pc;
             }
             const auto instruction = function(frame).instructions[frame.pc];
-            if (handle_author_fault(instruction, exception)) {
+            discard_pending_exception(frame);
+            frame.unwind.reset();
+            if (handle_author_fault(frame.pc, ActiveException {.kind = PythonFaultKind::value_error,
+                                                               .value = exception,
+                                                               .code = VmErrorCode::value_error,
+                                                               .span = instruction.span})) {
                 return execute();
             }
             return fail(VmError {.code = VmErrorCode::value_error,

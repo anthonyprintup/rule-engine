@@ -38,9 +38,9 @@ namespace rule_engine::python::tools {
 
         constexpr std::size_t maximum_configuration_bytes = 1U * mebibyte;
         constexpr std::string_view sdk_content_digest =
-            "sha256:a1917fbe67b4fe7b21667726390620d58b0dab09472b1b18e68c29121337cc0d";
+            "sha256:63e9dc14ea14316b1eaf5e673f3bd6fb2e7985202dd2f6957853f9aff8b3d5a1";
         constexpr std::string_view sdk_manifest_digest =
-            "53e7bf64b0bcadeb1989a868ea1e801ffd3612aa6c0863fa7bf46695b24e8d07";
+            "4710b0aff636c8456113264fe13d8f69b7071539cd7968d0e1bee2876e527dcd";
 
         [[nodiscard]] ToolFailure failure(const ToolFailureKind kind, std::string code, std::string message) {
             return ToolFailure {

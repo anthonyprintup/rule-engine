@@ -119,7 +119,8 @@ in the implementation status.
 ## Build requirements
 
 - CMake 3.31 or newer
-- Ninja
+- Ninja 1.13.2 or newer (Ninja 1.12.1 is not supported for this graph on
+  Windows because its dyndep handling can assert during concurrent builds)
 - a C++23 compiler
 - OpenSSL 3 or newer for TLS and Ed25519 operations
 - SQLite development support (Windows system SQLite is supported)
@@ -143,6 +144,8 @@ configure time; the engine never falls back to a system interpreter:
 
 ```powershell
 cmake -S . -B build/debug -G Ninja `
+  -DCMAKE_BUILD_TYPE=Debug `
+  -DRULE_ENGINE_PYTHON_RUNTIME_ARCHIVE=C:/cache/python-3.14.6-embed-amd64.zip `
   -DRULE_ENGINE_TEST_PYTHON_RUNTIME_ARCHIVE=C:/cache/python-3.14.6-embed-amd64.zip `
   -DRULE_ENGINE_TEST_PYTHON_RUNTIME_ROOT=C:/cache/python-3.14.6
 cmake --build build/debug
@@ -155,13 +158,21 @@ accepting dependency-unavailable stubs:
 ```powershell
 cmake -S . -B build/release -G Ninja `
   -DCMAKE_BUILD_TYPE=Release `
-  -DRULE_ENGINE_PROTOCOL_REQUIRE_SECURE_RUNTIME=ON
+  -DBUILD_TESTING=OFF `
+  -DRULE_ENGINE_PROTOCOL_REQUIRE_SECURE_RUNTIME=ON `
+  -DRULE_ENGINE_INSTALL_PRIVATE_PYTHON=ON `
+  -DRULE_ENGINE_PRIVATE_PYTHON_RUNTIME_ROOT=C:/cache/python-3.14.6
+cmake --build build/release
+cmake --install build/release --prefix C:/rule-engine
 ```
 
-Exact runtime staging, install/package commands, and executable examples are
-documented with their shipped targets once those integration gates are present.
-Until then, consult the implementation status rather than inferring readiness
-from an architecture chapter.
+The install contains `rule_engine_pack`, `rule_engine_check`,
+`rule_engine_admin`, `rule_engine_server`, `rule_engine_agent`, and
+`rule_engine_benchmark`. Each executable accepts `--help` and `--version`; no
+legacy rule or protocol entrypoint is installed. Exact authoring, signing,
+server, agent, and deployment commands are in
+[`OPERATIONS.md`](docs/python-engine/OPERATIONS.md). Package layout and
+relocation guarantees are in [`cmake/INSTALL_PACKAGE.md`](cmake/INSTALL_PACKAGE.md).
 
 ## Clean break from YARA
 
