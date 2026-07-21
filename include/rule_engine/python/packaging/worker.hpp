@@ -73,6 +73,19 @@ namespace rule_engine::python::packaging {
         std::string stderr_excerpt;
     };
 
+    struct WindowsWorkerProcessContract {
+        std::vector<std::wstring> arguments;
+        std::vector<std::wstring> environment;
+    };
+
+    // Pure description of the exact executable arguments and reduced
+    // environment used by WindowsJobWorkerLauncher. The launcher still
+    // validates that the supplied runtime is the staged private distribution.
+    [[nodiscard]] WindowsWorkerProcessContract
+    windows_private_worker_process_contract(const PrivatePythonRuntime &runtime, WorkerMode mode,
+                                            std::uint32_t hash_seed, const std::filesystem::path &temporary_directory,
+                                            std::wstring system_root);
+
     struct WorkerLauncher {
         virtual ~WorkerLauncher() = default;
 

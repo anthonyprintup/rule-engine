@@ -21,18 +21,22 @@ target_link_libraries(
         rule_engine::python_vm
         Catch2::Catch2WithMain
 )
-file(
-    TO_CMAKE_PATH
-    "${PROJECT_SOURCE_DIR}/src/python/packaging/rule_engine_python_worker.py"
-    compiler_python_worker_script_for_cxx
-)
-target_compile_definitions(
-    rule_engine_python_compiler_tests
-    PRIVATE RULE_ENGINE_PACKAGING_WORKER_SCRIPT="${compiler_python_worker_script_for_cxx}"
-)
 set_source_files_properties(
     "../../../tests/python_compiler_tests.cpp"
     PROPERTIES COMPILE_OPTIONS $<$<COMPILE_LANG_AND_ID:CXX,Clang>:-Wno-c2y-extensions>
+)
+target_compile_options(
+    rule_engine_python_compiler_tests
+    PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,Clang>:-Wno-exit-time-destructors>
+)
+file(
+    TO_CMAKE_PATH
+    "${PROJECT_SOURCE_DIR}/src/python/packaging/rule_engine_python_worker.py"
+    compiler_test_python_worker_script
+)
+target_compile_definitions(
+    rule_engine_python_compiler_tests
+    PRIVATE RULE_ENGINE_COMPILER_TEST_WORKER_SCRIPT="${compiler_test_python_worker_script}"
 )
 enable_testing()
 add_test(NAME rule_engine_python_compiler_tests COMMAND $<TARGET_FILE:rule_engine_python_compiler_tests>)

@@ -4,10 +4,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#ifndef RULE_ENGINE_PACKAGING_WORKER_SCRIPT
-#define RULE_ENGINE_PACKAGING_WORKER_SCRIPT ""
-#endif
-
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
@@ -30,6 +26,10 @@ namespace {
 
     namespace packaging = rule_engine::python::packaging;
     namespace vm = rule_engine::python::vm;
+
+#ifndef RULE_ENGINE_COMPILER_TEST_WORKER_SCRIPT
+#define RULE_ENGINE_COMPILER_TEST_WORKER_SCRIPT ""
+#endif
 
     constexpr std::string_view source_name = "rules.main";
 
@@ -57,7 +57,7 @@ namespace {
                 {
                     .pack = PackId {"com.example.rules"},
                     .version = PackVersion {"1.0.0"},
-                    .compiler_abi = "python-3.14.6/static-compiler-v1",
+                    .compiler_abi = std::string {python_static_compiler_abi_v1},
                     .budget_profile = "balanced.v1",
                     .entry_modules = {"rules.main"},
                     .dependency_digests = {},
@@ -139,18 +139,18 @@ namespace {
 #endif
     }
 
-    struct ExactRuntimeFixture {
+    struct SharedRuntime {
         std::optional<packaging::PrivatePythonRuntime> runtime;
         std::filesystem::path temporary_parent;
         std::string unavailable_reason;
         std::string staging_failure;
 
-        ExactRuntimeFixture() = default;
-        ExactRuntimeFixture(const ExactRuntimeFixture &) = delete;
-        ExactRuntimeFixture &operator=(const ExactRuntimeFixture &) = delete;
-        ExactRuntimeFixture(ExactRuntimeFixture &&) noexcept = default;
+        SharedRuntime() = default;
+        SharedRuntime(const SharedRuntime &) = delete;
+        SharedRuntime &operator=(const SharedRuntime &) = delete;
+        SharedRuntime(SharedRuntime &&) noexcept = default;
 
-        ~ExactRuntimeFixture() {
+        ~SharedRuntime() {
             if (!temporary_parent.empty()) {
                 std::error_code ignored;
                 std::filesystem::remove_all(temporary_parent, ignored);
@@ -158,44 +158,47 @@ namespace {
         }
     };
 
-    ExactRuntimeFixture exact_runtime() {
-        ExactRuntimeFixture result;
-        const auto root_text = environment_value("RULE_ENGINE_TEST_PYTHON_RUNTIME_ROOT");
-        const auto archive_text = environment_value("RULE_ENGINE_TEST_PYTHON_RUNTIME_ARCHIVE");
-        if (!root_text || !archive_text || root_text->empty() || archive_text->empty()) {
-            result.unavailable_reason = "exact CPython 3.14.6 test artifact was not configured";
+    SharedRuntime &shared_runtime() {
+        static SharedRuntime state = [] {
+            SharedRuntime result;
+            const auto root_text = environment_value("RULE_ENGINE_TEST_PYTHON_RUNTIME_ROOT");
+            const auto archive_text = environment_value("RULE_ENGINE_TEST_PYTHON_RUNTIME_ARCHIVE");
+            if (!root_text || !archive_text || root_text->empty() || archive_text->empty()) {
+                result.unavailable_reason = "exact CPython 3.14.6 test artifact was not configured";
+                return result;
+            }
+            std::error_code filesystem_error;
+            if (!std::filesystem::is_directory(*root_text, filesystem_error) || filesystem_error ||
+                !std::filesystem::is_regular_file(*archive_text, filesystem_error) || filesystem_error) {
+                result.unavailable_reason = "exact CPython 3.14.6 test artifact is absent";
+                return result;
+            }
+            const auto temporary_root = std::filesystem::temp_directory_path(filesystem_error);
+            if (filesystem_error) {
+                result.unavailable_reason = "cannot resolve the test temporary directory";
+                return result;
+            }
+            const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+            result.temporary_parent = temporary_root / ("rule-engine-python-compiler-" + std::to_string(nonce));
+            if (!std::filesystem::create_directory(result.temporary_parent, filesystem_error) || filesystem_error) {
+                result.unavailable_reason = "cannot create the compiler test runtime staging directory";
+                result.temporary_parent.clear();
+                return result;
+            }
+            const auto staged = packaging::stage_exact_private_runtime(packaging::PythonRuntimeStageRequest {
+                .artifact_archive = *archive_text,
+                .extracted_distribution = *root_text,
+                .destination = result.temporary_parent / "python-3.14.6",
+                .worker_script = RULE_ENGINE_COMPILER_TEST_WORKER_SCRIPT,
+            });
+            if (!staged) {
+                result.staging_failure = staged.error().message;
+                return result;
+            }
+            result.runtime = *staged;
             return result;
-        }
-        std::error_code filesystem_error;
-        if (!std::filesystem::is_directory(*root_text, filesystem_error) || filesystem_error ||
-            !std::filesystem::is_regular_file(*archive_text, filesystem_error) || filesystem_error) {
-            result.unavailable_reason = "exact CPython 3.14.6 test artifact is absent";
-            return result;
-        }
-        const auto temporary_root = std::filesystem::temp_directory_path(filesystem_error);
-        if (filesystem_error) {
-            result.unavailable_reason = "cannot resolve the test temporary directory";
-            return result;
-        }
-        const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
-        result.temporary_parent = temporary_root / ("rule-engine-python-compiler-" + std::to_string(nonce));
-        if (!std::filesystem::create_directory(result.temporary_parent, filesystem_error) || filesystem_error) {
-            result.unavailable_reason = "cannot create the test runtime staging directory";
-            result.temporary_parent.clear();
-            return result;
-        }
-        const auto staged = packaging::stage_exact_private_runtime(packaging::PythonRuntimeStageRequest {
-            .artifact_archive = *archive_text,
-            .extracted_distribution = *root_text,
-            .destination = result.temporary_parent / "python-3.14.6",
-            .worker_script = RULE_ENGINE_PACKAGING_WORKER_SCRIPT,
-        });
-        if (!staged) {
-            result.staging_failure = staged.error().message;
-            return result;
-        }
-        result.runtime = *staged;
-        return result;
+        }();
+        return state;
     }
 
     struct QueueLauncher final: packaging::WorkerLauncher {
@@ -351,17 +354,18 @@ namespace {
     }
 
     TEST_CASE("static pack compiler consumes the exact worker payload contract", "[compiler-vm-progress]") {
-        auto runtime = exact_runtime();
-        if (!runtime.runtime) {
-            if (!runtime.staging_failure.empty()) {
-                FAIL_CHECK(runtime.staging_failure);
+        if (!shared_runtime().runtime) {
+            if (!shared_runtime().staging_failure.empty()) {
+                FAIL_CHECK(shared_runtime().staging_failure);
                 return;
             }
-            WARN("SKIPPED: " << runtime.unavailable_reason);
+            WARN("SKIPPED: " << shared_runtime().unavailable_reason);
             return;
         }
         const auto rule_pack = pack();
-        const auto ast_payload = encode_ast_envelope(envelope(constant_rule_nodes(false)));
+        auto worker_envelope = envelope(constant_rule_nodes(false));
+        worker_envelope.source_digest = rule_pack.sources.front().digest;
+        const auto ast_payload = encode_ast_envelope(worker_envelope);
         REQUIRE(ast_payload.has_value());
         const auto response_frame = packaging::encode_worker_response_frame(packaging::WorkerResponse {
             .protocol = packaging::python_worker_protocol_v1,
@@ -390,7 +394,7 @@ namespace {
             .stdout_bytes = *response_frame,
             .stderr_excerpt = {},
         });
-        packaging::WorkerClient client {.runtime = *runtime.runtime, .launcher = launcher, .limits = {}};
+        packaging::WorkerClient client {.runtime = *shared_runtime().runtime, .launcher = launcher, .limits = {}};
         WorkerAstEnvelopeProvider provider {client};
         StaticPackCompiler compiler {provider};
 
@@ -398,6 +402,7 @@ namespace {
         const auto compiled = compiler.compile(rule_pack, {}, bindings);
         INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
         REQUIRE(compiled.has_value());
+        CHECK(compiled->compiler_abi == python_static_compiler_abi_v1);
         REQUIRE(compiled->functions.size() == 1U);
         const auto &function = compiled->functions.front();
         REQUIRE(function.id == ExecutableId {"com.example.constant"});
@@ -648,7 +653,7 @@ namespace {
             .pack = PackId {"com.example.interop"},
             .version = PackVersion {"1.0.0"},
             .source_digest = SourceDigest {"sha256:interop"},
-            .compiler_abi = "python-3.14.6/static-compiler-v1",
+            .compiler_abi = std::string {python_static_compiler_abi_v1},
             .semantic_hash = "fnv1a64:interop",
             .schemas = {},
             .constants =

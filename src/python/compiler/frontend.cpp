@@ -2246,7 +2246,7 @@ namespace rule_engine::python::compiler {
     StaticCompiler::compile(const VerifiedRulePack &pack, const std::span<const std::byte> ast_payload,
                             const SchemaCatalog &schemas, const OperatorBindings &bindings) const {
         DiagnosticSet diagnostics;
-        if (pack.manifest.compiler_abi != "python-3.14.6/static-compiler-v1") {
+        if (pack.manifest.compiler_abi != python_static_compiler_abi_v1) {
             diagnostics.push_back(make_diagnostic(
                 "PY-COMPILER-ABI", "verified pack compiler ABI does not select the exact static compiler"));
         }
@@ -2322,7 +2322,7 @@ namespace rule_engine::python::compiler {
             .pack = pack.manifest.pack,
             .version = pack.manifest.version,
             .source_digest = pack.closure_digest,
-            .compiler_abi = "python-3.14.6/static-compiler-v1",
+            .compiler_abi = std::string {python_static_compiler_abi_v1},
             .semantic_hash = {},
             .schemas = std::move(merged_schemas),
             .constants = {},

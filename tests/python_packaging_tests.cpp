@@ -10,6 +10,7 @@
 #include <expected>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -104,6 +105,7 @@ namespace rule_engine::python::packaging {
         struct FakeSignatureVerifier final: SignatureVerifier {
             mutable std::size_t calls {};
             bool accepted {true};
+            std::optional<std::size_t> rejected_call;
             mutable std::vector<std::byte> last_message;
 
             std::expected<bool, PackagingError>
@@ -113,7 +115,7 @@ namespace rule_engine::python::packaging {
                 last_message.assign(message.begin(), message.end());
                 REQUIRE(public_key.size() == 32U);
                 REQUIRE(signature.size() == 64U);
-                return accepted;
+                return accepted && (!rejected_call || calls != *rejected_call);
             }
         };
 
@@ -123,11 +125,31 @@ namespace rule_engine::python::packaging {
             std::vector<std::byte> public_key;
         };
 
-        SignedArchiveFixture make_signed_archive(const SourcePackManifest &source_manifest = manifest()) {
-            std::vector<ArchiveEntry> payloads {
-                ArchiveEntry {.path = "rulepack.toml", .bytes = bytes(canonical_manifest(source_manifest))},
-                ArchiveEntry {.path = "src/acme/rules.py", .bytes = bytes("def sample() -> bool:\n    return True\n")},
-            };
+        struct EmbeddedDependency {
+            std::string alias;
+            PackId pack;
+            std::vector<std::byte> archive_bytes;
+            std::optional<SourceDigest> declared_digest;
+        };
+
+        SignedArchiveFixture make_signed_archive(SourcePackManifest source_manifest = manifest(),
+                                                 const std::vector<EmbeddedDependency> &embedded_dependencies = {}) {
+            std::vector<ArchiveEntry> payloads;
+            for (const auto &embedded : embedded_dependencies) {
+                const auto digest = embedded.declared_digest.value_or(
+                    SourceDigest {.value = "sha256:" + sha256_hex(embedded.archive_bytes)});
+                source_manifest.dependencies.push_back(
+                    PackDependency {.alias = embedded.alias, .pack = embedded.pack, .digest = digest});
+                payloads.push_back(ArchiveEntry {
+                    .path = "deps/" + digest.value.substr(7U) + ".rpack",
+                    .bytes = embedded.archive_bytes,
+                });
+            }
+            std::ranges::sort(source_manifest.dependencies, {}, &PackDependency::alias);
+            payloads.push_back(
+                ArchiveEntry {.path = "rulepack.toml", .bytes = bytes(canonical_manifest(source_manifest))});
+            payloads.push_back(
+                ArchiveEntry {.path = "src/acme/rules.py", .bytes = bytes("def sample() -> bool:\n    return True\n")});
             if (source_manifest.generator) {
                 payloads.push_back(ArchiveEntry {.path = "generator.lock", .bytes = bytes("format = 1\n")});
                 payloads.push_back(ArchiveEntry {.path = "generator/acme/generate.py",
@@ -135,12 +157,6 @@ namespace rule_engine::python::packaging {
                 for (const auto &input : source_manifest.generator->inputs) {
                     payloads.push_back(ArchiveEntry {.path = input.path, .bytes = bytes("{}")});
                 }
-            }
-            for (const auto &dependency : source_manifest.dependencies) {
-                payloads.push_back(ArchiveEntry {
-                    .path = "deps/" + dependency.digest.value.substr(7U) + ".rpack",
-                    .bytes = bytes("canonical dependency bytes"),
-                });
             }
             std::ranges::sort(payloads, {}, &ArchiveEntry::path);
 
@@ -186,6 +202,18 @@ namespace rule_engine::python::packaging {
                 .policy = std::move(policy),
                 .public_key = std::move(public_key),
             };
+        }
+
+        std::vector<std::byte> encoded_archive(const SignedArchiveFixture &fixture) {
+            const auto encoded = encode_canonical_source_pack(fixture.archive);
+            REQUIRE(encoded.has_value());
+            return *encoded;
+        }
+
+        SourcePackManifest pack_manifest(std::string pack_id) {
+            auto result = manifest();
+            result.pack = PackId {std::move(pack_id)};
+            return result;
         }
 
         struct SharedRuntime {
@@ -371,6 +399,158 @@ namespace rule_engine::python::packaging {
         REQUIRE(first->contract_pack.sources.front().module == "acme.rules");
         REQUIRE(verifier.calls == 2U);
         REQUIRE_FALSE(verifier.last_message.empty());
+    }
+
+    TEST_CASE("dependency closure is digest-bound recursively verified and diamond-deduplicated") {
+        const auto shared_leaf = make_signed_archive(pack_manifest("com.acme.shared"));
+        const auto shared_leaf_bytes = encoded_archive(shared_leaf);
+        const auto left =
+            make_signed_archive(pack_manifest("com.acme.left"), {EmbeddedDependency {.alias = "shared",
+                                                                                     .pack = PackId {"com.acme.shared"},
+                                                                                     .archive_bytes = shared_leaf_bytes,
+                                                                                     .declared_digest = std::nullopt}});
+        const auto right = make_signed_archive(pack_manifest("com.acme.right"),
+                                               {EmbeddedDependency {.alias = "shared",
+                                                                    .pack = PackId {"com.acme.shared"},
+                                                                    .archive_bytes = shared_leaf_bytes,
+                                                                    .declared_digest = std::nullopt}});
+        const auto root =
+            make_signed_archive(pack_manifest("com.acme.root"), {
+                                                                    EmbeddedDependency {
+                                                                        .alias = "left",
+                                                                        .pack = PackId {"com.acme.left"},
+                                                                        .archive_bytes = encoded_archive(left),
+                                                                        .declared_digest = std::nullopt,
+                                                                    },
+                                                                    EmbeddedDependency {
+                                                                        .alias = "right",
+                                                                        .pack = PackId {"com.acme.right"},
+                                                                        .archive_bytes = encoded_archive(right),
+                                                                        .declared_digest = std::nullopt,
+                                                                    },
+                                                                });
+        FakeSignatureVerifier verifier;
+
+        const auto loaded = verify_and_load_source_pack(root.archive, root.policy, verifier);
+
+        REQUIRE(loaded.has_value());
+        REQUIRE(loaded->closure_digest.value.starts_with("sha256:"));
+        // root, left, shared, and right are verified. The second byte-identical
+        // shared dependency is a bounded diamond-cache hit.
+        REQUIRE(verifier.calls == 4U);
+
+        FakeSignatureVerifier nested_rejection;
+        nested_rejection.rejected_call = 2U;
+        const auto rejected = verify_and_load_source_pack(root.archive, root.policy, nested_rejection);
+        REQUIRE_FALSE(rejected.has_value());
+        REQUIRE(rejected.error().code == PackagingErrorCode::signature_invalid);
+        REQUIRE(nested_rejection.calls == 2U);
+    }
+
+    TEST_CASE("dependency closure rejects artifact substitution and logical cycles") {
+        SECTION("declared digest does not match embedded bytes") {
+            const auto dependency = make_signed_archive(pack_manifest("com.acme.dependency"));
+            const auto root = make_signed_archive(
+                pack_manifest("com.acme.root"), {EmbeddedDependency {
+                                                    .alias = "dependency",
+                                                    .pack = PackId {"com.acme.dependency"},
+                                                    .archive_bytes = encoded_archive(dependency),
+                                                    .declared_digest = SourceDigest {"sha256:" + std::string(64U, '0')},
+                                                }});
+            FakeSignatureVerifier verifier;
+
+            const auto loaded = verify_and_load_source_pack(root.archive, root.policy, verifier);
+
+            REQUIRE_FALSE(loaded.has_value());
+            REQUIRE(loaded.error().code == PackagingErrorCode::dependency_mismatch);
+        }
+
+        SECTION("nested dependency returns to an active pack ID") {
+            const auto nested_root_identity = make_signed_archive(pack_manifest("com.acme.root"));
+            const auto middle =
+                make_signed_archive(pack_manifest("com.acme.middle"),
+                                    {EmbeddedDependency {.alias = "root",
+                                                         .pack = PackId {"com.acme.root"},
+                                                         .archive_bytes = encoded_archive(nested_root_identity),
+                                                         .declared_digest = std::nullopt}});
+            const auto root = make_signed_archive(pack_manifest("com.acme.root"),
+                                                  {EmbeddedDependency {.alias = "middle",
+                                                                       .pack = PackId {"com.acme.middle"},
+                                                                       .archive_bytes = encoded_archive(middle),
+                                                                       .declared_digest = std::nullopt}});
+            FakeSignatureVerifier verifier;
+
+            const auto loaded = verify_and_load_source_pack(root.archive, root.policy, verifier);
+
+            REQUIRE_FALSE(loaded.has_value());
+            REQUIRE(loaded.error().code == PackagingErrorCode::dependency_cycle);
+        }
+    }
+
+    TEST_CASE("dependency traversal enforces global depth count and byte limits") {
+        const auto leaf = make_signed_archive(pack_manifest("com.acme.leaf"));
+        const auto leaf_bytes = encoded_archive(leaf);
+
+        SECTION("depth") {
+            const auto middle = make_signed_archive(pack_manifest("com.acme.middle"),
+                                                    {EmbeddedDependency {.alias = "leaf",
+                                                                         .pack = PackId {"com.acme.leaf"},
+                                                                         .archive_bytes = leaf_bytes,
+                                                                         .declared_digest = std::nullopt}});
+            const auto root = make_signed_archive(pack_manifest("com.acme.root"),
+                                                  {EmbeddedDependency {.alias = "middle",
+                                                                       .pack = PackId {"com.acme.middle"},
+                                                                       .archive_bytes = encoded_archive(middle),
+                                                                       .declared_digest = std::nullopt}});
+            SourcePackLimits limits;
+            limits.maximum_dependency_depth = 1U;
+            FakeSignatureVerifier verifier;
+
+            const auto loaded = verify_and_load_source_pack(root.archive, root.policy, verifier, limits);
+
+            REQUIRE_FALSE(loaded.has_value());
+            REQUIRE(loaded.error().code == PackagingErrorCode::size_limit);
+        }
+
+        SECTION("unique pack count") {
+            const auto second = make_signed_archive(pack_manifest("com.acme.second"));
+            const auto root = make_signed_archive(pack_manifest("com.acme.root"),
+                                                  {
+                                                      EmbeddedDependency {.alias = "leaf",
+                                                                          .pack = PackId {"com.acme.leaf"},
+                                                                          .archive_bytes = leaf_bytes,
+                                                                          .declared_digest = std::nullopt},
+                                                      EmbeddedDependency {.alias = "second",
+                                                                          .pack = PackId {"com.acme.second"},
+                                                                          .archive_bytes = encoded_archive(second),
+                                                                          .declared_digest = std::nullopt},
+                                                  });
+            SourcePackLimits limits;
+            limits.maximum_dependency_packs = 1U;
+            FakeSignatureVerifier verifier;
+
+            const auto loaded = verify_and_load_source_pack(root.archive, root.policy, verifier, limits);
+
+            REQUIRE_FALSE(loaded.has_value());
+            REQUIRE(loaded.error().code == PackagingErrorCode::size_limit);
+        }
+
+        SECTION("unique artifact bytes") {
+            const auto root = make_signed_archive(pack_manifest("com.acme.root"),
+                                                  {EmbeddedDependency {.alias = "leaf",
+                                                                       .pack = PackId {"com.acme.leaf"},
+                                                                       .archive_bytes = leaf_bytes,
+                                                                       .declared_digest = std::nullopt}});
+            SourcePackLimits limits;
+            REQUIRE_FALSE(leaf_bytes.empty());
+            limits.maximum_dependency_bytes = leaf_bytes.size() - 1U;
+            FakeSignatureVerifier verifier;
+
+            const auto loaded = verify_and_load_source_pack(root.archive, root.policy, verifier, limits);
+
+            REQUIRE_FALSE(loaded.has_value());
+            REQUIRE(loaded.error().code == PackagingErrorCode::size_limit);
+        }
     }
 
     TEST_CASE("SHA-256 and complex canonical manifest use stable public vectors") {
@@ -620,6 +800,40 @@ namespace rule_engine::python::packaging {
         auto wrong_hash = exact_runtime();
         wrong_hash.verified_artifact_sha256 = std::string(64U, '0');
         REQUIRE_FALSE(validate_exact_private_runtime(wrong_hash).has_value());
+    }
+
+    TEST_CASE("Windows worker process contract uses isolated exact argv and a closed environment") {
+        PrivatePythonRuntime runtime;
+        runtime.python_executable = L"C:\\private runtime\\python.exe";
+        runtime.worker_script = L"C:\\private runtime\\rule_engine_python_worker.py";
+        const std::filesystem::path temporary_directory {L"C:\\private temp\\worker"};
+
+        const auto contract = windows_private_worker_process_contract(runtime, WorkerMode::static_parse, 73U,
+                                                                      temporary_directory, L"C:\\Windows");
+
+        const std::vector<std::wstring> expected_arguments {
+            runtime.python_executable.wstring(), L"-I",           L"-S",           L"-s", L"-B",
+            runtime.worker_script.wstring(),     L"--mode=parse", L"--protocol=1",
+        };
+        const std::vector<std::wstring> expected_environment {
+            L"PYTHONDONTWRITEBYTECODE=1",
+            L"PYTHONHASHSEED=73",
+            L"PYTHONNOUSERSITE=1",
+            L"SYSTEMROOT=C:\\Windows",
+            L"TEMP=C:\\private temp\\worker",
+            L"TMP=C:\\private temp\\worker",
+        };
+        REQUIRE(contract.arguments == expected_arguments);
+        REQUIRE(contract.environment == expected_environment);
+        REQUIRE(std::ranges::none_of(contract.environment, [](const std::wstring_view variable) {
+            return variable.starts_with(L"PATH=") || variable.starts_with(L"PYTHONPATH=") ||
+                   variable.starts_with(L"PYTHONHOME=");
+        }));
+
+        const auto generator = windows_private_worker_process_contract(runtime, WorkerMode::trusted_generator, 0U,
+                                                                       temporary_directory, L"C:\\Windows");
+        REQUIRE(generator.arguments[6] == L"--mode=generate");
+        REQUIRE(generator.arguments.front() == runtime.python_executable.wstring());
     }
 
     TEST_CASE("worker client preserves opaque AST seam and validates exact response identity") {

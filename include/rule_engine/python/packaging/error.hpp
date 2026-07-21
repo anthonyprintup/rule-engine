@@ -22,6 +22,7 @@ namespace rule_engine::python::packaging {
         entry_size_mismatch,
         entry_digest_mismatch,
         dependency_mismatch,
+        dependency_cycle,
         signature_required,
         signer_unknown,
         signer_revoked,

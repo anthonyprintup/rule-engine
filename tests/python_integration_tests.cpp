@@ -1,14 +1,18 @@
 #include "rule_engine/python/cluster/store.hpp"
 #include "rule_engine/python/compiler.hpp"
 #include "rule_engine/python/engine.hpp"
+#include "rule_engine/python/packaging.hpp"
 #include "rule_engine/python/vm/register_vm.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -19,7 +23,66 @@ namespace {
     using namespace rule_engine::python::compiler;
     using namespace rule_engine::python::vm;
 
+    namespace packaging = rule_engine::python::packaging;
+
     constexpr auto module_name = "rules.main";
+
+    [[nodiscard]] std::vector<std::byte> bytes(const std::string_view text) {
+        return {reinterpret_cast<const std::byte *>(text.data()),
+                reinterpret_cast<const std::byte *>(text.data() + text.size())};
+    }
+
+    struct UnusedSignatureVerifier final: packaging::SignatureVerifier {
+        [[nodiscard]] std::expected<bool, packaging::PackagingError>
+        verify_ed25519(std::span<const std::byte>, std::span<const std::byte>,
+                       std::span<const std::byte>) const override {
+            return false;
+        }
+    };
+
+    [[nodiscard]] packaging::SourcePackArchive packaged_source_archive() {
+        const packaging::SourcePackManifest manifest {
+            .format = 1U,
+            .pack = PackId {"com.example.integration"},
+            .version = PackVersion {"1.0.0"},
+            .kind = packaging::PackKind::rules,
+            .engine_api = 1U,
+            .python_version = "3.14.6",
+            .entry_modules = {module_name},
+            .budget_profile = "balanced.v1",
+            .policy_profile = "production.v1",
+        };
+        std::vector<packaging::ArchiveEntry> payloads {
+            packaging::ArchiveEntry {
+                .path = "rulepack.toml",
+                .bytes = bytes(packaging::canonical_manifest(manifest)),
+            },
+            packaging::ArchiveEntry {
+                .path = "src/rules/main.py",
+                .bytes = bytes("@rule(\"com.example.constant\")\ndef constant_rule() -> bool:\n    return True\n"),
+            },
+        };
+        std::ranges::sort(payloads, {}, &packaging::ArchiveEntry::path);
+
+        packaging::SourceIndex index;
+        for (const auto &payload : payloads) {
+            index.entries.push_back(packaging::SourceIndexEntry {
+                .media_type = payload.path.ends_with(".py") ? "text/x-python" : "application/toml",
+                .path = payload.path,
+                .sha256 = packaging::sha256_hex(payload.bytes),
+                .size = payload.bytes.size(),
+            });
+        }
+
+        packaging::SourcePackArchive archive;
+        archive.entries.push_back(packaging::ArchiveEntry {
+            .path = "META-INF/index.json",
+            .bytes = bytes(packaging::canonical_index(index)),
+        });
+        archive.entries.insert(archive.entries.end(), payloads.begin(), payloads.end());
+        std::ranges::sort(archive.entries, {}, &packaging::ArchiveEntry::path);
+        return archive;
+    }
 
     [[nodiscard]] SourceSpan span(const std::uint32_t begin = 0U, const std::uint32_t end = 1U) {
         return {.source = SourceId {module_name}, .begin_byte = begin, .end_byte = end};
@@ -39,7 +102,7 @@ namespace {
                 PackManifest {
                     .pack = PackId {"com.example.integration"},
                     .version = PackVersion {"1.0.0"},
-                    .compiler_abi = "python-3.14.6/static-compiler-v1",
+                    .compiler_abi = std::string {python_static_compiler_abi_v1},
                     .budget_profile = "balanced.v1",
                     .entry_modules = {module_name},
                 },
@@ -139,6 +202,30 @@ namespace {
     }
 
 } // namespace
+
+TEST_CASE("verified source-pack ABI interoperates with the exact static compiler") {
+    const packaging::TrustPolicy development_policy {
+        .mode = packaging::TrustMode::development,
+        .allow_unsigned_packs = true,
+        .allow_unsigned_generators = false,
+    };
+    UnusedSignatureVerifier verifier;
+    const auto loaded = packaging::verify_and_load_source_pack(packaged_source_archive(), development_policy, verifier);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->contract_pack.manifest.compiler_abi == python_static_compiler_abi_v1);
+
+    auto ast = constant_rule_ast(true);
+    ast.source_digest = loaded->contract_pack.closure_digest;
+    ast.modules.front().name = loaded->contract_pack.sources.front().module;
+    ast.modules.front().source = loaded->contract_pack.sources.front().id;
+    for (auto &node : ast.nodes) { node.span.source = loaded->contract_pack.sources.front().id; }
+    const auto encoded = encode_ast_envelope(ast);
+    REQUIRE(encoded.has_value());
+
+    const auto compiled = StaticCompiler {}.compile(loaded->contract_pack, *encoded, {}, {});
+    REQUIRE(compiled.has_value());
+    CHECK(compiled->pack.compiler_abi == python_static_compiler_abi_v1);
+}
 
 TEST_CASE("static Python AST compiles, executes in the register VM, and commits atomically") {
     auto encoded = encode_ast_envelope(constant_rule_ast(true));
