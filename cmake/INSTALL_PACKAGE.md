@@ -102,11 +102,14 @@ Cargo/Rust.
 and FetchContent fully disconnected. The parent configure passes only its
 already-populated Asio, Abseil, and RE2 source directories into that fresh
 producer. Both registration and execution validate dependency-specific marker
-files, and no download or update fallback is allowed. The gate then builds and
-installs the real exported target graph, relocates the prefix, runs every
-discovered public executable with `--version`, and builds/runs a
-`python_protocol` downstream consumer solely from the installed prefix plus
-normal platform dependencies. The focused fixture is registered separately as
+files, and no download or update fallback is allowed. The producer, relocated
+prefix, and consumer use a unique short directory directly under the system
+temporary directory; the harness validates that exact directory before safely
+removing it on either success or failure. The gate builds and installs the real
+exported target graph, relocates the prefix, runs every discovered public
+executable with `--version`, and builds/runs a `python_protocol` downstream
+consumer solely from the installed prefix plus normal platform dependencies.
+The focused fixture is registered separately as
 `rule_engine_install_fixture_smoke`.
 
 When registered by the integration build, run:

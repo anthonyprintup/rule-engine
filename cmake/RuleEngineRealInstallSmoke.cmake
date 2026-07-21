@@ -7,9 +7,157 @@ foreach(required IN ITEMS RULE_ENGINE_SOURCE_DIR RULE_ENGINE_BINARY_ROOT)
 endforeach()
 
 cmake_path(ABSOLUTE_PATH RULE_ENGINE_SOURCE_DIR NORMALIZE OUTPUT_VARIABLE source_root)
-cmake_path(ABSOLUTE_PATH RULE_ENGINE_BINARY_ROOT NORMALIZE OUTPUT_VARIABLE binary_root)
-if(binary_root STREQUAL source_root)
+cmake_path(
+    ABSOLUTE_PATH RULE_ENGINE_BINARY_ROOT
+    NORMALIZE
+    OUTPUT_VARIABLE requested_binary_root
+)
+if(requested_binary_root STREQUAL source_root)
     message(FATAL_ERROR "Real install smoke binary root cannot be the source root")
+endif()
+
+set(system_temp_candidates "$ENV{TMPDIR}" "$ENV{TEMP}" "$ENV{TMP}")
+if(NOT WIN32)
+    list(APPEND system_temp_candidates /tmp)
+endif()
+set(system_temp_root "")
+foreach(candidate IN LISTS system_temp_candidates)
+    if(NOT candidate STREQUAL "" AND IS_DIRECTORY "${candidate}")
+        file(REAL_PATH "${candidate}" system_temp_root)
+        break()
+    endif()
+endforeach()
+if(system_temp_root STREQUAL "")
+    message(FATAL_ERROR "Real install smoke could not resolve the system temporary directory")
+endif()
+
+function(validate_short_work_root candidate output_variable)
+    cmake_path(ABSOLUTE_PATH candidate NORMALIZE OUTPUT_VARIABLE normalized_candidate)
+    cmake_path(GET normalized_candidate PARENT_PATH candidate_parent)
+    cmake_path(GET normalized_candidate FILENAME candidate_name)
+    cmake_path(
+        COMPARE "${candidate_parent}" EQUAL "${system_temp_root}"
+        is_direct_temp_child
+    )
+    string(LENGTH "${candidate_name}" candidate_name_length)
+    if(NOT is_direct_temp_child OR
+       NOT candidate_name MATCHES "^rei-[0-9a-f]+$" OR
+       NOT candidate_name_length EQUAL 16)
+        message(FATAL_ERROR
+            "Refusing unsafe real install smoke work root: ${normalized_candidate}"
+        )
+    endif()
+    set("${output_variable}" "${normalized_candidate}" PARENT_SCOPE)
+endfunction()
+
+function(remove_short_work_root candidate)
+    validate_short_work_root("${candidate}" validated_candidate)
+    if(IS_SYMLINK "${validated_candidate}")
+        message(FATAL_ERROR
+            "Refusing to recursively remove symlinked real install smoke root: "
+            "${validated_candidate}"
+        )
+    endif()
+    file(REMOVE_RECURSE "${validated_candidate}")
+    if(EXISTS "${validated_candidate}")
+        message(FATAL_ERROR
+            "Failed to clean real install smoke work root: ${validated_candidate}"
+        )
+    endif()
+endfunction()
+
+# Keep the supervisor outside the disposable tree. The worker may stop through
+# any FATAL_ERROR below; execute_process still returns control so the supervisor
+# can validate and remove the exact tree on both success and failure.
+if(NOT DEFINED RULE_ENGINE_REAL_INSTALL_SMOKE_WORK_ROOT)
+    set(work_root "")
+    foreach(attempt RANGE 1 8)
+        string(RANDOM LENGTH 12 ALPHABET 0123456789abcdef nonce)
+        set(candidate "${system_temp_root}/rei-${nonce}")
+        if(EXISTS "${candidate}")
+            continue()
+        endif()
+        file(MAKE_DIRECTORY "${candidate}" RESULT make_result)
+        if(make_result STREQUAL "0")
+            validate_short_work_root("${candidate}" work_root)
+            break()
+        endif()
+    endforeach()
+    if(work_root STREQUAL "")
+        message(FATAL_ERROR
+            "Real install smoke could not create a unique short work root under "
+            "${system_temp_root}"
+        )
+    endif()
+
+    set(worker_args
+        "-DRULE_ENGINE_REAL_INSTALL_SMOKE_WORK_ROOT=${work_root}"
+        "-DRULE_ENGINE_REAL_INSTALL_SMOKE_TEMP_ROOT=${system_temp_root}"
+    )
+    foreach(input IN ITEMS
+        RULE_ENGINE_SOURCE_DIR
+        RULE_ENGINE_BINARY_ROOT
+        RULE_ENGINE_INSTALL_HOOK
+        RULE_ENGINE_INSTALL_MODULE
+        RULE_ENGINE_DOWNSTREAM_SOURCE
+        RULE_ENGINE_CMAKE_GENERATOR
+        RULE_ENGINE_C_COMPILER
+        RULE_ENGINE_CXX_COMPILER
+        RULE_ENGINE_MAKE_PROGRAM
+        RULE_ENGINE_CMAKE_AR
+        RULE_ENGINE_CMAKE_LINKER
+        RULE_ENGINE_ASIO_SOURCE_DIR
+        RULE_ENGINE_ABSEIL_SOURCE_DIR
+        RULE_ENGINE_RE2_SOURCE_DIR
+        RULE_ENGINE_EXPECTED_TOOL_NAMES
+    )
+        if(DEFINED ${input})
+            list(APPEND worker_args "-D${input}=${${input}}")
+        endif()
+    endforeach()
+    execute_process(
+        COMMAND
+            "${CMAKE_COMMAND}"
+            ${worker_args}
+            -P "${CMAKE_CURRENT_LIST_FILE}"
+        RESULT_VARIABLE worker_result
+        OUTPUT_VARIABLE worker_output
+        ERROR_VARIABLE worker_error
+    )
+    remove_short_work_root("${work_root}")
+    if(NOT worker_result EQUAL 0)
+        message(FATAL_ERROR
+            "Real install smoke worker failed (${worker_result}):\n"
+            "${worker_output}${worker_error}"
+        )
+    endif()
+    if(NOT worker_output STREQUAL "")
+        message("${worker_output}")
+    endif()
+    if(NOT worker_error STREQUAL "")
+        message("${worker_error}")
+    endif()
+    message(STATUS
+        "Rule Engine real-graph install smoke cleaned short work root: ${work_root}"
+    )
+    return()
+endif()
+
+if(NOT DEFINED RULE_ENGINE_REAL_INSTALL_SMOKE_TEMP_ROOT)
+    message(FATAL_ERROR "Real install smoke worker is missing its system temp root")
+endif()
+cmake_path(
+    ABSOLUTE_PATH RULE_ENGINE_REAL_INSTALL_SMOKE_TEMP_ROOT
+    NORMALIZE
+    OUTPUT_VARIABLE worker_temp_root
+)
+cmake_path(COMPARE "${worker_temp_root}" EQUAL "${system_temp_root}" temp_root_matches)
+if(NOT temp_root_matches)
+    message(FATAL_ERROR "Real install smoke worker temp root changed between processes")
+endif()
+validate_short_work_root("${RULE_ENGINE_REAL_INSTALL_SMOKE_WORK_ROOT}" binary_root)
+if(NOT IS_DIRECTORY "${binary_root}" OR IS_SYMLINK "${binary_root}")
+    message(FATAL_ERROR "Real install smoke worker root is missing or unsafe: ${binary_root}")
 endif()
 
 set(tool_dirs_to_remove "")
@@ -73,12 +221,10 @@ foreach(required_path IN ITEMS "${install_hook}" "${install_module}" "${downstre
     endif()
 endforeach()
 
-set(producer_build "${binary_root}/producer-build")
-set(downstream_build "${binary_root}/downstream-build")
-set(configured_prefix "${binary_root}/configured-prefix")
-set(prefix "${binary_root}/relocated-prefix")
-file(REMOVE_RECURSE "${producer_build}" "${downstream_build}" "${configured_prefix}" "${prefix}")
-file(MAKE_DIRECTORY "${binary_root}")
+set(producer_build "${binary_root}/producer")
+set(downstream_build "${binary_root}/consumer")
+set(configured_prefix "${binary_root}/installed")
+set(prefix "${binary_root}/relocated")
 
 set(generator_args "")
 if(DEFINED RULE_ENGINE_CMAKE_GENERATOR AND NOT RULE_ENGINE_CMAKE_GENERATOR STREQUAL "")
