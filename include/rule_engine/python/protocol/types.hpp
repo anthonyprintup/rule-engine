@@ -59,6 +59,7 @@ namespace rule_engine::python::protocol_v2 {
         dependency_unavailable,
         transport_error,
         persistence_error,
+        timed_out,
     };
 
     struct ProtocolError {

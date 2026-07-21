@@ -7,12 +7,13 @@ instead of silently supplying a second implementation of rule semantics.
 
 from __future__ import annotations
 
-from enum import StrEnum
-from typing import Final
+from enum import StrEnum as _StrEnum
+from typing import Final as _Final
+from typing import Never as _Never
 
-SDK_VERSION: Final = "1.0.0"
-ENGINE_API: Final = 1
-PYTHON_ABI: Final = "3.14.6"
+SDK_VERSION: _Final = "1.0.0"
+ENGINE_API: _Final = 1
+PYTHON_ABI: _Final = "3.14.6"
 
 
 class StaticIntrinsicError(RuntimeError):
@@ -109,7 +110,7 @@ class _IntrinsicObject:
     def __getattr__(self, name: str) -> object:
         raise _unavailable(f"{self._name}.{name}")
 
-    def __setattr__(self, name: str, value: object) -> Never:
+    def __setattr__(self, name: str, value: object) -> _Never:
         raise _unavailable(f"{self._name}.{name}")
 
 
@@ -211,7 +212,7 @@ class SoftBudgetExceeded(RuntimeError):
     pass
 
 
-class StateScope(StrEnum):
+class StateScope(_StrEnum):
     SESSION = "session"
     PEER = "peer"
     SUBJECT = "subject"
@@ -219,18 +220,18 @@ class StateScope(StrEnum):
     SHARED = "shared"
 
 
-class PostDisposition(StrEnum):
+class PostDisposition(_StrEnum):
     QUEUED = "queued"
     DRY_RUN = "dry_run"
     SUPPRESSED = "suppressed"
 
 
-class TaskGroupExit(StrEnum):
+class TaskGroupExit(_StrEnum):
     CANCEL_PENDING = "cancel_pending"
     WAIT_PENDING = "wait_pending"
 
 
-class FaultKind(StrEnum):
+class FaultKind(_StrEnum):
     PYTHON_EXCEPTION = "python_exception"
     ENGINE_EXCEPTION = "engine_exception"
     CONTROL_FAULT = "control_fault"
@@ -254,6 +255,3 @@ for _class_name in _STATIC_CLASSES:
 
 def __getattr__(name: str) -> object:
     raise _unavailable(name)
-
-
-__all__ = [name for name in globals() if not name.startswith("_")]

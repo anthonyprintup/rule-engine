@@ -2,11 +2,25 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <ctime>
 #include <limits>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <WinSock2.h>
+#else
+#include <poll.h>
+#endif
 
 #if RULE_ENGINE_PROTOCOL_HAS_OPENSSL
 #include <openssl/err.h>
@@ -18,13 +32,83 @@
 namespace rule_engine::python::protocol_v2 {
     namespace {
 
-        constexpr std::string_view peer_alpn = "rule-engine-peer/2";
-
         [[nodiscard]] ProtocolError transport_error(const ProtocolErrorCode code, std::string message) {
             return ProtocolError {.code = code, .message = std::move(message), .byte_offset = 0};
         }
 
 #if RULE_ENGINE_PROTOCOL_HAS_OPENSSL
+        constexpr std::string_view peer_alpn = "rule-engine-peer/2";
+
+        enum struct SocketReadiness : std::uint8_t { read, write };
+
+        [[nodiscard]] std::expected<void, ProtocolError> wait_for_socket(const int socket,
+                                                                         const SocketReadiness readiness,
+                                                                         const TransportOperation &operation,
+                                                                         const std::string_view activity) {
+            constexpr auto cancellation_poll = std::chrono::milliseconds {25};
+            while (true) {
+                if (operation.cancellation.stop_requested()) {
+                    return std::unexpected(
+                        transport_error(ProtocolErrorCode::canceled, std::string {activity} + " was canceled"));
+                }
+
+                const auto now = std::chrono::steady_clock::now();
+                if (operation.deadline != std::chrono::steady_clock::time_point::max() && now >= operation.deadline) {
+                    return std::unexpected(
+                        transport_error(ProtocolErrorCode::timed_out, std::string {activity} + " timed out"));
+                }
+                auto wait = cancellation_poll;
+                if (operation.deadline != std::chrono::steady_clock::time_point::max()) {
+                    wait = std::min(wait, std::chrono::ceil<std::chrono::milliseconds>(operation.deadline - now));
+                }
+                const auto wait_ms = static_cast<int>((std::max) (std::chrono::milliseconds {1}, wait).count());
+
+#ifdef _WIN32
+                WSAPOLLFD descriptor {
+                    .fd = static_cast<SOCKET>(socket),
+                    .events = static_cast<SHORT>(readiness == SocketReadiness::read ? POLLRDNORM : POLLWRNORM),
+                    .revents = 0};
+                const auto result = WSAPoll(&descriptor, 1, wait_ms);
+                if (result > 0) {
+                    return {};
+                }
+                if (result < 0 && WSAGetLastError() != WSAEINTR) {
+                    return std::unexpected(transport_error(ProtocolErrorCode::transport_error,
+                                                           std::string {activity} + " socket wait failed"));
+                }
+#else
+                pollfd descriptor {.fd = socket,
+                                   .events = static_cast<short>(readiness == SocketReadiness::read ? POLLIN : POLLOUT),
+                                   .revents = 0};
+                const auto result = poll(&descriptor, 1, wait_ms);
+                if (result > 0) {
+                    return {};
+                }
+                if (result < 0 && errno != EINTR) {
+                    return std::unexpected(transport_error(ProtocolErrorCode::transport_error,
+                                                           std::string {activity} + " socket wait failed"));
+                }
+#endif
+            }
+        }
+
+        [[nodiscard]] std::expected<void, ProtocolError> wait_for_ssl(const SSL *ssl, const int error,
+                                                                      const TransportOperation &operation,
+                                                                      const std::string_view activity) {
+            if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
+                return std::unexpected(
+                    transport_error(ProtocolErrorCode::transport_error, std::string {activity} + " failed"));
+            }
+            const auto socket = SSL_get_fd(ssl);
+            if (socket < 0) {
+                return std::unexpected(
+                    transport_error(ProtocolErrorCode::transport_error, std::string {activity} + " has no socket"));
+            }
+            return wait_for_socket(socket,
+                                   error == SSL_ERROR_WANT_READ ? SocketReadiness::read : SocketReadiness::write,
+                                   operation, activity);
+        }
+
         [[nodiscard]] int select_peer_alpn(SSL *, const unsigned char **output, unsigned char *output_size,
                                            const unsigned char *input, const unsigned int input_size, void *) {
             const auto expected_size = static_cast<unsigned int>(peer_alpn.size());
@@ -109,29 +193,38 @@ namespace rule_engine::python::protocol_v2 {
                     if (name == nullptr || name->type != GEN_URI) {
                         continue;
                     }
+                    ++uri_count;
                     const auto *data = ASN1_STRING_get0_data(name->d.uniformResourceIdentifier);
                     const auto size = ASN1_STRING_length(name->d.uniformResourceIdentifier);
                     if (data == nullptr || size <= 0 ||
                         std::memchr(data, '\0', static_cast<std::size_t>(size)) != nullptr) {
                         continue;
                     }
-                    ++uri_count;
                     identity.canonical_uri_san.assign(reinterpret_cast<const char *>(data),
                                                       static_cast<std::size_t>(size));
                 }
                 GENERAL_NAMES_free(names);
             }
             X509_free(certificate);
-            if (role == TlsEndpointRole::server && uri_count != 1) {
+            if (uri_count != 1 || identity.canonical_uri_san.empty()) {
                 return std::unexpected(transport_error(ProtocolErrorCode::unauthenticated,
-                                                       "TLS client certificate requires one canonical URI SAN"));
+                                                       "TLS peer certificate requires one canonical URI SAN"));
             }
             return identity;
         }
 
-        [[nodiscard]] std::expected<void, ProtocolError> write_all(SSL *ssl, const std::span<const std::byte> bytes) {
+        [[nodiscard]] std::expected<void, ProtocolError> write_all(SSL *ssl, const std::span<const std::byte> bytes,
+                                                                   const TransportOperation &operation) {
             std::size_t offset {};
             while (offset < bytes.size()) {
+                if (operation.cancellation.stop_requested()) {
+                    return std::unexpected(
+                        transport_error(ProtocolErrorCode::canceled, "TLS record write was canceled"));
+                }
+                if (operation.deadline != std::chrono::steady_clock::time_point::max() &&
+                    std::chrono::steady_clock::now() >= operation.deadline) {
+                    return std::unexpected(transport_error(ProtocolErrorCode::timed_out, "TLS record write timed out"));
+                }
                 std::size_t written {};
                 const auto result = SSL_write_ex(ssl, bytes.data() + offset, bytes.size() - offset, &written);
                 if (result == 1 && written != 0) {
@@ -140,6 +233,9 @@ namespace rule_engine::python::protocol_v2 {
                 }
                 const auto code = SSL_get_error(ssl, result);
                 if (code == SSL_ERROR_WANT_READ || code == SSL_ERROR_WANT_WRITE) {
+                    if (auto ready = wait_for_ssl(ssl, code, operation, "TLS record write"); !ready) {
+                        return ready;
+                    }
                     continue;
                 }
                 return std::unexpected(transport_error(ProtocolErrorCode::transport_error, "TLS record write failed"));
@@ -147,9 +243,18 @@ namespace rule_engine::python::protocol_v2 {
             return {};
         }
 
-        [[nodiscard]] std::expected<void, ProtocolError> read_all(SSL *ssl, const std::span<std::byte> bytes) {
+        [[nodiscard]] std::expected<void, ProtocolError> read_all(SSL *ssl, const std::span<std::byte> bytes,
+                                                                  const TransportOperation &operation) {
             std::size_t offset {};
             while (offset < bytes.size()) {
+                if (operation.cancellation.stop_requested()) {
+                    return std::unexpected(
+                        transport_error(ProtocolErrorCode::canceled, "TLS record read was canceled"));
+                }
+                if (operation.deadline != std::chrono::steady_clock::time_point::max() &&
+                    std::chrono::steady_clock::now() >= operation.deadline) {
+                    return std::unexpected(transport_error(ProtocolErrorCode::timed_out, "TLS record read timed out"));
+                }
                 std::size_t received {};
                 const auto result = SSL_read_ex(ssl, bytes.data() + offset, bytes.size() - offset, &received);
                 if (result == 1 && received != 0) {
@@ -158,6 +263,9 @@ namespace rule_engine::python::protocol_v2 {
                 }
                 const auto code = SSL_get_error(ssl, result);
                 if (code == SSL_ERROR_WANT_READ || code == SSL_ERROR_WANT_WRITE) {
+                    if (auto ready = wait_for_ssl(ssl, code, operation, "TLS record read"); !ready) {
+                        return ready;
+                    }
                     continue;
                 }
                 return std::unexpected(transport_error(ProtocolErrorCode::transport_error, "TLS record read failed"));
@@ -321,22 +429,49 @@ namespace rule_engine::python::protocol_v2 {
 #endif
     }
 
+    bool OpenSslTlsContext::valid() const noexcept { return impl_ != nullptr; }
+
+    TlsEndpointRole OpenSslTlsContext::role() const noexcept {
+        return impl_ == nullptr ? TlsEndpointRole::client : impl_->configuration.role;
+    }
+
     OpenSslTlsSession::OpenSslTlsSession(std::unique_ptr<Impl> impl) noexcept: impl_ {std::move(impl)} {}
     OpenSslTlsSession::OpenSslTlsSession(OpenSslTlsSession &&) noexcept = default;
     OpenSslTlsSession &OpenSslTlsSession::operator=(OpenSslTlsSession &&) noexcept = default;
     OpenSslTlsSession::~OpenSslTlsSession() = default;
 
     std::expected<TlsPeerIdentity, ProtocolError> OpenSslTlsSession::handshake() noexcept {
+        return handshake(TransportOperation {});
+    }
+
+    std::expected<TlsPeerIdentity, ProtocolError>
+    OpenSslTlsSession::handshake(const TransportOperation &operation) noexcept {
 #if RULE_ENGINE_PROTOCOL_HAS_OPENSSL
         if (impl_ == nullptr || impl_->ssl == nullptr || impl_->established) {
             return std::unexpected(
                 transport_error(ProtocolErrorCode::transport_error, "TLS session cannot begin a handshake"));
         }
-        const auto result = impl_->context->configuration.role == TlsEndpointRole::server ? SSL_accept(impl_->ssl) :
-                                                                                            SSL_connect(impl_->ssl);
-        if (result != 1) {
-            return std::unexpected(
-                transport_error(ProtocolErrorCode::unauthenticated, "TLS handshake or peer verification failed"));
+        while (true) {
+            if (operation.cancellation.stop_requested()) {
+                return std::unexpected(transport_error(ProtocolErrorCode::canceled, "TLS handshake was canceled"));
+            }
+            if (operation.deadline != std::chrono::steady_clock::time_point::max() &&
+                std::chrono::steady_clock::now() >= operation.deadline) {
+                return std::unexpected(transport_error(ProtocolErrorCode::timed_out, "TLS handshake timed out"));
+            }
+            const auto result = impl_->context->configuration.role == TlsEndpointRole::server ? SSL_accept(impl_->ssl) :
+                                                                                                SSL_connect(impl_->ssl);
+            if (result == 1) {
+                break;
+            }
+            const auto code = SSL_get_error(impl_->ssl, result);
+            if (code != SSL_ERROR_WANT_READ && code != SSL_ERROR_WANT_WRITE) {
+                return std::unexpected(
+                    transport_error(ProtocolErrorCode::unauthenticated, "TLS handshake or peer verification failed"));
+            }
+            if (auto ready = wait_for_ssl(impl_->ssl, code, operation, "TLS handshake"); !ready) {
+                return std::unexpected(std::move(ready.error()));
+            }
         }
         auto identity = extract_peer_identity(impl_->ssl, impl_->context->configuration.role);
         if (!identity) {
@@ -345,6 +480,7 @@ namespace rule_engine::python::protocol_v2 {
         impl_->established = true;
         return identity;
 #else
+        static_cast<void>(operation);
         return std::unexpected(
             transport_error(ProtocolErrorCode::dependency_unavailable,
                             "secure protocol transport is unavailable because OpenSSL 3 or newer was not linked"));
@@ -352,6 +488,11 @@ namespace rule_engine::python::protocol_v2 {
     }
 
     std::expected<void, ProtocolError> OpenSslTlsSession::send(const PeerEnvelope &envelope) noexcept {
+        return send(envelope, TransportOperation {});
+    }
+
+    std::expected<void, ProtocolError> OpenSslTlsSession::send(const PeerEnvelope &envelope,
+                                                               const TransportOperation &operation) noexcept {
 #if RULE_ENGINE_PROTOCOL_HAS_OPENSSL
         if (!established()) {
             return std::unexpected(
@@ -361,9 +502,10 @@ namespace rule_engine::python::protocol_v2 {
         if (!frame) {
             return std::unexpected(std::move(frame.error()));
         }
-        return write_all(impl_->ssl, *frame);
+        return write_all(impl_->ssl, *frame, operation);
 #else
         static_cast<void>(envelope);
+        static_cast<void>(operation);
         return std::unexpected(
             transport_error(ProtocolErrorCode::dependency_unavailable,
                             "secure protocol transport is unavailable because OpenSSL 3 or newer was not linked"));
@@ -371,13 +513,18 @@ namespace rule_engine::python::protocol_v2 {
     }
 
     std::expected<PeerEnvelope, ProtocolError> OpenSslTlsSession::receive() noexcept {
+        return receive(TransportOperation {});
+    }
+
+    std::expected<PeerEnvelope, ProtocolError>
+    OpenSslTlsSession::receive(const TransportOperation &operation) noexcept {
 #if RULE_ENGINE_PROTOCOL_HAS_OPENSSL
         if (!established()) {
             return std::unexpected(
                 transport_error(ProtocolErrorCode::transport_error, "TLS session is not established"));
         }
         std::array<std::byte, 4> header {};
-        if (auto read = read_all(impl_->ssl, header); !read) {
+        if (auto read = read_all(impl_->ssl, header, operation); !read) {
             return std::unexpected(std::move(read.error()));
         }
         const auto size = (std::to_integer<std::uint32_t>(header[0]) << 24U) |
@@ -390,7 +537,7 @@ namespace rule_engine::python::protocol_v2 {
         }
         std::vector<std::byte> frame(static_cast<std::size_t>(size) + header.size());
         std::ranges::copy(header, frame.begin());
-        if (auto read = read_all(impl_->ssl, std::span {frame}.subspan(header.size())); !read) {
+        if (auto read = read_all(impl_->ssl, std::span {frame}.subspan(header.size()), operation); !read) {
             return std::unexpected(std::move(read.error()));
         }
         auto decoded = decode_frame(frame, impl_->context->configuration.protocol_limits);
@@ -399,6 +546,7 @@ namespace rule_engine::python::protocol_v2 {
         }
         return std::move(decoded->envelope);
 #else
+        static_cast<void>(operation);
         return std::unexpected(
             transport_error(ProtocolErrorCode::dependency_unavailable,
                             "secure protocol transport is unavailable because OpenSSL 3 or newer was not linked"));

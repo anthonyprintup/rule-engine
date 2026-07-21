@@ -16,10 +16,15 @@ namespace rule_engine::python::tools {
 
         constexpr std::string_view check_help_text = R"(Usage: rule_engine_check --pack PATH [options]
 
-Statically check a Python rule pack. Static rule modules are never imported or executed.
+Authoritatively compile and type-check a Python rule pack with the exact private runtime.
+Static rule modules are parsed but never imported or executed.
 
 Options:
   --pack PATH          Source tree or source-only pack
+  --runtime-root PATH  Staged exact private CPython 3.14.6 runtime
+  --trust-config PATH  Production signer policy and explicit OpenSSL path
+  --trust-mode MODE    production or development (default: production)
+  --temporary-root PATH  Worker scratch directory
   --watch              Cancel stale checks and publish only the latest complete result
   --format FORMAT      text, json, or sarif (default: text)
   --explain-facts      Show logical fact routes separately from physical prefetch
@@ -30,17 +35,27 @@ Options:
 
         constexpr std::string_view pack_help_text = R"(Usage: rule_engine_pack COMMAND PATH [options]
 
-Build and inspect deterministic source-only Python rule packs.
+Build and inspect deterministic source-only Python rule packs. Generator-free build validates
+packaging without requiring CPython; rule_engine_check owns static-language validation.
+Static rule modules are never imported or executed.
 
 Commands:
   build                Canonicalize, validate, optionally run an authorized generator twice, and build
+  sign                 Sign a canonical unsigned archive with an offline Ed25519 seed
   verify               Verify archive, digest closure, runtime pins, and signature policy
   inspect              Emit a redacted canonical summary
   stubs                Emit PEP 561 and typed binding stubs
 
 Options:
+  --source PATH        Source directory (equivalent to positional PATH)
   --output PATH        Output archive or stub directory
-  --signer REF         External signer/key-provider reference (never printed)
+  --signer REF         Absolute file: reference to a private ACL-protected 32-byte seed (never printed)
+  --key-id ID          Optional expected sha256: signer key ID
+  --runtime-root PATH  Staged exact private CPython 3.14.6 runtime
+  --sdk-root PATH      Tracked, manifest-verified author SDK
+  --trust-config PATH  Production signer policy and explicit OpenSSL path
+  --trust-mode MODE    production or development (default: production)
+  --temporary-root PATH  Worker scratch directory
   --format FORMAT      text, json, or sarif (default: text)
   --help               Show this help
   --version            Show the tool API version
@@ -55,6 +70,7 @@ Commands:
   capture backfill outbox deadletters purge audit
 
 Options:
+  --config PATH        Authenticated endpoint, client certificate/key, and trust bundle
   --request-id ID      Idempotent request identity for mutations
   --reason TEXT        Audited operator reason (never echoed)
   --wait               Wait by polling the durable operation record
@@ -240,6 +256,9 @@ Options:
             if (value == "build") {
                 return PackAction::build;
             }
+            if (value == "sign") {
+                return PackAction::sign;
+            }
             if (value == "verify") {
                 return PackAction::verify;
             }
@@ -300,6 +319,49 @@ Options:
                     command.pack_path = *value;
                     continue;
                 }
+                if (argument == "--runtime-root" || argument == "--trust-config" || argument == "--temporary-root" ||
+                    argument == "--trust-mode") {
+                    const auto value = required_option_value(arguments, index, argument);
+                    if (!value.has_value()) {
+                        return std::unexpected(value.error());
+                    }
+                    if (argument == "--runtime-root") {
+                        command.runtime_root = *value;
+                    } else if (argument == "--trust-config") {
+                        command.trust_config_path = *value;
+                    } else if (argument == "--temporary-root") {
+                        command.temporary_root = *value;
+                    } else if (*value == "development") {
+                        command.development_unsigned = true;
+                    } else if (*value == "production") {
+                        command.development_unsigned = false;
+                    } else {
+                        return std::unexpected(ParseError {.message = "trust mode must be production or development"});
+                    }
+                    continue;
+                }
+                if (const auto value = inline_option_value(argument, "--runtime-root"); value.has_value()) {
+                    command.runtime_root = *value;
+                    continue;
+                }
+                if (const auto value = inline_option_value(argument, "--trust-config"); value.has_value()) {
+                    command.trust_config_path = *value;
+                    continue;
+                }
+                if (const auto value = inline_option_value(argument, "--temporary-root"); value.has_value()) {
+                    command.temporary_root = *value;
+                    continue;
+                }
+                if (const auto value = inline_option_value(argument, "--trust-mode"); value.has_value()) {
+                    if (*value == "development") {
+                        command.development_unsigned = true;
+                    } else if (*value == "production") {
+                        command.development_unsigned = false;
+                    } else {
+                        return std::unexpected(ParseError {.message = "trust mode must be production or development"});
+                    }
+                    continue;
+                }
                 if (argument == "--format") {
                     const auto value = required_option_value(arguments, index, argument);
                     if (!value.has_value()) {
@@ -344,7 +406,10 @@ Options:
 
             for (std::size_t index = 1; index < arguments.size(); ++index) {
                 const auto argument = arguments[index];
-                if (argument == "--output" || argument == "--signer" || argument == "--format") {
+                if (argument == "--output" || argument == "--signer" || argument == "--key-id" ||
+                    argument == "--format" || argument == "--source" || argument == "--runtime-root" ||
+                    argument == "--sdk-root" || argument == "--trust-config" || argument == "--trust-mode" ||
+                    argument == "--temporary-root") {
                     const auto value = required_option_value(arguments, index, argument);
                     if (!value.has_value()) {
                         return std::unexpected(value.error());
@@ -353,6 +418,27 @@ Options:
                         command.output_path = *value;
                     } else if (argument == "--signer") {
                         command.signer_reference = *value;
+                    } else if (argument == "--key-id") {
+                        command.requested_key_id = *value;
+                    } else if (argument == "--source") {
+                        command.input_path = *value;
+                    } else if (argument == "--runtime-root") {
+                        command.runtime_root = *value;
+                    } else if (argument == "--sdk-root") {
+                        command.sdk_root = *value;
+                    } else if (argument == "--trust-config") {
+                        command.trust_config_path = *value;
+                    } else if (argument == "--temporary-root") {
+                        command.temporary_root = *value;
+                    } else if (argument == "--trust-mode") {
+                        if (*value == "development") {
+                            command.development_unsigned = true;
+                        } else if (*value == "production") {
+                            command.development_unsigned = false;
+                        } else {
+                            return std::unexpected(
+                                ParseError {.message = "trust mode must be production or development"});
+                        }
                     } else {
                         const auto format = parse_output_format(*value);
                         if (!format.has_value()) {
@@ -368,6 +454,40 @@ Options:
                 }
                 if (const auto value = inline_option_value(argument, "--signer"); value.has_value()) {
                     command.signer_reference = *value;
+                    continue;
+                }
+                if (const auto value = inline_option_value(argument, "--key-id"); value.has_value()) {
+                    command.requested_key_id = *value;
+                    continue;
+                }
+                if (const auto value = inline_option_value(argument, "--source"); value.has_value()) {
+                    command.input_path = *value;
+                    continue;
+                }
+                if (const auto value = inline_option_value(argument, "--runtime-root"); value.has_value()) {
+                    command.runtime_root = *value;
+                    continue;
+                }
+                if (const auto value = inline_option_value(argument, "--sdk-root"); value.has_value()) {
+                    command.sdk_root = *value;
+                    continue;
+                }
+                if (const auto value = inline_option_value(argument, "--trust-config"); value.has_value()) {
+                    command.trust_config_path = *value;
+                    continue;
+                }
+                if (const auto value = inline_option_value(argument, "--temporary-root"); value.has_value()) {
+                    command.temporary_root = *value;
+                    continue;
+                }
+                if (const auto value = inline_option_value(argument, "--trust-mode"); value.has_value()) {
+                    if (*value == "development") {
+                        command.development_unsigned = true;
+                    } else if (*value == "production") {
+                        command.development_unsigned = false;
+                    } else {
+                        return std::unexpected(ParseError {.message = "trust mode must be production or development"});
+                    }
                     continue;
                 }
                 if (const auto value = inline_option_value(argument, "--format"); value.has_value()) {
@@ -419,7 +539,8 @@ Options:
                     command.preview = false;
                     continue;
                 }
-                if (argument == "--request-id" || argument == "--reason" || argument == "--format") {
+                if (argument == "--request-id" || argument == "--reason" || argument == "--format" ||
+                    argument == "--config") {
                     const auto value = required_option_value(arguments, index, argument);
                     if (!value.has_value()) {
                         return std::unexpected(value.error());
@@ -428,6 +549,8 @@ Options:
                         command.request_id = *value;
                     } else if (argument == "--reason") {
                         command.reason = *value;
+                    } else if (argument == "--config") {
+                        command.config_path = *value;
                     } else {
                         const auto format = parse_output_format(*value);
                         if (!format.has_value()) {
@@ -443,6 +566,10 @@ Options:
                 }
                 if (const auto value = inline_option_value(argument, "--reason"); value.has_value()) {
                     command.reason = *value;
+                    continue;
+                }
+                if (const auto value = inline_option_value(argument, "--config"); value.has_value()) {
+                    command.config_path = *value;
                     continue;
                 }
                 if (const auto value = inline_option_value(argument, "--format"); value.has_value()) {

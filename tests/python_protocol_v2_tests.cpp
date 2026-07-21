@@ -429,6 +429,11 @@ namespace {
         auto batch = agent.take_transmit_batch();
         REQUIRE(batch.size() == 1);
         REQUIRE(batch.front().sequence == 1);
+        agent.disconnect();
+        REQUIRE_FALSE(agent.established());
+        const auto disconnected_work = agent.accept_work(work_lease());
+        REQUIRE_FALSE(disconnected_work.has_value());
+        REQUIRE(disconnected_work.error().code == ProtocolErrorCode::stale_session);
         REQUIRE(agent.establish(hello).has_value());
         batch = agent.take_transmit_batch();
         REQUIRE(batch.size() == 1);

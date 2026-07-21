@@ -381,6 +381,99 @@ namespace rule_engine::python::protocol_v2 {
 #endif
     }
 
+    std::expected<std::vector<std::uint64_t>, ProtocolError>
+    SqliteAgentSpool::enqueue_batch(const std::span<const DurableAgentBody> bodies) noexcept {
+#if RULE_ENGINE_PROTOCOL_HAS_SQLITE
+        if (impl_ == nullptr) {
+            return std::unexpected(spool_error(ProtocolErrorCode::persistence_error, "SQLite spool is not open"));
+        }
+        if (bodies.empty()) {
+            return std::vector<std::uint64_t> {};
+        }
+        std::vector<std::vector<std::byte>> encoded;
+        encoded.reserve(bodies.size());
+        std::size_t total_bytes {};
+        for (const auto &body : bodies) {
+            auto value = encode_durable_body(body, impl_->protocol_limits);
+            if (!value) {
+                return std::unexpected(std::move(value.error()));
+            }
+            if (value->size() > impl_->limits.maximum_bytes - (std::min) (total_bytes, impl_->limits.maximum_bytes)) {
+                return std::unexpected(
+                    spool_error(ProtocolErrorCode::backpressured, "SQLite spool batch exceeds the byte limit"));
+            }
+            total_bytes += value->size();
+            encoded.push_back(std::move(*value));
+        }
+
+        std::scoped_lock lock {impl_->writer};
+        if (auto refreshed = impl_->refresh_locked(); !refreshed) {
+            return std::unexpected(std::move(refreshed.error()));
+        }
+        if (bodies.size() >
+                impl_->limits.maximum_records - (std::min) (impl_->records, impl_->limits.maximum_records) ||
+            total_bytes > impl_->limits.maximum_bytes - (std::min) (impl_->bytes, impl_->limits.maximum_bytes) ||
+            impl_->next_sequence > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) -
+                                       static_cast<std::uint64_t>(bodies.size() - 1U)) {
+            impl_->backpressured = true;
+            static_cast<void>(set_meta_u64(impl_->database, "backpressured", 1));
+            return std::unexpected(spool_error(ProtocolErrorCode::backpressured, "SQLite spool hard limit is reached"));
+        }
+        if (auto started = begin(impl_->database); !started) {
+            return std::unexpected(std::move(started.error()));
+        }
+        auto insert =
+            prepare(impl_->database, "INSERT INTO spool_outbound(sequence, epoch, kind, payload, encoded_bytes, "
+                                     "created_unix_seconds, transmit_attempts) "
+                                     "VALUES(?1, ?2, ?3, ?4, ?5, cast(strftime('%s','now') AS INTEGER), 0)");
+        if (!insert) {
+            rollback(impl_->database);
+            return std::unexpected(std::move(insert.error()));
+        }
+        std::vector<std::uint64_t> sequences;
+        sequences.reserve(bodies.size());
+        for (std::size_t index = 0U; index < bodies.size(); ++index) {
+            const auto sequence = impl_->next_sequence + index;
+            const auto &payload = encoded[index];
+            const auto bound =
+                sqlite3_reset(insert->value) == SQLITE_OK && sqlite3_clear_bindings(insert->value) == SQLITE_OK &&
+                sqlite3_bind_int64(insert->value, 1, static_cast<sqlite3_int64>(sequence)) == SQLITE_OK &&
+                sqlite3_bind_text(insert->value, 2, impl_->epoch.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                sqlite3_bind_int(insert->value, 3, static_cast<int>(durable_kind(bodies[index]))) == SQLITE_OK &&
+                sqlite3_bind_blob(insert->value, 4, payload.data(), static_cast<int>(payload.size()),
+                                  SQLITE_TRANSIENT) == SQLITE_OK &&
+                sqlite3_bind_int64(insert->value, 5, static_cast<sqlite3_int64>(payload.size())) == SQLITE_OK &&
+                sqlite3_step(insert->value) == SQLITE_DONE;
+            if (!bound) {
+                rollback(impl_->database);
+                return std::unexpected(
+                    spool_error(ProtocolErrorCode::persistence_error, "SQLite spool batch insert failed"));
+            }
+            sequences.push_back(sequence);
+        }
+        if (!set_meta_u64(impl_->database, "next_sequence", impl_->next_sequence + bodies.size())) {
+            rollback(impl_->database);
+            return std::unexpected(
+                spool_error(ProtocolErrorCode::persistence_error, "SQLite spool batch metadata update failed"));
+        }
+        if (auto committed = commit(impl_->database); !committed) {
+            rollback(impl_->database);
+            return std::unexpected(std::move(committed.error()));
+        }
+        if (auto refreshed = impl_->refresh_locked(); !refreshed) {
+            return std::unexpected(std::move(refreshed.error()));
+        }
+        if (auto pressure = impl_->update_backpressure_locked(); !pressure) {
+            return std::unexpected(std::move(pressure.error()));
+        }
+        return sequences;
+#else
+        static_cast<void>(bodies);
+        return std::unexpected(spool_error(ProtocolErrorCode::dependency_unavailable,
+                                           "durable agent spooling is unavailable because SQLite was not linked"));
+#endif
+    }
+
     std::expected<std::vector<StoredSpoolRecord>, ProtocolError>
     SqliteAgentSpool::pending(const std::size_t maximum_records, const std::size_t maximum_bytes) const noexcept {
 #if RULE_ENGINE_PROTOCOL_HAS_SQLITE
@@ -735,6 +828,15 @@ namespace rule_engine::python::protocol_v2 {
         }
         release(nack.sequence);
         return {};
+    }
+
+    void PersistentAgentSession::update_credit(const CreditWindow credit) noexcept { credit_ = credit; }
+
+    void PersistentAgentSession::disconnect() noexcept {
+        clear_in_flight();
+        control_.disconnect();
+        session_.reset();
+        credit_ = {};
     }
 
     void PersistentAgentSession::clear_in_flight() noexcept { in_flight_.clear(); }

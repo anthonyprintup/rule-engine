@@ -1,5 +1,7 @@
 #include "rule_engine/python/compiler/ast.hpp"
 
+#include "ast_internal.hpp"
+
 #include <algorithm>
 #include <array>
 #include <functional>
@@ -481,6 +483,15 @@ namespace rule_engine::python::compiler {
         return AstValue {.data = std::make_shared<const AstSequence>(AstSequence {.values = std::move(values)})};
     }
 
+    std::expected<AstEnvelope, DiagnosticSet> detail::finish_ast_envelope(AstEnvelope envelope,
+                                                                          const VerifiedRulePack &pack) {
+        auto diagnostics = validate_envelope(envelope, pack);
+        if (!diagnostics.empty()) {
+            return std::unexpected(std::move(diagnostics));
+        }
+        return envelope;
+    }
+
     std::expected<std::vector<std::byte>, DiagnosticSet> encode_ast_envelope(const AstEnvelope &input) {
         auto envelope = input;
         std::ranges::sort(envelope.modules, {}, [](const AstModule &module) { return module.name; });
@@ -620,11 +631,7 @@ namespace rule_engine::python::compiler {
             return std::unexpected(DiagnosticSet {diagnostic("PY-AST-TRAILING", "AST envelope has trailing bytes")});
         }
 
-        auto diagnostics = validate_envelope(envelope, pack);
-        if (!diagnostics.empty()) {
-            return std::unexpected(std::move(diagnostics));
-        }
-        return envelope;
+        return detail::finish_ast_envelope(std::move(envelope), pack);
     }
 
 } // namespace rule_engine::python::compiler

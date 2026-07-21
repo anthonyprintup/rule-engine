@@ -1,5 +1,3 @@
 build/
-rust/yara_bridge/target/
-rust/yara_bridge/generated/
 .idea/
 cmake-build-*/

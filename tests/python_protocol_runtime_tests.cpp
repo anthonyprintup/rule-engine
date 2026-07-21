@@ -245,6 +245,100 @@ namespace {
         }
     };
 
+    TlsConfiguration orchestration_server_configuration(const CertificateFixture &certificates) {
+        return TlsConfiguration {
+            .role = TlsEndpointRole::server,
+            .trust_anchors_pem = certificates.ca.string(),
+            .certificate_chain_pem = certificates.server_certificate.string(),
+            .private_key_pem = certificates.server_key.string(),
+            .crl_pem = {},
+            .expected_server_name = {},
+            .require_crl = false,
+            .verification_time_unix_seconds = std::nullopt,
+            .protocol_limits = {},
+        };
+    }
+
+    TlsConfiguration orchestration_client_configuration(const CertificateFixture &certificates) {
+        return TlsConfiguration {
+            .role = TlsEndpointRole::client,
+            .trust_anchors_pem = certificates.ca.string(),
+            .certificate_chain_pem = certificates.client_certificate.string(),
+            .private_key_pem = certificates.client_key.string(),
+            .crl_pem = {},
+            .expected_server_name = "localhost",
+            .require_crl = false,
+            .verification_time_unix_seconds = std::nullopt,
+            .protocol_limits = {},
+        };
+    }
+
+    SocketTimeouts orchestration_timeouts() {
+        return SocketTimeouts {
+            .resolve = std::chrono::milliseconds {500},
+            .connect = std::chrono::milliseconds {500},
+            .accept = std::chrono::seconds {2},
+            .handshake = std::chrono::seconds {2},
+            .read = std::chrono::seconds {2},
+            .write = std::chrono::seconds {2},
+            .total_dial = std::chrono::seconds {5},
+        };
+    }
+
+    ReconnectPolicy one_round_reconnect() {
+        return ReconnectPolicy {
+            .initial_backoff = std::chrono::milliseconds {10},
+            .maximum_backoff = std::chrono::milliseconds {20},
+            .maximum_rounds = 1,
+            .maximum_endpoints = 4,
+            .maximum_addresses_per_endpoint = 8,
+            .maximum_connection_attempts = 16,
+        };
+    }
+
+    struct FixedResolver final: IEndpointResolver {
+        std::vector<ResolvedTcpAddress> addresses;
+        bool use_endpoint_port {};
+        std::atomic_size_t calls {};
+
+        explicit FixedResolver(std::vector<ResolvedTcpAddress> resolved, const bool inherit_endpoint_port = false):
+            addresses {std::move(resolved)}, use_endpoint_port {inherit_endpoint_port} {}
+
+        [[nodiscard]] bool hard_bounds_guaranteed() const noexcept override { return true; }
+
+        [[nodiscard]] std::expected<std::vector<ResolvedTcpAddress>, ProtocolError>
+        resolve(const TcpEndpoint &endpoint, const std::size_t, const std::chrono::steady_clock::time_point deadline,
+                const std::stop_token cancellation) noexcept override {
+            ++calls;
+            if (cancellation.stop_requested()) {
+                return std::unexpected(ProtocolError {
+                    .code = ProtocolErrorCode::canceled, .message = "fixed resolver canceled", .byte_offset = 0});
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return std::unexpected(ProtocolError {.code = ProtocolErrorCode::transport_error,
+                                                      .message = "fixed resolver timed out",
+                                                      .byte_offset = 0});
+            }
+            auto result = addresses;
+            if (use_endpoint_port) {
+                for (auto &address : result) { address.port = endpoint.port; }
+            }
+            return result;
+        }
+    };
+
+    struct RecordingJitter final: IBackoffJitter {
+        std::vector<std::chrono::milliseconds> bounds;
+        std::atomic_size_t calls {};
+
+        [[nodiscard]] std::chrono::milliseconds
+        choose(const std::chrono::milliseconds inclusive_upper_bound) noexcept override {
+            bounds.push_back(inclusive_upper_bound);
+            calls.store(bounds.size());
+            return inclusive_upper_bound;
+        }
+    };
+
     struct TlsPairResult {
         std::optional<std::expected<TlsPeerIdentity, ProtocolError>> server_handshake;
         std::optional<std::expected<TlsPeerIdentity, ProtocolError>> client_handshake;
@@ -367,6 +461,19 @@ namespace {
             .capabilities = {},
             .credit = CreditWindow {.bytes = 1 * mebibyte, .messages = 1, .work_attempts = 1, .snapshot_chunks = 1},
             .heartbeat_interval_ms = 5'000,
+        };
+    }
+
+    AgentHelloMessage runtime_agent_hello() {
+        return AgentHelloMessage {
+            .minimum_minor = 0,
+            .maximum_minor = 0,
+            .agent_version = "agent/test",
+            .agent_epoch = "replaced-by-reconnect",
+            .next_sequence = 1,
+            .schemas = {},
+            .capabilities = {},
+            .receive_limit = {.bytes = 1 * mebibyte, .messages = 4, .work_attempts = 2, .snapshot_chunks = 2},
         };
     }
 
@@ -698,6 +805,421 @@ namespace {
         auto missing_crl = server_configuration(certificates->server_certificate, certificates->server_key);
         missing_crl.require_crl = true;
         REQUIRE_FALSE(OpenSslTlsContext::create(std::move(missing_crl)).has_value());
+#endif
+    }
+
+    TEST_CASE("owned TLS orchestration authenticates loopback peers and replays the durable agent spool") {
+        if (!tls_backend_status().available || !spool_backend_status().available) {
+            SUCCEED("TLS and SQLite backends are required for the reconnect integration test");
+            return;
+        }
+#ifndef RULE_ENGINE_PROTOCOL_OPENSSL_EXECUTABLE
+        SUCCEED("OpenSSL certificate-generation executable is unavailable");
+        return;
+#else
+        SocketRuntime sockets;
+        REQUIRE(sockets.available);
+        TemporaryDirectory temporary;
+        const auto certificates = CertificateFixture::generate(temporary.path);
+        REQUIRE(certificates.has_value());
+
+        auto server_context = OpenSslTlsContext::create(orchestration_server_configuration(*certificates));
+        auto client_context = OpenSslTlsContext::create(orchestration_client_configuration(*certificates));
+        REQUIRE(server_context.has_value());
+        REQUIRE(client_context.has_value());
+        const auto timeouts = orchestration_timeouts();
+        auto listener = TlsSessionListener::bind(std::move(*server_context),
+                                                 TcpEndpoint {.host = "127.0.0.1", .port = 0}, timeouts);
+        REQUIRE(listener.has_value());
+        const auto endpoint = listener->local_endpoint();
+        auto dialer = TlsSessionDialer::create(
+            std::move(*client_context), {TcpEndpoint {.host = "localhost", .port = endpoint.port}},
+            TlsPeerRequirement {.canonical_uri_san = "urn:rule-engine:server", .certificate_sha256 = std::nullopt},
+            timeouts, one_round_reconnect());
+        REQUIRE(dialer.has_value());
+
+        OperatorTrustPolicy policy;
+        REQUIRE(policy
+                    .enroll(PeerEnrollment {
+                        .canonical_uri_san = "urn:rule-engine:peer-1",
+                        .certificate_sha256 = {},
+                        .identity = AuthenticatedPeer {.tenant = TenantId {"tenant-1"}, .peer = PeerId {"peer-1"}},
+                        .disabled = false,
+                        .capabilities = {},
+                    })
+                    .has_value());
+
+        auto spool = SqliteAgentSpool::open((temporary.path / "network-spool.sqlite3").string());
+        REQUIRE(spool.has_value());
+        PersistentAgentSession persistent {PeerId {"peer-1"}, *spool};
+        REQUIRE(persistent.enqueue(runtime_work_result()).has_value());
+
+        std::optional<ProtocolError> server_error;
+        std::optional<AuthenticatedPeer> authenticated_peer;
+        std::optional<AgentHelloMessage> received_hello;
+        std::optional<std::uint64_t> replayed_sequence;
+        std::jthread server {[&] {
+            auto accepted = listener->accept(policy);
+            if (!accepted) {
+                server_error = accepted.error();
+                return;
+            }
+            authenticated_peer = accepted->peer;
+            auto hello = accepted->connection.receive();
+            if (!hello) {
+                server_error = hello.error();
+                return;
+            }
+            if (!std::holds_alternative<AgentHelloMessage>(hello->body)) {
+                server_error = ProtocolError {.code = ProtocolErrorCode::unexpected_message,
+                                              .message = "server expected agent hello",
+                                              .byte_offset = 0};
+                return;
+            }
+            received_hello = std::get<AgentHelloMessage>(std::move(hello->body));
+
+            const auto welcome = runtime_server_hello();
+            PeerEnvelope welcome_envelope {
+                .protocol_major = 2,
+                .protocol_minor = 0,
+                .message_id = "server-welcome",
+                .session = welcome.session,
+                .agent_epoch = received_hello->agent_epoch,
+                .agent_sequence = 0,
+                .acknowledged_agent_sequence = 0,
+                .body = welcome,
+            };
+            if (auto sent = accepted->connection.send(welcome_envelope); !sent) {
+                server_error = sent.error();
+                return;
+            }
+            auto replay = accepted->connection.receive();
+            if (!replay) {
+                server_error = replay.error();
+                return;
+            }
+            if (!std::holds_alternative<WorkResultMessage>(replay->body)) {
+                server_error = ProtocolError {.code = ProtocolErrorCode::unexpected_message,
+                                              .message = "server expected replayed work result",
+                                              .byte_offset = 0};
+                return;
+            }
+            replayed_sequence = replay->agent_sequence;
+        }};
+
+        auto connected = dialer->reconnect(persistent, runtime_agent_hello());
+        server.join();
+        REQUIRE(connected.has_value());
+        REQUIRE_FALSE(server_error.has_value());
+        REQUIRE(authenticated_peer.has_value());
+        REQUIRE(authenticated_peer->tenant.value == "tenant-1");
+        REQUIRE(authenticated_peer->peer.value == "peer-1");
+        REQUIRE(received_hello.has_value());
+        REQUIRE(received_hello->agent_epoch == spool->agent_epoch());
+        REQUIRE(received_hello->next_sequence == 2);
+        REQUIRE(replayed_sequence == 1);
+        REQUIRE(connected->replayed_records == 1);
+        REQUIRE(connected->server_hello.session.value == "session-1");
+        REQUIRE(connected->connection.peer_identity().canonical_uri_san == "urn:rule-engine:server");
+        REQUIRE(connected->connection.remote_endpoint().port == endpoint.port);
+        REQUIRE(persistent.established());
+
+        PeerEnvelope extra {
+            .protocol_major = 2,
+            .protocol_minor = 0,
+            .message_id = "expired-write",
+            .session = SessionId {"session-1"},
+            .agent_epoch = spool->agent_epoch(),
+            .agent_sequence = 1,
+            .acknowledged_agent_sequence = 0,
+            .body = runtime_work_result(),
+        };
+        const auto expired_write =
+            connected->connection.send_until(extra, std::chrono::steady_clock::now() - std::chrono::milliseconds {1});
+        REQUIRE_FALSE(expired_write.has_value());
+        REQUIRE(expired_write.error().code == ProtocolErrorCode::timed_out);
+        REQUIRE(expired_write.error().message.find("timed out") != std::string::npos);
+#endif
+    }
+
+    TEST_CASE("TLS socket orchestration bounds refusal timeout cancellation backoff and address failover") {
+        if (!tls_backend_status().available) {
+            SUCCEED("OpenSSL backend is unavailable");
+            return;
+        }
+#ifndef RULE_ENGINE_PROTOCOL_OPENSSL_EXECUTABLE
+        SUCCEED("OpenSSL certificate-generation executable is unavailable");
+        return;
+#else
+        SocketRuntime sockets;
+        REQUIRE(sockets.available);
+        TemporaryDirectory temporary;
+        const auto certificates = CertificateFixture::generate(temporary.path);
+        REQUIRE(certificates.has_value());
+
+        OperatorTrustPolicy policy;
+        REQUIRE(policy
+                    .enroll(PeerEnrollment {
+                        .canonical_uri_san = "urn:rule-engine:peer-1",
+                        .certificate_sha256 = {},
+                        .identity = AuthenticatedPeer {.tenant = TenantId {"tenant-1"}, .peer = PeerId {"peer-1"}},
+                        .disabled = false,
+                        .capabilities = {},
+                    })
+                    .has_value());
+
+        auto timeout_context = OpenSslTlsContext::create(orchestration_server_configuration(*certificates));
+        REQUIRE(timeout_context.has_value());
+        auto accept_timeouts = orchestration_timeouts();
+        accept_timeouts.accept = std::chrono::milliseconds {50};
+        auto timeout_listener = TlsSessionListener::bind(std::move(*timeout_context),
+                                                         TcpEndpoint {.host = "127.0.0.1", .port = 0}, accept_timeouts);
+        REQUIRE(timeout_listener.has_value());
+        const auto accept_started = std::chrono::steady_clock::now();
+        const auto accept_timeout = timeout_listener->accept(policy);
+        REQUIRE_FALSE(accept_timeout.has_value());
+        REQUIRE(accept_timeout.error().code == ProtocolErrorCode::timed_out);
+        REQUIRE(accept_timeout.error().message.find("timed out") != std::string::npos);
+        REQUIRE(std::chrono::steady_clock::now() - accept_started < std::chrono::seconds {1});
+
+        auto cancel_context = OpenSslTlsContext::create(orchestration_server_configuration(*certificates));
+        REQUIRE(cancel_context.has_value());
+        auto cancel_timeouts = orchestration_timeouts();
+        cancel_timeouts.accept = std::chrono::seconds {5};
+        auto cancel_listener = TlsSessionListener::bind(std::move(*cancel_context),
+                                                        TcpEndpoint {.host = "127.0.0.1", .port = 0}, cancel_timeouts);
+        REQUIRE(cancel_listener.has_value());
+        std::optional<std::expected<AuthenticatedTlsPeer, ProtocolError>> canceled_accept;
+        std::jthread accepting {
+            [&](const std::stop_token stop) { canceled_accept = cancel_listener->accept(policy, stop); }};
+        std::this_thread::sleep_for(std::chrono::milliseconds {25});
+        accepting.request_stop();
+        accepting.join();
+        REQUIRE(canceled_accept.has_value());
+        REQUIRE_FALSE(canceled_accept->has_value());
+        REQUIRE(canceled_accept->error().code == ProtocolErrorCode::canceled);
+
+        std::optional<std::expected<AuthenticatedTlsPeer, ProtocolError>> listener_canceled_accept;
+        std::jthread listener_accepting {[&] { listener_canceled_accept = cancel_listener->accept(policy); }};
+        std::this_thread::sleep_for(std::chrono::milliseconds {25});
+        cancel_listener->cancel();
+        listener_accepting.join();
+        REQUIRE(listener_canceled_accept.has_value());
+        REQUIRE_FALSE(listener_canceled_accept->has_value());
+        REQUIRE(listener_canceled_accept->error().code == ProtocolErrorCode::canceled);
+
+        auto handshake_cancel_context = OpenSslTlsContext::create(orchestration_server_configuration(*certificates));
+        REQUIRE(handshake_cancel_context.has_value());
+        auto handshake_cancel_timeouts = orchestration_timeouts();
+        handshake_cancel_timeouts.handshake = std::chrono::seconds {5};
+        auto handshake_cancel_listener =
+            TlsSessionListener::bind(std::move(*handshake_cancel_context), TcpEndpoint {.host = "127.0.0.1", .port = 0},
+                                     handshake_cancel_timeouts);
+        REQUIRE(handshake_cancel_listener.has_value());
+        std::optional<std::expected<AuthenticatedTlsPeer, ProtocolError>> canceled_handshake;
+        std::jthread handshake_accepting {[&] { canceled_handshake = handshake_cancel_listener->accept(policy); }};
+        auto raw_handshake_client = connect_loopback(handshake_cancel_listener->local_endpoint().port);
+        REQUIRE(raw_handshake_client.has_value());
+        std::this_thread::sleep_for(std::chrono::milliseconds {25});
+        const auto handshake_cancel_started = std::chrono::steady_clock::now();
+        handshake_cancel_listener->cancel();
+        handshake_accepting.join();
+        REQUIRE(canceled_handshake.has_value());
+        REQUIRE_FALSE(canceled_handshake->has_value());
+        REQUIRE(canceled_handshake->error().code == ProtocolErrorCode::canceled);
+        REQUIRE(std::chrono::steady_clock::now() - handshake_cancel_started < std::chrono::seconds {1});
+
+        auto released_listener = listen_loopback();
+        REQUIRE(released_listener.has_value());
+        const auto refused_port = released_listener->port;
+        released_listener.reset();
+        auto refused_context = OpenSslTlsContext::create(orchestration_client_configuration(*certificates));
+        REQUIRE(refused_context.has_value());
+        auto refusal_timeouts = orchestration_timeouts();
+        refusal_timeouts.connect = std::chrono::milliseconds {100};
+        refusal_timeouts.total_dial = std::chrono::seconds {2};
+        ReconnectPolicy refusal_policy {
+            .initial_backoff = std::chrono::milliseconds {10},
+            .maximum_backoff = std::chrono::milliseconds {25},
+            .maximum_rounds = 4,
+            .maximum_endpoints = 1,
+            .maximum_addresses_per_endpoint = 1,
+            .maximum_connection_attempts = 4,
+            .require_hard_resolver_bounds = true,
+        };
+        auto refused_dialer = TlsSessionDialer::create(
+            std::move(*refused_context), {TcpEndpoint {.host = "refused.test", .port = refused_port}},
+            TlsPeerRequirement {.canonical_uri_san = "urn:rule-engine:server", .certificate_sha256 = std::nullopt},
+            refusal_timeouts, refusal_policy);
+        REQUIRE(refused_dialer.has_value());
+        const auto moved_context_rejected = TlsSessionDialer::create(
+            std::move(*refused_context), {TcpEndpoint {.host = "refused.test", .port = refused_port}},
+            TlsPeerRequirement {.canonical_uri_san = "urn:rule-engine:server", .certificate_sha256 = std::nullopt},
+            refusal_timeouts, refusal_policy);
+        REQUIRE_FALSE(moved_context_rejected.has_value());
+        REQUIRE(moved_context_rejected.error().code == ProtocolErrorCode::malformed);
+        const auto system_resolver_rejected = refused_dialer->connect();
+        REQUIRE_FALSE(system_resolver_rejected.has_value());
+        REQUIRE(system_resolver_rejected.error().code == ProtocolErrorCode::dependency_unavailable);
+        FixedResolver refused_resolver {
+            {{.family = TcpAddressFamily::ipv4, .address = "127.0.0.1", .port = refused_port}}};
+        RecordingJitter refusal_jitter;
+        const auto refused = refused_dialer->connect(refused_resolver, refusal_jitter);
+        REQUIRE_FALSE(refused.has_value());
+        REQUIRE((refused.error().code == ProtocolErrorCode::transport_error ||
+                 refused.error().code == ProtocolErrorCode::timed_out));
+        REQUIRE(refusal_jitter.bounds == std::vector {std::chrono::milliseconds {10}, std::chrono::milliseconds {20},
+                                                      std::chrono::milliseconds {25}});
+        REQUIRE(refused_resolver.calls.load() == 4);
+
+        auto cancel_dial_context = OpenSslTlsContext::create(orchestration_client_configuration(*certificates));
+        REQUIRE(cancel_dial_context.has_value());
+        ReconnectPolicy cancel_dial_policy = refusal_policy;
+        cancel_dial_policy.initial_backoff = std::chrono::seconds {5};
+        cancel_dial_policy.maximum_backoff = std::chrono::seconds {5};
+        cancel_dial_policy.maximum_rounds = 8;
+        cancel_dial_policy.maximum_connection_attempts = 8;
+        refusal_timeouts.total_dial = std::chrono::seconds {30};
+        auto cancel_dialer = TlsSessionDialer::create(
+            std::move(*cancel_dial_context), {TcpEndpoint {.host = "refused.test", .port = refused_port}},
+            TlsPeerRequirement {.canonical_uri_san = "urn:rule-engine:server", .certificate_sha256 = std::nullopt},
+            refusal_timeouts, cancel_dial_policy);
+        REQUIRE(cancel_dialer.has_value());
+        FixedResolver cancel_resolver {
+            {{.family = TcpAddressFamily::ipv4, .address = "127.0.0.1", .port = refused_port}}};
+        RecordingJitter cancel_jitter;
+        std::optional<std::expected<TlsPeerConnection, ProtocolError>> canceled_dial;
+        std::jthread dialing {[&](const std::stop_token stop) {
+            canceled_dial = cancel_dialer->connect(cancel_resolver, cancel_jitter, stop);
+        }};
+        for (std::size_t poll = 0; poll < 1'000 && cancel_jitter.calls.load() == 0; ++poll) {
+            std::this_thread::sleep_for(std::chrono::milliseconds {1});
+        }
+        REQUIRE(cancel_jitter.calls.load() == 1);
+        dialing.request_stop();
+        dialing.join();
+        REQUIRE(canceled_dial.has_value());
+        REQUIRE_FALSE(canceled_dial->has_value());
+        REQUIRE(canceled_dial->error().code == ProtocolErrorCode::canceled);
+
+        auto silent_listener = listen_loopback();
+        REQUIRE(silent_listener.has_value());
+        std::jthread silent_server {[&] {
+            sockaddr_in address {};
+#ifdef _WIN32
+            int address_size = sizeof(address);
+#else
+            socklen_t address_size = sizeof(address);
+#endif
+            TestSocket socket {
+                accept(silent_listener->socket.value, reinterpret_cast<sockaddr *>(&address), &address_size)};
+            if (socket.value != invalid_test_socket) {
+                std::this_thread::sleep_for(std::chrono::milliseconds {200});
+            }
+        }};
+        auto handshake_context = OpenSslTlsContext::create(orchestration_client_configuration(*certificates));
+        REQUIRE(handshake_context.has_value());
+        auto handshake_timeouts = orchestration_timeouts();
+        handshake_timeouts.handshake = std::chrono::milliseconds {50};
+        handshake_timeouts.total_dial = std::chrono::seconds {1};
+        auto handshake_dialer = TlsSessionDialer::create(
+            std::move(*handshake_context), {TcpEndpoint {.host = "silent.test", .port = silent_listener->port}},
+            TlsPeerRequirement {.canonical_uri_san = "urn:rule-engine:server", .certificate_sha256 = std::nullopt},
+            handshake_timeouts, one_round_reconnect());
+        REQUIRE(handshake_dialer.has_value());
+        FixedResolver silent_resolver {
+            {{.family = TcpAddressFamily::ipv4, .address = "127.0.0.1", .port = silent_listener->port}}};
+        RecordingJitter silent_jitter;
+        const auto handshake_timeout = handshake_dialer->connect(silent_resolver, silent_jitter);
+        silent_server.join();
+        REQUIRE_FALSE(handshake_timeout.has_value());
+        REQUIRE(handshake_timeout.error().code == ProtocolErrorCode::timed_out);
+        REQUIRE(handshake_timeout.error().message.find("timed out") != std::string::npos);
+
+        auto failover_server_context = OpenSslTlsContext::create(orchestration_server_configuration(*certificates));
+        auto failover_client_context = OpenSslTlsContext::create(orchestration_client_configuration(*certificates));
+        REQUIRE(failover_server_context.has_value());
+        REQUIRE(failover_client_context.has_value());
+        auto failover_timeouts = orchestration_timeouts();
+        failover_timeouts.read = std::chrono::milliseconds {50};
+        auto failover_listener = TlsSessionListener::bind(
+            std::move(*failover_server_context), TcpEndpoint {.host = "127.0.0.1", .port = 0}, failover_timeouts);
+        REQUIRE(failover_listener.has_value());
+        const auto failover_port = failover_listener->local_endpoint().port;
+        auto failover_dialer = TlsSessionDialer::create(
+            std::move(*failover_client_context),
+            {TcpEndpoint {.host = "refused.test", .port = refused_port},
+             TcpEndpoint {.host = "multi-address.test", .port = failover_port}},
+            TlsPeerRequirement {.canonical_uri_san = "urn:rule-engine:server", .certificate_sha256 = std::nullopt},
+            failover_timeouts, one_round_reconnect());
+        REQUIRE(failover_dialer.has_value());
+        FixedResolver failover_resolver {{{.family = TcpAddressFamily::ipv4, .address = "127.0.0.2", .port = 0},
+                                          {.family = TcpAddressFamily::ipv4, .address = "127.0.0.1", .port = 0}},
+                                         true};
+        RecordingJitter failover_jitter;
+        std::optional<ProtocolError> failover_server_error;
+        std::optional<AuthenticatedPeer> failover_peer;
+        std::jthread failover_server {[&] {
+            auto accepted = failover_listener->accept(policy);
+            if (!accepted) {
+                failover_server_error = accepted.error();
+                return;
+            }
+            failover_peer = accepted->peer;
+            std::this_thread::sleep_for(std::chrono::milliseconds {200});
+        }};
+        auto failover = failover_dialer->connect(failover_resolver, failover_jitter);
+        REQUIRE(failover.has_value());
+        REQUIRE(failover->remote_endpoint().host == "127.0.0.1");
+        REQUIRE(failover_resolver.calls.load() == 2);
+        const auto read_timeout = failover->receive();
+        failover_server.join();
+        REQUIRE_FALSE(failover_server_error.has_value());
+        REQUIRE(failover_peer.has_value());
+        REQUIRE_FALSE(read_timeout.has_value());
+        REQUIRE(read_timeout.error().code == ProtocolErrorCode::timed_out);
+        REQUIRE(read_timeout.error().message.find("timed out") != std::string::npos);
+
+        auto identity_server_context = OpenSslTlsContext::create(orchestration_server_configuration(*certificates));
+        auto identity_client_context = OpenSslTlsContext::create(orchestration_client_configuration(*certificates));
+        REQUIRE(identity_server_context.has_value());
+        REQUIRE(identity_client_context.has_value());
+        auto identity_listener =
+            TlsSessionListener::bind(std::move(*identity_server_context), TcpEndpoint {.host = "127.0.0.1", .port = 0},
+                                     orchestration_timeouts());
+        REQUIRE(identity_listener.has_value());
+        const auto identity_port = identity_listener->local_endpoint().port;
+        auto identity_dialer = TlsSessionDialer::create(
+            std::move(*identity_client_context), {TcpEndpoint {.host = "identity.test", .port = identity_port}},
+            TlsPeerRequirement {.canonical_uri_san = "urn:rule-engine:wrong-server",
+                                .certificate_sha256 = std::nullopt},
+            orchestration_timeouts(), one_round_reconnect());
+        REQUIRE(identity_dialer.has_value());
+        FixedResolver identity_resolver {
+            {{.family = TcpAddressFamily::ipv4, .address = "127.0.0.1", .port = identity_port}}};
+        RecordingJitter identity_jitter;
+        std::jthread identity_server {[&] { static_cast<void>(identity_listener->accept(policy)); }};
+        const auto identity_mismatch = identity_dialer->connect(identity_resolver, identity_jitter);
+        identity_server.join();
+        REQUIRE_FALSE(identity_mismatch.has_value());
+        REQUIRE(identity_mismatch.error().code == ProtocolErrorCode::unauthenticated);
+
+        auto fingerprint_client_context = OpenSslTlsContext::create(orchestration_client_configuration(*certificates));
+        REQUIRE(fingerprint_client_context.has_value());
+        auto fingerprint_dialer = TlsSessionDialer::create(
+            std::move(*fingerprint_client_context), {TcpEndpoint {.host = "fingerprint.test", .port = identity_port}},
+            TlsPeerRequirement {.canonical_uri_san = "urn:rule-engine:server",
+                                .certificate_sha256 = std::string(64, '0')},
+            orchestration_timeouts(), one_round_reconnect());
+        REQUIRE(fingerprint_dialer.has_value());
+        FixedResolver fingerprint_resolver {
+            {{.family = TcpAddressFamily::ipv4, .address = "127.0.0.1", .port = identity_port}}};
+        RecordingJitter fingerprint_jitter;
+        std::jthread fingerprint_server {[&] { static_cast<void>(identity_listener->accept(policy)); }};
+        const auto fingerprint_mismatch = fingerprint_dialer->connect(fingerprint_resolver, fingerprint_jitter);
+        fingerprint_server.join();
+        REQUIRE_FALSE(fingerprint_mismatch.has_value());
+        REQUIRE(fingerprint_mismatch.error().code == ProtocolErrorCode::unauthenticated);
 #endif
     }
 

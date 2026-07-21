@@ -2,7 +2,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -168,6 +170,118 @@ namespace {
         const auto result = verify_bytecode(pack);
         REQUIRE_FALSE(result.has_value());
         REQUIRE(result.error().back().code == "PYC0201");
+    }
+
+    TEST_CASE("bytecode verifier validates container iterator and state deletion encodings") {
+        auto pack = minimal_pack();
+        pack.constants.push_back(make_fact(std::monostate {}));
+        auto &function = pack.functions.front();
+        function.register_count = 4U;
+        function.instructions = {
+            {.opcode = Opcode::build_list,
+             .destination = 0U,
+             .operand_a = 1U,
+             .operand_b = 2U,
+             .immediate = 0U,
+             .span = span()},
+            {.opcode = Opcode::build_tuple,
+             .destination = 1U,
+             .operand_a = 0U,
+             .operand_b = 1U,
+             .immediate = 0U,
+             .span = span()},
+            {.opcode = Opcode::build_dict,
+             .destination = 2U,
+             .operand_a = 0U,
+             .operand_b = 2U,
+             .immediate = 0U,
+             .span = span()},
+            {.opcode = Opcode::get_iter,
+             .destination = 3U,
+             .operand_a = 0U,
+             .operand_b = 0U,
+             .immediate = 0U,
+             .span = span()},
+            {.opcode = Opcode::iter_next,
+             .destination = 1U,
+             .operand_a = 3U,
+             .operand_b = 0U,
+             .immediate = 7U,
+             .span = span()},
+            {.opcode = Opcode::load_subscript,
+             .destination = 2U,
+             .operand_a = 0U,
+             .operand_b = 1U,
+             .immediate = 0U,
+             .span = span()},
+            {.opcode = Opcode::store_subscript,
+             .destination = 2U,
+             .operand_a = 0U,
+             .operand_b = 1U,
+             .immediate = 0U,
+             .span = span()},
+            {.opcode = Opcode::delete_state,
+             .destination = 0U,
+             .operand_a = 0U,
+             .operand_b = 0U,
+             .immediate = 0U,
+             .span = span()},
+        };
+        REQUIRE(verify_bytecode(pack).has_value());
+
+        const auto rejects = [&](const Instruction malformed, const std::string_view code) {
+            auto candidate = minimal_pack();
+            candidate.functions.front().register_count = 2U;
+            candidate.functions.front().instructions = {malformed};
+            const auto verified = verify_bytecode(candidate);
+            REQUIRE_FALSE(verified.has_value());
+            CHECK(std::ranges::any_of(verified.error(), [&](const auto &item) { return item.code == code; }));
+        };
+
+        rejects(Instruction {.opcode = Opcode::build_list,
+                             .destination = 0U,
+                             .operand_a = 1U,
+                             .operand_b = 2U,
+                             .immediate = 0U,
+                             .span = span()},
+                "PYC0106");
+        rejects(Instruction {.opcode = Opcode::build_dict,
+                             .destination = 0U,
+                             .operand_a = 1U,
+                             .operand_b = 1U,
+                             .immediate = 0U,
+                             .span = span()},
+                "PYC0106");
+        rejects(Instruction {.opcode = Opcode::iter_next,
+                             .destination = 0U,
+                             .operand_a = 1U,
+                             .operand_b = 0U,
+                             .immediate = 1U,
+                             .span = span()},
+                "PYC0104");
+        rejects(Instruction {.opcode = Opcode::load_subscript,
+                             .destination = 0U,
+                             .operand_a = 0U,
+                             .operand_b = 2U,
+                             .immediate = 0U,
+                             .span = span()},
+                "PYC0106");
+        rejects(Instruction {.opcode = Opcode::get_iter,
+                             .destination = 0U,
+                             .operand_a = 1U,
+                             .operand_b = 1U,
+                             .immediate = 0U,
+                             .span = span()},
+                "PYC0107");
+        rejects(Instruction {.opcode = Opcode::delete_state,
+                             .destination = 0U,
+                             .operand_a = 0U,
+                             .operand_b = 0U,
+                             .immediate = 0U,
+                             .span = span()},
+                "PYC0108");
+        rejects(Instruction {.opcode = static_cast<Opcode>(std::numeric_limits<std::uint16_t>::max()), .span = span()},
+                "PYC0109");
     }
 
 } // namespace

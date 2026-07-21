@@ -158,17 +158,94 @@ namespace rule_engine::python {
             }
             for (std::size_t index = 0; index < function.instructions.size(); ++index) {
                 const auto &instruction = function.instructions[index];
+                if (std::to_underlying(instruction.opcode) > std::to_underlying(Opcode::delete_state)) {
+                    diagnostics.push_back(bytecode_error("PYC0109", "instruction opcode is unknown", instruction.span));
+                    continue;
+                }
                 if (!instruction.span.valid()) {
                     diagnostics.push_back(bytecode_error("PYC0102", "instruction has an invalid UTF-8 byte span"));
                 }
-                if (instruction.destination >= function.register_count && instruction.opcode != Opcode::jump &&
-                    instruction.opcode != Opcode::enter_try && instruction.opcode != Opcode::leave_try) {
+                const auto has_no_destination =
+                    instruction.opcode == Opcode::jump || instruction.opcode == Opcode::enter_try ||
+                    instruction.opcode == Opcode::leave_try || instruction.opcode == Opcode::begin_transaction ||
+                    instruction.opcode == Opcode::commit_transaction ||
+                    instruction.opcode == Opcode::rollback_transaction || instruction.opcode == Opcode::delete_state;
+                if (instruction.destination >= function.register_count && !has_no_destination) {
                     diagnostics.push_back(bytecode_error("PYC0103", "instruction destination register is out of range",
                                                          instruction.span));
                 }
-                if ((instruction.opcode == Opcode::jump || instruction.opcode == Opcode::jump_if_false) &&
+                if ((instruction.opcode == Opcode::jump || instruction.opcode == Opcode::jump_if_false ||
+                     instruction.opcode == Opcode::iter_next) &&
                     instruction.immediate >= function.instructions.size()) {
                     diagnostics.push_back(bytecode_error("PYC0104", "jump target is out of range", instruction.span));
+                }
+                const auto register_valid = [&](const std::uint32_t reg) { return reg < function.register_count; };
+                const auto register_window_valid = [&](const std::uint32_t first, const std::uint32_t count) {
+                    return first <= function.register_count && count <= function.register_count - first;
+                };
+                const auto malformed_register = [&] {
+                    diagnostics.push_back(
+                        bytecode_error("PYC0106", "instruction register operand is out of range", instruction.span));
+                };
+                const auto malformed_reserved = [&] {
+                    diagnostics.push_back(
+                        bytecode_error("PYC0107", "instruction reserved operand must be zero", instruction.span));
+                };
+                switch (instruction.opcode) {
+                    case Opcode::build_list:
+                    case Opcode::build_tuple:
+                        if (!register_window_valid(instruction.operand_a, instruction.operand_b)) {
+                            malformed_register();
+                        }
+                        if (instruction.immediate != 0U) {
+                            malformed_reserved();
+                        }
+                        break;
+                    case Opcode::build_dict:
+                        if (instruction.operand_a > function.register_count ||
+                            instruction.operand_b > (function.register_count - instruction.operand_a) / 2U) {
+                            malformed_register();
+                        }
+                        if (instruction.immediate != 0U) {
+                            malformed_reserved();
+                        }
+                        break;
+                    case Opcode::get_iter:
+                        if (!register_valid(instruction.operand_a)) {
+                            malformed_register();
+                        }
+                        if (instruction.operand_b != 0U || instruction.immediate != 0U) {
+                            malformed_reserved();
+                        }
+                        break;
+                    case Opcode::iter_next:
+                        if (!register_valid(instruction.operand_a)) {
+                            malformed_register();
+                        }
+                        if (instruction.operand_b != 0U) {
+                            malformed_reserved();
+                        }
+                        break;
+                    case Opcode::load_subscript:
+                    case Opcode::store_subscript:
+                        if (!register_valid(instruction.operand_a) || !register_valid(instruction.operand_b)) {
+                            malformed_register();
+                        }
+                        if (instruction.immediate != 0U) {
+                            malformed_reserved();
+                        }
+                        break;
+                    case Opcode::delete_state:
+                        if (instruction.immediate >= pack.constants.size()) {
+                            diagnostics.push_back(bytecode_error(
+                                "PYC0108", "delete_state constant index is out of range", instruction.span));
+                        }
+                        if (instruction.destination != 0U || instruction.operand_a != 0U ||
+                            instruction.operand_b != 0U) {
+                            malformed_reserved();
+                        }
+                        break;
+                    default: break;
                 }
             }
             for (const auto &region : function.exception_regions) {

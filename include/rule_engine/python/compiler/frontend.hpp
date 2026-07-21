@@ -22,6 +22,7 @@ namespace rule_engine::python::compiler {
         model,
         callable,
         unknown,
+        tuple,
     };
 
     struct StaticType {

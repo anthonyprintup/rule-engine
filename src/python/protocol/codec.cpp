@@ -2995,7 +2995,7 @@ namespace rule_engine::python::protocol_v2 {
                     if (tag->field == 2) {
                         result.sequence = *number;
                     } else if (tag->field == 3) {
-                        if (*number > static_cast<std::uint8_t>(ProtocolErrorCode::persistence_error)) {
+                        if (*number > static_cast<std::uint8_t>(ProtocolErrorCode::timed_out)) {
                             return std::unexpected(
                                 codec_error(ProtocolErrorCode::malformed, "NACK reason is invalid", reader.offset));
                         }

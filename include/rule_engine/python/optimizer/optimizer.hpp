@@ -21,6 +21,8 @@ namespace rule_engine::python::optimizer {
         certificate_executable_mismatch,
         certificate_semantic_hash_mismatch,
         contradictory_certificate,
+        noncanonical_certificate,
+        certificate_prefix_out_of_bounds,
     };
 
     struct OptimizerError {
@@ -35,6 +37,8 @@ namespace rule_engine::python::optimizer {
         duplicate_certificate,
         certificate_semantic_hash_mismatch,
         contradictory_certificate,
+        certificate_noncanonical,
+        certificate_prefix_out_of_bounds,
         certificate_not_transitively_pure,
         certificate_may_fault,
         certificate_recorder_observable,
@@ -44,6 +48,7 @@ namespace rule_engine::python::optimizer {
         certificate_calls_services,
         certificate_emits_effects,
         certificate_has_logical_reads,
+        certificate_has_no_pure_prefix,
         no_transform_requested,
         no_applicable_transform,
     };
@@ -54,6 +59,8 @@ namespace rule_engine::python::optimizer {
         bool request_specialization {true};
         bool request_pruning {true};
         bool full_flight_recorder_armed {};
+        // Binds certified prefix exits to the exact verified bytecode body.
+        std::uint32_t exact_instruction_count {};
     };
 
     struct OptimizationSelection {
@@ -69,10 +76,9 @@ namespace rule_engine::python::optimizer {
 
     // A certificate is bound to both an executable and its platform-independent
     // semantic hash. A mismatch is an activation error, not an optimization miss.
-    [[nodiscard]] std::expected<void, OptimizerError>
-    validate_optimization_certificate(const OptimizationCertificate &certificate,
-                                      const ExecutableId &expected_executable,
-                                      std::string_view expected_executable_semantic_hash);
+    [[nodiscard]] std::expected<void, OptimizerError> validate_optimization_certificate(
+        const OptimizationCertificate &certificate, const ExecutableId &expected_executable,
+        std::string_view expected_executable_semantic_hash, std::uint32_t exact_instruction_count);
 
     // Missing, inconsistent, or conservatively unsafe evidence selects exact
     // bytecode. Only a malformed caller request fails selection.
@@ -86,6 +92,18 @@ namespace rule_engine::python::optimizer {
         SchemaId schema;
         FactTerminalStatus status {FactTerminalStatus::failed};
         SourceSpan span;
+        DataLabel label;
+        std::string value_digest;
+    };
+
+    // Reached provider results are distinct from tentative physical prefetch.
+    // Only results made visible at a VM logical-read boundary belong here.
+    struct FactReadObservation {
+        std::uint64_t sequence {};
+        std::string subject_key_digest;
+        FactRoute route;
+        SchemaId schema;
+        FactTerminalStatus status {FactTerminalStatus::failed};
         DataLabel label;
         std::string value_digest;
     };
@@ -117,20 +135,24 @@ namespace rule_engine::python::optimizer {
 
     struct ShadowExecutionSnapshot {
         EvaluationResult evaluation;
+        std::vector<FactReadObservation> fact_reads;
         std::vector<LogicalReadObservation> logical_reads;
         std::vector<RecorderEvent> recorder;
         SemanticResourceCounters resources;
+        DiagnosticSet diagnostics;
     };
 
     enum struct ShadowParityDimension : std::uint8_t {
         outcome,
         verdict,
+        fact_reads,
         logical_reads,
         ordered_effects,
         state,
         recorder,
         fault,
-        semantic_resources,
+        budgets,
+        diagnostics,
     };
 
     // This deliberately contains no compared values. Counts and an optional
@@ -143,7 +165,7 @@ namespace rule_engine::python::optimizer {
         std::optional<std::size_t> first_difference_index;
     };
 
-    inline constexpr std::size_t maximum_shadow_mismatch_records = 8;
+    inline constexpr std::size_t maximum_shadow_mismatch_records = 12;
 
     struct ShadowParityLimits {
         std::size_t maximum_mismatch_records {maximum_shadow_mismatch_records};

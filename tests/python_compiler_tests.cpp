@@ -4,10 +4,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#ifndef RULE_ENGINE_PACKAGING_WORKER_SCRIPT
-#define RULE_ENGINE_PACKAGING_WORKER_SCRIPT ""
-#endif
-
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
@@ -30,6 +26,10 @@ namespace {
 
     namespace packaging = rule_engine::python::packaging;
     namespace vm = rule_engine::python::vm;
+
+#ifndef RULE_ENGINE_COMPILER_TEST_WORKER_SCRIPT
+#define RULE_ENGINE_COMPILER_TEST_WORKER_SCRIPT ""
+#endif
 
     constexpr std::string_view source_name = "rules.main";
 
@@ -57,7 +57,7 @@ namespace {
                 {
                     .pack = PackId {"com.example.rules"},
                     .version = PackVersion {"1.0.0"},
-                    .compiler_abi = "python-3.14.6/static-compiler-v1",
+                    .compiler_abi = std::string {python_static_compiler_abi_v1},
                     .budget_profile = "balanced.v1",
                     .entry_modules = {"rules.main"},
                     .dependency_digests = {},
@@ -139,18 +139,18 @@ namespace {
 #endif
     }
 
-    struct ExactRuntimeFixture {
+    struct SharedRuntime {
         std::optional<packaging::PrivatePythonRuntime> runtime;
         std::filesystem::path temporary_parent;
         std::string unavailable_reason;
         std::string staging_failure;
 
-        ExactRuntimeFixture() = default;
-        ExactRuntimeFixture(const ExactRuntimeFixture &) = delete;
-        ExactRuntimeFixture &operator=(const ExactRuntimeFixture &) = delete;
-        ExactRuntimeFixture(ExactRuntimeFixture &&) noexcept = default;
+        SharedRuntime() = default;
+        SharedRuntime(const SharedRuntime &) = delete;
+        SharedRuntime &operator=(const SharedRuntime &) = delete;
+        SharedRuntime(SharedRuntime &&) noexcept = default;
 
-        ~ExactRuntimeFixture() {
+        ~SharedRuntime() {
             if (!temporary_parent.empty()) {
                 std::error_code ignored;
                 std::filesystem::remove_all(temporary_parent, ignored);
@@ -158,44 +158,47 @@ namespace {
         }
     };
 
-    ExactRuntimeFixture exact_runtime() {
-        ExactRuntimeFixture result;
-        const auto root_text = environment_value("RULE_ENGINE_TEST_PYTHON_RUNTIME_ROOT");
-        const auto archive_text = environment_value("RULE_ENGINE_TEST_PYTHON_RUNTIME_ARCHIVE");
-        if (!root_text || !archive_text || root_text->empty() || archive_text->empty()) {
-            result.unavailable_reason = "exact CPython 3.14.6 test artifact was not configured";
+    SharedRuntime &shared_runtime() {
+        static SharedRuntime state = [] {
+            SharedRuntime result;
+            const auto root_text = environment_value("RULE_ENGINE_TEST_PYTHON_RUNTIME_ROOT");
+            const auto archive_text = environment_value("RULE_ENGINE_TEST_PYTHON_RUNTIME_ARCHIVE");
+            if (!root_text || !archive_text || root_text->empty() || archive_text->empty()) {
+                result.unavailable_reason = "exact CPython 3.14.6 test artifact was not configured";
+                return result;
+            }
+            std::error_code filesystem_error;
+            if (!std::filesystem::is_directory(*root_text, filesystem_error) || filesystem_error ||
+                !std::filesystem::is_regular_file(*archive_text, filesystem_error) || filesystem_error) {
+                result.unavailable_reason = "exact CPython 3.14.6 test artifact is absent";
+                return result;
+            }
+            const auto temporary_root = std::filesystem::temp_directory_path(filesystem_error);
+            if (filesystem_error) {
+                result.unavailable_reason = "cannot resolve the test temporary directory";
+                return result;
+            }
+            const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+            result.temporary_parent = temporary_root / ("rule-engine-python-compiler-" + std::to_string(nonce));
+            if (!std::filesystem::create_directory(result.temporary_parent, filesystem_error) || filesystem_error) {
+                result.unavailable_reason = "cannot create the compiler test runtime staging directory";
+                result.temporary_parent.clear();
+                return result;
+            }
+            const auto staged = packaging::stage_exact_private_runtime(packaging::PythonRuntimeStageRequest {
+                .artifact_archive = *archive_text,
+                .extracted_distribution = *root_text,
+                .destination = result.temporary_parent / "python-3.14.6",
+                .worker_script = RULE_ENGINE_COMPILER_TEST_WORKER_SCRIPT,
+            });
+            if (!staged) {
+                result.staging_failure = staged.error().message;
+                return result;
+            }
+            result.runtime = *staged;
             return result;
-        }
-        std::error_code filesystem_error;
-        if (!std::filesystem::is_directory(*root_text, filesystem_error) || filesystem_error ||
-            !std::filesystem::is_regular_file(*archive_text, filesystem_error) || filesystem_error) {
-            result.unavailable_reason = "exact CPython 3.14.6 test artifact is absent";
-            return result;
-        }
-        const auto temporary_root = std::filesystem::temp_directory_path(filesystem_error);
-        if (filesystem_error) {
-            result.unavailable_reason = "cannot resolve the test temporary directory";
-            return result;
-        }
-        const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
-        result.temporary_parent = temporary_root / ("rule-engine-python-compiler-" + std::to_string(nonce));
-        if (!std::filesystem::create_directory(result.temporary_parent, filesystem_error) || filesystem_error) {
-            result.unavailable_reason = "cannot create the test runtime staging directory";
-            result.temporary_parent.clear();
-            return result;
-        }
-        const auto staged = packaging::stage_exact_private_runtime(packaging::PythonRuntimeStageRequest {
-            .artifact_archive = *archive_text,
-            .extracted_distribution = *root_text,
-            .destination = result.temporary_parent / "python-3.14.6",
-            .worker_script = RULE_ENGINE_PACKAGING_WORKER_SCRIPT,
-        });
-        if (!staged) {
-            result.staging_failure = staged.error().message;
-            return result;
-        }
-        result.runtime = *staged;
-        return result;
+        }();
+        return state;
     }
 
     struct QueueLauncher final: packaging::WorkerLauncher {
@@ -218,6 +221,59 @@ namespace {
             return result;
         }
     };
+
+    std::vector<std::byte> as_bytes(const std::string_view text) {
+        const auto raw = std::as_bytes(std::span {text.data(), text.size()});
+        return {raw.begin(), raw.end()};
+    }
+
+    std::string as_text(const std::span<const std::byte> bytes) {
+        return {reinterpret_cast<const char *>(bytes.data()), bytes.size()};
+    }
+
+    bool replace_once(std::string &text, const std::string_view needle, const std::string_view replacement) {
+        const auto position = text.find(needle);
+        if (position == std::string::npos) {
+            return false;
+        }
+        text.replace(position, needle.size(), replacement);
+        return true;
+    }
+
+    std::expected<packaging::WorkerResponse, packaging::PackagingError>
+    exact_worker_response(const packaging::PrivatePythonRuntime &runtime, const std::filesystem::path &temporary_root,
+                          const VerifiedRulePack &rule_pack) {
+        const auto &source = rule_pack.sources.front();
+        packaging::WindowsJobWorkerLauncher launcher;
+        launcher.temporary_root = temporary_root;
+        packaging::WorkerClient client {.runtime = runtime, .launcher = launcher, .limits = {}};
+        return client.invoke(packaging::WorkerRequest {
+            .protocol = packaging::python_worker_protocol_v1,
+            .request_id = RequestId {"compiler-json-test"},
+            .mode = packaging::WorkerMode::static_parse,
+            .runtime = packaging::official_windows_cpython_3146(),
+            .payload =
+                packaging::OpaqueWorkerPayload {
+                    .schema = std::string {packaging::static_source_schema_v1},
+                    .source = source.id,
+                    .source_digest = source.digest,
+                    .bytes = as_bytes(source.utf8),
+                },
+            .hash_seed = 0U,
+            .generator_execution_authorized = false,
+        });
+    }
+
+    std::expected<CompiledPack, DiagnosticSet> compile_exact_source(const packaging::PrivatePythonRuntime &runtime,
+                                                                    const std::filesystem::path &temporary_root,
+                                                                    std::string source, const std::string &executable) {
+        packaging::WindowsJobWorkerLauncher launcher;
+        launcher.temporary_root = temporary_root;
+        packaging::WorkerClient client {.runtime = runtime, .launcher = launcher, .limits = {}};
+        WorkerAstEnvelopeProvider provider {client};
+        StaticPackCompiler compiler {provider};
+        return compiler.compile(pack(std::move(source)), {}, OperatorBindings {binding(executable)});
+    }
 
     std::vector<std::string> diagnostic_signatures(const DiagnosticSet &diagnostics) {
         std::vector<std::string> result;
@@ -293,6 +349,35 @@ namespace {
         };
     }
 
+    std::vector<AstNode> direct_fact_rule_nodes() {
+        return {
+            node(1, "Module",
+                 {field("body", ast_sequence({ast_reference(2)})), field("type_ignores", ast_sequence({}))}),
+            node(2, "FunctionDef",
+                 {field("name", ast_string("unsigned")), field("args", ast_reference(3)),
+                  field("body", ast_sequence({ast_reference(10)})),
+                  field("decorator_list", ast_sequence({ast_reference(4)})), field("returns", ast_reference(7))}),
+            node(3, "arguments",
+                 {field("posonlyargs", ast_sequence({})), field("args", ast_sequence({ast_reference(8)})),
+                  field("vararg", ast_none()), field("kwonlyargs", ast_sequence({})),
+                  field("kw_defaults", ast_sequence({})), field("kwarg", ast_none()),
+                  field("defaults", ast_sequence({}))}),
+            node(4, "Call",
+                 {field("func", ast_reference(5)), field("args", ast_sequence({ast_reference(6)})),
+                  field("keywords", ast_sequence({}))}),
+            node(5, "Name", {field("id", ast_string("rule"))}),
+            node(6, "Constant", {field("value", ast_string("com.example.unsigned"))}),
+            node(7, "Name", {field("id", ast_string("bool"))}),
+            node(8, "arg", {field("arg", ast_string("process")), field("annotation", ast_reference(9))}),
+            node(9, "Name", {field("id", ast_string("Process"))}),
+            node(10, "Return", {field("value", ast_reference(11))}),
+            node(11, "UnaryOp", {field("op", ast_reference(14)), field("operand", ast_reference(12))}),
+            node(12, "Attribute", {field("value", ast_reference(13)), field("attr", ast_string("is_signed"))}),
+            node(13, "Name", {field("id", ast_string("process"))}),
+            node(14, "Not", {}),
+        };
+    }
+
     TEST_CASE("AST envelope is bounded, versioned, and source-bound") {
         const auto rule_pack = pack();
         const auto payload = encode_ast_envelope(envelope(constant_rule_nodes(false)));
@@ -321,8 +406,53 @@ namespace {
         REQUIRE(oversized.error().front().code == "PY-AST-LIMIT");
     }
 
-    TEST_CASE("static pack compiler consumes the exact worker payload contract") {
-        auto runtime = exact_runtime();
+    TEST_CASE("static pack compiler consumes the exact worker payload contract", "[compiler-vm-progress]") {
+        if (!shared_runtime().runtime) {
+            if (!shared_runtime().staging_failure.empty()) {
+                FAIL_CHECK(shared_runtime().staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << shared_runtime().unavailable_reason);
+            return;
+        }
+        const auto rule_pack = pack("@rule(\"com.example.constant\")\n"
+                                    "def constant_rule() -> bool:\n"
+                                    "    return False\n");
+        packaging::WindowsJobWorkerLauncher launcher;
+        launcher.temporary_root = shared_runtime().temporary_parent;
+        packaging::WorkerClient client {.runtime = *shared_runtime().runtime, .launcher = launcher, .limits = {}};
+        WorkerAstEnvelopeProvider provider {client};
+        StaticPackCompiler compiler {provider};
+
+        const OperatorBindings bindings {binding("com.example.constant")};
+        const auto compiled = compiler.compile(rule_pack, {}, bindings);
+        INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
+        REQUIRE(compiled.has_value());
+        CHECK(compiled->compiler_abi == python_static_compiler_abi_v1);
+        REQUIRE(compiled->functions.size() == 1U);
+        const auto &function = compiled->functions.front();
+        REQUIRE(function.id == ExecutableId {"com.example.constant"});
+        REQUIRE(function.instructions.size() == 2U);
+        REQUIRE(function.instructions[0].opcode == Opcode::load_const);
+        REQUIRE(function.instructions[1].opcode == Opcode::return_value);
+
+        auto bounded_invocation = invocation();
+        bounded_invocation.budget.normal.elapsed = std::chrono::seconds {1};
+        bounded_invocation.budget.normal.instructions = function.instructions.size();
+        bounded_invocation.budget.normal.loop_iterations_and_yields = 0U;
+        auto session = vm::RegisterVmSession::create(*compiled, bounded_invocation);
+        REQUIRE(session.has_value());
+        REQUIRE((*session)->counters().instructions == 0U);
+        const auto completed = (*session)->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        REQUIRE(completed.result->verdict == false);
+        REQUIRE((*session)->counters().instructions == function.instructions.size());
+        REQUIRE((*session)->counters().loop_iterations_and_yields == 0U);
+    }
+
+    TEST_CASE("exact worker AST JSON rejects noncanonical and adversarial envelopes deterministically") {
+        auto &runtime = shared_runtime();
         if (!runtime.runtime) {
             if (!runtime.staging_failure.empty()) {
                 FAIL_CHECK(runtime.staging_failure);
@@ -331,54 +461,420 @@ namespace {
             WARN("SKIPPED: " << runtime.unavailable_reason);
             return;
         }
-        const auto rule_pack = pack();
-        const auto ast_payload = encode_ast_envelope(envelope(constant_rule_nodes(false)));
-        REQUIRE(ast_payload.has_value());
-        const auto response_frame = packaging::encode_worker_response_frame(packaging::WorkerResponse {
-            .protocol = packaging::python_worker_protocol_v1,
-            .request_id = RequestId {"compiler-ast:1:0"},
-            .mode = packaging::WorkerMode::static_parse,
-            .runtime_version = packaging::official_windows_cpython_3146().python_version,
-            .runtime_artifact_sha256 = packaging::official_windows_cpython_3146().artifact_sha256,
-            .status = packaging::WorkerResponseStatus::ok,
-            .payload =
-                packaging::OpaqueWorkerPayload {
-                    .schema = std::string {packaging::static_ast_schema_v1},
-                    .source = SourceId {std::string {source_name}},
-                    .source_digest = rule_pack.sources.front().digest,
-                    .bytes = *ast_payload,
-                },
-        });
-        REQUIRE(response_frame.has_value());
+        const auto rule_pack = pack("@rule(\"com.example.constant\")\n"
+                                    "def constant_rule() -> bool:\n"
+                                    "    return False\n");
+        const auto response = exact_worker_response(*runtime.runtime, runtime.temporary_parent, rule_pack);
+        REQUIRE(response.has_value());
+        const auto &source = rule_pack.sources.front();
+        const auto decoded =
+            decode_worker_ast_json(response->payload.bytes, rule_pack, source, response->payload.source_digest);
+        INFO((decoded.has_value() ? std::string {} : diagnostic_text(decoded.error())));
+        REQUIRE(decoded.has_value());
 
-        QueueLauncher launcher;
-        launcher.results.push_back(packaging::WorkerProcessResult {
-            .exit_code = 0,
-            .crashed = false,
-            .timed_out = false,
-            .output_limited = false,
-            .process_tree_terminated = true,
-            .stdout_bytes = *response_frame,
-            .stderr_excerpt = {},
-        });
+        const auto canonical = as_text(response->payload.bytes);
+        const auto reject = [&](const std::string_view name, std::string mutated, const std::string_view code) {
+            INFO(name);
+            const auto result = decode_worker_ast_json(as_bytes(mutated), rule_pack, source, source.digest);
+            REQUIRE_FALSE(result.has_value());
+            REQUIRE(result.error().front().code == code);
+        };
+
+        auto wrong_schema = canonical;
+        REQUIRE(replace_once(wrong_schema, "\"schema\":\"rule-engine.ast/1\"", "\"schema\":\"rule-engine.ast/2\""));
+        reject("wrong schema", std::move(wrong_schema), "PY-AST-VERSION");
+
+        auto duplicate_top_level = canonical;
+        REQUIRE(replace_once(duplicate_top_level, "\"format\":1", "\"format\":1,\"format\":1"));
+        reject("duplicate top-level field", std::move(duplicate_top_level), "PY-AST-JSON-FIELD");
+
+        auto out_of_order = canonical;
+        REQUIRE(replace_once(out_of_order, "\"format\":1,\"schema\":\"rule-engine.ast/1\"",
+                             "\"schema\":\"rule-engine.ast/1\",\"format\":1"));
+        reject("out-of-order top-level field", std::move(out_of_order), "PY-AST-JSON-FIELD");
+
+        auto unknown_node_field = canonical;
+        REQUIRE(replace_once(unknown_node_field, "\"fields\":{\"body\":", "\"fields\":{\"unexpected\":null,\"body\":"));
+        reject("unknown node field", std::move(unknown_node_field), "PY-AST-JSON-FIELD");
+
+        auto duplicate_node_field = canonical;
+        REQUIRE(replace_once(duplicate_node_field, "\"fields\":{\"body\":", "\"fields\":{\"body\":null,\"body\":"));
+        reject("duplicate node field", std::move(duplicate_node_field), "PY-AST-JSON-FIELD");
+
+        auto oversized_name = canonical;
+        const auto long_field = "\"fields\":{\"" + std::string(129U, 'x') + "\":null,";
+        REQUIRE(replace_once(oversized_name, "\"fields\":{", long_field));
+        reject("oversized field name", std::move(oversized_name), "PY-AST-LIMIT");
+
+        auto excessive_depth = canonical;
+        const auto nested = "\"type_ignores\":" + std::string(maximum_ast_depth + 8U, '[') + "null" +
+                            std::string(maximum_ast_depth + 8U, ']');
+        REQUIRE(replace_once(excessive_depth, "\"type_ignores\":[]", nested));
+        reject("excessive nesting", std::move(excessive_depth), "PY-AST-DEPTH");
+
+        auto huge_span_number = canonical;
+        REQUIRE(
+            replace_once(huge_span_number, "\"col\":0", "\"col\":999999999999999999999999999999999999999999999999"));
+        reject("overflowing span number", std::move(huge_span_number), "PY-AST-LIMIT");
+
+        auto huge_token_number = canonical;
+        REQUIRE(replace_once(huge_token_number, "\"end\":[0,0]",
+                             "\"end\":[999999999999999999999999999999999999999999999999,0]"));
+        reject("overflowing token number", std::move(huge_token_number), "PY-AST-LIMIT");
+
+        auto invalid_base64 = canonical;
+        const auto base64 = invalid_base64.find("\"wtf8_base64\":\"");
+        REQUIRE(base64 != std::string::npos);
+        const auto value_begin = base64 + std::string_view {"\"wtf8_base64\":\""}.size();
+        REQUIRE(value_begin < invalid_base64.size());
+        invalid_base64[value_begin] = '*';
+        reject("invalid tagged string", std::move(invalid_base64), "PY-AST-JSON");
+
+        auto invalid_wtf8 = canonical;
+        const auto wtf8 = invalid_wtf8.find("\"wtf8_base64\":\"");
+        REQUIRE(wtf8 != std::string::npos);
+        const auto wtf8_begin = wtf8 + std::string_view {"\"wtf8_base64\":\""}.size();
+        const auto wtf8_end = invalid_wtf8.find('"', wtf8_begin);
+        REQUIRE(wtf8_end != std::string::npos);
+        invalid_wtf8.replace(wtf8_begin, wtf8_end - wtf8_begin, "_w");
+        reject("invalid WTF-8 string", std::move(invalid_wtf8), "PY-AST-STRING");
+
+        auto wrong_worker = canonical;
+        REQUIRE(replace_once(wrong_worker, "\"unicode\":\"16.0.0\"", "\"unicode\":\"15.1.0\""));
+        reject("wrong worker identity", std::move(wrong_worker), "PY-AST-RUNTIME");
+
+        auto truncated = canonical;
+        truncated.pop_back();
+        reject("truncated envelope", std::move(truncated), "PY-AST-JSON");
+
+        const auto digest_mismatch =
+            decode_worker_ast_json(response->payload.bytes, rule_pack, source, SourceDigest {"sha256:mismatch"});
+        REQUIRE_FALSE(digest_mismatch.has_value());
+        REQUIRE(digest_mismatch.error().front().code == "PY-AST-SOURCE");
+
+        const std::vector<std::byte> oversized(maximum_ast_payload_bytes + 1U);
+        const auto oversized_result = decode_worker_ast_json(oversized, rule_pack, source, source.digest);
+        REQUIRE_FALSE(oversized_result.has_value());
+        REQUIRE(oversized_result.error().front().code == "PY-AST-LIMIT");
+    }
+
+    TEST_CASE("exact worker fact rule compiles and resumes through the register VM") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+        const auto rule_pack = pack("from rule_engine import Model, provider_fact, rule\n"
+                                    "\n"
+                                    "class Process(Model):\n"
+                                    "    is_signed: bool = provider_fact(route=\"process.is_signed\")\n"
+                                    "\n"
+                                    "@rule(\"com.example.unsigned\")\n"
+                                    "def unsigned(process: Process) -> bool:\n"
+                                    "    return not process.is_signed\n");
+        packaging::WindowsJobWorkerLauncher launcher;
+        launcher.temporary_root = runtime.temporary_parent;
         packaging::WorkerClient client {.runtime = *runtime.runtime, .launcher = launcher, .limits = {}};
         WorkerAstEnvelopeProvider provider {client};
         StaticPackCompiler compiler {provider};
 
-        const OperatorBindings bindings {binding("com.example.constant")};
+        const OperatorBindings bindings {binding("com.example.unsigned")};
         const auto compiled = compiler.compile(rule_pack, {}, bindings);
         INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
         REQUIRE(compiled.has_value());
         REQUIRE(compiled->functions.size() == 1U);
-        REQUIRE(compiled->functions.front().id == ExecutableId {"com.example.constant"});
-        REQUIRE(launcher.calls == 1U);
+        const auto &function = compiled->functions.front();
+        REQUIRE(function.parameter_count == 1U);
+        REQUIRE(function.register_count == 3U);
+        REQUIRE(function.instructions.size() == 3U);
+        CHECK(function.instructions[0].opcode == Opcode::await_fact);
+        CHECK(function.instructions[0].destination == 1U);
+        CHECK(function.instructions[0].operand_a == 0U);
+        CHECK(function.instructions[0].immediate == 0U);
+        CHECK(function.instructions[1].opcode == Opcode::unary_op);
+        CHECK(function.instructions[1].destination == 2U);
+        CHECK(function.instructions[1].operand_a == 1U);
+        CHECK(function.instructions[1].immediate == 0U);
+        CHECK(function.instructions[2].opcode == Opcode::return_value);
+        CHECK(function.instructions[2].destination == 2U);
+        CHECK(function.instructions[2].operand_a == 2U);
+
+        auto session = vm::RegisterVmSession::create(*compiled, invocation());
+        REQUIRE(session.has_value());
+        const auto waiting = (*session)->step({});
+        REQUIRE(waiting.state == VmStepState::waiting_for_facts);
+        REQUIRE(waiting.fact_requests.size() == 1U);
+        const auto still_waiting = (*session)->step({});
+        REQUIRE(still_waiting.state == VmStepState::waiting_for_facts);
+        REQUIRE(still_waiting.fact_requests.empty());
+
+        HostResponses response;
+        response.facts.push_back(FactResponse {
+            .request_id = waiting.fact_requests.front().request_id,
+            .subject = waiting.fact_requests.front().subject,
+            .status = FactTerminalStatus::value,
+            .value = make_fact(false),
+            .diagnostic = std::nullopt,
+        });
+        const auto completed = (*session)->step(std::move(response));
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        REQUIRE(completed.result->verdict == true);
+    }
+
+    TEST_CASE("exact worker lowers fresh container displays and subscription mutation into verified bytecode",
+              "[compiler-vm-progress]") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+        const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                   "from rule_engine import rule\n"
+                                                   "\n"
+                                                   "@rule(\"com.example.containers\")\n"
+                                                   "def containers() -> bool:\n"
+                                                   "    values = [1, 2]\n"
+                                                   "    values[0] = values[1]\n"
+                                                   "    pair = (values[0], 3)\n"
+                                                   "    mapping = {\"answer\": pair[0]}\n"
+                                                   "    return mapping[\"answer\"] == 2\n",
+                                                   "com.example.containers");
+        INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
+        REQUIRE(compiled.has_value());
+        REQUIRE(compiled->functions.size() == 1U);
+        const auto &function = compiled->functions.front();
+        const auto has_opcode = [&](const Opcode opcode) {
+            return std::ranges::any_of(function.instructions,
+                                       [&](const Instruction &instruction) { return instruction.opcode == opcode; });
+        };
+        CHECK(has_opcode(Opcode::build_list));
+        CHECK(has_opcode(Opcode::build_tuple));
+        CHECK(has_opcode(Opcode::build_dict));
+        CHECK(has_opcode(Opcode::load_subscript));
+        CHECK(has_opcode(Opcode::store_subscript));
+        REQUIRE(verify_bytecode(*compiled).has_value());
+
+        for (const auto &instruction : function.instructions) {
+            if (instruction.opcode == Opcode::build_list || instruction.opcode == Opcode::build_tuple) {
+                CHECK(instruction.operand_a <= function.register_count);
+                CHECK(instruction.operand_b <= function.register_count - instruction.operand_a);
+            }
+            if (instruction.opcode == Opcode::build_dict) {
+                CHECK(instruction.operand_a <= function.register_count);
+                CHECK(instruction.operand_b <= (function.register_count - instruction.operand_a) / 2U);
+            }
+        }
 
         auto session = vm::RegisterVmSession::create(*compiled, invocation());
         REQUIRE(session.has_value());
         const auto completed = (*session)->step({});
         REQUIRE(completed.state == VmStepState::complete);
         REQUIRE(completed.result.has_value());
-        REQUIRE(completed.result->verdict == false);
+        CHECK(completed.result->verdict == true);
+
+        const auto first_build = std::ranges::find(function.instructions, Opcode::build_list, &Instruction::opcode);
+        REQUIRE(first_build != function.instructions.end());
+        auto bounded = invocation();
+        bounded.budget.normal.instructions =
+            static_cast<std::uint64_t>(std::distance(function.instructions.begin(), first_build)) + 1U;
+        auto budgeted = vm::RegisterVmSession::create(*compiled, bounded);
+        REQUIRE(budgeted.has_value());
+        const auto heap_before = (*budgeted)->heap_stats();
+        const auto faulted = (*budgeted)->step({});
+        REQUIRE(faulted.state == VmStepState::faulted);
+        REQUIRE(faulted.result.has_value());
+        REQUIRE(faulted.result->fault.has_value());
+        CHECK(faulted.result->fault->frames.front().code == "PYVM4003");
+        CHECK((*budgeted)->counters().instructions == bounded.budget.normal.instructions);
+        CHECK((*budgeted)->heap_stats().live_objects == heap_before.live_objects);
+        CHECK((*budgeted)->heap_stats().live_bytes == heap_before.live_bytes);
+
+        auto malformed = *compiled;
+        const auto malformed_build =
+            std::ranges::find(malformed.functions.front().instructions, Opcode::build_list, &Instruction::opcode);
+        REQUIRE(malformed_build != malformed.functions.front().instructions.end());
+        malformed_build->operand_a = malformed.functions.front().register_count;
+        malformed_build->operand_b = 1U;
+        CHECK_FALSE(verify_bytecode(malformed).has_value());
+    }
+
+    TEST_CASE("exact worker lowers deterministic for else break and continue with charged iterator edges",
+              "[compiler-vm-progress]") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+        const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                   "from rule_engine import rule\n"
+                                                   "\n"
+                                                   "@rule(\"com.example.loops\")\n"
+                                                   "def loops() -> bool:\n"
+                                                   "    total = 0\n"
+                                                   "    for value in [1, 2, 3]:\n"
+                                                   "        if value == 2:\n"
+                                                   "            continue\n"
+                                                   "        total = total + value\n"
+                                                   "    else:\n"
+                                                   "        total = total + 10\n"
+                                                   "    for value in []:\n"
+                                                   "        total = 0\n"
+                                                   "    else:\n"
+                                                   "        total = total + 1\n"
+                                                   "    for value in {\"x\": 1, \"y\": 2}:\n"
+                                                   "        if value == \"x\":\n"
+                                                   "            total = total + 4\n"
+                                                   "            break\n"
+                                                   "    else:\n"
+                                                   "        total = 0\n"
+                                                   "    return total == 19\n",
+                                                   "com.example.loops");
+        INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
+        REQUIRE(compiled.has_value());
+        REQUIRE(compiled->functions.size() == 1U);
+        const auto &function = compiled->functions.front();
+        CHECK(std::ranges::count(function.instructions, Opcode::get_iter, &Instruction::opcode) == 3);
+        CHECK(std::ranges::count(function.instructions, Opcode::iter_next, &Instruction::opcode) == 3);
+        REQUIRE(verify_bytecode(*compiled).has_value());
+        for (const auto &instruction : function.instructions) {
+            if (instruction.opcode == Opcode::iter_next) {
+                CHECK(instruction.immediate < function.instructions.size());
+            }
+        }
+
+        auto session = vm::RegisterVmSession::create(*compiled, invocation());
+        REQUIRE(session.has_value());
+        const auto completed = (*session)->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        CHECK(completed.result->verdict == true);
+        CHECK((*session)->counters().loop_iterations_and_yields == 4U);
+
+        auto bounded = invocation();
+        bounded.budget.normal.loop_iterations_and_yields = 3U;
+        auto budgeted = vm::RegisterVmSession::create(*compiled, bounded);
+        REQUIRE(budgeted.has_value());
+        const auto faulted = (*budgeted)->step({});
+        REQUIRE(faulted.state == VmStepState::faulted);
+        REQUIRE(faulted.result.has_value());
+        REQUIRE(faulted.result->fault.has_value());
+        CHECK(faulted.result->fault->frames.front().code == "PYVM4006");
+        CHECK((*budgeted)->counters().loop_iterations_and_yields == 3U);
+
+        auto malformed = *compiled;
+        const auto malformed_next =
+            std::ranges::find(malformed.functions.front().instructions, Opcode::iter_next, &Instruction::opcode);
+        REQUIRE(malformed_next != malformed.functions.front().instructions.end());
+        malformed_next->immediate = static_cast<std::uint32_t>(malformed.functions.front().instructions.size());
+        CHECK_FALSE(verify_bytecode(malformed).has_value());
+    }
+
+    TEST_CASE("exact worker dictionary lowering faults before evaluating a later entry") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+        const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                   "from rule_engine import rule\n"
+                                                   "\n"
+                                                   "def later_entry() -> int:\n"
+                                                   "    raise \"later dictionary entry was evaluated\"\n"
+                                                   "\n"
+                                                   "@rule(\"com.example.dict-fault-order\")\n"
+                                                   "def dictionary_fault_order() -> bool:\n"
+                                                   "    mapping = {[]: True, later_entry(): True}\n"
+                                                   "    return False\n",
+                                                   "com.example.dict-fault-order");
+        INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
+        REQUIRE(compiled.has_value());
+        auto session = vm::RegisterVmSession::create(*compiled, invocation());
+        REQUIRE(session.has_value());
+        const auto faulted = (*session)->step({});
+        REQUIRE(faulted.state == VmStepState::faulted);
+        REQUIRE(faulted.result.has_value());
+        REQUIRE(faulted.result->fault.has_value());
+        REQUIRE_FALSE(faulted.result->fault->frames.empty());
+        CHECK(faulted.result->fault->frames.front().code == "PYVM2001");
+        CHECK(faulted.result->fault->frames.front().message.find("unhashable map key") != std::string::npos);
+        CHECK(faulted.result->fault->frames.front().message.find("later dictionary entry") == std::string::npos);
+    }
+
+    TEST_CASE("exact worker keeps state deletion and comprehension prerequisites fail closed") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+
+        SECTION("state delete requires StateKey and injected capability lowering") {
+            const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                       "from rule_engine import State, StateKey, rule\n"
+                                                       "\n"
+                                                       "@rule(\"com.example.state-delete\")\n"
+                                                       "def clear(state: State, key: StateKey[bool]) -> bool:\n"
+                                                       "    state.delete(key)\n"
+                                                       "    return True\n",
+                                                       "com.example.state-delete");
+            REQUIRE_FALSE(compiled.has_value());
+            CHECK(std::ranges::any_of(compiled.error(), [](const Diagnostic &diagnostic) {
+                return diagnostic.code == "PY-NYI-STATE-LOWERING" &&
+                       diagnostic.message.find("StateKey") != std::string::npos &&
+                       diagnostic.message.find("delete_state") != std::string::npos;
+            }));
+        }
+
+        SECTION("comprehensions require a bounded result builder and scope model") {
+            const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                       "from rule_engine import rule\n"
+                                                       "\n"
+                                                       "@rule(\"com.example.comprehension\")\n"
+                                                       "def comprehension() -> bool:\n"
+                                                       "    return [value for value in [True]][0]\n",
+                                                       "com.example.comprehension");
+            REQUIRE_FALSE(compiled.has_value());
+            CHECK(std::ranges::any_of(compiled.error(), [](const Diagnostic &diagnostic) {
+                return diagnostic.code == "PY-NYI-COMPREHENSION-LOWERING";
+            }));
+        }
+
+        SECTION("ordinary item deletion is not miscompiled as persistent state deletion") {
+            const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                       "from rule_engine import rule\n"
+                                                       "\n"
+                                                       "@rule(\"com.example.item-delete\")\n"
+                                                       "def item_delete() -> bool:\n"
+                                                       "    values = [True]\n"
+                                                       "    del values[0]\n"
+                                                       "    return True\n",
+                                                       "com.example.item-delete");
+            REQUIRE_FALSE(compiled.has_value());
+            CHECK(std::ranges::any_of(compiled.error(), [](const Diagnostic &diagnostic) {
+                return diagnostic.code == "PY-NYI-DELETE-LOWERING" &&
+                       diagnostic.message.find("state.delete") != std::string::npos;
+            }));
+        }
     }
 
     TEST_CASE("UTF-8 source spans are byte offsets and never split a code point") {
@@ -551,12 +1047,64 @@ namespace {
         REQUIRE(verify_compiler_output(*artifact).has_value());
     }
 
+    TEST_CASE("compiled direct subject fact rule resumes to a verdict in the real register VM",
+              "[compiler-vm-progress]") {
+        const auto rule_pack = pack();
+        const auto payload = encode_ast_envelope(envelope(direct_fact_rule_nodes()));
+        REQUIRE(payload.has_value());
+
+        const OperatorBindings bindings {binding("com.example.unsigned")};
+        const auto artifact = StaticCompiler {}.compile(rule_pack, *payload, {}, bindings);
+        INFO((artifact.has_value() ? std::string {} : diagnostic_text(artifact.error())));
+        REQUIRE(artifact.has_value());
+        const auto &function = artifact->pack.functions.front();
+        REQUIRE(function.parameter_count == 1U);
+        REQUIRE(function.register_count == 3U);
+        REQUIRE(function.instructions.size() == 3U);
+        REQUIRE(function.instructions[0].opcode == Opcode::await_fact);
+        REQUIRE(function.instructions[0].destination == 1U);
+        REQUIRE(function.instructions[0].operand_a == 0U);
+        REQUIRE(function.instructions[1].opcode == Opcode::unary_op);
+        REQUIRE(function.instructions[1].destination == 2U);
+        REQUIRE(function.instructions[1].operand_a == 1U);
+        REQUIRE(function.instructions[2].opcode == Opcode::return_value);
+        REQUIRE(function.instructions[2].operand_a == 2U);
+
+        auto bounded_invocation = invocation();
+        bounded_invocation.budget.normal.elapsed = std::chrono::seconds {1};
+        bounded_invocation.budget.normal.instructions = function.instructions.size();
+        bounded_invocation.budget.normal.loop_iterations_and_yields = 0U;
+        auto session = vm::RegisterVmSession::create(artifact->pack, bounded_invocation);
+        INFO((session.has_value() ? std::string {} : diagnostic_text(session.error())));
+        REQUIRE(session.has_value());
+        REQUIRE((*session)->counters().instructions == 0U);
+        const auto waiting = (*session)->step({});
+        REQUIRE(waiting.state == VmStepState::waiting_for_facts);
+        REQUIRE(waiting.fact_requests.size() == 1U);
+        REQUIRE((*session)->counters().instructions == 1U);
+
+        HostResponses response;
+        response.facts.push_back(FactResponse {
+            .request_id = waiting.fact_requests.front().request_id,
+            .subject = waiting.fact_requests.front().subject,
+            .status = FactTerminalStatus::value,
+            .value = make_fact(false),
+            .diagnostic = std::nullopt,
+        });
+        const auto completed = (*session)->step(std::move(response));
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        REQUIRE(completed.result->verdict == true);
+        REQUIRE((*session)->counters().instructions == function.instructions.size());
+        REQUIRE((*session)->counters().loop_iterations_and_yields == 0U);
+    }
+
     TEST_CASE("compiler operand constants are accepted by the real register VM") {
         CompiledPack compiled {
             .pack = PackId {"com.example.interop"},
             .version = PackVersion {"1.0.0"},
             .source_digest = SourceDigest {"sha256:interop"},
-            .compiler_abi = "python-3.14.6/static-compiler-v1",
+            .compiler_abi = std::string {python_static_compiler_abi_v1},
             .semantic_hash = "fnv1a64:interop",
             .schemas = {},
             .constants =
@@ -882,7 +1430,7 @@ namespace {
         REQUIRE(first->pack.schemas.canonical_hash == second->pack.schemas.canonical_hash);
     }
 
-    TEST_CASE("recursively constant list and dictionary displays become frozen constants") {
+    TEST_CASE("recursively constant list and dictionary displays allocate fresh VM containers") {
         auto nodes = constant_rule_nodes(false);
         const auto decorators = std::ranges::find(nodes[1].fields, "decorator_list", &AstField::name);
         const auto returns = std::ranges::find(nodes[1].fields, "returns", &AstField::name);
@@ -909,14 +1457,17 @@ namespace {
         const auto artifact_diagnostics = artifact ? std::string {} : diagnostic_text(artifact.error());
         INFO(artifact_diagnostics);
         REQUIRE(artifact.has_value());
-        REQUIRE(artifact->pack.constants.size() == 1U);
-        const auto *list = std::get_if<FactList>(&artifact->pack.constants.front().node->data);
-        REQUIRE(list != nullptr);
-        REQUIRE(list->items.size() == 2U);
-        REQUIRE(std::holds_alternative<FactMap>(list->items.back().node->data));
+        REQUIRE(artifact->pack.constants.size() == 3U);
+        REQUIRE(artifact->pack.functions.size() == 1U);
+        const auto &instructions = artifact->pack.functions.front().instructions;
+        CHECK(std::ranges::count(instructions, Opcode::load_const, &Instruction::opcode) == 3);
+        CHECK(std::ranges::count(instructions, Opcode::build_dict, &Instruction::opcode) == 1);
+        CHECK(std::ranges::count(instructions, Opcode::build_list, &Instruction::opcode) == 1);
+        REQUIRE(artifact->pack.optimization_certificates.size() == 1U);
+        CHECK(artifact->pack.optimization_certificates.front().may_fault);
     }
 
-    TEST_CASE("unsupported F0 constructs fail with precise stable diagnostics") {
+    TEST_CASE("bounded collection control flow lowers while remaining F0 gaps fail precisely") {
         SECTION("subscription") {
             auto nodes = constant_rule_nodes(false);
             nodes[8] = node(9, "Subscript", {field("value", ast_reference(10)), field("slice", ast_reference(11))});
@@ -925,10 +1476,12 @@ namespace {
             const auto payload = encode_ast_envelope(envelope(std::move(nodes)));
             REQUIRE(payload.has_value());
             const auto result = StaticCompiler {}.compile(pack(), *payload, {}, {});
-            REQUIRE_FALSE(result.has_value());
-            INFO(diagnostic_text(result.error()));
-            REQUIRE(std::ranges::any_of(
-                result.error(), [](const Diagnostic &item) { return item.code == "PY-NYI-SUBSCRIPT-LOWERING"; }));
+            INFO((result.has_value() ? std::string {} : diagnostic_text(result.error())));
+            REQUIRE(result.has_value());
+            REQUIRE(result->pack.functions.size() == 1U);
+            CHECK(std::ranges::any_of(result->pack.functions.front().instructions, [](const Instruction &instruction) {
+                return instruction.opcode == Opcode::load_subscript;
+            }));
         }
 
         SECTION("comprehension") {
@@ -959,9 +1512,12 @@ namespace {
             const auto payload = encode_ast_envelope(envelope(std::move(nodes)));
             REQUIRE(payload.has_value());
             const auto result = StaticCompiler {}.compile(pack(), *payload, {}, {});
-            REQUIRE_FALSE(result.has_value());
-            REQUIRE(std::ranges::any_of(
-                result.error(), [](const Diagnostic &item) { return item.code == "PY-NYI-ITERATION-LOWERING"; }));
+            INFO((result.has_value() ? std::string {} : diagnostic_text(result.error())));
+            REQUIRE(result.has_value());
+            REQUIRE(result->pack.functions.size() == 1U);
+            const auto &instructions = result->pack.functions.front().instructions;
+            CHECK(std::ranges::count(instructions, Opcode::get_iter, &Instruction::opcode) == 1);
+            CHECK(std::ranges::count(instructions, Opcode::iter_next, &Instruction::opcode) == 1);
         }
 
         SECTION("finally unwind") {
@@ -1058,6 +1614,23 @@ namespace {
         const auto uninitialized = verify_compiler_output(*artifact);
         REQUIRE_FALSE(uninitialized.has_value());
         REQUIRE(std::ranges::any_of(uninitialized.error(),
+                                    [](const Diagnostic &item) { return item.code == "PYC-UNINITIALIZED"; }));
+
+        artifact = StaticCompiler {}.compile(rule_pack, *payload, {}, {});
+        REQUIRE(artifact.has_value());
+        auto &iterator_function = artifact->pack.functions.front();
+        const auto span = iterator_function.instructions.front().span;
+        iterator_function.register_count = 4U;
+        iterator_function.instructions = {
+            {.opcode = Opcode::build_list, .destination = 1U, .operand_a = 0U, .operand_b = 0U, .span = span},
+            {.opcode = Opcode::get_iter, .destination = 2U, .operand_a = 1U, .span = span},
+            {.opcode = Opcode::iter_next, .destination = 3U, .operand_a = 2U, .immediate = 4U, .span = span},
+            {.opcode = Opcode::return_value, .operand_a = 3U, .span = span},
+            {.opcode = Opcode::return_value, .operand_a = 3U, .span = span},
+        };
+        const auto exhausted_value = verify_compiler_output(*artifact);
+        REQUIRE_FALSE(exhausted_value.has_value());
+        REQUIRE(std::ranges::any_of(exhausted_value.error(),
                                     [](const Diagnostic &item) { return item.code == "PYC-UNINITIALIZED"; }));
     }
 

@@ -6,6 +6,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -374,6 +375,299 @@ TEST_CASE("records and maps have canonical schema-checked boundaries") {
     CHECK(first_frozen->canonical_digest == second_frozen->canonical_digest);
 }
 
+TEST_CASE("container bytecode preserves nested mutation identity") {
+    auto pack = pack_with(
+        {text("items"), integer("0"), integer("7"), integer("-1")},
+        {function(
+            "rule.main", 12U,
+            {
+                instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                instruction(Opcode::load_const, 1U, 0U, 0U, 1U),
+                instruction(Opcode::build_list, 2U, 1U, 1U),
+                instruction(Opcode::build_tuple, 3U, 2U, 1U),
+                instruction(Opcode::move, 1U, 3U),
+                instruction(Opcode::build_dict, 4U, 0U, 1U),
+                instruction(Opcode::load_const, 5U, 0U, 0U, 3U),
+                instruction(Opcode::load_const, 6U, 0U, 0U, 2U),
+                instruction(Opcode::load_subscript, 7U, 4U, 0U),
+                instruction(Opcode::load_subscript, 8U, 7U, 5U),
+                instruction(Opcode::store_subscript, 6U, 8U, 5U),
+                instruction(Opcode::load_subscript, 9U, 4U, 0U),
+                instruction(Opcode::compare, 10U, 7U, 9U, static_cast<std::uint32_t>(CompareOperation::identity)),
+                instruction(Opcode::load_subscript, 9U, 9U, 5U),
+                instruction(Opcode::load_subscript, 9U, 9U, 5U),
+                instruction(Opcode::compare, 11U, 9U, 6U, static_cast<std::uint32_t>(CompareOperation::equal)),
+                instruction(Opcode::binary_op, 10U, 10U, 11U, static_cast<std::uint32_t>(BinaryOperation::bit_and)),
+                instruction(Opcode::return_value, 0U, 10U),
+            })});
+    auto session = start(pack);
+    const auto completed = session->step({});
+    REQUIRE(completed.state == VmStepState::complete);
+    REQUIRE(completed.result.has_value());
+    CHECK(completed.result->verdict == true);
+}
+
+TEST_CASE("dictionary keys use Python tuple and numeric equality while retaining insertion identity") {
+    auto pack = pack_with({make_fact(true), integer("1"), make_fact(false)},
+                          {function("rule.main", 10U,
+                                    {
+                                        instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                                        instruction(Opcode::build_tuple, 1U, 0U, 1U),
+                                        instruction(Opcode::load_const, 2U, 0U, 0U, 2U),
+                                        instruction(Opcode::build_dict, 3U, 1U, 1U),
+                                        instruction(Opcode::load_const, 4U, 0U, 0U, 1U),
+                                        instruction(Opcode::build_tuple, 5U, 4U, 1U),
+                                        instruction(Opcode::load_const, 6U, 0U, 0U, 0U),
+                                        instruction(Opcode::store_subscript, 6U, 3U, 5U),
+                                        instruction(Opcode::load_subscript, 7U, 3U, 1U),
+                                        instruction(Opcode::get_iter, 8U, 3U),
+                                        instruction(Opcode::iter_next, 9U, 8U, 0U, 14U),
+                                        instruction(Opcode::iter_next, 9U, 8U, 0U, 14U),
+                                        instruction(Opcode::load_const, 7U, 0U, 0U, 2U),
+                                        instruction(Opcode::return_value, 0U, 7U),
+                                        instruction(Opcode::return_value, 0U, 7U),
+                                    })});
+    auto session = start(pack);
+    const auto completed = session->step({});
+    REQUIRE(completed.state == VmStepState::complete);
+    REQUIRE(completed.result.has_value());
+    CHECK(completed.result->verdict == true);
+    CHECK(session->counters().loop_iterations_and_yields == 1U);
+}
+
+TEST_CASE("iterator bytecode loops in insertion order and branches explicitly on exhaustion") {
+    const auto make_loop_pack = [] {
+        return pack_with(
+            {integer("1"), integer("2"), integer("3"), integer("0"), integer("123"), integer("10")},
+            {function(
+                "rule.main", 9U,
+                {
+                    instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                    instruction(Opcode::load_const, 1U, 0U, 0U, 1U),
+                    instruction(Opcode::load_const, 2U, 0U, 0U, 2U),
+                    instruction(Opcode::build_list, 3U, 0U, 3U),
+                    instruction(Opcode::get_iter, 4U, 3U),
+                    instruction(Opcode::load_const, 5U, 0U, 0U, 3U),
+                    instruction(Opcode::load_const, 7U, 0U, 0U, 5U),
+                    instruction(Opcode::iter_next, 6U, 4U, 0U, 11U),
+                    instruction(Opcode::binary_op, 5U, 5U, 7U, static_cast<std::uint32_t>(BinaryOperation::multiply)),
+                    instruction(Opcode::binary_op, 5U, 5U, 6U, static_cast<std::uint32_t>(BinaryOperation::add)),
+                    instruction(Opcode::jump, 0U, 0U, 0U, 7U),
+                    instruction(Opcode::load_const, 7U, 0U, 0U, 4U),
+                    instruction(Opcode::compare, 8U, 5U, 7U, static_cast<std::uint32_t>(CompareOperation::equal)),
+                    instruction(Opcode::return_value, 0U, 8U),
+                })});
+    };
+
+    SECTION("complete loop") {
+        auto pack = make_loop_pack();
+        auto session = start(pack);
+        const auto completed = session->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        CHECK(completed.result->verdict == true);
+        CHECK(session->counters().loop_iterations_and_yields == 3U);
+    }
+
+    SECTION("loop budget is charged before iterator advancement") {
+        auto pack = make_loop_pack();
+        auto budget = balanced_v1;
+        budget.normal.loop_iterations_and_yields = 2U;
+        auto session = start(pack, invocation(budget));
+        const auto faulted = session->step({});
+        REQUIRE(faulted.state == VmStepState::faulted);
+        REQUIRE(faulted.result.has_value());
+        REQUIRE(faulted.result->fault.has_value());
+        CHECK(faulted.result->fault->frames.front().code == "PYVM4006");
+        CHECK(session->counters().loop_iterations_and_yields == 2U);
+    }
+
+    SECTION("empty iterator takes only the exhausted edge") {
+        auto pack = pack_with({make_fact(false), make_fact(true)},
+                              {function("rule.main", 4U,
+                                        {
+                                            instruction(Opcode::build_list, 0U, 0U, 0U),
+                                            instruction(Opcode::get_iter, 1U, 0U),
+                                            instruction(Opcode::iter_next, 2U, 1U, 0U, 4U),
+                                            instruction(Opcode::load_const, 3U, 0U, 0U, 0U),
+                                            instruction(Opcode::load_const, 3U, 0U, 0U, 1U),
+                                            instruction(Opcode::return_value, 0U, 3U),
+                                        })});
+        auto session = start(pack);
+        const auto completed = session->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        CHECK(completed.result->verdict == true);
+        CHECK(session->counters().loop_iterations_and_yields == 0U);
+    }
+}
+
+TEST_CASE("container bytecode rejects invalid keys indices and mutation during dictionary iteration") {
+    const auto require_fault = [](const CompiledPack &pack, const std::string_view code,
+                                  const std::string_view message) {
+        auto session = start(pack);
+        const auto faulted = session->step({});
+        REQUIRE(faulted.state == VmStepState::faulted);
+        REQUIRE(faulted.result.has_value());
+        REQUIRE(faulted.result->fault.has_value());
+        REQUIRE_FALSE(faulted.result->fault->frames.empty());
+        CHECK(faulted.result->fault->frames.front().code == code);
+        CHECK(faulted.result->fault->frames.front().message.find(message) != std::string::npos);
+    };
+
+    SECTION("out-of-range list index") {
+        require_fault(
+            pack_with({make_fact(true), integer("1")}, {function("rule.main", 4U,
+                                                                 {
+                                                                     instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                                                                     instruction(Opcode::build_list, 1U, 0U, 1U),
+                                                                     instruction(Opcode::load_const, 2U, 0U, 0U, 1U),
+                                                                     instruction(Opcode::load_subscript, 3U, 1U, 2U),
+                                                                     instruction(Opcode::return_value, 0U, 3U),
+                                                                 })}),
+            "PYVM2002", "index is out of range");
+    }
+
+    SECTION("non-integer list index") {
+        require_fault(
+            pack_with({make_fact(true), text("zero")}, {function("rule.main", 4U,
+                                                                 {
+                                                                     instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                                                                     instruction(Opcode::build_list, 1U, 0U, 1U),
+                                                                     instruction(Opcode::load_const, 2U, 0U, 0U, 1U),
+                                                                     instruction(Opcode::load_subscript, 3U, 1U, 2U),
+                                                                     instruction(Opcode::return_value, 0U, 3U),
+                                                                 })}),
+            "PYVM2001", "index must be an integer");
+    }
+
+    SECTION("tuple containing a list is unhashable") {
+        require_fault(pack_with({make_fact(true)}, {function("rule.main", 4U,
+                                                             {
+                                                                 instruction(Opcode::build_list, 0U, 0U, 0U),
+                                                                 instruction(Opcode::build_tuple, 1U, 0U, 1U),
+                                                                 instruction(Opcode::load_const, 2U, 0U, 0U, 0U),
+                                                                 instruction(Opcode::build_dict, 3U, 1U, 1U),
+                                                                 instruction(Opcode::return_value, 0U, 2U),
+                                                             })}),
+                      "PYVM2001", "unhashable map key");
+    }
+
+    SECTION("missing dictionary key") {
+        require_fault(pack_with({text("present"), make_fact(true), text("missing")},
+                                {function("rule.main", 5U,
+                                          {
+                                              instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                                              instruction(Opcode::load_const, 1U, 0U, 0U, 1U),
+                                              instruction(Opcode::build_dict, 2U, 0U, 1U),
+                                              instruction(Opcode::load_const, 3U, 0U, 0U, 2U),
+                                              instruction(Opcode::load_subscript, 4U, 2U, 3U),
+                                              instruction(Opcode::return_value, 0U, 4U),
+                                          })}),
+                      "PYVM2002", "map key was not found");
+    }
+
+    SECTION("dictionary size change invalidates its iterator") {
+        require_fault(pack_with({text("first"), make_fact(true), text("second")},
+                                {function("rule.main", 7U,
+                                          {
+                                              instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                                              instruction(Opcode::load_const, 1U, 0U, 0U, 1U),
+                                              instruction(Opcode::build_dict, 2U, 0U, 1U),
+                                              instruction(Opcode::get_iter, 3U, 2U),
+                                              instruction(Opcode::iter_next, 4U, 3U, 0U, 9U),
+                                              instruction(Opcode::load_const, 5U, 0U, 0U, 2U),
+                                              instruction(Opcode::load_const, 6U, 0U, 0U, 1U),
+                                              instruction(Opcode::store_subscript, 6U, 2U, 5U),
+                                              instruction(Opcode::jump, 0U, 0U, 0U, 4U),
+                                              instruction(Opcode::return_value, 0U, 1U),
+                                          })}),
+                      "PYVM2002", "dictionary changed size during iteration");
+    }
+}
+
+TEST_CASE("container allocation and iteration obey hard heap and suspension bounds") {
+    SECTION("container elements are instruction-precharged before allocation") {
+        auto pack = pack_with({make_fact(true), make_fact(false)},
+                              {function("rule.main", 3U,
+                                        {
+                                            instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                                            instruction(Opcode::load_const, 1U, 0U, 0U, 1U),
+                                            instruction(Opcode::build_list, 2U, 0U, 2U),
+                                            instruction(Opcode::return_value, 0U, 2U),
+                                        })});
+        auto budget = balanced_v1;
+        budget.normal.instructions = 3U;
+        auto session = start(pack, invocation(budget));
+        const auto heap_before = session->heap_stats();
+        const auto faulted = session->step({});
+        REQUIRE(faulted.state == VmStepState::faulted);
+        REQUIRE(faulted.result.has_value());
+        REQUIRE(faulted.result->fault.has_value());
+        CHECK(faulted.result->fault->frames.front().code == "PYVM4003");
+        CHECK(session->counters().instructions == 3U);
+        CHECK(session->heap_stats().live_objects == heap_before.live_objects);
+        CHECK(session->heap_stats().live_bytes == heap_before.live_bytes);
+    }
+
+    SECTION("empty container allocation is pre-charged") {
+        auto pack = pack_with({}, {function("rule.main", 1U,
+                                            {
+                                                instruction(Opcode::build_list, 0U, 0U, 0U),
+                                                instruction(Opcode::return_value, 0U, 0U),
+                                            })});
+        auto budget = balanced_v1;
+        budget.normal.heap_bytes = 1U;
+        auto session = start(pack, invocation(budget));
+        const auto faulted = session->step({});
+        REQUIRE(faulted.state == VmStepState::faulted);
+        REQUIRE(faulted.result.has_value());
+        REQUIRE(faulted.result->fault.has_value());
+        CHECK(faulted.result->fault->frames.front().code == "PYVM4004");
+        CHECK(session->counters().instructions == 1U);
+        CHECK(session->heap_stats().live_objects == 0U);
+    }
+
+    SECTION("fact suspension resumes the same live iterator") {
+        auto pack =
+            pack_with({integer("1"), integer("2"),
+                       make_fact_operand(FactRoute {.provider = "process", .fact = "enabled"}, SchemaId {"bool"})},
+                      {function("rule.main", 6U,
+                                {
+                                    instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                                    instruction(Opcode::load_const, 1U, 0U, 0U, 1U),
+                                    instruction(Opcode::build_list, 2U, 0U, 2U),
+                                    instruction(Opcode::get_iter, 3U, 2U),
+                                    instruction(Opcode::iter_next, 4U, 3U, 0U, 7U),
+                                    instruction(Opcode::await_fact, 5U, 4U, 0U, 2U),
+                                    instruction(Opcode::jump, 0U, 0U, 0U, 4U),
+                                    instruction(Opcode::return_value, 0U, 5U),
+                                })});
+        auto session = start(pack);
+        const auto waiting = session->step({});
+        REQUIRE(waiting.state == VmStepState::waiting_for_facts);
+        REQUIRE(waiting.fact_requests.size() == 1U);
+        CHECK(session->counters().loop_iterations_and_yields == 1U);
+
+        const auto still_waiting = session->step({});
+        CHECK(still_waiting.state == VmStepState::waiting_for_facts);
+        CHECK(still_waiting.fact_requests.empty());
+
+        HostResponses response;
+        response.facts.push_back(FactResponse {.request_id = waiting.fact_requests.front().request_id,
+                                               .subject = waiting.fact_requests.front().subject,
+                                               .status = FactTerminalStatus::value,
+                                               .value = make_fact(true),
+                                               .diagnostic = std::nullopt});
+        const auto completed = session->step(std::move(response));
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        CHECK(completed.result->verdict == true);
+        CHECK(session->logical_read_count() == 1U);
+        CHECK(session->counters().loop_iterations_and_yields == 2U);
+    }
+}
+
 TEST_CASE("fact suspension resumes the exact PC without duplicate reads or intents") {
     auto pack = pack_with(
         {
@@ -522,6 +816,86 @@ TEST_CASE("state reads suspend once validate boundaries and preserve read-your-w
     REQUIRE(complete.result->state_mutations.front().value.has_value());
     CHECK(frozen_boolean(*complete.result->state_mutations.front().value) == true);
     CHECK(session->logical_read_count() == 1U);
+}
+
+TEST_CASE("state deletion stages deterministic tombstones and rolls back transactionally") {
+    SECTION("read version is retained and the tombstone is visible to later reads") {
+        const auto pack = pack_with(
+            {make_state_operand("tenant", "enabled", SchemaId {"bool"}), make_fact(std::monostate {})},
+            {function("rule.main", 4U,
+                      {
+                          instruction(Opcode::read_state, 0U, 0U, 0U, 0U),
+                          instruction(Opcode::delete_state, 0U, 0U, 0U, 0U),
+                          instruction(Opcode::read_state, 1U, 0U, 0U, 0U),
+                          instruction(Opcode::load_const, 2U, 0U, 0U, 1U),
+                          instruction(Opcode::compare, 3U, 1U, 2U, static_cast<std::uint32_t>(CompareOperation::equal)),
+                          instruction(Opcode::return_value, 0U, 3U),
+                      })});
+        const auto execute = [&] {
+            auto session = start(pack);
+            const auto waiting = session->step({});
+            REQUIRE(waiting.state == VmStepState::yielded);
+            REQUIRE(waiting.state_requests.size() == 1U);
+            HostResponses response;
+            response.state.push_back(StateReadResponse {.request_id = waiting.state_requests.front().request_id,
+                                                        .value = canonical_frozen(make_fact(true)),
+                                                        .version = 7U,
+                                                        .diagnostic = std::nullopt});
+            const auto completed = session->step(std::move(response));
+            REQUIRE(completed.state == VmStepState::complete);
+            REQUIRE(completed.result.has_value());
+            REQUIRE(completed.result->verdict == true);
+            REQUIRE(completed.result->state_mutations.size() == 1U);
+            CHECK(session->logical_read_count() == 1U);
+            CHECK(session->counters().state_keys == 1U);
+            return completed.result->state_mutations.front();
+        };
+
+        const auto first = execute();
+        const auto second = execute();
+        CHECK(first.owner == second.owner);
+        CHECK(first.namespace_name == "tenant");
+        CHECK(first.namespace_name == second.namespace_name);
+        CHECK(first.key == "enabled");
+        CHECK(first.key == second.key);
+        CHECK(first.expected_version == 7U);
+        CHECK(first.expected_version == second.expected_version);
+        CHECK_FALSE(first.value.has_value());
+        CHECK_FALSE(second.value.has_value());
+    }
+
+    SECTION("explicit rollback removes a staged tombstone") {
+        auto pack = pack_with({make_state_operand("tenant", "enabled", SchemaId {"bool"}), make_fact(true)},
+                              {function("rule.main", 1U,
+                                        {
+                                            instruction(Opcode::begin_transaction),
+                                            instruction(Opcode::delete_state, 0U, 0U, 0U, 0U),
+                                            instruction(Opcode::rollback_transaction),
+                                            instruction(Opcode::load_const, 0U, 0U, 0U, 1U),
+                                            instruction(Opcode::return_value, 0U, 0U),
+                                        })});
+        auto session = start(pack);
+        const auto completed = session->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        CHECK(completed.result->verdict == true);
+        CHECK(completed.result->state_mutations.empty());
+        CHECK(session->state_mutation_count() == 0U);
+        CHECK(session->counters().state_keys == 1U);
+        CHECK(session->counters().state_bytes == 0U);
+    }
+
+    SECTION("malformed state operand is rejected when the session is created") {
+        const auto pack =
+            pack_with({text("not-a-state-operand")}, {function("rule.main", 1U,
+                                                               {
+                                                                   instruction(Opcode::delete_state, 0U, 0U, 0U, 0U),
+                                                                   instruction(Opcode::return_value, 0U, 0U),
+                                                               })});
+        const auto session = RegisterVmSession::create(pack, invocation());
+        REQUIRE_FALSE(session.has_value());
+        CHECK(std::ranges::any_of(session.error(), [](const auto &item) { return item.code == "PYVM0010"; }));
+    }
 }
 
 TEST_CASE("state responses fail closed on non-canonical digests and schemas") {

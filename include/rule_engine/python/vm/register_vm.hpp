@@ -21,6 +21,17 @@ namespace rule_engine::python::vm {
 
     // Instruction operand encoding used by the C++ compiler and the exact VM.
     // - load_const: immediate is the constant index.
+    // - build_list/build_tuple: destination receives a new container built from operand_b
+    //   consecutive registers beginning at operand_a; immediate is zero.
+    // - build_dict: destination receives a new insertion-ordered dictionary built from operand_b
+    //   key/value pairs in consecutive registers beginning at operand_a; immediate is zero.
+    // - get_iter: destination receives an iterator over operand_a; operand_b and immediate are zero.
+    // - iter_next: operand_a is an iterator. A produced item is stored in destination and execution
+    //   continues at the successor; exhaustion branches to the absolute instruction index in immediate.
+    //   operand_b is zero, and each produced item charges one loop iteration before advancing; a backward
+    //   jump targeting iter_next does not charge the same iteration again.
+    // - load_subscript: destination receives operand_a[operand_b]; immediate is zero.
+    // - store_subscript: operand_a[operand_b] is assigned from destination; immediate is zero.
     // - unary/binary/compare: immediate is the corresponding operation enum.
     // - call: immediate is the function index, operand_a is the first argument register,
     //   and operand_b is the argument count.
@@ -29,6 +40,7 @@ namespace rule_engine::python::vm {
     // - await_capability: immediate names a capability operand constant and operand_a is the argument register.
     // - read_state: immediate names a state operand constant.
     // - write_state: immediate names a state operand constant and operand_a is the value register.
+    // - delete_state: immediate names a state operand constant; all register operands are zero.
     // - append_effect: immediate names a Unicode effect-kind constant and operand_a is the payload register.
     [[nodiscard]] FactValue make_fact_operand(FactRoute route, SchemaId expected_schema);
     [[nodiscard]] FactValue make_capability_operand(CapabilityId capability, SchemaId request_schema,

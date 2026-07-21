@@ -427,8 +427,7 @@ namespace rule_engine::python::optimizer {
             return {};
         }
 
-        class WireWriter {
-        public:
+        struct WireWriter {
             explicit WireWriter(const std::size_t maximum): maximum_ {maximum} {}
 
             [[nodiscard]] std::expected<void, ScanWireError> append_raw(const std::string_view value) {
@@ -552,8 +551,7 @@ namespace rule_engine::python::optimizer {
             return result;
         }
 
-        class WireReader {
-        public:
+        struct WireReader {
             explicit WireReader(const std::string_view input): input_ {input}, offset_ {wire_magic.size()} {}
 
             [[nodiscard]] std::expected<std::string_view, ScanWireError> token() {

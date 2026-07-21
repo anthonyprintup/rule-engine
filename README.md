@@ -1,408 +1,185 @@
 # Rule Engine
 
-Rule Engine is a Windows-only C++23 rule engine for parsing, validating, lowering,
-and evaluating YARA rules against live process subjects. YARA syntax is parsed by a
-small Rust bridge over YARA-X, but rule semantics stay in C++.
+Rule Engine is a C++23 engine whose authoring language is a statically checked,
+resource-bounded subset of Python 3.14. The repository contains one rule
+language and one runtime path: there is no YARA compatibility frontend or
+translation layer.
 
-The core trust boundary is simple: the server owns all rule meaning and match
-decisions. Clients enumerate subjects and return typed facts or structured
-diagnostics. A client never evaluates conditions, predicates, or whole rules.
+C++ owns every security-relevant semantic decision. A short-lived, exact
+CPython 3.14.6 worker converts source into a bounded syntax envelope, but static
+rule modules are never imported or evaluated by CPython. The C++ compiler binds,
+type-checks, lowers, verifies, optimizes, and executes rules in a resumable VM.
+Remote agents enumerate typed subjects and return requested facts, scans,
+observations, or diagnostics; they never receive predicates or return verdicts.
 
-## Current Scope
+The full design, rationale, rejected alternatives, and known limitations are in
+[`docs/python-engine/`](docs/python-engine/README.md). The architecture documents
+describe the product target. [`IMPLEMENTATION_STATUS.md`](docs/python-engine/IMPLEMENTATION_STATUS.md)
+is the authoritative record of what the current tree has implemented and
+verified.
 
-- Parse YARA through the Rust `yara-x-parser` bridge.
-- Validate modules, fields, functions, globals, externals, rule references, and
-  unsupported expression shapes in C++.
-- Lower validated rules into deterministic debug-oriented IR and schedules.
-- Evaluate rules through a synchronous VM step function that pauses for missing
-  provider facts.
-- Evaluate pattern-set and boolean tuple `of` expressions, including numeric and
-  percentage quantifiers plus `at`/`in` anchors for pattern sets.
-- Evaluate built-in integer readers such as `uint8`, `uint16`, and `uint32`
-  inside the VM from provider-supplied scan-space bytes.
-- Request process, PE image, and fixture pattern facts through provider routes.
-- Exchange localhost v1 client/server messages with length-prefixed frames.
-- Emit machine-readable artifacts, readable dumps, diagnostics, and opt-in traces
-  with explicit schema identifiers.
+## Core invariants
 
-See [GOAL.md](GOAL.md) for the project target and
-[docs/V1_IMPLEMENTATION_STATUS.md](docs/V1_IMPLEMENTATION_STATUS.md) for the
-current implementation checklist. See
-[docs/RUST_BRIDGE_UPDATE.md](docs/RUST_BRIDGE_UPDATE.md) for the YARA-X bridge
-and cbindgen update workflow, and
-[docs/TRANSPORT_BOUNDARY.md](docs/TRANSPORT_BOUNDARY.md) for the localhost V1
-transport boundary.
+- Production rule packs are canonical, source-only archives authenticated by an
+  operator trust policy and Ed25519 signatures.
+- Static Python source is parsed as data in a private worker process and then
+  compiled by C++; CPython never supplies rule semantics.
+- Trusted generators may execute only after signature authorization, with
+  declared inputs, a cleared environment, exact runtime validation, bounded
+  framing, process-tree limits, and deterministic double-run validation.
+- Rule execution occurs only in the verified C++ register VM under a named,
+  immutable budget profile.
+- Values are typed, labeled, canonical, acyclic, and deep-frozen before crossing
+  provider, service, event, effect, or persistence boundaries.
+- Reached effects remain ordered and transactional. External actions originate
+  only from a committed durable outbox.
+- Protocol v2 uses TLS 1.3 mutual authentication, typed recursive subject
+  identities, leases, sequence fencing, and durable agent spooling.
+- Pack activation is generation-fenced so old and new semantics cannot own the
+  same work concurrently.
 
-## Execution Model
+## Authoring model
 
-The rule engine treats YARA rules as symbolic programs over facts. Parsing starts
-in the Rust `yara-x-parser` bridge, but the bridge only returns syntax. C++ then
-verifies imports, module fields, module functions, globals, rule references, and
-unsupported expression forms against `ModuleRegistry` descriptors.
+Rules use ordinary typed Python syntax over engine-provided declarations. For
+example:
 
-Descriptors are the contract between rule syntax and providers:
+```python
+from rule_engine import Identity, Model, Sensitive, provider_fact, rule
 
-- `FieldDescriptor` maps a visible field such as `process.pid` to a typed fact
-  key, provider route, TTL, request timeout, and prefetch cost hint.
-- `FunctionDescriptor` maps a visible function such as `demo.score(...)` to a
-  return type, argument types, provider route, TTL, request timeout, and a stable
-  fact-key prefix.
-- `GlobalDescriptor` maps bare external/global names to provider-backed facts.
 
-Verification lowers descriptor-backed expressions into requirements, not values.
-For example, `process.name` becomes a requirement for the `process.name` fact on
-`endpoint.process.snapshot`. A module function call remains symbolic until its
-arguments are evaluated; `demo.score(process.pid, "alpha")` first asks for
-`process.pid`, then derives a typed function fact key such as
-`demo.score(i:4242,s:616c706861)`. Provider key v1 tokens are ASCII and
-delimiter-safe: strings and bytes use lowercase hex payloads, floating-point
-values use their IEEE-754 bit pattern, arrays/objects recurse into nested
-argument tokens, and undefined is encoded explicitly as `u`.
+class Process(Model):
+    pid: Identity[int]
+    creation_time: Identity[int]
+    image_path: Sensitive[str]
+    is_signed: bool = provider_fact(route="process.signer.is_signed")
 
-The VM is synchronous and resumable. `Evaluator::step(subject)` either returns a
-complete set of rule results or returns `waiting_for_facts` with missing fact
-batches grouped by provider route. The caller sends those batches to a client,
-stores returned facts in the session `FactCache`, and calls `step` again. This
-keeps async I/O out of the VM while still allowing facts to arrive later from
-local or remote handlers. The scheduler prefetches descriptor facts marked as
-cheap, including deterministic module function facts whose arguments are
-statically known, then evaluates symbolically and requests expensive facts only
-when control flow reaches them. Pattern scan facts are treated as expensive so
-process/PE filters can short-circuit before a scan route is requested.
-Provider request timeouts and retry policy are descriptor-owned: each field,
-function, and global fact carries a timeout into the lowered requirement, and
-route batches use the maximum timeout among the facts grouped into that request.
-Descriptors may opt into retrying timed-out fact diagnostics for a bounded retry
-budget. If evaluation is cancelled before provider dispatch, the server
-synthesizes unavailable facts with the descriptor cancellation diagnostic instead
-of asking the client to decide anything about the rule.
 
-The optimizer extracts canonical descriptor-backed comparison predicates, builds
-shared predicate DAG candidate sets, derives lazy provider expansion plans,
-models generic candidate-provider subject sets, and reports exact-VM-only or
-unsafe-pruning shapes. `build_optimizer_plan` packages those pieces into a
-server-owned artifact with predicate nodes, safe order, exact-VM fallback notes,
-provider requirements, and generic candidate-provider requests.
-`evaluate_with_optimizer_plan` consumes that artifact for the optimized VM sweep
-path that runs exact VM only for surviving rule/subject pairs and synthesizes
-no-match results for pruned pairs. Developer trace/report artifacts and new
-optimizer experiments can still be opt-in, but the standard localhost
-client/server evaluation path is now optimized VM-backed by default. The exact
-baseline remains available for tests, benchmarks, and parity checks. The
-benchmark CLI can measure this path with `--simulate-optimizer-plan-prefilter`,
-including exact-VM work avoided, skip trace events, result mismatches, and
-incomplete subjects. When combined with `--simulate-candidate-provider`, the
-same plan-driven path consumes generic provider-scope subject sets before
-exact-VM final evaluation and falls back to server-side predicate evaluation
-when those results are unavailable.
-The v1 protocol also has generic candidate-provider request/response messages
-for route/filter/argument subject-set filters with status, diagnostics, and TTLs;
-these messages intentionally carry no rule identifiers. The localhost client
-session helpers can exchange those messages through built-in generic providers
-and optional candidate-provider handlers. The default localhost client advertises
-`endpoint.process.inventory` / `process.inventory.by_image_name`, backed only by
-`process.name` facts and generic matching subject ids. The default
-`evaluate_subjects_with_client` path uses optimized VM-backed evaluation, and
-`evaluate_subjects_with_optimizer_plan` uses those advertised
-filters before exact VM and only requests provider facts for rule/subject pairs
-that survive the server-owned optimizer plan. If a filter is not advertised, the
-client path skips that frame and rebuilds the same candidates from ordinary fact
-batches. Its optional instrumentation records candidate-provider request
-messages, requested filters, returned subject ids, skipped unadvertised filters,
-available broad results that cover every evaluated subject, and elapsed time
-beside the ordinary provider-fact counters. Optimized client sessions also
-expose the evaluated subjects, fact snapshot, and
-candidate-provider results needed to replay the same server-owned optimized
-sweep without live providers through `replay_optimized_client_evaluation`.
-The exact baseline comparison remains available for tests and benchmarks to
-prove parity with optimized VM-backed evaluation.
-
-Facts carry a subject id, key, typed `Value`, status, diagnostic text, and TTL.
-Available facts participate in expression evaluation. Unavailable or
-access-denied facts produce per-rule diagnostics and no-match results. Undefined
-values propagate with YARA-like semantics: boolean `and`/`or` treat undefined
-operands as false, while comparisons and string predicates return undefined when
-their operands are undefined.
-
-Clients are provider endpoints only. A localhost client advertises capabilities,
-enumerates subjects, receives fact-batch requests, and returns typed facts or
-structured diagnostics. It never evaluates predicates or decides rule matches.
-Built-in routes serve process snapshot facts, PE image header, section, import,
-export, debug-directory, resource, certificate-table, and TLS callback facts, and
-fixture-backed pattern facts. Custom C++ handlers can be bound for
-descriptor-backed module function routes while preserving the same trust
-boundary. After handshake, the server compares the verified program's required
-provider-route registry against the client's advertised capabilities before
-evaluation starts. Each emitted request is checked again before send; before
-facts enter the cache, available values are checked against the
-descriptor-derived expected type. The VM also rechecks descriptor-backed cached
-field/global/pattern facts and function return facts before consuming them, so
-manually populated or stale wrong-typed cache entries produce no-match
-diagnostics.
-
-## Custom Descriptor Configs
-
-`rule_engine_server --module-config <file>` loads extra descriptors before rule
-verification. The v1 text format is whitespace-delimited:
-
-```text
-module demo
-function score integer integer,string endpoint.demo.functions demo.score 30 false 12
+@rule("com.example.process.unsigned")
+def unsigned_process(process: Process) -> bool:
+    return not process.is_signed
 ```
 
-The function fields are: name, return type, comma-separated argument types or
-`-`, provider route, key prefix, TTL seconds, cheap-prefetch boolean, and
-optional timeout seconds. The same file format also accepts
-`field <key> <type> <route> <ttl> <cheap> [timeout]` inside a module and
-`global <name> <type> <key> <route> <ttl> <cheap> [timeout]`. Each descriptor
-line may then add `[retry-policy] [retry-budget] [cancel-diagnostic]`. The
-current retry policies are `none` and `timed_out`; cancellation diagnostics are
-single whitespace-delimited tokens, with `-` meaning the default diagnostic. If
-omitted, the descriptor timeout defaults to 5 seconds, retry policy defaults to
-`none`, retry budget defaults to 0, and the cancellation diagnostic defaults to a
-generic evaluator shutdown message.
+The decorator, annotations, model, identity fields, label, and provider route are
+static declarations. Unsupported dynamic Python constructs fail compilation
+with stable source diagnostics. The precise accepted subset is specified in
+[`02-authoring-language-and-types.md`](docs/python-engine/architecture/02-authoring-language-and-types.md),
+and the current compiler coverage and remaining gaps are listed in the
+implementation status.
 
-`rule_engine_client --custom-fact-fixture <file>` advertises configured custom
-routes and serves fixture facts for them:
+The complete source-only example is
+[`examples/python/unsigned_process/`](examples/python/unsigned_process/README.md).
+Versioned PEP 561 authoring and trusted-generator packages live under
+[`sdk/`](sdk/README.md).
 
-```text
-capability endpoint.demo.functions
-fact endpoint.demo.functions demo.score(i:42,s:616c706861) integer 9 30
-```
+## Python worker safety boundary
 
-Fact fixture fields are: route, provider key, value type, value token, and TTL
-seconds. String and bytes values are lowercase hex payloads. These fixture
-handlers are for local v1 demos and tests; they still only return typed facts.
+The private worker is an availability boundary, not a hostile-code sandbox.
+Static rule modules are never executed, which keeps ordinary rule authors
+outside the Python execution boundary. A generator does execute Python, so its
+signer must be explicitly trusted to authorize generation for that pack scope.
+Worker isolation, resource limits, import restrictions, and double-run checks
+reduce operational risk but do not make a malicious authorized generator safe.
 
-See `examples/custom_binding/` for a complete custom module example with a
-descriptor config, YARA rule, and client fact fixture. In two terminals, run the
-client first and then the server:
+If untrusted parties must be allowed to submit executable generators, run that
+operation inside a separately administered OS or container sandbox. Do not
+weaken the signer policy or treat the worker process controls as that sandbox.
 
-```powershell
-build\debug\rule_engine_client.exe --custom-fact-fixture examples\custom_binding\demo.facts
-build\debug\rule_engine_server.exe --module-config examples\custom_binding\demo.module --rule examples\custom_binding\demo_rule.yar
-```
+## Repository layout
 
-By default, `rule_engine_client` serves one localhost session and exits. Use
-`--max-sessions <n>` to serve a bounded number of sessions, or `--serve` to keep
-the local provider service running until it is stopped. Sessions are handled
-serially unless `--session-workers <n>` is set, which admits up to `n`
-concurrent localhost sessions before applying listener backpressure.
+- `include/rule_engine/python/` — public Python-engine C++ contracts.
+- `src/python/packaging/` — canonical packs, trust, exact runtime, and worker.
+- `src/python/compiler/` — syntax-envelope decoding, binding, typing, lowering,
+  and bytecode verification.
+- `src/python/vm/` — bounded values, resumable execution, structured tasks, and
+  faults.
+- `src/python/effects/` and `src/python/events/` — journals, services, replay,
+  labels, typed events, history, state, and correlation.
+- `src/python/optimizer/` — effect-aware planning and bounded RE2 scanning.
+- `src/python/protocol/` and `src/python/windows/` — protocol v2, secure
+  transport/spool, and typed Windows providers.
+- `src/python/cluster/` and `src/python/runtime/` — durable stores, fencing,
+  activation, coordination, and resident orchestration.
+- `src/python/tools/` — pack, check, admin, diagnostics, and redaction command
+  surfaces.
+- `sdk/`, `examples/python/`, and `docs/python-engine/` — authoring packages,
+  examples, and the durable specification.
+- `tests/python_*` — component and cross-component qualification.
 
-## Pattern Scan Configs
+## Supported deployment target
 
-`rule_engine_client --pattern-fixture <file>` accepts the original explicit
-fixture lines:
+- Windows 10 or Windows Server 2019 and newer, x64: server and agent.
+- glibc 2.35 or newer, x86-64: server only.
+- PostgreSQL 17 or newer: production runtime store.
+- SQLite: explicit single-process development and test store.
 
-```text
-$needle true 4096 6 fixture.process.memory rx 6e6565646c65
-```
+Windows is the locally qualified platform in the current tree. Linux and live
+PostgreSQL qualification remain visible gates until their evidence is recorded
+in the implementation status.
 
-It also accepts literal scan directives that scan configured bytes and return
-real `PatternValue` match metadata:
+## Build requirements
 
-```text
-scan $needle configured.file r-- 41416e6565646c655a5a 6e6565646c65
-```
-
-The scan fields are: pattern key, scan-space name, region permissions, haystack
-bytes as lowercase hex, and literal needle bytes as lowercase hex. File-backed
-scan directives read bytes from a configured file path, resolving relative paths
-against the fixture file:
-
-```text
-scan_file $needle file.bytes r-- sample.bin 6e6565646c65
-```
-
-The `scan_file` fields are: pattern key, scan-space name, region permissions,
-file path, and literal needle bytes as lowercase hex. The client only returns
-pattern facts such as `$needle.matches` and `$needle.pattern`; the server still
-evaluates all rule conditions.
-
-For rule-derived literal scan plans, configure only the scan space and let the
-server send the YARA string literal bytes in the fact request:
-
-```text
-scan_file_space file.bytes r-- sample.bin
-```
-
-When evaluating a rule such as `$needle = "needle" ascii`, the server attaches a
-scan plan for `$needle` to the `endpoint.scan.patterns` request. The client uses
-that literal to scan the configured space and returns ordinary pattern facts.
-When no explicit scan spaces are configured, the default Windows client adds a
-subject-scoped `process.image.bytes` scan space by reading each requested
-process subject's image file, so rules can match literals against process image
-bytes without duplicating those literals in client config.
-Rules that use built-in integer readers such as `uint32(0)` request the same
-`process.image.bytes` scan-space as a raw `bytes` fact; clients return bytes only,
-and the C++ VM performs the integer read and comparison.
-To scan mapped image sections instead of the whole image file, enable explicit
-section scan spaces in the pattern fixture file:
-
-```text
-scan_process_image_sections
-```
-
-For each requested process subject, the client parses the image's PE section
-table and returns matches from `process.image.section.<name>` scan spaces with
-`rwx`-style permissions derived from section characteristics.
-Readable process memory scan spaces are also explicit. Use the directive without
-arguments to scan committed readable regions, or pass a decimal base address and
-size to scope the scan:
-
-```text
-scan_readable_memory_regions
-scan_readable_memory_regions 140737488355328 4096
-```
-
-Matching chunks are returned as subject-scoped `process.memory.region.<address>`
-scan spaces with the Windows protection string as region permissions.
-
-## Rule Corpus
-
-`examples/rule_corpus/` contains a small checked corpus for the current YARA
-subset. The `supported_*.yar` files are expected to parse and verify with the
-default descriptors. The `unsupported_*.yar` files are expected to parse but fail
-semantic verification, documenting constructs that are intentionally outside the
-current implementation.
-
-## Repository Layout
-
-- `include/rule_engine/` - public C++ headers for the core engine and providers.
-- `src/` - compiler, evaluator, protocol, trace, provider, and CLI code.
-- `src/proto/` - v1 protocol schema.
-- `rust/yara_bridge/` - Rust YARA-X parser bridge and generated C++ ABI inputs.
-- `tests/` - Catch2 tests and YARA fixtures.
-- `examples/` - tested custom-binding and rule-corpus examples.
-- `docs/` - implementation notes, optimizer architecture, bridge/transport
-  guidance, and status tracking.
-
-## Requirements
-
-- Windows
 - CMake 3.31 or newer
 - Ninja
-- A C++23 compiler compatible with the MSVC frontend
-- Visual Studio C++ build environment
-- Rust and Cargo
+- a C++23 compiler
+- OpenSSL 3 or newer for TLS and Ed25519 operations
+- SQLite development support (Windows system SQLite is supported)
+- PostgreSQL 17 client development files for production-store builds
+- network access during first configure for pinned C++ dependencies, or a
+  pre-populated CMake dependency cache
 
-The Rust bridge uses `cbindgen` as a Cargo build dependency to generate the C++
-bridge header during the CMake build.
+Rust, Cargo, cbindgen, a YARA implementation, and a system Python installation
+are not build dependencies.
 
-## Build
-
-Run CMake from a Visual Studio developer environment:
+Configure and build from a developer environment:
 
 ```powershell
 cmake -S . -B build/debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/debug
 ```
 
-For Clang on Windows, pass `clang-cl` as the C and C++ compiler during
-configuration if it is not already selected by your environment.
-
-## Test
+Tests that exercise the real worker require the official CPython 3.14.6 Windows
+x64 embeddable archive and its extracted contents. Pass their explicit paths at
+configure time; the engine never falls back to a system interpreter:
 
 ```powershell
+cmake -S . -B build/debug -G Ninja `
+  -DRULE_ENGINE_TEST_PYTHON_RUNTIME_ARCHIVE=C:/cache/python-3.14.6-embed-amd64.zip `
+  -DRULE_ENGINE_TEST_PYTHON_RUNTIME_ROOT=C:/cache/python-3.14.6
+cmake --build build/debug
 ctest --test-dir build/debug --output-on-failure
 ```
 
-The test suite covers parser bridge conversion, semantic validation, VM behavior,
-scheduling, protocol framing/codecs, runtime orchestration, traces, and unattended
-abort behavior. Trace replay artifacts snapshot cached subject facts, including
-runtime-derived custom function facts, so replay does not need live providers.
-Debug IR artifacts use `rule-engine-debug-ir.v1`, schedule artifacts use
-`rule-engine-schedule.v1`, and evaluation trace artifacts use
-`rule-engine-evaluation-trace.v1`.
+Production builds should require the secure protocol dependencies rather than
+accepting dependency-unavailable stubs:
 
-## CLI Tools
+```powershell
+cmake -S . -B build/release -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DRULE_ENGINE_PROTOCOL_REQUIRE_SECURE_RUNTIME=ON
+```
 
-- `rule_engine_check` parses and validates rules.
-- `rule_engine_server` evaluates rules against process subjects through the v1
-  client protocol. Pass `--json` to emit structured JSON for both rule
-  evaluation and smoke fact round trips. Rule evaluation uses `optimized_vm` by
-  default, with exact VM retained as the final executor for surviving optimized
-  rule/subject pairs. Rule-evaluation JSON includes `executionMode`,
-  `optimizedVm` summary counters, per-subject `exactVmRuleIds` and
-  `prunedRuleIds`, replay drift counters, runtime provider/VM queue
-  instrumentation, actual/planned candidate-provider request counters, and
-  static-cache instrumentation; use
-  `--vm-backpressure-subject-threshold <n>` and
-  `--provider-backpressure-request-threshold <n>` to record threshold-crossing
-  scheduler pressure events.
-- `rule_engine_client` serves localhost provider facts for v1 smoke paths. Pass
-  `--max-sessions <n>` for bounded multi-session service mode, `--serve` for an
-  unbounded local service, and `--session-workers <n>` to cap concurrent session
-  workers.
-- `rule_engine_benchmark` runs synthetic baseline evaluator workloads and emits
-  JSON by default, including reproducibility metadata, enabled optimizer flags,
-  provider-round, provider-elapsed, fact, expression-evaluation, cache hit/miss,
-  cache lookup-probe counters, and opt-in optimizer predicate order observations
-  with cost class and observed selectivity. Pass `--format markdown` for a
-  readable report. Pass `--simulate-shared-predicate-dag` to keep baseline
-  exact-VM execution enabled while adding simulated shared-predicate prune, peak
-  candidate-set subject/byte, optimizer trace-event count,
-  nonselective-predicate, predicate-order, cost-class, and selectivity metrics.
-  Pass `--simulate-discovery-gates` to report pack-level discovery-gate counts,
-  evaluations, skips, and trace events; use `--scenario discovery_gate_empty_pack`
-  for an empty-pack gate workload.
-  Use `--scenario or_process_name --simulate-prefiltered-evaluation` for a
-  selective simple-OR workload that validates candidate-set union pruning and
-  baseline parity.
-  Use `--scenario broad_process_name` for a nonselective shared-predicate
-  workload where every subject survives the cheap process-name filter.
-  Use `--scenario empty_process_name_expensive_pe --simulate-lazy-provider-expansion`
-  to validate dropped branches and zero lazy expensive fact requests when no
-  subject survives a cheap filter.
-  Use `--scenario mixed_process_name_expensive_pe` for mixed cheap-first,
-  expensive-first, and exact-VM-only branches with an expensive PE-import leaf.
-  Use `--scenario production_scale_validation` for a scalable validation fixture
-  that combines selective shared predicates, broad nonselective filters,
-  expensive PE-import leaves, exact-VM-only `with` leaves, and benchmark metadata
-  for the acceptance target scale.
-  Pass `--simulate-lazy-provider-expansion` with a scenario such as
-  `shared_process_name_expensive_pe` to add simulated lazy provider
-  batch/request/avoidance metrics. Pass `--simulate-candidate-provider` to add
-  generic candidate-provider request, returned-subject, broad-result, and
-  fallback counters.
-  Use `--scenario candidate_provider_unavailable --simulate-candidate-provider`
-  to force server-side candidate reconstruction from per-subject facts when the
-  provider-scope filter is unavailable; optimizer trace records include the
-  generic filter key and provider diagnostic for that fallback.
-  Pass `--simulate-prefiltered-evaluation` to add exact-VM execution avoidance,
-  exact-VM skip trace-event, and baseline parity counters for the shared-DAG
-  candidate path. Pass `--simulate-optimizer-plan-prefilter` to benchmark the
-  opt-in `OptimizerPlan` sweep path directly, including plan-driven exact-VM
-  executions, avoided executions, skip trace events, result mismatches, and
-  incomplete subjects. Combine it with `--simulate-candidate-provider` and
-  `--simulate-lazy-provider-expansion` to measure generic provider-scope
-  candidate sets feeding the plan-driven exact-VM prefilter and avoided
-  expensive fact materialization. Use `--scenario global_gate_prefilter
-  --simulate-optimizer-plan-prefilter` to validate global-rule gating while
-  report counters stay scoped to reportable rules. Opt-in optimizer reports include a bounded
-  optimizer trace record section with event, predicate, source-span,
-  rule/subject, reason, and candidate-set fields for debugging. Pass
-  `--simulate-selectivity-feedback` with `selectivity_feedback_inventory` to
-  build a server-owned observed-selectivity profile from a warm-up shared-DAG
-  sweep and use it as a same-cost predicate-order tie-breaker. Pass
-  `--simulate-optimization-comparison`
-  with `production_scale_validation` to emit the default optimized VM acceptance
-  report with exact-baseline comparison counters for exact-VM executions,
-  expensive provider facts, expression evaluations, parity, replay drift, and
-  broad candidate-state boundedness. Pass
-  `--simulate-watchdogs` to add trace-only watchdog budget counters for broad
-  predicate selectivity and oversized lazy provider route batches without
-  enforcing cooldowns. Pass `--simulate-watchdog-enforcement` to add explicit
-  budget diagnostic counters for the first opt-in policy outcomes: deferred
-  broad-predicate branches and timed-out oversized route batches. Pass
-  `--simulate-static-fact-cache` to add
-  content-addressed static image fact cache reuse/invalidation counters without
-  changing VM/provider behavior. Pass `--simulate-scheduler-controls` to add
-  stress-tier jitter, queue, backpressure, deadline, and idle-state counters for
-  10,000 simulated clients without changing runtime scheduling.
+Exact runtime staging, install/package commands, and executable examples are
+documented with their shipped targets once those integration gates are present.
+Until then, consult the implementation status rather than inferring readiness
+from an architecture chapter.
 
-## Generated Files
+## Clean break from YARA
 
-Build outputs, Rust target artifacts, generated bridge headers, and IDE metadata
-are ignored. Regenerate them through the normal CMake/Cargo build flow instead of
-committing local build products.
+Existing YARA rules and protocol-v1 clients are intentionally incompatible.
+There is no parser fallback, feature flag, compatibility artifact, or automatic
+translator. Rewrite rules against the typed Python SDK and re-enroll agents for
+protocol v2. Historical design discussion may mention the removed system only
+to explain the clean-break decision; no live source, fixture, target, or runtime
+path supports it.
+
+## Design and operational references
+
+- [`GOAL.md`](GOAL.md) — product invariants and deployment target.
+- [`docs/python-engine/CONTRACTS.md`](docs/python-engine/CONTRACTS.md) — frozen
+  cross-component contracts.
+- [`docs/python-engine/LIMITATIONS.md`](docs/python-engine/LIMITATIONS.md) —
+  impacts, mitigations, observability, and revisit criteria.
+- [`docs/python-engine/decisions/`](docs/python-engine/decisions/) — accepted
+  architecture decisions and rejected alternatives.
+- [`docs/python-engine/architecture/10-verification-and-cutover.md`](docs/python-engine/architecture/10-verification-and-cutover.md)
+  — release qualification and removal gates.

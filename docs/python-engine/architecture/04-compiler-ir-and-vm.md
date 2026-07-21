@@ -260,6 +260,48 @@ There is no generic native-call opcode. Every modeled operation has a stable opc
 
 Bytecode uses fixed-width opcode headers and bounded variable-length operands. All indices are checked before use. Its encoding is versioned but not public: a cache entry with any ABI mismatch is discarded and recompiled.
 
+### 5.8 Implemented display, subscription, and synchronous-loop lowering
+
+The current compiler backend uses the following exact mappings for its bounded
+container/control-flow slice:
+
+- list/tuple displays evaluate children left to right, copy their results into
+  a contiguous register range, and emit `build_list`/`build_tuple`;
+- dictionary displays emit an empty `build_dict`, then evaluate one key and one
+  value and emit `store_subscript` before starting the next entry;
+- subscription reads emit `load_subscript`; one-target list/dictionary writes
+  emit `store_subscript` after evaluating the assignment RHS, container, and key
+  in that order; and
+- synchronous `for` evaluates its iterable once, emits `get_iter` once, and
+  uses one `iter_next` header whose fallthrough enters the body and whose
+  explicit exhaustion target enters `else`. Natural completion and `continue`
+  jump to the header; `break` targets the point after `else`.
+
+Dictionary construction is deliberately incremental even though `build_dict`
+can consume a contiguous key/value range. Python hashes and compares each key
+before evaluating the next entry. Deferring every insertion until all
+expressions had run would expose later effects or faults after an earlier
+unhashable key and would therefore be observably wrong.
+
+The verifier treats the two `iter_next` successors asymmetrically: the
+fallthrough initializes the loop-target register, while the exhaustion edge
+retains the incoming initialization state. It checks every container range,
+subscription operand, iterator register, and control-flow target. Consequently,
+a new loop target cannot be read after a possibly empty loop unless another path
+initializes it.
+
+Container build work is instruction-precharged before allocation. Empty
+dictionary allocation is charged before its first entry expression, each item
+store is a checked instruction, and iterator advance consumes the loop budget
+before changing iterator state. Budget failure therefore cannot partially
+allocate the charged list/tuple or advance past the last accounted iteration.
+
+This is an implementation slice, not a relaxation of the full typed-HIR design.
+Starred/`**` expansion, sets, slices, comprehensions, generator expressions,
+destructuring targets, item deletion, `range`, `async for`, arbitrary iterator
+protocols, and the source-level state API remain fail-closed until their typed
+scope, exception, replay, and charging contracts exist.
+
 ## 6. Independent bytecode verification
 
 The verifier is a separate component that consumes serialized bytecode rather than compiler-internal objects. Activation requires successful verification.

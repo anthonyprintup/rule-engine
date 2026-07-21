@@ -14,7 +14,7 @@
 
 namespace rule_engine::python::compiler {
 
-    inline constexpr std::string_view ast_envelope_media_type = "rule-engine.ast/1";
+    inline constexpr std::string_view ast_envelope_media_type = python_ast_schema_v1;
     inline constexpr std::uint16_t ast_envelope_protocol_major = 1;
     inline constexpr std::uint16_t ast_envelope_protocol_minor = 0;
     inline constexpr std::uint16_t python_grammar_major = 3;
@@ -90,5 +90,8 @@ namespace rule_engine::python::compiler {
 
     [[nodiscard]] std::expected<AstEnvelope, DiagnosticSet> decode_ast_envelope(std::span<const std::byte> payload,
                                                                                 const VerifiedRulePack &pack);
+    [[nodiscard]] std::expected<AstEnvelope, DiagnosticSet>
+    decode_worker_ast_json(std::span<const std::byte> payload, const VerifiedRulePack &pack, const SourceFile &source,
+                           const SourceDigest &payload_source_digest);
 
 } // namespace rule_engine::python::compiler
