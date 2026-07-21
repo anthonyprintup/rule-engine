@@ -1721,8 +1721,8 @@ namespace rule_engine::python::vm {
                 case PythonFaultKind::type_error: return VmErrorCode::type_error;
                 case PythonFaultKind::arithmetic_error: return VmErrorCode::arithmetic_error;
                 case PythonFaultKind::exception: return VmErrorCode::value_error;
+                default: return VmErrorCode::engine_fault;
             }
-            std::unreachable();
         }
 
         [[nodiscard]] static bool exception_matches(const PythonFaultKind filter,

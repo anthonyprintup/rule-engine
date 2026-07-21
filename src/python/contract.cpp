@@ -304,6 +304,7 @@ namespace rule_engine::python {
                     case Opcode::begin_transaction:
                     case Opcode::commit_transaction:
                     case Opcode::rollback_transaction: break;
+                    default: std::unreachable();
                 }
             }
             const auto instruction_count = function.instructions.size();
@@ -346,6 +347,7 @@ namespace rule_engine::python {
                                 bytecode_error("PYC0110", "cleanup regions must have distinct entry instructions"));
                         }
                         break;
+                    default: std::unreachable();
                 }
 
                 if (function.instructions[region.handler_instruction].opcode != Opcode::match_exception) {
@@ -472,6 +474,7 @@ namespace rule_engine::python {
                     case Opcode::delete_state:
                     case Opcode::load_current_exception: add(pc + 1U); break;
                     case Opcode::leave_except: add(pc + 1U); break;
+                    default: break;
                 }
             };
             for (std::uint32_t pc = 0U; pc < instruction_count; ++pc) {
