@@ -737,6 +737,13 @@ namespace rule_engine::python::protocol_v2 {
         return {};
     }
 
+    void PersistentAgentSession::disconnect() noexcept {
+        clear_in_flight();
+        control_.disconnect();
+        session_.reset();
+        credit_ = {};
+    }
+
     void PersistentAgentSession::clear_in_flight() noexcept { in_flight_.clear(); }
 
     void PersistentAgentSession::release(const std::uint64_t sequence) noexcept {

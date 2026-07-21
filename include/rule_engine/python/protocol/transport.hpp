@@ -3,10 +3,12 @@
 #include "rule_engine/python/protocol/codec.hpp"
 #include "rule_engine/python/protocol/session.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <memory>
 #include <optional>
+#include <stop_token>
 #include <string>
 
 namespace rule_engine::python::protocol_v2 {
@@ -33,6 +35,11 @@ namespace rule_engine::python::protocol_v2 {
 
     [[nodiscard]] TlsBackendStatus tls_backend_status() noexcept;
 
+    struct TransportOperation {
+        std::chrono::steady_clock::time_point deadline {std::chrono::steady_clock::time_point::max()};
+        std::stop_token cancellation;
+    };
+
     struct OpenSslTlsSession {
         OpenSslTlsSession(OpenSslTlsSession &&) noexcept;
         OpenSslTlsSession &operator=(OpenSslTlsSession &&) noexcept;
@@ -41,8 +48,13 @@ namespace rule_engine::python::protocol_v2 {
         ~OpenSslTlsSession();
 
         [[nodiscard]] std::expected<TlsPeerIdentity, ProtocolError> handshake() noexcept;
+        [[nodiscard]] std::expected<TlsPeerIdentity, ProtocolError>
+        handshake(const TransportOperation &operation) noexcept;
         [[nodiscard]] std::expected<void, ProtocolError> send(const PeerEnvelope &envelope) noexcept;
+        [[nodiscard]] std::expected<void, ProtocolError> send(const PeerEnvelope &envelope,
+                                                              const TransportOperation &operation) noexcept;
         [[nodiscard]] std::expected<PeerEnvelope, ProtocolError> receive() noexcept;
+        [[nodiscard]] std::expected<PeerEnvelope, ProtocolError> receive(const TransportOperation &operation) noexcept;
         [[nodiscard]] bool established() const noexcept;
         void shutdown() noexcept;
 
@@ -63,10 +75,13 @@ namespace rule_engine::python::protocol_v2 {
         [[nodiscard]] static std::expected<OpenSslTlsContext, ProtocolError>
         create(TlsConfiguration configuration) noexcept;
 
-        // The caller owns the connected blocking socket and must keep it open
-        // for the session lifetime. The value is SOCKET on Windows and fd on POSIX.
+        // The caller owns the connected socket and must keep it open for the session lifetime.
+        // Deadline/cancellation overloads require a nonblocking socket; network.hpp supplies one.
+        // The value is SOCKET on Windows and fd on POSIX.
         [[nodiscard]] std::expected<OpenSslTlsSession, ProtocolError>
         attach_connected_socket(std::intptr_t native_socket) const noexcept;
+        [[nodiscard]] bool valid() const noexcept;
+        [[nodiscard]] TlsEndpointRole role() const noexcept;
 
     private:
         struct Impl;

@@ -123,6 +123,7 @@ namespace rule_engine::python::protocol_v2 {
         explicit AgentSessionState(PeerId peer, std::string agent_epoch, AgentSpoolLimits limits = {});
 
         [[nodiscard]] std::expected<void, ProtocolError> establish(const ServerHelloMessage &hello);
+        void disconnect() noexcept;
         [[nodiscard]] std::expected<WorkAcceptance, ProtocolError> accept_work(const WorkLeaseMessage &work);
         [[nodiscard]] std::expected<std::vector<RequestId>, ProtocolError>
         accept_cancel(const CancelWorkMessage &cancel);

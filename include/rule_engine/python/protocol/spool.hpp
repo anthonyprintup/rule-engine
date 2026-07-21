@@ -76,9 +76,12 @@ namespace rule_engine::python::protocol_v2 {
         take_transmit_batch(std::size_t maximum_records = 256) noexcept;
         [[nodiscard]] std::expected<void, ProtocolError> acknowledge(const AckMessage &ack) noexcept;
         [[nodiscard]] std::expected<void, ProtocolError> reject(const NackMessage &nack) noexcept;
+        void disconnect() noexcept;
 
         [[nodiscard]] bool established() const noexcept { return session_.has_value(); }
         [[nodiscard]] bool backpressured() const noexcept { return spool_->backpressured(); }
+        [[nodiscard]] const std::string &agent_epoch() const noexcept { return spool_->agent_epoch(); }
+        [[nodiscard]] std::uint64_t next_sequence() const noexcept { return spool_->next_sequence(); }
 
     private:
         struct InFlight {

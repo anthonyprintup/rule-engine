@@ -2,6 +2,7 @@ add_library(
     rule_engine_python_protocol
     types.cpp
     codec.cpp
+    network.cpp
     provider_router.cpp
     session.cpp
     snapshot.cpp
@@ -15,6 +16,8 @@ target_link_libraries(
     PUBLIC
         rule_engine::python_contract
         rule_engine::project_options
+    PRIVATE
+        asio::asio
 )
 
 option(RULE_ENGINE_PROTOCOL_ENABLE_SECURE_RUNTIME "Build OpenSSL transport and SQLite agent spool backends" ON)
