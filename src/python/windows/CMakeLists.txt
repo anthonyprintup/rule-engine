@@ -28,6 +28,10 @@ add_executable(
     rule_engine_python_windows_provider_tests
     "${PROJECT_SOURCE_DIR}/tests/python_windows_provider_tests.cpp"
 )
+set_target_properties(
+    rule_engine_python_windows_provider_tests
+    PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+)
 target_link_libraries(
     rule_engine_python_windows_provider_tests
     PRIVATE

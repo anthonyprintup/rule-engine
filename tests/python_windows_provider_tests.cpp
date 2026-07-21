@@ -100,6 +100,9 @@ namespace {
         if constexpr (requires { space.identity; }) {
             space.identity = space.kind;
         }
+        if constexpr (requires { space.subject_generation; }) {
+            space.subject_generation = 1U;
+        }
     }
 
     template<typename Plan> void complete_scan_plan_metadata(Plan &plan) {

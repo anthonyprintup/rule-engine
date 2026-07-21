@@ -3,6 +3,21 @@ set(RE2_TEST OFF CACHE BOOL "Build RE2 tests" FORCE)
 set(RE2_BENCHMARK OFF CACHE BOOL "Build RE2 benchmarks" FORCE)
 set(RE2_INSTALL OFF CACHE BOOL "Install RE2" FORCE)
 set(RE2_USE_ICU OFF CACHE BOOL "Use ICU from RE2" FORCE)
+set(ABSL_BUILD_TESTING OFF CACHE BOOL "Build Abseil tests" FORCE)
+set(ABSL_ENABLE_INSTALL OFF CACHE BOOL "Install Abseil" FORCE)
+set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "Propagate the project C++ standard through Abseil" FORCE)
+if(WIN32)
+    set(ABSL_MSVC_STATIC_RUNTIME ON CACHE BOOL "Keep RE2 and Abseil behind the static-CRT bridge" FORCE)
+endif()
+if(NOT TARGET absl::base)
+    FetchContent_Declare(
+        rule_engine_abseil
+        SYSTEM
+        GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
+        GIT_TAG 76bb24329e8bf5f39704eb10d21b9a80befa7c81
+    )
+    FetchContent_MakeAvailable(rule_engine_abseil)
+endif()
 if(NOT TARGET re2::re2)
     FetchContent_Declare(
         rule_engine_re2
