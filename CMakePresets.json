@@ -7,180 +7,31 @@
   },
   "configurePresets": [
     {
-      "name": "windows-base",
-      "hidden": true,
-      "displayName": "Windows base",
-      "description": "Shared Ninja configuration for the Python-only rule engine.",
+      "name": "Debug",
       "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/${presetName}",
-      "installDir": "${sourceDir}/build/install/${presetName}",
-      "condition": {
-        "type": "equals",
-        "lhs": "${hostSystemName}",
-        "rhs": "Windows"
-      },
-      "cacheVariables": {
-        "CMAKE_EXPORT_COMPILE_COMMANDS": true,
-        "RULE_ENGINE_BUILD_FUZZERS": false,
-        "RULE_ENGINE_ENABLE_INSTALL_RULES": true,
-        "RULE_ENGINE_ENABLE_INSTALL_SMOKE_TEST": true,
-        "RULE_ENGINE_ENABLE_REAL_INSTALL_SMOKE_TEST": true,
-        "RULE_ENGINE_PROTOCOL_ENABLE_SECURE_RUNTIME": true,
-        "RULE_ENGINE_PROTOCOL_REQUIRE_SECURE_RUNTIME": true,
-        "RULE_ENGINE_PYTHON_RUNTIME_ALLOW_DOWNLOAD": false
-      }
-    },
-    {
-      "name": "windows-clangcl-debug",
-      "displayName": "Windows clang-cl Debug",
-      "description": "Developer build with all tests, install smoke coverage, OpenSSL, and durable SQLite support.",
-      "inherits": "windows-base",
+      "binaryDir": "${sourceDir}/build/Debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_C_COMPILER": "clang-cl",
-        "CMAKE_CXX_COMPILER": "clang-cl",
-        "BUILD_TESTING": true,
-        "RULE_ENGINE_INSTALL_PRIVATE_PYTHON": false,
-        "RULE_ENGINE_PYTHON_RUNTIME_STAGE_FOR_TESTS": false
+        "RULE_ENGINE_PROTOCOL_REQUIRE_SECURE_RUNTIME": true
       }
     },
     {
-      "name": "windows-msvc-debug",
-      "displayName": "Windows MSVC Debug",
-      "description": "Second-toolchain developer build with all tests and secure runtime dependencies required.",
-      "inherits": "windows-base",
+      "name": "RelWithDebInfo",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/RelWithDebInfo",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_C_COMPILER": "cl",
-        "CMAKE_CXX_COMPILER": "cl",
-        "BUILD_TESTING": true,
-        "RULE_ENGINE_INSTALL_PRIVATE_PYTHON": false,
-        "RULE_ENGINE_PYTHON_RUNTIME_STAGE_FOR_TESTS": false
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "RULE_ENGINE_PROTOCOL_REQUIRE_SECURE_RUNTIME": true
       }
     },
     {
-      "name": "windows-clangcl-release",
-      "displayName": "Windows clang-cl Release package",
-      "description": "Production package configuration with the exact private CPython runtime bundled at install time.",
-      "inherits": "windows-base",
+      "name": "Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/Release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_C_COMPILER": "clang-cl",
-        "CMAKE_CXX_COMPILER": "clang-cl",
-        "BUILD_TESTING": false,
-        "RULE_ENGINE_ENABLE_INSTALL_SMOKE_TEST": false,
-        "RULE_ENGINE_ENABLE_REAL_INSTALL_SMOKE_TEST": false,
-        "RULE_ENGINE_INSTALL_PRIVATE_PYTHON": true
+        "RULE_ENGINE_PROTOCOL_REQUIRE_SECURE_RUNTIME": true
       }
-    }
-  ],
-  "buildPresets": [
-    {
-      "name": "windows-clangcl-debug",
-      "displayName": "Build Windows clang-cl Debug",
-      "configurePreset": "windows-clangcl-debug",
-      "jobs": 6
-    },
-    {
-      "name": "windows-msvc-debug",
-      "displayName": "Build Windows MSVC Debug",
-      "configurePreset": "windows-msvc-debug",
-      "jobs": 6
-    },
-    {
-      "name": "windows-clangcl-release",
-      "displayName": "Build Windows clang-cl Release",
-      "configurePreset": "windows-clangcl-release",
-      "jobs": 6
-    },
-    {
-      "name": "windows-clangcl-release-install",
-      "displayName": "Build and install Windows clang-cl Release",
-      "configurePreset": "windows-clangcl-release",
-      "targets": [
-        "install"
-      ],
-      "jobs": 6
-    }
-  ],
-  "testPresets": [
-    {
-      "name": "windows-clangcl-debug",
-      "displayName": "Test Windows clang-cl Debug",
-      "configurePreset": "windows-clangcl-debug",
-      "output": {
-        "outputOnFailure": true
-      },
-      "execution": {
-        "jobs": 1,
-        "noTestsAction": "error",
-        "stopOnFailure": false
-      }
-    },
-    {
-      "name": "windows-msvc-debug",
-      "displayName": "Test Windows MSVC Debug",
-      "configurePreset": "windows-msvc-debug",
-      "output": {
-        "outputOnFailure": true
-      },
-      "execution": {
-        "jobs": 1,
-        "noTestsAction": "error",
-        "stopOnFailure": false
-      }
-    }
-  ],
-  "workflowPresets": [
-    {
-      "name": "windows-clangcl-debug-check",
-      "displayName": "Configure, build, and test Windows clang-cl Debug",
-      "steps": [
-        {
-          "type": "configure",
-          "name": "windows-clangcl-debug"
-        },
-        {
-          "type": "build",
-          "name": "windows-clangcl-debug"
-        },
-        {
-          "type": "test",
-          "name": "windows-clangcl-debug"
-        }
-      ]
-    },
-    {
-      "name": "windows-msvc-debug-check",
-      "displayName": "Configure, build, and test Windows MSVC Debug",
-      "steps": [
-        {
-          "type": "configure",
-          "name": "windows-msvc-debug"
-        },
-        {
-          "type": "build",
-          "name": "windows-msvc-debug"
-        },
-        {
-          "type": "test",
-          "name": "windows-msvc-debug"
-        }
-      ]
-    },
-    {
-      "name": "windows-clangcl-release-package",
-      "displayName": "Configure and install Windows clang-cl Release",
-      "steps": [
-        {
-          "type": "configure",
-          "name": "windows-clangcl-release"
-        },
-        {
-          "type": "build",
-          "name": "windows-clangcl-release-install"
-        }
-      ]
     }
   ]
 }
