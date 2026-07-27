@@ -1,0 +1,294 @@
+syntax = "proto3";
+
+package rule_engine.python.protocol_v2.wire;
+
+message CreditWindow {
+  uint64 bytes = 1;
+  uint32 messages = 2;
+  uint32 work_attempts = 3;
+  uint32 snapshot_chunks = 4;
+}
+
+message SchemaAdvertisement {
+  string schema = 1;
+  uint32 major = 2;
+  string canonical_hash = 3;
+}
+
+message SchemaIdentity {
+  string id = 1;
+  string canonical_hash = 2;
+}
+
+message CapabilityAdvertisement {
+  string capability = 1;
+  uint32 version = 2;
+  string request_schema = 3;
+  string response_schema = 4;
+}
+
+message IdentityField {
+  uint32 field_id = 1;
+  uint32 kind = 2;
+  bool bool_value = 3;
+  sfixed64 int64_value = 4;
+  uint64 uint64_value = 5;
+  string integer_value = 6;
+  string unicode_value = 7;
+  bytes bytes_value = 8;
+}
+
+message SubjectKey {
+  string peer = 1;
+  string descriptor = 2;
+  repeated IdentityField identity = 3;
+  SubjectKey parent = 4;
+}
+
+message EnumValue {
+  string schema = 1;
+  string member = 2;
+}
+
+message FactMapEntry {
+  FactValue key = 1;
+  FactValue value = 2;
+}
+
+message FactRecordField {
+  uint32 field_id = 1;
+  FactValue value = 2;
+}
+
+message FactValue {
+  uint32 kind = 1;
+  bool bool_value = 2;
+  string integer_value = 3;
+  double double_value = 4;
+  string unicode_value = 5;
+  bytes bytes_value = 6;
+  EnumValue enum_value = 7;
+  repeated FactValue list_items = 8;
+  repeated FactMapEntry map_entries = 9;
+  string record_schema = 10;
+  repeated FactRecordField record_fields = 11;
+}
+
+message ProviderDiagnostic {
+  string code = 1;
+  uint32 severity = 2;
+  string message = 3;
+}
+
+message DataLabel {
+  uint32 classification = 1;
+  repeated string categories = 2;
+}
+
+message FactRequest {
+  string request_id = 1;
+  SubjectKey subject = 2;
+  string provider = 3;
+  string fact = 4;
+  string expected_schema = 5;
+  uint64 deadline_unix_ms = 6;
+  string expected_schema_hash = 7;
+}
+
+message ScanRequest {
+  string request_id = 1;
+  SubjectKey subject = 2;
+  string space_kind = 3;
+  uint64 begin = 4;
+  uint64 size = 5;
+  uint32 permissions = 6;
+  string plan_id = 7;
+  string encoded_pattern = 8;
+  uint64 maximum_bytes = 9;
+  uint32 maximum_matches = 10;
+  uint64 deadline_unix_ms = 11;
+  string space_identity = 12;
+  uint64 subject_generation = 13;
+  DataLabel label = 14;
+  uint32 context_bytes_before = 15;
+  uint32 context_bytes_after = 16;
+  uint32 result_mode = 17;
+  repeated string pattern_ids = 18;
+}
+
+message FactResponse {
+  string request_id = 1;
+  SubjectKey subject = 2;
+  uint32 status = 3;
+  FactValue value = 4;
+  ProviderDiagnostic diagnostic = 5;
+  SchemaIdentity returned_schema = 6;
+}
+
+message ScanMatch {
+  uint64 offset = 1;
+  uint64 length = 2;
+  string pattern_id = 3;
+  string scan_space_id = 4;
+  uint64 absolute_address = 5;
+  uint32 permission_snapshot = 6;
+  bytes matched_bytes = 7;
+  bytes before_bytes = 8;
+  bytes after_bytes = 9;
+  DataLabel label = 10;
+  uint64 subject_generation = 11;
+}
+
+message ScanResponse {
+  string request_id = 1;
+  SubjectKey subject = 2;
+  uint32 status = 3;
+  repeated ScanMatch matches = 4;
+  bool truncated = 5;
+  ProviderDiagnostic diagnostic = 6;
+  uint32 result_mode = 7;
+}
+
+message AgentHello {
+  uint32 minimum_minor = 1;
+  uint32 maximum_minor = 2;
+  string agent_version = 3;
+  string agent_epoch = 4;
+  uint64 next_sequence = 5;
+  repeated SchemaAdvertisement schemas = 6;
+  repeated CapabilityAdvertisement capabilities = 7;
+  CreditWindow receive_limit = 8;
+}
+
+message ServerHello {
+  uint32 selected_minor = 1;
+  string session = 2;
+  string peer = 3;
+  uint64 session_fence = 4;
+  uint64 acknowledged_sequence = 5;
+  repeated SchemaAdvertisement schemas = 6;
+  repeated CapabilityAdvertisement capabilities = 7;
+  CreditWindow credit = 8;
+  uint64 heartbeat_interval_ms = 9;
+}
+
+message WorkLease {
+  string session = 1;
+  string peer = 2;
+  uint64 session_fence = 3;
+  string work_id = 4;
+  string attempt_id = 5;
+  uint64 work_fence = 6;
+  uint64 generation = 7;
+  uint64 server_sequence = 8;
+  string route = 9;
+  repeated FactRequest facts = 10;
+  repeated ScanRequest scans = 11;
+}
+
+message WorkResult {
+  string originating_session = 1;
+  string peer = 2;
+  uint64 originating_session_fence = 3;
+  string work_id = 4;
+  string attempt_id = 5;
+  uint64 work_fence = 6;
+  uint64 generation = 7;
+  repeated FactResponse facts = 8;
+  repeated ScanResponse scans = 9;
+}
+
+message CancelWork {
+  string session = 1;
+  string peer = 2;
+  uint64 session_fence = 3;
+  string work_id = 4;
+  string attempt_id = 5;
+  uint64 work_fence = 6;
+  uint64 server_sequence = 7;
+  string route = 8;
+  repeated string requests = 9;
+}
+
+message SnapshotBegin {
+  string session = 1;
+  string peer = 2;
+  uint64 session_fence = 3;
+  string snapshot_id = 4;
+  SubjectKey parent = 5;
+  string subject_schema = 6;
+  uint64 generation = 7;
+  uint64 expected_count = 8;
+  string expected_digest = 9;
+}
+
+message SnapshotChunk {
+  string session = 1;
+  string peer = 2;
+  uint64 session_fence = 3;
+  string snapshot_id = 4;
+  uint64 generation = 5;
+  uint32 chunk_index = 6;
+  repeated SubjectKey subjects = 7;
+}
+
+message SnapshotCommit {
+  string session = 1;
+  string peer = 2;
+  uint64 session_fence = 3;
+  string snapshot_id = 4;
+  uint64 generation = 5;
+  uint64 item_count = 6;
+  string canonical_digest = 7;
+}
+
+message Ack {
+  string agent_epoch = 1;
+  uint64 acknowledged_through = 2;
+  CreditWindow credit = 3;
+}
+
+message Nack {
+  string agent_epoch = 1;
+  uint64 sequence = 2;
+  uint32 reason = 3;
+  bool permanent = 4;
+  string diagnostic = 5;
+}
+
+message CreditUpdate {
+  CreditWindow credit = 1;
+}
+
+message MessageBody {
+  oneof value {
+    AgentHello agent_hello = 1;
+    ServerHello server_hello = 2;
+    WorkLease work_lease = 3;
+    WorkResult work_result = 4;
+    CancelWork cancel_work = 5;
+    SnapshotBegin snapshot_begin = 6;
+    SnapshotChunk snapshot_chunk = 7;
+    SnapshotCommit snapshot_commit = 8;
+    Ack ack = 9;
+    Nack nack = 10;
+    CreditUpdate credit_update = 11;
+  }
+}
+
+message PeerEnvelope {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string message_id = 3;
+  optional string session = 4;
+  string agent_epoch = 5;
+  uint64 agent_sequence = 6;
+  uint64 acknowledged_agent_sequence = 7;
+  uint32 message_kind = 8;
+  MessageBody body = 9;
+}
+
+message DurableAgentEnvelope {
+  uint32 message_kind = 1;
+  MessageBody body = 2;
+}

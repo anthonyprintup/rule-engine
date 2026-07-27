@@ -1,3239 +1,1657 @@
 #include "rule_engine/python/protocol/codec.hpp"
 
+#include "protocol_v2.protocyte.hpp"
+
 #include <protocyte/runtime/runtime.hpp>
 
 #include <algorithm>
 #include <array>
-#include <bit>
-#include <cmath>
-#include <cstring>
-#include <exception>
+#include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <limits>
-#include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace rule_engine::python::protocol_v2 {
     namespace {
-
-        enum struct WireType : std::uint8_t { varint = 0, fixed64 = 1, length_delimited = 2, fixed32 = 5 };
-
-        struct Tag {
-            std::uint32_t field {};
-            WireType wire {};
-        };
+        namespace wire = rule_engine::python::protocol_v2::wire;
+        using Context = protocyte::DefaultConfig::Context;
 
         [[nodiscard]] ProtocolError codec_error(const ProtocolErrorCode code, std::string message,
                                                 const std::size_t offset = 0) {
             return ProtocolError {.code = code, .message = std::move(message), .byte_offset = offset};
         }
 
-        struct Writer {
-            std::vector<std::byte> bytes;
-
-            [[nodiscard]] protocyte::Status write_byte(const protocyte::u8 value) noexcept {
-                bytes.push_back(static_cast<std::byte>(value));
-                return {};
+        [[nodiscard]] ProtocolError wire_error(const protocyte::Error error, std::string_view operation) {
+            ProtocolErrorCode code = ProtocolErrorCode::malformed;
+            switch (error.code) {
+                case protocyte::ErrorCode::unexpected_eof: code = ProtocolErrorCode::truncated; break;
+                case protocyte::ErrorCode::invalid_utf8: code = ProtocolErrorCode::invalid_utf8; break;
+                case protocyte::ErrorCode::no_memory:
+                case protocyte::ErrorCode::recursion_limit:
+                case protocyte::ErrorCode::size_limit:
+                case protocyte::ErrorCode::count_limit: code = ProtocolErrorCode::limit_exceeded; break;
+                default: break;
             }
-
-            void varint(std::uint64_t value) {
-                if (const auto status = protocyte::write_varint(*this, value); !status) {
-                    std::terminate();
-                }
-            }
-
-            void tag(const std::uint32_t field, const WireType wire) {
-                varint((static_cast<std::uint64_t>(field) << 3U) | static_cast<std::uint8_t>(wire));
-            }
-
-            void unsigned_field(const std::uint32_t field, const std::uint64_t value) {
-                tag(field, WireType::varint);
-                varint(value);
-            }
-
-            void boolean_field(const std::uint32_t field, const bool value) { unsigned_field(field, value ? 1U : 0U); }
-
-            void fixed64_field(const std::uint32_t field, const std::uint64_t value) {
-                tag(field, WireType::fixed64);
-                for (std::uint32_t shift = 0; shift < 64; shift += 8) {
-                    bytes.push_back(static_cast<std::byte>((value >> shift) & 0xffU));
-                }
-            }
-
-            void raw_length_field(const std::uint32_t field, const std::span<const std::byte> value) {
-                tag(field, WireType::length_delimited);
-                varint(value.size());
-                bytes.insert(bytes.end(), value.begin(), value.end());
-            }
-
-            void string_field(const std::uint32_t field, const std::string_view value) {
-                raw_length_field(field, std::as_bytes(std::span {value.data(), value.size()}));
-            }
-
-            void message_field(const std::uint32_t field, const Writer &message) {
-                raw_length_field(field, message.bytes);
-            }
-        };
-
-        struct DecodeBudget {
-            std::size_t value_nodes {};
-            std::size_t collection_items {};
-        };
-
-        struct Reader {
-            std::span<const std::byte> bytes;
-            const ProtocolLimits *limits {};
-            DecodeBudget *budget {};
-            std::size_t depth {};
-            std::size_t offset {};
-
-            [[nodiscard]] bool eof() const noexcept { return offset == bytes.size(); }
-            [[nodiscard]] std::size_t position() const noexcept { return offset; }
-
-            [[nodiscard]] protocyte::Result<protocyte::u8> read_byte() noexcept {
-                if (offset >= bytes.size()) {
-                    return protocyte::unexpected(protocyte::ErrorCode::unexpected_eof, offset);
-                }
-                return std::to_integer<protocyte::u8>(bytes[offset++]);
-            }
-
-            [[nodiscard]] std::expected<std::uint64_t, ProtocolError> varint() {
-                const auto start = offset;
-                auto value = protocyte::read_varint(*this);
-                if (!value) {
-                    const auto truncated = value.error().code == protocyte::ErrorCode::unexpected_eof;
-                    return std::unexpected(codec_error(truncated ? ProtocolErrorCode::truncated :
-                                                                   ProtocolErrorCode::malformed,
-                                                       truncated ? "truncated varint" : "malformed varint",
-                                                       value.error().offset));
-                }
-                if (offset - start != protocyte::varint_size(*value)) {
-                    return std::unexpected(
-                        codec_error(ProtocolErrorCode::malformed, "non-canonical overlong varint", start));
-                }
-                return *value;
-            }
-
-            [[nodiscard]] std::expected<Tag, ProtocolError> next_tag() {
-                const auto start = offset;
-                auto encoded = varint();
-                if (!encoded) {
-                    return std::unexpected(std::move(encoded.error()));
-                }
-                const auto field = static_cast<std::uint32_t>(*encoded >> 3U);
-                const auto wire_number = static_cast<std::uint8_t>(*encoded & 0x7U);
-                if (field == 0 || field > 0x1fffffffU ||
-                    (wire_number != 0 && wire_number != 1 && wire_number != 2 && wire_number != 5)) {
-                    return std::unexpected(codec_error(ProtocolErrorCode::malformed, "invalid protobuf tag", start));
-                }
-                return Tag {.field = field, .wire = static_cast<WireType>(wire_number)};
-            }
-
-            [[nodiscard]] std::expected<std::uint64_t, ProtocolError> read_unsigned(const Tag tag) {
-                if (tag.wire != WireType::varint) {
-                    return std::unexpected(codec_error(ProtocolErrorCode::malformed, "expected varint field", offset));
-                }
-                return varint();
-            }
-
-            [[nodiscard]] std::expected<bool, ProtocolError> read_boolean(const Tag tag) {
-                auto value = read_unsigned(tag);
-                if (!value) {
-                    return std::unexpected(std::move(value.error()));
-                }
-                if (*value > 1) {
-                    return std::unexpected(
-                        codec_error(ProtocolErrorCode::malformed, "boolean is not zero or one", offset));
-                }
-                return *value == 1;
-            }
-
-            [[nodiscard]] std::expected<std::uint64_t, ProtocolError> read_fixed64(const Tag tag) {
-                if (tag.wire != WireType::fixed64 || bytes.size() - offset < 8) {
-                    return std::unexpected(codec_error(tag.wire == WireType::fixed64 ? ProtocolErrorCode::truncated :
-                                                                                       ProtocolErrorCode::malformed,
-                                                       "invalid fixed64 field", offset));
-                }
-                std::uint64_t value {};
-                for (std::uint32_t shift = 0; shift < 64; shift += 8) {
-                    value |= static_cast<std::uint64_t>(std::to_integer<std::uint8_t>(bytes[offset++])) << shift;
-                }
-                return value;
-            }
-
-            [[nodiscard]] std::expected<std::span<const std::byte>, ProtocolError>
-            read_bytes(const Tag tag, const std::size_t maximum) {
-                if (tag.wire != WireType::length_delimited) {
-                    return std::unexpected(
-                        codec_error(ProtocolErrorCode::malformed, "expected length-delimited field", offset));
-                }
-                auto size = varint();
-                if (!size) {
-                    return std::unexpected(std::move(size.error()));
-                }
-                if (*size > maximum || *size > bytes.size() - offset) {
-                    return std::unexpected(
-                        codec_error(*size > maximum ? ProtocolErrorCode::limit_exceeded : ProtocolErrorCode::truncated,
-                                    "length-delimited field exceeds its bound", offset));
-                }
-                const auto result = bytes.subspan(offset, static_cast<std::size_t>(*size));
-                offset += static_cast<std::size_t>(*size);
-                return result;
-            }
-
-            [[nodiscard]] std::expected<void, ProtocolError> skip(const Tag tag) {
-                switch (tag.wire) {
-                    case WireType::varint: {
-                        auto ignored = varint();
-                        if (!ignored) {
-                            return std::unexpected(std::move(ignored.error()));
-                        }
-                        return {};
-                    }
-                    case WireType::fixed64:
-                        if (bytes.size() - offset < 8) {
-                            return std::unexpected(
-                                codec_error(ProtocolErrorCode::truncated, "truncated unknown fixed64 field", offset));
-                        }
-                        offset += 8;
-                        return {};
-                    case WireType::fixed32:
-                        if (bytes.size() - offset < 4) {
-                            return std::unexpected(
-                                codec_error(ProtocolErrorCode::truncated, "truncated unknown fixed32 field", offset));
-                        }
-                        offset += 4;
-                        return {};
-                    case WireType::length_delimited: {
-                        auto ignored = read_bytes(tag, limits->maximum_frame_bytes);
-                        if (!ignored) {
-                            return std::unexpected(std::move(ignored.error()));
-                        }
-                        return {};
-                    }
-                    default: break;
-                }
-                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "unknown wire type", offset));
-            }
-        };
-
-        struct SeenFields {
-            std::unordered_set<std::uint32_t> fields;
-
-            [[nodiscard]] std::expected<void, ProtocolError> mark(const std::uint32_t field, const std::size_t offset) {
-                if (!fields.insert(field).second) {
-                    return std::unexpected(
-                        codec_error(ProtocolErrorCode::duplicate_field, "duplicate non-repeated field", offset));
-                }
-                return {};
-            }
-        };
-
-        [[nodiscard]] bool valid_utf8(const std::string_view text) noexcept {
-            const auto *data = reinterpret_cast<const unsigned char *>(text.data());
-            std::size_t index {};
-            while (index < text.size()) {
-                const auto first = data[index++];
-                if (first <= 0x7fU) {
-                    continue;
-                }
-                std::uint32_t value {};
-                std::size_t continuation {};
-                std::uint32_t minimum {};
-                if (first >= 0xc2U && first <= 0xdfU) {
-                    value = first & 0x1fU;
-                    continuation = 1;
-                    minimum = 0x80U;
-                } else if (first >= 0xe0U && first <= 0xefU) {
-                    value = first & 0x0fU;
-                    continuation = 2;
-                    minimum = 0x800U;
-                } else if (first >= 0xf0U && first <= 0xf4U) {
-                    value = first & 0x07U;
-                    continuation = 3;
-                    minimum = 0x10000U;
-                } else {
-                    return false;
-                }
-                if (continuation > text.size() - index) {
-                    return false;
-                }
-                for (std::size_t count = 0; count < continuation; ++count) {
-                    const auto next = data[index++];
-                    if ((next & 0xc0U) != 0x80U) {
-                        return false;
-                    }
-                    value = (value << 6U) | (next & 0x3fU);
-                }
-                if (value < minimum || value > 0x10ffffU || (value >= 0xd800U && value <= 0xdfffU)) {
-                    return false;
-                }
-            }
-            return true;
+            return codec_error(code, std::string {operation} + " failed in generated Protocyte code", error.offset);
         }
 
-        [[nodiscard]] std::expected<void, ProtocolError>
-        validate_scan_pattern_ids(const std::span<const std::string> pattern_ids, const ProtocolLimits &limits) {
-            if (pattern_ids.empty()) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::malformed, "scan plan must declare at least one pattern ID"));
-            }
-            if (pattern_ids.size() > limits.maximum_scan_patterns) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::limit_exceeded, "scan pattern ID count exceeds the limit"));
-            }
+        [[nodiscard]] Context make_context(const ProtocolLimits &limits) {
+            protocyte::Limits wire_limits;
+            wire_limits.max_total_bytes = limits.maximum_frame_bytes;
+            wire_limits.max_recursion_depth =
+                std::max(limits.maximum_subject_depth, limits.maximum_value_depth) + 16;
+            wire_limits.max_message_bytes = limits.maximum_frame_bytes;
+            wire_limits.max_string_bytes = limits.maximum_string_bytes;
+            wire_limits.max_repeated_elements = limits.maximum_collection_items;
+            wire_limits.max_map_entries = limits.maximum_collection_items;
+            wire_limits.max_total_allocation_bytes =
+                limits.maximum_frame_bytes > std::numeric_limits<std::size_t>::max() / 4
+                    ? std::numeric_limits<std::size_t>::max()
+                    : limits.maximum_frame_bytes * 4;
+            wire_limits.max_unknown_field_bytes = 0;
+            return Context {protocyte::hosted_allocator(), wire_limits};
+        }
 
-            std::unordered_set<std::string_view> unique_ids;
-            unique_ids.reserve(pattern_ids.size());
-            for (const auto &pattern_id : pattern_ids) {
-                if (pattern_id.empty()) {
-                    return std::unexpected(
-                        codec_error(ProtocolErrorCode::malformed, "scan pattern ID must not be empty"));
-                }
-                if (pattern_id.size() > limits.maximum_string_bytes) {
-                    return std::unexpected(
-                        codec_error(ProtocolErrorCode::limit_exceeded, "scan pattern ID exceeds the string limit"));
-                }
-                if (!valid_utf8(pattern_id)) {
-                    return std::unexpected(
-                        codec_error(ProtocolErrorCode::invalid_utf8, "scan pattern ID is not canonical UTF-8"));
-                }
-                if (!unique_ids.insert(pattern_id).second) {
-                    return std::unexpected(
-                        codec_error(ProtocolErrorCode::duplicate_item, "scan pattern IDs must be unique"));
-                }
+        [[nodiscard]] std::string text(const protocyte::StringView value) {
+            return std::string {value.data(), value.size()};
+        }
+
+        [[nodiscard]] std::vector<std::byte> bytes(const protocyte::Span<const protocyte::u8> value) {
+            const auto *first = reinterpret_cast<const std::byte *>(value.data());
+            return std::vector<std::byte> {first, first + value.size()};
+        }
+
+        [[nodiscard]] protocyte::Span<const protocyte::u8> byte_view(const std::span<const std::byte> value) {
+            return {reinterpret_cast<const protocyte::u8 *>(value.data()), value.size()};
+        }
+
+        template<typename Status>
+        [[nodiscard]] std::expected<void, ProtocolError> checked(Status status, std::string_view operation) {
+            if (!status) {
+                return std::unexpected(wire_error(status.error(), operation));
             }
             return {};
         }
 
-        [[nodiscard]] bool canonical_integer(const std::string_view decimal) noexcept {
-            if (decimal.empty()) {
+        template<typename Vector, typename Fill>
+        [[nodiscard]] std::expected<void, ProtocolError> append_message(Vector &values, Context &ctx, Fill &&fill) {
+            auto added = values.emplace_back(ctx);
+            if (!added) {
+                return std::unexpected(wire_error(added.error(), "Protocyte repeated-message allocation"));
+            }
+            return std::forward<Fill>(fill)(*added);
+        }
+
+        template<typename Vector>
+        [[nodiscard]] std::expected<void, ProtocolError> append_text(Vector &values, Context &ctx,
+                                                                     const std::string_view value) {
+            auto added = values.emplace_back(&ctx);
+            if (!added) {
+                return std::unexpected(wire_error(added.error(), "Protocyte repeated-string allocation"));
+            }
+            return checked(added->assign(protocyte::Span<const char> {value.data(), value.size()}),
+                           "Protocyte repeated-string assignment");
+        }
+
+        [[nodiscard]] bool canonical_integer(const std::string_view value) noexcept {
+            if (value.empty()) {
                 return false;
             }
             std::size_t offset {};
-            if (decimal.front() == '-') {
-                if (decimal.size() == 1 || decimal[1] == '0') {
+            if (value.front() == '-') {
+                if (value.size() == 1 || value[1] == '0') {
                     return false;
                 }
                 offset = 1;
             }
-            if (decimal[offset] == '0' && decimal.size() - offset != 1) {
+            if (value[offset] == '0' && value.size() - offset != 1) {
                 return false;
             }
-            return std::ranges::all_of(decimal.substr(offset),
-                                       [](const char value) { return value >= '0' && value <= '9'; });
+            return std::all_of(value.begin() + static_cast<std::ptrdiff_t>(offset), value.end(),
+                               [](const char ch) { return ch >= '0' && ch <= '9'; });
         }
 
-        [[nodiscard]] std::expected<std::string, ProtocolError> read_string(Reader &reader, const Tag tag,
-                                                                            const bool require_utf8 = true) {
-            auto bytes = reader.read_bytes(tag, reader.limits->maximum_string_bytes);
-            if (!bytes) {
-                return std::unexpected(std::move(bytes.error()));
+        enum struct PreflightShape : std::uint8_t { peer_envelope, durable_envelope };
+
+        [[nodiscard]] std::expected<std::uint64_t, ProtocolError>
+        read_canonical_varint(const std::span<const std::byte> input, std::size_t &offset) {
+            std::uint64_t value {};
+            std::size_t count {};
+            for (; count < 10; ++count) {
+                if (offset >= input.size()) {
+                    return std::unexpected(codec_error(ProtocolErrorCode::truncated, "protobuf varint is truncated",
+                                                       offset));
+                }
+                const auto byte = std::to_integer<std::uint8_t>(input[offset++]);
+                if (count == 9 && byte > 1) {
+                    return std::unexpected(
+                        codec_error(ProtocolErrorCode::malformed, "protobuf varint overflows uint64", offset - 1));
+                }
+                value |= static_cast<std::uint64_t>(byte & 0x7fU) << (count * 7U);
+                if ((byte & 0x80U) == 0) {
+                    if (count != 0 && byte == 0) {
+                        return std::unexpected(codec_error(ProtocolErrorCode::malformed,
+                                                           "protobuf varint is not canonical", offset - 1));
+                    }
+                    return value;
+                }
             }
-            std::string result(reinterpret_cast<const char *>(bytes->data()), bytes->size());
-            if (require_utf8 && !valid_utf8(result)) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::invalid_utf8, "string is not canonical UTF-8", reader.offset));
-            }
-            return result;
+            return std::unexpected(
+                codec_error(ProtocolErrorCode::malformed, "protobuf varint is too long", offset));
         }
 
-        [[nodiscard]] std::expected<Reader, ProtocolError> child_reader(Reader &reader, const Tag tag,
-                                                                        const std::size_t maximum_depth) {
-            if (reader.depth >= maximum_depth) {
-                return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                   "nested message depth exceeds the limit", reader.offset));
-            }
-            auto body = reader.read_bytes(tag, reader.limits->maximum_frame_bytes);
-            if (!body) {
-                return std::unexpected(std::move(body.error()));
-            }
-            return Reader {.bytes = *body,
-                           .limits = reader.limits,
-                           .budget = reader.budget,
-                           .depth = reader.depth + 1,
-                           .offset = 0};
-        }
-
-        [[nodiscard]] std::expected<void, ProtocolError> count_collection(Reader &reader,
-                                                                          const std::size_t amount = 1) {
-            if (amount > reader.limits->maximum_collection_items - reader.budget->collection_items) {
-                return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                   "decoded collection item count exceeds the limit", reader.offset));
-            }
-            reader.budget->collection_items += amount;
-            return {};
-        }
-
-        void encode_credit(Writer &writer, const CreditWindow &credit) {
-            writer.unsigned_field(1, credit.bytes);
-            writer.unsigned_field(2, credit.messages);
-            writer.unsigned_field(3, credit.work_attempts);
-            writer.unsigned_field(4, credit.snapshot_chunks);
-        }
-
-        [[nodiscard]] std::expected<CreditWindow, ProtocolError> decode_credit(Reader &reader) {
-            CreditWindow result;
-            SeenFields seen;
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
+        [[nodiscard]] std::expected<void, ProtocolError>
+        preflight_generated_message(const std::span<const std::byte> input, const PreflightShape shape) {
+            std::array<bool, 10> seen {};
+            const std::uint32_t maximum_field = shape == PreflightShape::peer_envelope ? 9U : 2U;
+            std::size_t offset {};
+            while (offset < input.size()) {
+                const auto tag_offset = offset;
+                auto tag = read_canonical_varint(input, offset);
                 if (!tag) {
                     return std::unexpected(std::move(tag.error()));
                 }
-                if (tag->field > 4) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
+                const auto field = static_cast<std::uint32_t>(*tag >> 3U);
+                const auto wire_type = static_cast<std::uint8_t>(*tag & 7U);
+                if (field == 0 || wire_type == 3 || wire_type == 4 || wire_type > 5) {
+                    return std::unexpected(
+                        codec_error(ProtocolErrorCode::malformed, "protobuf tag is invalid", tag_offset));
+                }
+                if (field <= maximum_field) {
+                    if (seen[field]) {
+                        return std::unexpected(codec_error(ProtocolErrorCode::duplicate_field,
+                                                           "duplicate envelope field", tag_offset));
+                    }
+                    seen[field] = true;
+                }
+                if (wire_type == 0) {
+                    if (auto value = read_canonical_varint(input, offset); !value) {
+                        return std::unexpected(std::move(value.error()));
                     }
                     continue;
                 }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                auto value = reader.read_unsigned(*tag);
-                if (!value) {
-                    return std::unexpected(std::move(value.error()));
-                }
-                switch (tag->field) {
-                    case 1: result.bytes = *value; break;
-                    case 2:
-                        if (*value > std::numeric_limits<std::uint32_t>::max()) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                               "message credit exceeds uint32", reader.offset));
-                        }
-                        result.messages = static_cast<std::uint32_t>(*value);
-                        break;
-                    case 3:
-                        if (*value > std::numeric_limits<std::uint32_t>::max()) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                               "work credit exceeds uint32", reader.offset));
-                        }
-                        result.work_attempts = static_cast<std::uint32_t>(*value);
-                        break;
-                    case 4:
-                        if (*value > std::numeric_limits<std::uint32_t>::max()) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                               "snapshot credit exceeds uint32", reader.offset));
-                        }
-                        result.snapshot_chunks = static_cast<std::uint32_t>(*value);
-                        break;
-                    default: break;
-                }
-            }
-            return result;
-        }
-
-        void encode_schema(Writer &writer, const SchemaAdvertisement &schema) {
-            writer.string_field(1, schema.schema.value);
-            writer.unsigned_field(2, schema.major);
-            writer.string_field(3, schema.canonical_hash);
-        }
-
-        [[nodiscard]] std::expected<SchemaAdvertisement, ProtocolError> decode_schema(Reader &reader) {
-            SchemaAdvertisement result;
-            SeenFields seen;
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field > 3) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
+                if (wire_type == 1 || wire_type == 5) {
+                    const std::size_t width = wire_type == 1 ? 8 : 4;
+                    if (input.size() - offset < width) {
+                        return std::unexpected(
+                            codec_error(ProtocolErrorCode::truncated, "fixed-width protobuf field is truncated", offset));
                     }
+                    offset += width;
                     continue;
                 }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
+                auto length = read_canonical_varint(input, offset);
+                if (!length) {
+                    return std::unexpected(std::move(length.error()));
                 }
-                if (tag->field == 2) {
-                    auto value = reader.read_unsigned(*tag);
-                    if (!value || *value > std::numeric_limits<std::uint32_t>::max()) {
-                        return std::unexpected(value ? codec_error(ProtocolErrorCode::limit_exceeded,
-                                                                   "schema major exceeds uint32", reader.offset) :
-                                                       std::move(value.error()));
-                    }
-                    result.major = static_cast<std::uint32_t>(*value);
-                    continue;
+                if (*length > input.size() - offset) {
+                    return std::unexpected(
+                        codec_error(ProtocolErrorCode::truncated, "length-delimited protobuf field is truncated", offset));
                 }
-                auto value = read_string(reader, *tag);
-                if (!value) {
-                    return std::unexpected(std::move(value.error()));
-                }
-                if (tag->field == 1) {
-                    result.schema = SchemaId {std::move(*value)};
-                } else {
-                    result.canonical_hash = std::move(*value);
-                }
-            }
-            if (result.schema.empty() || result.major == 0 || result.canonical_hash.empty()) {
-                return std::unexpected(codec_error(ProtocolErrorCode::schema_mismatch,
-                                                   "schema advertisement is incomplete", reader.offset));
-            }
-            return result;
-        }
-
-        void encode_schema_identity(Writer &writer, const SchemaIdentity &identity) {
-            writer.string_field(1, identity.id.value);
-            writer.string_field(2, identity.canonical_hash);
-        }
-
-        [[nodiscard]] std::expected<SchemaIdentity, ProtocolError> decode_schema_identity(Reader &reader) {
-            SchemaIdentity result;
-            SeenFields seen;
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field > 2) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                auto value = read_string(reader, *tag);
-                if (!value) {
-                    return std::unexpected(std::move(value.error()));
-                }
-                if (tag->field == 1) {
-                    result.id = SchemaId {std::move(*value)};
-                } else {
-                    result.canonical_hash = std::move(*value);
-                }
-            }
-            if (!result.valid()) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::schema_mismatch, "schema identity is incomplete", reader.offset));
-            }
-            return result;
-        }
-
-        void encode_capability(Writer &writer, const CapabilityAdvertisement &capability) {
-            writer.string_field(1, capability.capability.value);
-            writer.unsigned_field(2, capability.version);
-            writer.string_field(3, capability.request_schema.value);
-            writer.string_field(4, capability.response_schema.value);
-        }
-
-        [[nodiscard]] std::expected<CapabilityAdvertisement, ProtocolError> decode_capability(Reader &reader) {
-            CapabilityAdvertisement result;
-            SeenFields seen;
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field > 4) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 2) {
-                    auto value = reader.read_unsigned(*tag);
-                    if (!value || *value > std::numeric_limits<std::uint32_t>::max()) {
-                        return std::unexpected(value ? codec_error(ProtocolErrorCode::limit_exceeded,
-                                                                   "capability version exceeds uint32", reader.offset) :
-                                                       std::move(value.error()));
-                    }
-                    result.version = static_cast<std::uint32_t>(*value);
-                    continue;
-                }
-                auto value = read_string(reader, *tag);
-                if (!value) {
-                    return std::unexpected(std::move(value.error()));
-                }
-                if (tag->field == 1) {
-                    result.capability = CapabilityId {std::move(*value)};
-                } else if (tag->field == 3) {
-                    result.request_schema = SchemaId {std::move(*value)};
-                } else {
-                    result.response_schema = SchemaId {std::move(*value)};
-                }
-            }
-            if (result.capability.empty() || result.version == 0 || result.request_schema.empty() ||
-                result.response_schema.empty()) {
-                return std::unexpected(codec_error(ProtocolErrorCode::capability_mismatch,
-                                                   "capability advertisement is incomplete", reader.offset));
-            }
-            return result;
-        }
-
-        void encode_identity(Writer &writer, const IdentityField &identity) {
-            writer.unsigned_field(1, identity.field_id);
-            std::visit(
-                [&writer](const auto &value) {
-                    using Value = std::remove_cvref_t<decltype(value)>;
-                    if constexpr (std::is_same_v<Value, bool>) {
-                        writer.unsigned_field(2, 1);
-                        writer.boolean_field(3, value);
-                    } else if constexpr (std::is_same_v<Value, std::int64_t>) {
-                        writer.unsigned_field(2, 2);
-                        writer.fixed64_field(4, std::bit_cast<std::uint64_t>(value));
-                    } else if constexpr (std::is_same_v<Value, std::uint64_t>) {
-                        writer.unsigned_field(2, 3);
-                        writer.unsigned_field(5, value);
-                    } else if constexpr (std::is_same_v<Value, IntegerValue>) {
-                        writer.unsigned_field(2, 4);
-                        writer.string_field(6, value.decimal);
-                    } else if constexpr (std::is_same_v<Value, UnicodeValue>) {
-                        writer.unsigned_field(2, 5);
-                        writer.string_field(7, value.utf8);
-                    } else {
-                        writer.unsigned_field(2, 6);
-                        writer.raw_length_field(8, value.bytes);
-                    }
-                },
-                identity.value);
-        }
-
-        [[nodiscard]] std::expected<IdentityField, ProtocolError> decode_identity(Reader &reader) {
-            IdentityField result;
-            SeenFields seen;
-            std::optional<std::uint64_t> kind;
-            std::optional<IdentityScalar> value;
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field > 8) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 1 || tag->field == 2 || tag->field == 3 || tag->field == 5) {
-                    if (tag->field == 3) {
-                        auto boolean = reader.read_boolean(*tag);
-                        if (!boolean) {
-                            return std::unexpected(std::move(boolean.error()));
-                        }
-                        value = *boolean;
-                        continue;
-                    }
-                    auto number = reader.read_unsigned(*tag);
-                    if (!number) {
-                        return std::unexpected(std::move(number.error()));
-                    }
-                    if (tag->field == 1) {
-                        if (*number == 0 || *number > std::numeric_limits<std::uint32_t>::max()) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::invalid_identity,
-                                                               "identity field number is invalid", reader.offset));
-                        }
-                        result.field_id = static_cast<std::uint32_t>(*number);
-                    } else if (tag->field == 2) {
-                        kind = *number;
-                    } else {
-                        value = *number;
-                    }
-                    continue;
-                }
-                if (tag->field == 4) {
-                    auto number = reader.read_fixed64(*tag);
-                    if (!number) {
-                        return std::unexpected(std::move(number.error()));
-                    }
-                    value = std::bit_cast<std::int64_t>(*number);
-                    continue;
-                }
-                if (tag->field == 8) {
-                    auto bytes = reader.read_bytes(*tag, reader.limits->maximum_blob_bytes);
-                    if (!bytes) {
-                        return std::unexpected(std::move(bytes.error()));
-                    }
-                    value = BytesValue {std::vector<std::byte>(bytes->begin(), bytes->end())};
-                    continue;
-                }
-                auto text = read_string(reader, *tag);
-                if (!text) {
-                    return std::unexpected(std::move(text.error()));
-                }
-                if (tag->field == 6) {
-                    value = IntegerValue {std::move(*text)};
-                } else {
-                    value = UnicodeValue {std::move(*text)};
-                }
-            }
-            if (result.field_id == 0 || !kind.has_value() || !value.has_value() || *kind == 0 || *kind > 6 ||
-                value->index() != *kind - 1) {
-                return std::unexpected(codec_error(ProtocolErrorCode::invalid_identity,
-                                                   "identity kind and value do not agree", reader.offset));
-            }
-            if (const auto *integer = std::get_if<IntegerValue>(&*value);
-                integer != nullptr && !canonical_integer(integer->decimal)) {
-                return std::unexpected(codec_error(ProtocolErrorCode::invalid_identity,
-                                                   "arbitrary integer spelling is not canonical", reader.offset));
-            }
-            result.value = std::move(*value);
-            return result;
-        }
-
-        void encode_subject(Writer &writer, const SubjectKey &subject, const std::size_t depth = 0) {
-            writer.string_field(1, subject.peer.value);
-            writer.string_field(2, subject.descriptor.value);
-            for (const auto &identity : subject.identity) {
-                Writer nested;
-                encode_identity(nested, identity);
-                writer.message_field(3, nested);
-            }
-            if (subject.parent) {
-                Writer nested;
-                encode_subject(nested, *subject.parent, depth + 1);
-                writer.message_field(4, nested);
-            }
-        }
-
-        [[nodiscard]] std::expected<SubjectKey, ProtocolError> decode_subject(Reader &reader) {
-            SubjectKey result;
-            SeenFields seen;
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field == 3) {
-                    if (auto counted = count_collection(reader); !counted) {
-                        return std::unexpected(std::move(counted.error()));
-                    }
-                    if (result.identity.size() >= reader.limits->maximum_identity_fields) {
-                        return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                           "subject identity field count exceeds the limit",
-                                                           reader.offset));
-                    }
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_subject_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    auto identity = decode_identity(*nested);
-                    if (!identity) {
-                        return std::unexpected(std::move(identity.error()));
-                    }
-                    result.identity.push_back(std::move(*identity));
-                    continue;
-                }
-                if (tag->field == 4) {
-                    if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                        return std::unexpected(std::move(marked.error()));
-                    }
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_subject_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    auto parent = decode_subject(*nested);
-                    if (!parent) {
-                        return std::unexpected(std::move(parent.error()));
-                    }
-                    result.parent = std::make_shared<const SubjectKey>(std::move(*parent));
-                    continue;
-                }
-                if (tag->field == 1 || tag->field == 2) {
-                    if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                        return std::unexpected(std::move(marked.error()));
-                    }
-                    auto text = read_string(reader, *tag);
-                    if (!text) {
-                        return std::unexpected(std::move(text.error()));
-                    }
-                    if (tag->field == 1) {
-                        result.peer = PeerId {std::move(*text)};
-                    } else {
-                        result.descriptor = SchemaId {std::move(*text)};
-                    }
-                    continue;
-                }
-                if (auto skipped = reader.skip(*tag); !skipped) {
-                    return std::unexpected(std::move(skipped.error()));
-                }
-            }
-            if (!result.valid()) {
-                return std::unexpected(codec_error(ProtocolErrorCode::invalid_identity,
-                                                   "decoded subject identity is invalid", reader.offset));
-            }
-            return result;
-        }
-
-        struct EncodeBudget {
-            std::size_t value_nodes {};
-            std::size_t collection_items {};
-            std::vector<const FactNode *> active_nodes;
-        };
-
-        [[nodiscard]] std::expected<void, ProtocolError> encode_fact_value(Writer &writer, const FactValue &value,
-                                                                           const ProtocolLimits &limits,
-                                                                           EncodeBudget &budget,
-                                                                           const std::size_t depth = 0) {
-            if (!value.valid()) {
-                return std::unexpected(codec_error(ProtocolErrorCode::invalid_value, "fact value handle is empty"));
-            }
-            if (depth > limits.maximum_value_depth || budget.value_nodes >= limits.maximum_total_value_nodes) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::limit_exceeded, "fact value depth or node count exceeds the limit"));
-            }
-            if (std::ranges::find(budget.active_nodes, value.node.get()) != budget.active_nodes.end()) {
-                return std::unexpected(codec_error(ProtocolErrorCode::invalid_value, "fact value contains a cycle"));
-            }
-            ++budget.value_nodes;
-            budget.active_nodes.push_back(value.node.get());
-            const auto pop = [&budget]() { budget.active_nodes.pop_back(); };
-
-            const auto &data = value.node->data;
-            writer.unsigned_field(1, data.index());
-            auto result = std::visit(
-                [&](const auto &item) -> std::expected<void, ProtocolError> {
-                    using Item = std::remove_cvref_t<decltype(item)>;
-                    if constexpr (std::is_same_v<Item, std::monostate>) {
-                        return {};
-                    } else if constexpr (std::is_same_v<Item, bool>) {
-                        writer.boolean_field(2, item);
-                        return {};
-                    } else if constexpr (std::is_same_v<Item, IntegerValue>) {
-                        if (!canonical_integer(item.decimal) || item.decimal.size() > limits.maximum_string_bytes) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
-                                                               "integer spelling is not canonical or is too large"));
-                        }
-                        writer.string_field(3, item.decimal);
-                        return {};
-                    } else if constexpr (std::is_same_v<Item, double>) {
-                        writer.fixed64_field(4, std::bit_cast<std::uint64_t>(item));
-                        return {};
-                    } else if constexpr (std::is_same_v<Item, UnicodeValue>) {
-                        if (!valid_utf8(item.utf8) || item.utf8.size() > limits.maximum_string_bytes) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::invalid_utf8,
-                                                               "fact string is invalid UTF-8 or too large"));
-                        }
-                        writer.string_field(5, item.utf8);
-                        return {};
-                    } else if constexpr (std::is_same_v<Item, BytesValue>) {
-                        if (item.bytes.size() > limits.maximum_blob_bytes) {
-                            return std::unexpected(
-                                codec_error(ProtocolErrorCode::limit_exceeded, "fact bytes exceed the limit"));
-                        }
-                        writer.raw_length_field(6, item.bytes);
-                        return {};
-                    } else if constexpr (std::is_same_v<Item, EnumValue>) {
-                        if (item.schema.empty() || item.member.empty() || !valid_utf8(item.member)) {
-                            return std::unexpected(
-                                codec_error(ProtocolErrorCode::invalid_value, "enum identity is incomplete"));
-                        }
-                        Writer nested;
-                        nested.string_field(1, item.schema.value);
-                        nested.string_field(2, item.member);
-                        writer.message_field(7, nested);
-                        return {};
-                    } else if constexpr (std::is_same_v<Item, FactList>) {
-                        if (item.items.size() > limits.maximum_collection_items - budget.collection_items) {
-                            return std::unexpected(
-                                codec_error(ProtocolErrorCode::limit_exceeded, "fact list count exceeds the limit"));
-                        }
-                        budget.collection_items += item.items.size();
-                        for (const auto &child : item.items) {
-                            Writer nested;
-                            if (auto encoded = encode_fact_value(nested, child, limits, budget, depth + 1); !encoded) {
-                                return encoded;
-                            }
-                            writer.message_field(8, nested);
-                        }
-                        return {};
-                    } else if constexpr (std::is_same_v<Item, FactMap>) {
-                        if (item.entries.size() > limits.maximum_collection_items - budget.collection_items) {
-                            return std::unexpected(
-                                codec_error(ProtocolErrorCode::limit_exceeded, "fact map count exceeds the limit"));
-                        }
-                        budget.collection_items += item.entries.size();
-                        for (const auto &entry : item.entries) {
-                            Writer nested;
-                            Writer key;
-                            if (auto encoded = encode_fact_value(key, entry.key, limits, budget, depth + 1); !encoded) {
-                                return encoded;
-                            }
-                            nested.message_field(1, key);
-                            Writer mapped;
-                            if (auto encoded = encode_fact_value(mapped, entry.value, limits, budget, depth + 1);
-                                !encoded) {
-                                return encoded;
-                            }
-                            nested.message_field(2, mapped);
-                            writer.message_field(9, nested);
-                        }
-                        return {};
-                    } else {
-                        if (item.schema.empty() ||
-                            item.fields.size() > limits.maximum_collection_items - budget.collection_items) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                               "fact record schema or field count is invalid"));
-                        }
-                        budget.collection_items += item.fields.size();
-                        writer.string_field(10, item.schema.value);
-                        std::uint32_t previous {};
-                        for (const auto &field : item.fields) {
-                            if (field.field_id == 0 || field.field_id <= previous) {
-                                return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
-                                                                   "fact record fields are not canonical"));
-                            }
-                            previous = field.field_id;
-                            Writer nested;
-                            nested.unsigned_field(1, field.field_id);
-                            Writer field_value;
-                            if (auto encoded = encode_fact_value(field_value, field.value, limits, budget, depth + 1);
-                                !encoded) {
-                                return encoded;
-                            }
-                            nested.message_field(2, field_value);
-                            writer.message_field(11, nested);
-                        }
-                        return {};
-                    }
-                },
-                data);
-            pop();
-            return result;
-        }
-
-        [[nodiscard]] std::expected<EnumValue, ProtocolError> decode_enum(Reader &reader) {
-            EnumValue result;
-            SeenFields seen;
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field != 1 && tag->field != 2) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                auto text = read_string(reader, *tag);
-                if (!text) {
-                    return std::unexpected(std::move(text.error()));
-                }
-                if (tag->field == 1) {
-                    result.schema = SchemaId {std::move(*text)};
-                } else {
-                    result.member = std::move(*text);
-                }
-            }
-            if (result.schema.empty() || result.member.empty()) {
-                return std::unexpected(codec_error(ProtocolErrorCode::invalid_value, "enum value is incomplete"));
-            }
-            return result;
-        }
-
-        [[nodiscard]] std::expected<FactValue, ProtocolError> decode_fact_value(Reader &reader) {
-            if (reader.depth > reader.limits->maximum_value_depth ||
-                reader.budget->value_nodes >= reader.limits->maximum_total_value_nodes) {
-                return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                   "fact value depth or node count exceeds the limit", reader.offset));
-            }
-            ++reader.budget->value_nodes;
-            SeenFields seen;
-            std::optional<std::uint64_t> kind;
-            FactData data;
-            bool payload_seen {};
-            std::vector<FactValue> list_items;
-            std::vector<FactMapEntry> map_entries;
-            SchemaId record_schema;
-            std::vector<FactRecordField> record_fields;
-
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field == 8 || tag->field == 9 || tag->field == 11) {
-                    if (auto counted = count_collection(reader); !counted) {
-                        return std::unexpected(std::move(counted.error()));
-                    }
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    if (tag->field == 8) {
-                        auto child = decode_fact_value(*nested);
-                        if (!child) {
-                            return std::unexpected(std::move(child.error()));
-                        }
-                        list_items.push_back(std::move(*child));
-                        continue;
-                    }
-                    if (tag->field == 9) {
-                        SeenFields entry_seen;
-                        std::optional<FactValue> key;
-                        std::optional<FactValue> value;
-                        while (!nested->eof()) {
-                            auto entry_tag = nested->next_tag();
-                            if (!entry_tag) {
-                                return std::unexpected(std::move(entry_tag.error()));
-                            }
-                            if (entry_tag->field != 1 && entry_tag->field != 2) {
-                                if (auto skipped = nested->skip(*entry_tag); !skipped) {
-                                    return std::unexpected(std::move(skipped.error()));
-                                }
-                                continue;
-                            }
-                            if (auto marked = entry_seen.mark(entry_tag->field, nested->offset); !marked) {
-                                return std::unexpected(std::move(marked.error()));
-                            }
-                            auto value_reader = child_reader(*nested, *entry_tag, reader.limits->maximum_value_depth);
-                            if (!value_reader) {
-                                return std::unexpected(std::move(value_reader.error()));
-                            }
-                            auto decoded = decode_fact_value(*value_reader);
-                            if (!decoded) {
-                                return std::unexpected(std::move(decoded.error()));
-                            }
-                            if (entry_tag->field == 1) {
-                                key = std::move(*decoded);
-                            } else {
-                                value = std::move(*decoded);
-                            }
-                        }
-                        if (!key.has_value() || !value.has_value()) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
-                                                               "fact map entry is incomplete", reader.offset));
-                        }
-                        map_entries.push_back(FactMapEntry {.key = std::move(*key), .value = std::move(*value)});
-                        continue;
-                    }
-
-                    SeenFields field_seen;
-                    std::uint32_t field_id {};
-                    std::optional<FactValue> field_value;
-                    while (!nested->eof()) {
-                        auto field_tag = nested->next_tag();
-                        if (!field_tag) {
-                            return std::unexpected(std::move(field_tag.error()));
-                        }
-                        if (field_tag->field != 1 && field_tag->field != 2) {
-                            if (auto skipped = nested->skip(*field_tag); !skipped) {
-                                return std::unexpected(std::move(skipped.error()));
-                            }
-                            continue;
-                        }
-                        if (auto marked = field_seen.mark(field_tag->field, nested->offset); !marked) {
-                            return std::unexpected(std::move(marked.error()));
-                        }
-                        if (field_tag->field == 1) {
-                            auto number = nested->read_unsigned(*field_tag);
-                            if (!number || *number == 0 || *number > std::numeric_limits<std::uint32_t>::max()) {
-                                return std::unexpected(number ?
-                                                           codec_error(ProtocolErrorCode::invalid_value,
-                                                                       "record field ID is invalid", nested->offset) :
-                                                           std::move(number.error()));
-                            }
-                            field_id = static_cast<std::uint32_t>(*number);
-                            continue;
-                        }
-                        auto value_reader = child_reader(*nested, *field_tag, reader.limits->maximum_value_depth);
-                        if (!value_reader) {
-                            return std::unexpected(std::move(value_reader.error()));
-                        }
-                        auto decoded = decode_fact_value(*value_reader);
-                        if (!decoded) {
-                            return std::unexpected(std::move(decoded.error()));
-                        }
-                        field_value = std::move(*decoded);
-                    }
-                    if (field_id == 0 || !field_value.has_value() ||
-                        (!record_fields.empty() && field_id <= record_fields.back().field_id)) {
-                        return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
-                                                           "record fields are incomplete or non-canonical",
-                                                           reader.offset));
-                    }
-                    record_fields.push_back(FactRecordField {.field_id = field_id, .value = std::move(*field_value)});
-                    continue;
-                }
-
-                if (tag->field > 11) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                switch (tag->field) {
-                    case 1: {
-                        auto number = reader.read_unsigned(*tag);
-                        if (!number || *number > 9) {
-                            return std::unexpected(number ? codec_error(ProtocolErrorCode::invalid_value,
-                                                                        "fact value kind is invalid", reader.offset) :
-                                                            std::move(number.error()));
-                        }
-                        kind = *number;
-                        break;
-                    }
-                    case 2: {
-                        auto boolean = reader.read_boolean(*tag);
-                        if (!boolean) {
-                            return std::unexpected(std::move(boolean.error()));
-                        }
-                        data = *boolean;
-                        payload_seen = true;
-                        break;
-                    }
-                    case 3: {
-                        auto integer = read_string(reader, *tag);
-                        if (!integer) {
-                            return std::unexpected(std::move(integer.error()));
-                        }
-                        if (!canonical_integer(*integer)) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
-                                                               "integer spelling is not canonical", reader.offset));
-                        }
-                        data = IntegerValue {std::move(*integer)};
-                        payload_seen = true;
-                        break;
-                    }
-                    case 4: {
-                        auto bits = reader.read_fixed64(*tag);
-                        if (!bits) {
-                            return std::unexpected(std::move(bits.error()));
-                        }
-                        data = std::bit_cast<double>(*bits);
-                        payload_seen = true;
-                        break;
-                    }
-                    case 5: {
-                        auto text = read_string(reader, *tag);
-                        if (!text) {
-                            return std::unexpected(std::move(text.error()));
-                        }
-                        data = UnicodeValue {std::move(*text)};
-                        payload_seen = true;
-                        break;
-                    }
-                    case 6: {
-                        auto bytes = reader.read_bytes(*tag, reader.limits->maximum_blob_bytes);
-                        if (!bytes) {
-                            return std::unexpected(std::move(bytes.error()));
-                        }
-                        data = BytesValue {std::vector<std::byte>(bytes->begin(), bytes->end())};
-                        payload_seen = true;
-                        break;
-                    }
-                    case 7: {
-                        auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
-                        if (!nested) {
-                            return std::unexpected(std::move(nested.error()));
-                        }
-                        auto value = decode_enum(*nested);
-                        if (!value) {
-                            return std::unexpected(std::move(value.error()));
-                        }
-                        data = std::move(*value);
-                        payload_seen = true;
-                        break;
-                    }
-                    case 10: {
-                        auto schema = read_string(reader, *tag);
-                        if (!schema) {
-                            return std::unexpected(std::move(schema.error()));
-                        }
-                        record_schema = SchemaId {std::move(*schema)};
-                        break;
-                    }
-                    default:
-                        return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
-                                                           "unexpected non-repeated fact value field", reader.offset));
-                }
-            }
-
-            if (!kind.has_value()) {
-                return std::unexpected(codec_error(ProtocolErrorCode::invalid_value, "fact value kind is absent"));
-            }
-            if (*kind == 0) {
-                if (payload_seen || !list_items.empty() || !map_entries.empty() || !record_schema.empty() ||
-                    !record_fields.empty()) {
-                    return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
-                                                       "null fact value contains a payload", reader.offset));
-                }
-                return make_fact(std::monostate {});
-            }
-            if (*kind == 7) {
-                if (payload_seen || !map_entries.empty() || !record_schema.empty() || !record_fields.empty()) {
-                    return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
-                                                       "fact list has conflicting payload fields", reader.offset));
-                }
-                return make_fact(FactList {.items = std::move(list_items)});
-            }
-            if (*kind == 8) {
-                if (payload_seen || !list_items.empty() || !record_schema.empty() || !record_fields.empty()) {
-                    return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
-                                                       "fact map has conflicting payload fields", reader.offset));
-                }
-                return make_fact(FactMap {.entries = std::move(map_entries)});
-            }
-            if (*kind == 9) {
-                if (payload_seen || !list_items.empty() || !map_entries.empty() || record_schema.empty()) {
-                    return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
-                                                       "fact record has conflicting or missing fields", reader.offset));
-                }
-                return make_fact(FactRecord {.schema = std::move(record_schema), .fields = std::move(record_fields)});
-            }
-            if (!payload_seen || data.index() != *kind || !list_items.empty() || !map_entries.empty() ||
-                !record_schema.empty() || !record_fields.empty()) {
-                return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
-                                                   "fact value kind and payload do not agree", reader.offset));
-            }
-            return make_fact(std::move(data));
-        }
-
-        [[nodiscard]] std::expected<void, ProtocolError> validate_provider_diagnostic(const Diagnostic &diagnostic) {
-            if (diagnostic.code.empty() || diagnostic.message.empty() || !valid_utf8(diagnostic.code) ||
-                !valid_utf8(diagnostic.message) || diagnostic.span.has_value() || !diagnostic.related.empty()) {
-                return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
-                                                   "provider diagnostic must be bounded and source-free"));
+                offset += static_cast<std::size_t>(*length);
             }
             return {};
-        }
-
-        void encode_diagnostic(Writer &writer, const Diagnostic &diagnostic) {
-            writer.string_field(1, diagnostic.code);
-            writer.unsigned_field(2, static_cast<std::uint8_t>(diagnostic.severity));
-            writer.string_field(3, diagnostic.message);
-        }
-
-        [[nodiscard]] std::expected<Diagnostic, ProtocolError> decode_diagnostic(Reader &reader) {
-            Diagnostic result;
-            SeenFields seen;
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field > 3) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 2) {
-                    auto severity = reader.read_unsigned(*tag);
-                    if (!severity || *severity > static_cast<std::uint8_t>(DiagnosticSeverity::error)) {
-                        return std::unexpected(severity ? codec_error(ProtocolErrorCode::invalid_value,
-                                                                      "provider diagnostic severity is invalid",
-                                                                      reader.offset) :
-                                                          std::move(severity.error()));
-                    }
-                    result.severity = static_cast<DiagnosticSeverity>(*severity);
-                    continue;
-                }
-                auto text = read_string(reader, *tag);
-                if (!text) {
-                    return std::unexpected(std::move(text.error()));
-                }
-                if (tag->field == 1) {
-                    result.code = std::move(*text);
-                } else {
-                    result.message = std::move(*text);
-                }
-            }
-            if (auto valid = validate_provider_diagnostic(result); !valid) {
-                return std::unexpected(std::move(valid.error()));
-            }
-            return result;
-        }
-
-        [[nodiscard]] bool terminal_status_valid(const FactTerminalStatus status) noexcept {
-            return status >= FactTerminalStatus::value && status <= FactTerminalStatus::canceled;
         }
 
         [[nodiscard]] std::expected<void, ProtocolError> validate_label(const DataLabel &label,
                                                                         const ProtocolLimits &limits) {
-            if (label.classification > Classification::secret ||
-                label.categories.size() > limits.maximum_label_categories ||
-                !std::ranges::is_sorted(label.categories)) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::invalid_value, "scan data label is not canonical"));
+            if (static_cast<std::uint8_t>(label.classification) >
+                    static_cast<std::uint8_t>(Classification::secret) ||
+                label.categories.size() > limits.maximum_label_categories) {
+                return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded, "data label exceeds its limits"));
             }
-            std::string_view previous;
+            std::unordered_set<std::string_view> unique;
             for (const auto &category : label.categories) {
-                if (category.empty() || category.size() > limits.maximum_string_bytes || !valid_utf8(category) ||
-                    (!previous.empty() && previous == category)) {
+                if (category.empty() || category.size() > limits.maximum_string_bytes || !unique.insert(category).second) {
                     return std::unexpected(
-                        codec_error(ProtocolErrorCode::invalid_value, "scan data label category is invalid"));
+                        codec_error(ProtocolErrorCode::malformed, "data label category is empty or duplicated"));
                 }
-                previous = category;
             }
             return {};
         }
 
-        void encode_label(Writer &writer, const DataLabel &label) {
-            writer.unsigned_field(1, static_cast<std::uint8_t>(label.classification));
-            for (const auto &category : label.categories) { writer.string_field(2, category); }
-        }
-
-        [[nodiscard]] std::expected<DataLabel, ProtocolError> decode_label(Reader &reader) {
-            DataLabel result;
-            bool classification_seen {};
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field > 2) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (tag->field == 1) {
-                    if (classification_seen) {
-                        return std::unexpected(codec_error(ProtocolErrorCode::duplicate_field,
-                                                           "duplicate scan label classification", reader.offset));
-                    }
-                    auto classification = reader.read_unsigned(*tag);
-                    if (!classification || *classification > static_cast<std::uint8_t>(Classification::secret)) {
-                        return std::unexpected(classification ?
-                                                   codec_error(ProtocolErrorCode::invalid_value,
-                                                               "scan label classification is invalid", reader.offset) :
-                                                   std::move(classification.error()));
-                    }
-                    classification_seen = true;
-                    result.classification = static_cast<Classification>(*classification);
-                    continue;
-                }
-                if (auto counted = count_collection(reader); !counted) {
-                    return std::unexpected(std::move(counted.error()));
-                }
-                if (result.categories.size() >= reader.limits->maximum_label_categories) {
-                    return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                       "scan label category count exceeds the limit", reader.offset));
-                }
-                auto category = read_string(reader, *tag);
-                if (!category) {
-                    return std::unexpected(std::move(category.error()));
-                }
-                result.categories.push_back(std::move(*category));
-            }
-            if (!classification_seen) {
+        [[nodiscard]] std::expected<void, ProtocolError> validate_subject(const SubjectKey &subject,
+                                                                          const ProtocolLimits &limits,
+                                                                          const std::size_t depth = 1) {
+            if (depth > limits.maximum_subject_depth) {
                 return std::unexpected(
-                    codec_error(ProtocolErrorCode::invalid_value, "scan label classification is missing"));
+                    codec_error(ProtocolErrorCode::limit_exceeded, "subject nesting exceeds the limit"));
             }
-            if (auto valid = validate_label(result, *reader.limits); !valid) {
-                return std::unexpected(std::move(valid.error()));
+            if (!subject.valid() || subject.identity.size() > limits.maximum_identity_fields) {
+                return std::unexpected(codec_error(ProtocolErrorCode::invalid_identity, "subject identity is invalid"));
             }
-            return result;
-        }
-
-        [[nodiscard]] std::expected<void, ProtocolError> encode_fact_request(Writer &writer, const FactRequest &request,
-                                                                             const ProtocolLimits &limits) {
-            if (request.request_id.empty() || !request.subject.valid() || request.route.provider.empty() ||
-                request.route.fact.empty() || request.expected_schema.empty() || request.expected_schema_hash.empty() ||
-                request.expected_schema_hash.size() > limits.maximum_string_bytes ||
-                !valid_utf8(request.expected_schema_hash) || request.deadline_unix_ms == 0) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::malformed, "fact request identity is incomplete"));
-            }
-            writer.string_field(1, request.request_id.value);
-            Writer subject;
-            encode_subject(subject, request.subject);
-            writer.message_field(2, subject);
-            writer.string_field(3, request.route.provider);
-            writer.string_field(4, request.route.fact);
-            writer.string_field(5, request.expected_schema.value);
-            writer.unsigned_field(6, request.deadline_unix_ms);
-            writer.string_field(7, request.expected_schema_hash);
-            return {};
-        }
-
-        [[nodiscard]] std::expected<FactRequest, ProtocolError> decode_fact_request(Reader &reader) {
-            FactRequest result;
-            SeenFields seen;
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field > 7) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 2) {
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_subject_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    auto subject = decode_subject(*nested);
-                    if (!subject) {
-                        return std::unexpected(std::move(subject.error()));
-                    }
-                    result.subject = std::move(*subject);
-                    continue;
-                }
-                if (tag->field == 6) {
-                    auto deadline = reader.read_unsigned(*tag);
-                    if (!deadline) {
-                        return std::unexpected(std::move(deadline.error()));
-                    }
-                    result.deadline_unix_ms = *deadline;
-                    continue;
-                }
-                auto text = read_string(reader, *tag);
-                if (!text) {
-                    return std::unexpected(std::move(text.error()));
-                }
-                switch (tag->field) {
-                    case 1: result.request_id = RequestId {std::move(*text)}; break;
-                    case 3: result.route.provider = std::move(*text); break;
-                    case 4: result.route.fact = std::move(*text); break;
-                    case 5: result.expected_schema = SchemaId {std::move(*text)}; break;
-                    case 7: result.expected_schema_hash = std::move(*text); break;
-                    default: break;
-                }
-            }
-            if (result.request_id.empty() || !result.subject.valid() || result.route.provider.empty() ||
-                result.route.fact.empty() || result.expected_schema.empty() || result.expected_schema_hash.empty() ||
-                result.deadline_unix_ms == 0) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::malformed, "decoded fact request is incomplete", reader.offset));
-            }
-            return result;
-        }
-
-        [[nodiscard]] std::expected<void, ProtocolError> encode_scan_request(Writer &writer, const ScanRequest &request,
-                                                                             const ProtocolLimits &limits) {
-            if (request.request_id.empty() || !request.subject.valid() || request.space.kind.empty() ||
-                request.space.identity.empty() || request.space.subject_generation == 0 ||
-                request.space.size > std::numeric_limits<std::uint64_t>::max() - request.space.begin ||
-                request.plan.plan_id.empty() || request.plan.encoded_pattern.empty() ||
-                request.plan.encoded_pattern.size() > limits.maximum_string_bytes || request.plan.maximum_bytes == 0 ||
-                request.plan.maximum_bytes > limits.maximum_blob_bytes || request.plan.maximum_matches == 0 ||
-                request.plan.maximum_matches > limits.maximum_scan_matches ||
-                request.plan.context_bytes_before > limits.maximum_blob_bytes ||
-                request.plan.context_bytes_after > limits.maximum_blob_bytes ||
-                (request.plan.result_mode != ScanResultMode::exact_complete &&
-                 request.plan.result_mode != ScanResultMode::existential) ||
-                request.deadline_unix_ms == 0) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::malformed, "scan request identity or bounds are invalid"));
-            }
-            if (auto valid = validate_label(request.space.label, limits); !valid) {
-                return valid;
-            }
-            if (auto valid = validate_scan_pattern_ids(request.plan.pattern_ids, limits); !valid) {
-                return valid;
-            }
-            writer.string_field(1, request.request_id.value);
-            Writer subject;
-            encode_subject(subject, request.subject);
-            writer.message_field(2, subject);
-            writer.string_field(3, request.space.kind);
-            writer.unsigned_field(4, request.space.begin);
-            writer.unsigned_field(5, request.space.size);
-            writer.unsigned_field(6, request.space.permissions);
-            writer.string_field(7, request.plan.plan_id);
-            writer.string_field(8, request.plan.encoded_pattern);
-            writer.unsigned_field(9, request.plan.maximum_bytes);
-            writer.unsigned_field(10, request.plan.maximum_matches);
-            writer.unsigned_field(11, request.deadline_unix_ms);
-            writer.string_field(12, request.space.identity);
-            writer.unsigned_field(13, request.space.subject_generation);
-            Writer label;
-            encode_label(label, request.space.label);
-            writer.message_field(14, label);
-            writer.unsigned_field(15, request.plan.context_bytes_before);
-            writer.unsigned_field(16, request.plan.context_bytes_after);
-            writer.unsigned_field(17, static_cast<std::uint8_t>(request.plan.result_mode));
-            for (const auto &pattern_id : request.plan.pattern_ids) { writer.string_field(18, pattern_id); }
-            return {};
-        }
-
-        [[nodiscard]] std::expected<ScanRequest, ProtocolError> decode_scan_request(Reader &reader) {
-            ScanRequest result;
-            SeenFields seen;
-            bool label_seen {};
-            bool mode_seen {};
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field == 18) {
-                    if (auto counted = count_collection(reader); !counted) {
-                        return std::unexpected(std::move(counted.error()));
-                    }
-                    if (result.plan.pattern_ids.size() >= reader.limits->maximum_scan_patterns) {
-                        return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                           "scan pattern ID count exceeds the limit", reader.offset));
-                    }
-                    auto pattern_id = read_string(reader, *tag);
-                    if (!pattern_id) {
-                        return std::unexpected(std::move(pattern_id.error()));
-                    }
-                    result.plan.pattern_ids.push_back(std::move(*pattern_id));
-                    continue;
-                }
-                if (tag->field > 18) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 2 || tag->field == 14) {
-                    auto nested = child_reader(reader, *tag,
-                                               tag->field == 2 ? reader.limits->maximum_subject_depth :
-                                                                 reader.limits->maximum_value_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    if (tag->field == 2) {
-                        auto subject = decode_subject(*nested);
-                        if (!subject) {
-                            return std::unexpected(std::move(subject.error()));
-                        }
-                        result.subject = std::move(*subject);
-                    } else {
-                        auto label = decode_label(*nested);
-                        if (!label) {
-                            return std::unexpected(std::move(label.error()));
-                        }
-                        result.space.label = std::move(*label);
-                        label_seen = true;
-                    }
-                    continue;
-                }
-                if (tag->field == 1 || tag->field == 3 || tag->field == 7 || tag->field == 8 || tag->field == 12) {
-                    auto text = read_string(reader, *tag);
-                    if (!text) {
-                        return std::unexpected(std::move(text.error()));
-                    }
-                    if (tag->field == 1) {
-                        result.request_id = RequestId {std::move(*text)};
-                    } else if (tag->field == 3) {
-                        result.space.kind = std::move(*text);
-                    } else if (tag->field == 7) {
-                        result.plan.plan_id = std::move(*text);
-                    } else if (tag->field == 8) {
-                        result.plan.encoded_pattern = std::move(*text);
-                    } else {
-                        result.space.identity = std::move(*text);
-                    }
-                    continue;
-                }
-                auto number = reader.read_unsigned(*tag);
-                if (!number) {
-                    return std::unexpected(std::move(number.error()));
-                }
-                switch (tag->field) {
-                    case 4: result.space.begin = *number; break;
-                    case 5: result.space.size = *number; break;
-                    case 6:
-                        if (*number > std::numeric_limits<std::uint32_t>::max()) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                               "scan permissions exceed uint32", reader.offset));
-                        }
-                        result.space.permissions = static_cast<std::uint32_t>(*number);
-                        break;
-                    case 9: result.plan.maximum_bytes = *number; break;
-                    case 10:
-                        if (*number > std::numeric_limits<std::uint32_t>::max()) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                               "scan match bound exceeds uint32", reader.offset));
-                        }
-                        result.plan.maximum_matches = static_cast<std::uint32_t>(*number);
-                        break;
-                    case 11: result.deadline_unix_ms = *number; break;
-                    case 13: result.space.subject_generation = *number; break;
-                    case 15:
-                    case 16:
-                        if (*number > std::numeric_limits<std::uint32_t>::max()) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                               "scan context bound exceeds uint32", reader.offset));
-                        }
-                        if (tag->field == 15) {
-                            result.plan.context_bytes_before = static_cast<std::uint32_t>(*number);
+            for (const auto &field : subject.identity) {
+                const auto valid = std::visit(
+                    [&](const auto &value) {
+                        using Value = std::remove_cvref_t<decltype(value)>;
+                        if constexpr (std::is_same_v<Value, IntegerValue>) {
+                            return canonical_integer(value.decimal);
+                        } else if constexpr (std::is_same_v<Value, UnicodeValue>) {
+                            return value.utf8.size() <= limits.maximum_string_bytes;
+                        } else if constexpr (std::is_same_v<Value, BytesValue>) {
+                            return value.bytes.size() <= limits.maximum_blob_bytes;
                         } else {
-                            result.plan.context_bytes_after = static_cast<std::uint32_t>(*number);
+                            return true;
                         }
-                        break;
-                    case 17:
-                        if (*number < static_cast<std::uint8_t>(ScanResultMode::exact_complete) ||
-                            *number > static_cast<std::uint8_t>(ScanResultMode::existential)) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
-                                                               "scan result mode is invalid", reader.offset));
-                        }
-                        result.plan.result_mode = static_cast<ScanResultMode>(*number);
-                        mode_seen = true;
-                        break;
-                    default: break;
+                    },
+                    field.value);
+                if (!valid) {
+                    return std::unexpected(
+                        codec_error(ProtocolErrorCode::invalid_identity, "subject identity scalar is invalid"));
                 }
             }
-            if (!label_seen || !mode_seen || result.request_id.empty() || !result.subject.valid() ||
-                result.space.kind.empty() || result.space.identity.empty() || result.space.subject_generation == 0 ||
-                result.space.size > std::numeric_limits<std::uint64_t>::max() - result.space.begin ||
-                result.plan.plan_id.empty() || result.plan.encoded_pattern.empty() || result.plan.maximum_bytes == 0 ||
-                result.plan.maximum_bytes > reader.limits->maximum_blob_bytes || result.plan.maximum_matches == 0 ||
-                result.plan.maximum_matches > reader.limits->maximum_scan_matches ||
-                result.plan.context_bytes_before > reader.limits->maximum_blob_bytes ||
-                result.plan.context_bytes_after > reader.limits->maximum_blob_bytes || result.deadline_unix_ms == 0) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::malformed, "decoded scan request is invalid", reader.offset));
+            if (subject.parent) {
+                return validate_subject(*subject.parent, limits, depth + 1);
             }
-            if (auto valid = validate_scan_pattern_ids(result.plan.pattern_ids, *reader.limits); !valid) {
-                return std::unexpected(std::move(valid.error()));
-            }
-            return result;
+            return {};
         }
+
+        struct ValueBudget {
+            std::size_t nodes {};
+        };
 
         [[nodiscard]] std::expected<void, ProtocolError>
-        encode_fact_response(Writer &writer, const FactResponse &response, const ProtocolLimits &limits) {
-            if (response.request_id.empty() || !response.subject.valid() || !terminal_status_valid(response.status) ||
-                !valid_fact_response_shape(response) ||
-                (response.returned_schema.has_value() &&
-                 (response.returned_schema->id.value.size() > limits.maximum_string_bytes ||
-                  response.returned_schema->canonical_hash.size() > limits.maximum_string_bytes ||
-                  !valid_utf8(response.returned_schema->id.value) ||
-                  !valid_utf8(response.returned_schema->canonical_hash)))) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::invalid_value, "fact response terminal shape is invalid"));
+        validate_value(const FactValue &value, const ProtocolLimits &limits, ValueBudget &budget,
+                       const std::size_t depth = 1) {
+            if (!value.valid()) {
+                return std::unexpected(codec_error(ProtocolErrorCode::invalid_value, "fact value is absent"));
             }
-            writer.string_field(1, response.request_id.value);
-            Writer subject;
-            encode_subject(subject, response.subject);
-            writer.message_field(2, subject);
-            writer.unsigned_field(3, static_cast<std::uint8_t>(response.status));
-            if (response.value.has_value()) {
-                Writer value;
-                EncodeBudget budget;
-                if (auto encoded = encode_fact_value(value, *response.value, limits, budget); !encoded) {
-                    return encoded;
-                }
-                writer.message_field(4, value);
+            if (depth > limits.maximum_value_depth || ++budget.nodes > limits.maximum_total_value_nodes) {
+                return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded, "fact graph exceeds its budget"));
             }
-            if (response.diagnostic.has_value()) {
-                if (auto valid = validate_provider_diagnostic(*response.diagnostic); !valid) {
-                    return valid;
-                }
-                Writer diagnostic;
-                encode_diagnostic(diagnostic, *response.diagnostic);
-                writer.message_field(5, diagnostic);
-            }
-            if (response.returned_schema.has_value()) {
-                Writer schema;
-                encode_schema_identity(schema, *response.returned_schema);
-                writer.message_field(6, schema);
-            }
-            return {};
+            return std::visit(
+                [&](const auto &item) -> std::expected<void, ProtocolError> {
+                    using Item = std::remove_cvref_t<decltype(item)>;
+                    if constexpr (std::is_same_v<Item, IntegerValue>) {
+                        if (!canonical_integer(item.decimal)) {
+                            return std::unexpected(
+                                codec_error(ProtocolErrorCode::invalid_value, "integer spelling is not canonical"));
+                        }
+                    } else if constexpr (std::is_same_v<Item, UnicodeValue>) {
+                        if (item.utf8.size() > limits.maximum_string_bytes) {
+                            return std::unexpected(
+                                codec_error(ProtocolErrorCode::limit_exceeded, "Unicode fact exceeds the limit"));
+                        }
+                    } else if constexpr (std::is_same_v<Item, BytesValue>) {
+                        if (item.bytes.size() > limits.maximum_blob_bytes) {
+                            return std::unexpected(
+                                codec_error(ProtocolErrorCode::limit_exceeded, "bytes fact exceeds the limit"));
+                        }
+                    } else if constexpr (std::is_same_v<Item, EnumValue>) {
+                        if (item.schema.empty() || item.member.empty()) {
+                            return std::unexpected(codec_error(ProtocolErrorCode::invalid_value, "enum fact is empty"));
+                        }
+                    } else if constexpr (std::is_same_v<Item, FactList>) {
+                        if (item.items.size() > limits.maximum_collection_items) {
+                            return std::unexpected(
+                                codec_error(ProtocolErrorCode::limit_exceeded, "fact list exceeds the limit"));
+                        }
+                        for (const auto &child : item.items) {
+                            if (auto valid = validate_value(child, limits, budget, depth + 1); !valid) {
+                                return valid;
+                            }
+                        }
+                    } else if constexpr (std::is_same_v<Item, FactMap>) {
+                        if (item.entries.size() > limits.maximum_collection_items) {
+                            return std::unexpected(
+                                codec_error(ProtocolErrorCode::limit_exceeded, "fact map exceeds the limit"));
+                        }
+                        for (const auto &entry : item.entries) {
+                            if (auto valid = validate_value(entry.key, limits, budget, depth + 1); !valid) {
+                                return valid;
+                            }
+                            if (auto valid = validate_value(entry.value, limits, budget, depth + 1); !valid) {
+                                return valid;
+                            }
+                        }
+                    } else if constexpr (std::is_same_v<Item, FactRecord>) {
+                        if (item.schema.empty() || item.fields.size() > limits.maximum_collection_items) {
+                            return std::unexpected(
+                                codec_error(ProtocolErrorCode::invalid_value, "fact record is invalid"));
+                        }
+                        std::uint32_t previous {};
+                        for (const auto &field : item.fields) {
+                            if (field.field_id == 0 || field.field_id <= previous) {
+                                return std::unexpected(
+                                    codec_error(ProtocolErrorCode::invalid_value, "record fields are not canonical"));
+                            }
+                            previous = field.field_id;
+                            if (auto valid = validate_value(field.value, limits, budget, depth + 1); !valid) {
+                                return valid;
+                            }
+                        }
+                    }
+                    return {};
+                },
+                value.node->data);
         }
 
-        [[nodiscard]] std::expected<FactResponse, ProtocolError> decode_fact_response(Reader &reader) {
-            FactResponse result;
-            SeenFields seen;
-            bool status_seen {};
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field > 6) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 1) {
-                    auto id = read_string(reader, *tag);
-                    if (!id) {
-                        return std::unexpected(std::move(id.error()));
-                    }
-                    result.request_id = RequestId {std::move(*id)};
-                } else if (tag->field == 2) {
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_subject_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    auto subject = decode_subject(*nested);
-                    if (!subject) {
-                        return std::unexpected(std::move(subject.error()));
-                    }
-                    result.subject = std::move(*subject);
-                } else if (tag->field == 3) {
-                    auto status = reader.read_unsigned(*tag);
-                    if (!status || *status > static_cast<std::uint8_t>(FactTerminalStatus::canceled)) {
-                        return std::unexpected(status ? codec_error(ProtocolErrorCode::invalid_value,
-                                                                    "fact status is invalid", reader.offset) :
-                                                        std::move(status.error()));
-                    }
-                    result.status = static_cast<FactTerminalStatus>(*status);
-                    status_seen = true;
-                } else if (tag->field == 4) {
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    auto value = decode_fact_value(*nested);
-                    if (!value) {
-                        return std::unexpected(std::move(value.error()));
-                    }
-                    result.value = std::move(*value);
-                } else if (tag->field == 5) {
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    auto diagnostic = decode_diagnostic(*nested);
-                    if (!diagnostic) {
-                        return std::unexpected(std::move(diagnostic.error()));
-                    }
-                    result.diagnostic = std::move(*diagnostic);
-                } else {
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    auto schema = decode_schema_identity(*nested);
-                    if (!schema) {
-                        return std::unexpected(std::move(schema.error()));
-                    }
-                    result.returned_schema = std::move(*schema);
-                }
+        [[nodiscard]] std::expected<void, ProtocolError> validate_diagnostic(const Diagnostic &diagnostic) {
+            if (diagnostic.code.empty() || diagnostic.message.empty() || diagnostic.span || !diagnostic.related.empty()) {
+                return std::unexpected(
+                    codec_error(ProtocolErrorCode::provider_violation, "provider diagnostic contains source data"));
             }
-            if (!status_seen || result.request_id.empty() || !result.subject.valid() ||
-                !valid_fact_response_shape(result)) {
-                return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
-                                                   "decoded fact response is incomplete", reader.offset));
-            }
-            return result;
+            return {};
         }
 
         [[nodiscard]] std::expected<void, ProtocolError> validate_scan_match(const ScanMatch &match,
                                                                              const ProtocolLimits &limits) {
             if (match.pattern_id.empty() || match.scan_space_id.empty() ||
-                match.pattern_id.size() > limits.maximum_string_bytes ||
-                match.scan_space_id.size() > limits.maximum_string_bytes || !valid_utf8(match.pattern_id) ||
-                !valid_utf8(match.scan_space_id) || match.subject_generation == 0 ||
                 match.matched_bytes.size() != match.length || match.matched_bytes.size() > limits.maximum_blob_bytes ||
-                match.before_bytes.size() > limits.maximum_blob_bytes - match.matched_bytes.size() ||
-                match.after_bytes.size() >
-                    limits.maximum_blob_bytes - match.matched_bytes.size() - match.before_bytes.size()) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::invalid_value, "scan match metadata or context is invalid"));
+                match.before_bytes.size() > limits.maximum_blob_bytes || match.after_bytes.size() > limits.maximum_blob_bytes ||
+                match.subject_generation == 0) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "scan match is inconsistent"));
             }
             return validate_label(match.label, limits);
         }
 
-        [[nodiscard]] std::expected<void, ProtocolError> encode_scan_match(Writer &writer, const ScanMatch &match,
-                                                                           const ProtocolLimits &limits) {
-            if (auto valid = validate_scan_match(match, limits); !valid) {
-                return valid;
+        [[nodiscard]] std::expected<void, ProtocolError> validate_envelope(const PeerEnvelope &envelope,
+                                                                           const ProtocolLimits &limits);
+
+        void to_wire(wire::CreditWindow<> &target, const CreditWindow &source) {
+            target.set_bytes(source.bytes);
+            target.set_messages(source.messages);
+            target.set_work_attempts(source.work_attempts);
+            target.set_snapshot_chunks(source.snapshot_chunks);
+        }
+
+        [[nodiscard]] CreditWindow from_wire(const wire::CreditWindow<> &source) {
+            return {.bytes = source.bytes(),
+                    .messages = source.messages(),
+                    .work_attempts = source.work_attempts(),
+                    .snapshot_chunks = source.snapshot_chunks()};
+        }
+
+        [[nodiscard]] std::expected<void, ProtocolError>
+        to_wire(wire::SchemaAdvertisement<> &target, const SchemaAdvertisement &source) {
+            if (source.schema.empty() || source.major == 0 || source.canonical_hash.empty()) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "schema advertisement is incomplete"));
             }
-            writer.unsigned_field(1, match.offset);
-            writer.unsigned_field(2, match.length);
-            writer.string_field(3, match.pattern_id);
-            writer.string_field(4, match.scan_space_id);
-            writer.unsigned_field(5, match.absolute_address);
-            writer.unsigned_field(6, match.permission_snapshot);
-            writer.raw_length_field(7, match.matched_bytes);
-            writer.raw_length_field(8, match.before_bytes);
-            writer.raw_length_field(9, match.after_bytes);
-            Writer label;
-            encode_label(label, match.label);
-            writer.message_field(10, label);
-            writer.unsigned_field(11, match.subject_generation);
+            if (auto status = checked(target.set_schema(source.schema.value), "set schema ID"); !status) return status;
+            target.set_major(source.major);
+            return checked(target.set_canonical_hash(source.canonical_hash), "set schema hash");
+        }
+
+        [[nodiscard]] SchemaAdvertisement from_wire(const wire::SchemaAdvertisement<> &source) {
+            return {.schema = SchemaId {text(source.schema())},
+                    .major = source.major(),
+                    .canonical_hash = text(source.canonical_hash())};
+        }
+
+        [[nodiscard]] std::expected<void, ProtocolError>
+        to_wire(wire::SchemaIdentity<> &target, const SchemaIdentity &source) {
+            if (!source.valid()) {
+                return std::unexpected(codec_error(ProtocolErrorCode::schema_mismatch, "schema identity is incomplete"));
+            }
+            if (auto status = checked(target.set_id(source.id.value), "set schema identity"); !status) return status;
+            return checked(target.set_canonical_hash(source.canonical_hash), "set schema identity hash");
+        }
+
+        [[nodiscard]] SchemaIdentity from_wire(const wire::SchemaIdentity<> &source) {
+            return {.id = SchemaId {text(source.id())}, .canonical_hash = text(source.canonical_hash())};
+        }
+
+        [[nodiscard]] std::expected<void, ProtocolError>
+        to_wire(wire::CapabilityAdvertisement<> &target, const CapabilityAdvertisement &source) {
+            if (source.capability.empty() || source.version == 0 || source.request_schema.empty() ||
+                source.response_schema.empty()) {
+                return std::unexpected(
+                    codec_error(ProtocolErrorCode::malformed, "capability advertisement is incomplete"));
+            }
+            if (auto status = checked(target.set_capability(source.capability.value), "set capability"); !status)
+                return status;
+            target.set_version(source.version);
+            if (auto status = checked(target.set_request_schema(source.request_schema.value), "set request schema");
+                !status)
+                return status;
+            return checked(target.set_response_schema(source.response_schema.value), "set response schema");
+        }
+
+        [[nodiscard]] CapabilityAdvertisement from_wire(const wire::CapabilityAdvertisement<> &source) {
+            return {.capability = CapabilityId {text(source.capability())},
+                    .version = source.version(),
+                    .request_schema = SchemaId {text(source.request_schema())},
+                    .response_schema = SchemaId {text(source.response_schema())}};
+        }
+
+        [[nodiscard]] std::expected<void, ProtocolError>
+        to_wire(wire::IdentityField<> &target, const IdentityField &source) {
+            if (source.field_id == 0) {
+                return std::unexpected(codec_error(ProtocolErrorCode::invalid_identity, "identity field ID is zero"));
+            }
+            target.set_field_id(source.field_id);
+            return std::visit(
+                [&](const auto &value) -> std::expected<void, ProtocolError> {
+                    using Value = std::remove_cvref_t<decltype(value)>;
+                    if constexpr (std::is_same_v<Value, bool>) {
+                        target.set_kind(1);
+                        target.set_bool_value(value);
+                    } else if constexpr (std::is_same_v<Value, std::int64_t>) {
+                        target.set_kind(2);
+                        target.set_int64_value(value);
+                    } else if constexpr (std::is_same_v<Value, std::uint64_t>) {
+                        target.set_kind(3);
+                        target.set_uint64_value(value);
+                    } else if constexpr (std::is_same_v<Value, IntegerValue>) {
+                        target.set_kind(4);
+                        if (auto status = checked(target.set_integer_value(value.decimal), "set identity integer");
+                            !status)
+                            return status;
+                    } else if constexpr (std::is_same_v<Value, UnicodeValue>) {
+                        target.set_kind(5);
+                        if (auto status = checked(target.set_unicode_value(value.utf8), "set identity text"); !status)
+                            return status;
+                    } else {
+                        target.set_kind(6);
+                        if (auto status =
+                                checked(target.set_bytes_value(byte_view(value.bytes)), "set identity bytes");
+                            !status)
+                            return status;
+                    }
+                    return {};
+                },
+                source.value);
+        }
+
+        [[nodiscard]] std::expected<IdentityField, ProtocolError> from_wire(const wire::IdentityField<> &source) {
+            IdentityScalar value;
+            switch (source.kind()) {
+                case 1: value = source.bool_value(); break;
+                case 2: value = source.int64_value(); break;
+                case 3: value = source.uint64_value(); break;
+                case 4: value = IntegerValue {text(source.integer_value())}; break;
+                case 5: value = UnicodeValue {text(source.unicode_value())}; break;
+                case 6: value = BytesValue {bytes(source.bytes_value())}; break;
+                default:
+                    return std::unexpected(
+                        codec_error(ProtocolErrorCode::invalid_identity, "identity scalar kind is invalid"));
+            }
+            return IdentityField {.field_id = source.field_id(), .value = std::move(value)};
+        }
+
+        [[nodiscard]] std::expected<void, ProtocolError>
+        to_wire(wire::SubjectKey<> &target, const SubjectKey &source, Context &ctx, const ProtocolLimits &limits) {
+            if (auto valid = validate_subject(source, limits); !valid) return valid;
+            if (auto status = checked(target.set_peer(source.peer.value), "set subject peer"); !status) return status;
+            if (auto status = checked(target.set_descriptor(source.descriptor.value), "set subject descriptor"); !status)
+                return status;
+            for (const auto &field : source.identity) {
+                if (auto status = append_message(target.mutable_identity(), ctx,
+                                                 [&](auto &item) { return to_wire(item, field); });
+                    !status)
+                    return status;
+            }
+            if (source.parent) {
+                auto parent = target.ensure_parent();
+                if (!parent) return std::unexpected(wire_error(parent.error(), "allocate subject parent"));
+                return to_wire(*parent, *source.parent, ctx, limits);
+            }
             return {};
         }
 
-        [[nodiscard]] std::expected<ScanMatch, ProtocolError> decode_scan_match(Reader &reader) {
-            ScanMatch result;
-            SeenFields seen;
-            std::array<bool, 11> required {};
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field > 11) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                required[tag->field - 1] = true;
-                if (tag->field == 3 || tag->field == 4) {
-                    auto text = read_string(reader, *tag);
-                    if (!text) {
-                        return std::unexpected(std::move(text.error()));
-                    }
-                    if (tag->field == 3) {
-                        result.pattern_id = std::move(*text);
-                    } else {
-                        result.scan_space_id = std::move(*text);
-                    }
-                    continue;
-                }
-                if (tag->field >= 7 && tag->field <= 9) {
-                    auto bytes = reader.read_bytes(*tag, reader.limits->maximum_blob_bytes);
-                    if (!bytes) {
-                        return std::unexpected(std::move(bytes.error()));
-                    }
-                    std::vector<std::byte> value(bytes->begin(), bytes->end());
-                    if (tag->field == 7) {
-                        result.matched_bytes = std::move(value);
-                    } else if (tag->field == 8) {
-                        result.before_bytes = std::move(value);
-                    } else {
-                        result.after_bytes = std::move(value);
-                    }
-                    continue;
-                }
-                if (tag->field == 10) {
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    auto label = decode_label(*nested);
-                    if (!label) {
-                        return std::unexpected(std::move(label.error()));
-                    }
-                    result.label = std::move(*label);
-                    continue;
-                }
-                auto number = reader.read_unsigned(*tag);
-                if (!number) {
-                    return std::unexpected(std::move(number.error()));
-                }
-                switch (tag->field) {
-                    case 1: result.offset = *number; break;
-                    case 2: result.length = *number; break;
-                    case 5: result.absolute_address = *number; break;
-                    case 6:
-                        if (*number > std::numeric_limits<std::uint32_t>::max()) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                               "scan permission snapshot exceeds uint32",
-                                                               reader.offset));
+        [[nodiscard]] std::expected<SubjectKey, ProtocolError>
+        from_wire(const wire::SubjectKey<> &source, const ProtocolLimits &limits, const std::size_t depth = 1) {
+            if (depth > limits.maximum_subject_depth) {
+                return std::unexpected(
+                    codec_error(ProtocolErrorCode::limit_exceeded, "subject nesting exceeds the limit"));
+            }
+            SubjectKey result {.peer = PeerId {text(source.peer())},
+                               .descriptor = SchemaId {text(source.descriptor())},
+                               .identity = {},
+                               .parent = {}};
+            if (source.identity().size() > limits.maximum_identity_fields) {
+                return std::unexpected(
+                    codec_error(ProtocolErrorCode::limit_exceeded, "subject identity count exceeds the limit"));
+            }
+            result.identity.reserve(source.identity().size());
+            for (const auto &field : source.identity()) {
+                auto decoded = from_wire(field);
+                if (!decoded) return std::unexpected(std::move(decoded.error()));
+                result.identity.push_back(std::move(*decoded));
+            }
+            if (source.has_parent()) {
+                auto parent = from_wire(*source.parent(), limits, depth + 1);
+                if (!parent) return std::unexpected(std::move(parent.error()));
+                result.parent = std::make_shared<const SubjectKey>(std::move(*parent));
+            }
+            if (auto valid = validate_subject(result, limits); !valid) return std::unexpected(std::move(valid.error()));
+            return result;
+        }
+
+        [[nodiscard]] std::expected<void, ProtocolError>
+        to_wire(wire::FactValue<> &target, const FactValue &source, Context &ctx, const ProtocolLimits &limits,
+                ValueBudget &budget, const std::size_t depth = 1) {
+            if (depth == 1) {
+                if (auto valid = validate_value(source, limits, budget); !valid) return valid;
+            }
+            target.set_kind(static_cast<std::uint32_t>(source.node->data.index()));
+            return std::visit(
+                [&](const auto &item) -> std::expected<void, ProtocolError> {
+                    using Item = std::remove_cvref_t<decltype(item)>;
+                    if constexpr (std::is_same_v<Item, std::monostate>) {
+                        // The discriminator is the complete null representation.
+                    } else if constexpr (std::is_same_v<Item, bool>) {
+                        target.set_bool_value(item);
+                    } else if constexpr (std::is_same_v<Item, IntegerValue>) {
+                        if (auto status = checked(target.set_integer_value(item.decimal), "set fact integer"); !status)
+                            return status;
+                    } else if constexpr (std::is_same_v<Item, double>) {
+                        target.set_double_value(item);
+                    } else if constexpr (std::is_same_v<Item, UnicodeValue>) {
+                        if (auto status = checked(target.set_unicode_value(item.utf8), "set fact text"); !status)
+                            return status;
+                    } else if constexpr (std::is_same_v<Item, BytesValue>) {
+                        if (auto status = checked(target.set_bytes_value(byte_view(item.bytes)), "set fact bytes");
+                            !status)
+                            return status;
+                    } else if constexpr (std::is_same_v<Item, EnumValue>) {
+                        auto value = target.ensure_enum_value();
+                        if (!value) return std::unexpected(wire_error(value.error(), "allocate enum fact"));
+                        if (auto status = checked(value->set_schema(item.schema.value), "set enum schema"); !status)
+                            return status;
+                        if (auto status = checked(value->set_member(item.member), "set enum member"); !status)
+                            return status;
+                    } else if constexpr (std::is_same_v<Item, FactList>) {
+                        for (const auto &child : item.items) {
+                            if (auto status = append_message(target.mutable_list_items(), ctx, [&](auto &wire_child) {
+                                    return to_wire(wire_child, child, ctx, limits, budget, depth + 1);
+                                });
+                                !status)
+                                return status;
                         }
-                        result.permission_snapshot = static_cast<std::uint32_t>(*number);
-                        break;
-                    case 11: result.subject_generation = *number; break;
-                    default: break;
+                    } else if constexpr (std::is_same_v<Item, FactMap>) {
+                        for (const auto &entry : item.entries) {
+                            if (auto status = append_message(target.mutable_map_entries(), ctx, [&](auto &wire_entry) {
+                                    auto key = wire_entry.ensure_key();
+                                    if (!key) return std::expected<void, ProtocolError> {std::unexpected(
+                                        wire_error(key.error(), "allocate fact-map key"))};
+                                    if (auto child = to_wire(*key, entry.key, ctx, limits, budget, depth + 1); !child)
+                                        return child;
+                                    auto value = wire_entry.ensure_value();
+                                    if (!value) return std::expected<void, ProtocolError> {std::unexpected(
+                                        wire_error(value.error(), "allocate fact-map value"))};
+                                    return to_wire(*value, entry.value, ctx, limits, budget, depth + 1);
+                                });
+                                !status)
+                                return status;
+                        }
+                    } else {
+                        if (auto status = checked(target.set_record_schema(item.schema.value), "set record schema");
+                            !status)
+                            return status;
+                        for (const auto &field : item.fields) {
+                            if (auto status = append_message(target.mutable_record_fields(), ctx, [&](auto &wire_field) {
+                                    wire_field.set_field_id(field.field_id);
+                                    auto value = wire_field.ensure_value();
+                                    if (!value) return std::expected<void, ProtocolError> {std::unexpected(
+                                        wire_error(value.error(), "allocate record field"))};
+                                    return to_wire(*value, field.value, ctx, limits, budget, depth + 1);
+                                });
+                                !status)
+                                return status;
+                        }
+                    }
+                    return {};
+                },
+                source.node->data);
+        }
+
+        [[nodiscard]] std::expected<FactValue, ProtocolError>
+        from_wire(const wire::FactValue<> &source, const ProtocolLimits &limits, ValueBudget &budget,
+                  const std::size_t depth = 1) {
+            if (depth > limits.maximum_value_depth || ++budget.nodes > limits.maximum_total_value_nodes) {
+                return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded, "fact graph exceeds its budget"));
+            }
+            FactData result;
+            switch (source.kind()) {
+                case 0: result = std::monostate {}; break;
+                case 1: result = source.bool_value(); break;
+                case 2: result = IntegerValue {text(source.integer_value())}; break;
+                case 3: result = source.double_value(); break;
+                case 4: result = UnicodeValue {text(source.unicode_value())}; break;
+                case 5: result = BytesValue {bytes(source.bytes_value())}; break;
+                case 6:
+                    if (!source.has_enum_value()) {
+                        return std::unexpected(codec_error(ProtocolErrorCode::invalid_value, "enum fact is absent"));
+                    }
+                    result = EnumValue {.schema = SchemaId {text(source.enum_value()->schema())},
+                                        .member = text(source.enum_value()->member())};
+                    break;
+                case 7: {
+                    FactList list;
+                    list.items.reserve(source.list_items().size());
+                    for (const auto &child : source.list_items()) {
+                        auto decoded = from_wire(child, limits, budget, depth + 1);
+                        if (!decoded) return std::unexpected(std::move(decoded.error()));
+                        list.items.push_back(std::move(*decoded));
+                    }
+                    result = std::move(list);
+                    break;
+                }
+                case 8: {
+                    FactMap map;
+                    map.entries.reserve(source.map_entries().size());
+                    for (const auto &entry : source.map_entries()) {
+                        if (!entry.has_key() || !entry.has_value()) {
+                            return std::unexpected(
+                                codec_error(ProtocolErrorCode::invalid_value, "fact-map entry is incomplete"));
+                        }
+                        auto key = from_wire(*entry.key(), limits, budget, depth + 1);
+                        if (!key) return std::unexpected(std::move(key.error()));
+                        auto value = from_wire(*entry.value(), limits, budget, depth + 1);
+                        if (!value) return std::unexpected(std::move(value.error()));
+                        map.entries.push_back({.key = std::move(*key), .value = std::move(*value)});
+                    }
+                    result = std::move(map);
+                    break;
+                }
+                case 9: {
+                    FactRecord record {.schema = SchemaId {text(source.record_schema())}, .fields = {}};
+                    record.fields.reserve(source.record_fields().size());
+                    for (const auto &field : source.record_fields()) {
+                        if (!field.has_value()) {
+                            return std::unexpected(
+                                codec_error(ProtocolErrorCode::invalid_value, "record field value is absent"));
+                        }
+                        auto value = from_wire(*field.value(), limits, budget, depth + 1);
+                        if (!value) return std::unexpected(std::move(value.error()));
+                        record.fields.push_back({.field_id = field.field_id(), .value = std::move(*value)});
+                    }
+                    result = std::move(record);
+                    break;
+                }
+                default:
+                    return std::unexpected(codec_error(ProtocolErrorCode::invalid_value, "fact kind is invalid"));
+            }
+            auto value = make_fact(std::move(result));
+            if (depth == 1) {
+                ValueBudget validation;
+                if (auto valid = validate_value(value, limits, validation); !valid)
+                    return std::unexpected(std::move(valid.error()));
+            }
+            return value;
+        }
+
+        [[nodiscard]] std::expected<void, ProtocolError>
+        to_wire(wire::ProviderDiagnostic<> &target, const Diagnostic &source) {
+            if (auto valid = validate_diagnostic(source); !valid) return valid;
+            if (auto status = checked(target.set_code(source.code), "set diagnostic code"); !status) return status;
+            target.set_severity(static_cast<std::uint32_t>(source.severity));
+            return checked(target.set_message(source.message), "set diagnostic message");
+        }
+
+        [[nodiscard]] std::expected<Diagnostic, ProtocolError>
+        from_wire(const wire::ProviderDiagnostic<> &source) {
+            if (source.severity() > static_cast<std::uint32_t>(DiagnosticSeverity::error)) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "diagnostic severity is invalid"));
+            }
+            Diagnostic result {.code = text(source.code()),
+                               .severity = static_cast<DiagnosticSeverity>(source.severity()),
+                               .message = text(source.message()),
+                               .span = std::nullopt,
+                               .related = {}};
+            if (auto valid = validate_diagnostic(result); !valid) return std::unexpected(std::move(valid.error()));
+            return result;
+        }
+
+        [[nodiscard]] std::expected<void, ProtocolError>
+        to_wire(wire::DataLabel<> &target, const DataLabel &source, Context &ctx, const ProtocolLimits &limits) {
+            if (auto valid = validate_label(source, limits); !valid) return valid;
+            target.set_classification(static_cast<std::uint32_t>(source.classification));
+            for (const auto &category : source.categories) {
+                if (auto status = append_text(target.mutable_categories(), ctx, category); !status) return status;
+            }
+            return {};
+        }
+
+        [[nodiscard]] std::expected<DataLabel, ProtocolError>
+        from_wire(const wire::DataLabel<> &source, const ProtocolLimits &limits) {
+            DataLabel result {.classification = static_cast<Classification>(source.classification()), .categories = {}};
+            result.categories.reserve(source.categories().size());
+            for (const auto &category : source.categories()) result.categories.push_back(text(category.view()));
+            if (auto valid = validate_label(result, limits); !valid) return std::unexpected(std::move(valid.error()));
+            return result;
+        }
+
+        [[nodiscard]] std::expected<void, ProtocolError>
+        to_wire(wire::FactRequest<> &target, const FactRequest &source, Context &ctx, const ProtocolLimits &limits) {
+            if (source.request_id.empty() || source.route.provider.empty() || source.route.fact.empty() ||
+                source.expected_schema.empty() || source.expected_schema_hash.empty() || source.deadline_unix_ms == 0) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "fact request is incomplete"));
+            }
+            if (auto status = checked(target.set_request_id(source.request_id.value), "set fact request ID"); !status)
+                return status;
+            auto subject = target.ensure_subject();
+            if (!subject) return std::unexpected(wire_error(subject.error(), "allocate fact subject"));
+            if (auto status = to_wire(*subject, source.subject, ctx, limits); !status) return status;
+            if (auto status = checked(target.set_provider(source.route.provider), "set fact provider"); !status)
+                return status;
+            if (auto status = checked(target.set_fact(source.route.fact), "set fact name"); !status) return status;
+            if (auto status = checked(target.set_expected_schema(source.expected_schema.value), "set fact schema");
+                !status)
+                return status;
+            target.set_deadline_unix_ms(source.deadline_unix_ms);
+            return checked(target.set_expected_schema_hash(source.expected_schema_hash), "set expected schema hash");
+        }
+
+        [[nodiscard]] std::expected<FactRequest, ProtocolError>
+        from_wire(const wire::FactRequest<> &source, const ProtocolLimits &limits) {
+            if (!source.has_subject()) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "fact subject is absent"));
+            }
+            auto subject = from_wire(*source.subject(), limits);
+            if (!subject) return std::unexpected(std::move(subject.error()));
+            FactRequest result {.request_id = RequestId {text(source.request_id())},
+                                .subject = std::move(*subject),
+                                .route = {.provider = text(source.provider()), .fact = text(source.fact())},
+                                .expected_schema = SchemaId {text(source.expected_schema())},
+                                .expected_schema_hash = text(source.expected_schema_hash()),
+                                .deadline_unix_ms = source.deadline_unix_ms()};
+            if (result.request_id.empty() || result.route.provider.empty() || result.route.fact.empty() ||
+                result.expected_schema.empty() || result.expected_schema_hash.empty() || result.deadline_unix_ms == 0) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "fact request is incomplete"));
+            }
+            return result;
+        }
+
+        [[nodiscard]] std::expected<void, ProtocolError>
+        to_wire(wire::ScanRequest<> &target, const ScanRequest &source, Context &ctx, const ProtocolLimits &limits) {
+            if (source.plan.pattern_ids.size() > limits.maximum_scan_patterns) {
+                return std::unexpected(
+                    codec_error(ProtocolErrorCode::limit_exceeded, "scan pattern count exceeds the limit"));
+            }
+            if (source.request_id.empty() || source.space.kind.empty() || source.space.identity.empty() ||
+                source.space.size == 0 || source.space.subject_generation == 0 || source.plan.plan_id.empty() ||
+                source.plan.encoded_pattern.empty() || source.plan.maximum_bytes == 0 ||
+                source.plan.maximum_matches == 0 || source.deadline_unix_ms == 0 || source.plan.pattern_ids.empty() ||
+                source.plan.pattern_ids.size() > limits.maximum_collection_items) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "scan request is incomplete"));
+            }
+            std::unordered_set<std::string_view> patterns;
+            for (const auto &pattern : source.plan.pattern_ids) {
+                if (pattern.empty()) {
+                    return std::unexpected(codec_error(ProtocolErrorCode::malformed, "scan pattern ID is empty"));
+                }
+                if (!patterns.insert(pattern).second) {
+                    return std::unexpected(
+                        codec_error(ProtocolErrorCode::duplicate_item, "scan pattern ID is duplicated"));
                 }
             }
-            if (!std::ranges::all_of(required, std::identity {})) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::invalid_value, "scan match metadata is incomplete", reader.offset));
+            if (auto status = checked(target.set_request_id(source.request_id.value), "set scan request ID"); !status)
+                return status;
+            auto subject = target.ensure_subject();
+            if (!subject) return std::unexpected(wire_error(subject.error(), "allocate scan subject"));
+            if (auto status = to_wire(*subject, source.subject, ctx, limits); !status) return status;
+            if (auto status = checked(target.set_space_kind(source.space.kind), "set scan-space kind"); !status)
+                return status;
+            target.set_begin(source.space.begin);
+            target.set_size(source.space.size);
+            target.set_permissions(source.space.permissions);
+            if (auto status = checked(target.set_plan_id(source.plan.plan_id), "set scan plan ID"); !status)
+                return status;
+            if (auto status = checked(target.set_encoded_pattern(source.plan.encoded_pattern), "set scan pattern");
+                !status)
+                return status;
+            target.set_maximum_bytes(source.plan.maximum_bytes);
+            target.set_maximum_matches(source.plan.maximum_matches);
+            target.set_deadline_unix_ms(source.deadline_unix_ms);
+            if (auto status = checked(target.set_space_identity(source.space.identity), "set scan-space identity");
+                !status)
+                return status;
+            target.set_subject_generation(source.space.subject_generation);
+            auto label = target.ensure_label();
+            if (!label) return std::unexpected(wire_error(label.error(), "allocate scan label"));
+            if (auto status = to_wire(*label, source.space.label, ctx, limits); !status) return status;
+            target.set_context_bytes_before(source.plan.context_bytes_before);
+            target.set_context_bytes_after(source.plan.context_bytes_after);
+            target.set_result_mode(static_cast<std::uint32_t>(source.plan.result_mode));
+            for (const auto &pattern : source.plan.pattern_ids) {
+                if (auto status = append_text(target.mutable_pattern_ids(), ctx, pattern); !status) return status;
             }
-            if (auto valid = validate_scan_match(result, *reader.limits); !valid) {
+            return {};
+        }
+
+        [[nodiscard]] std::expected<ScanRequest, ProtocolError>
+        from_wire(const wire::ScanRequest<> &source, const ProtocolLimits &limits) {
+            if (!source.has_subject() || !source.has_label()) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "scan request subject or label absent"));
+            }
+            auto subject = from_wire(*source.subject(), limits);
+            if (!subject) return std::unexpected(std::move(subject.error()));
+            auto label = from_wire(*source.label(), limits);
+            if (!label) return std::unexpected(std::move(label.error()));
+            ScanRequest result {.request_id = RequestId {text(source.request_id())},
+                                .subject = std::move(*subject),
+                                .space = {.kind = text(source.space_kind()),
+                                          .begin = source.begin(),
+                                          .size = source.size(),
+                                          .permissions = source.permissions(),
+                                          .identity = text(source.space_identity()),
+                                          .label = std::move(*label),
+                                          .subject_generation = source.subject_generation()},
+                                .plan = {.plan_id = text(source.plan_id()),
+                                         .encoded_pattern = text(source.encoded_pattern()),
+                                         .maximum_bytes = source.maximum_bytes(),
+                                         .maximum_matches = source.maximum_matches(),
+                                         .context_bytes_before = source.context_bytes_before(),
+                                         .context_bytes_after = source.context_bytes_after(),
+                                         .result_mode = static_cast<ScanResultMode>(source.result_mode()),
+                                         .pattern_ids = {}},
+                                .deadline_unix_ms = source.deadline_unix_ms()};
+            result.plan.pattern_ids.reserve(source.pattern_ids().size());
+            for (const auto &pattern : source.pattern_ids()) result.plan.pattern_ids.push_back(text(pattern.view()));
+            Context ctx = make_context(limits);
+            auto probe = wire::ScanRequest<>::create(ctx);
+            if (auto valid = to_wire(probe, result, ctx, limits); !valid)
                 return std::unexpected(std::move(valid.error()));
-            }
             return result;
         }
 
         [[nodiscard]] std::expected<void, ProtocolError>
-        encode_scan_response(Writer &writer, const ScanResponse &response, const ProtocolLimits &limits) {
-            if (response.request_id.empty() || !response.subject.valid() || !terminal_status_valid(response.status) ||
-                response.truncated || response.matches.size() > limits.maximum_scan_matches ||
-                (response.mode != ScanResultMode::exact_complete && response.mode != ScanResultMode::existential) ||
-                (response.mode == ScanResultMode::existential && response.matches.size() > 1) ||
-                (response.status != FactTerminalStatus::value && !response.matches.empty())) {
-                return std::unexpected(codec_error(ProtocolErrorCode::invalid_value,
-                                                   "scan response is truncated, oversized, or status-invalid"));
+        to_wire(wire::FactResponse<> &target, const FactResponse &source, Context &ctx, const ProtocolLimits &limits) {
+            if (source.request_id.empty() || !valid_fact_response_shape(source)) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "fact response shape is invalid"));
             }
-            writer.string_field(1, response.request_id.value);
-            Writer subject;
-            encode_subject(subject, response.subject);
-            writer.message_field(2, subject);
-            writer.unsigned_field(3, static_cast<std::uint8_t>(response.status));
-            for (const auto &match : response.matches) {
-                Writer nested;
-                if (auto encoded = encode_scan_match(nested, match, limits); !encoded) {
-                    return encoded;
-                }
-                writer.message_field(4, nested);
+            if (auto status = checked(target.set_request_id(source.request_id.value), "set fact response ID"); !status)
+                return status;
+            auto subject = target.ensure_subject();
+            if (!subject) return std::unexpected(wire_error(subject.error(), "allocate fact-response subject"));
+            if (auto status = to_wire(*subject, source.subject, ctx, limits); !status) return status;
+            target.set_status(static_cast<std::uint32_t>(source.status));
+            if (source.value) {
+                auto value = target.ensure_value();
+                if (!value) return std::unexpected(wire_error(value.error(), "allocate fact response value"));
+                ValueBudget budget;
+                if (auto status = to_wire(*value, *source.value, ctx, limits, budget); !status) return status;
             }
-            writer.boolean_field(5, false);
-            if (response.diagnostic.has_value()) {
-                if (auto valid = validate_provider_diagnostic(*response.diagnostic); !valid) {
-                    return valid;
-                }
-                Writer diagnostic;
-                encode_diagnostic(diagnostic, *response.diagnostic);
-                writer.message_field(6, diagnostic);
+            if (source.diagnostic) {
+                auto diagnostic = target.ensure_diagnostic();
+                if (!diagnostic)
+                    return std::unexpected(wire_error(diagnostic.error(), "allocate fact diagnostic"));
+                if (auto status = to_wire(*diagnostic, *source.diagnostic); !status) return status;
             }
-            writer.unsigned_field(7, static_cast<std::uint8_t>(response.mode));
+            if (source.returned_schema) {
+                auto schema = target.ensure_returned_schema();
+                if (!schema) return std::unexpected(wire_error(schema.error(), "allocate returned schema"));
+                if (auto status = to_wire(*schema, *source.returned_schema); !status) return status;
+            }
             return {};
         }
 
-        [[nodiscard]] std::expected<ScanResponse, ProtocolError> decode_scan_response(Reader &reader) {
-            ScanResponse result;
-            SeenFields seen;
-            bool status_seen {};
-            bool mode_seen {};
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field == 4) {
-                    if (auto counted = count_collection(reader); !counted) {
-                        return std::unexpected(std::move(counted.error()));
-                    }
-                    if (result.matches.size() >= reader.limits->maximum_scan_matches) {
-                        return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                           "scan match count exceeds the limit", reader.offset));
-                    }
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    auto match = decode_scan_match(*nested);
-                    if (!match) {
-                        return std::unexpected(std::move(match.error()));
-                    }
-                    result.matches.push_back(*match);
-                    continue;
-                }
-                if (tag->field > 7) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 1) {
-                    auto id = read_string(reader, *tag);
-                    if (!id) {
-                        return std::unexpected(std::move(id.error()));
-                    }
-                    result.request_id = RequestId {std::move(*id)};
-                } else if (tag->field == 2) {
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_subject_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    auto subject = decode_subject(*nested);
-                    if (!subject) {
-                        return std::unexpected(std::move(subject.error()));
-                    }
-                    result.subject = std::move(*subject);
-                } else if (tag->field == 3) {
-                    auto status = reader.read_unsigned(*tag);
-                    if (!status || *status > static_cast<std::uint8_t>(FactTerminalStatus::canceled)) {
-                        return std::unexpected(status ? codec_error(ProtocolErrorCode::invalid_value,
-                                                                    "scan status is invalid", reader.offset) :
-                                                        std::move(status.error()));
-                    }
-                    result.status = static_cast<FactTerminalStatus>(*status);
-                    status_seen = true;
-                } else if (tag->field == 5) {
-                    auto truncated = reader.read_boolean(*tag);
-                    if (!truncated) {
-                        return std::unexpected(std::move(truncated.error()));
-                    }
-                    result.truncated = *truncated;
-                } else if (tag->field == 6) {
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    auto diagnostic = decode_diagnostic(*nested);
-                    if (!diagnostic) {
-                        return std::unexpected(std::move(diagnostic.error()));
-                    }
-                    result.diagnostic = std::move(*diagnostic);
-                } else {
-                    auto mode = reader.read_unsigned(*tag);
-                    if (!mode || *mode < static_cast<std::uint8_t>(ScanResultMode::exact_complete) ||
-                        *mode > static_cast<std::uint8_t>(ScanResultMode::existential)) {
-                        return std::unexpected(mode ? codec_error(ProtocolErrorCode::invalid_value,
-                                                                  "scan result mode is invalid", reader.offset) :
-                                                      std::move(mode.error()));
-                    }
-                    result.mode = static_cast<ScanResultMode>(*mode);
-                    mode_seen = true;
-                }
+        [[nodiscard]] std::expected<FactResponse, ProtocolError>
+        from_wire(const wire::FactResponse<> &source, const ProtocolLimits &limits) {
+            if (!source.has_subject() || source.status() > static_cast<std::uint32_t>(FactTerminalStatus::canceled)) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "fact response is invalid"));
             }
-            if (!status_seen || !mode_seen || result.request_id.empty() || !result.subject.valid() ||
-                result.truncated || (result.mode == ScanResultMode::existential && result.matches.size() > 1) ||
-                (result.status != FactTerminalStatus::value && !result.matches.empty())) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::invalid_value, "decoded scan response is invalid", reader.offset));
+            auto subject = from_wire(*source.subject(), limits);
+            if (!subject) return std::unexpected(std::move(subject.error()));
+            FactResponse result {.request_id = RequestId {text(source.request_id())},
+                                 .subject = std::move(*subject),
+                                 .status = static_cast<FactTerminalStatus>(source.status()),
+                                 .value = std::nullopt,
+                                 .returned_schema = std::nullopt,
+                                 .diagnostic = std::nullopt};
+            if (source.has_value()) {
+                ValueBudget budget;
+                auto value = from_wire(*source.value(), limits, budget);
+                if (!value) return std::unexpected(std::move(value.error()));
+                result.value = std::move(*value);
+            }
+            if (source.has_diagnostic()) {
+                auto diagnostic = from_wire(*source.diagnostic());
+                if (!diagnostic) return std::unexpected(std::move(diagnostic.error()));
+                result.diagnostic = std::move(*diagnostic);
+            }
+            if (source.has_returned_schema()) result.returned_schema = from_wire(*source.returned_schema());
+            if (result.request_id.empty() || !valid_fact_response_shape(result)) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "fact response shape is invalid"));
             }
             return result;
         }
 
         [[nodiscard]] std::expected<void, ProtocolError>
-        validate_advertisements(const std::span<const SchemaAdvertisement> schemas,
-                                const std::span<const CapabilityAdvertisement> capabilities,
-                                const ProtocolLimits &limits) {
-            if (schemas.size() > limits.maximum_collection_items ||
-                capabilities.size() > limits.maximum_collection_items - schemas.size()) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::limit_exceeded, "advertisement count exceeds the limit"));
+        to_wire(wire::ScanMatch<> &target, const ScanMatch &source, Context &ctx, const ProtocolLimits &limits) {
+            if (auto valid = validate_scan_match(source, limits); !valid) return valid;
+            target.set_offset(source.offset);
+            target.set_length(source.length);
+            if (auto status = checked(target.set_pattern_id(source.pattern_id), "set match pattern ID"); !status)
+                return status;
+            if (auto status = checked(target.set_scan_space_id(source.scan_space_id), "set match scan-space ID");
+                !status)
+                return status;
+            target.set_absolute_address(source.absolute_address);
+            target.set_permission_snapshot(source.permission_snapshot);
+            if (auto status = checked(target.set_matched_bytes(byte_view(source.matched_bytes)), "set matched bytes");
+                !status)
+                return status;
+            if (auto status = checked(target.set_before_bytes(byte_view(source.before_bytes)), "set before bytes");
+                !status)
+                return status;
+            if (auto status = checked(target.set_after_bytes(byte_view(source.after_bytes)), "set after bytes"); !status)
+                return status;
+            auto label = target.ensure_label();
+            if (!label) return std::unexpected(wire_error(label.error(), "allocate match label"));
+            if (auto status = to_wire(*label, source.label, ctx, limits); !status) return status;
+            target.set_subject_generation(source.subject_generation);
+            return {};
+        }
+
+        [[nodiscard]] std::expected<ScanMatch, ProtocolError>
+        from_wire(const wire::ScanMatch<> &source, const ProtocolLimits &limits) {
+            if (!source.has_label()) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "scan match label is absent"));
             }
-            std::unordered_set<std::string> schema_ids;
+            auto label = from_wire(*source.label(), limits);
+            if (!label) return std::unexpected(std::move(label.error()));
+            ScanMatch result {.offset = source.offset(),
+                              .length = source.length(),
+                              .pattern_id = text(source.pattern_id()),
+                              .scan_space_id = text(source.scan_space_id()),
+                              .absolute_address = source.absolute_address(),
+                              .permission_snapshot = source.permission_snapshot(),
+                              .matched_bytes = bytes(source.matched_bytes()),
+                              .before_bytes = bytes(source.before_bytes()),
+                              .after_bytes = bytes(source.after_bytes()),
+                              .label = std::move(*label),
+                              .subject_generation = source.subject_generation()};
+            if (auto valid = validate_scan_match(result, limits); !valid)
+                return std::unexpected(std::move(valid.error()));
+            return result;
+        }
+
+        [[nodiscard]] std::expected<void, ProtocolError>
+        to_wire(wire::ScanResponse<> &target, const ScanResponse &source, Context &ctx, const ProtocolLimits &limits) {
+            if (source.request_id.empty() || source.truncated ||
+                source.status > FactTerminalStatus::canceled || source.matches.size() > limits.maximum_scan_matches ||
+                (source.status == FactTerminalStatus::value && source.diagnostic) ||
+                (source.status != FactTerminalStatus::value && !source.matches.empty())) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "scan response shape is invalid"));
+            }
+            if (auto status = checked(target.set_request_id(source.request_id.value), "set scan response ID"); !status)
+                return status;
+            auto subject = target.ensure_subject();
+            if (!subject) return std::unexpected(wire_error(subject.error(), "allocate scan-response subject"));
+            if (auto status = to_wire(*subject, source.subject, ctx, limits); !status) return status;
+            target.set_status(static_cast<std::uint32_t>(source.status));
+            for (const auto &match : source.matches) {
+                if (auto status = append_message(target.mutable_matches(), ctx, [&](auto &item) {
+                        return to_wire(item, match, ctx, limits);
+                    });
+                    !status)
+                    return status;
+            }
+            target.set_truncated(false);
+            if (source.diagnostic) {
+                auto diagnostic = target.ensure_diagnostic();
+                if (!diagnostic)
+                    return std::unexpected(wire_error(diagnostic.error(), "allocate scan diagnostic"));
+                if (auto status = to_wire(*diagnostic, *source.diagnostic); !status) return status;
+            }
+            target.set_result_mode(static_cast<std::uint32_t>(source.mode));
+            return {};
+        }
+
+        [[nodiscard]] std::expected<ScanResponse, ProtocolError>
+        from_wire(const wire::ScanResponse<> &source, const ProtocolLimits &limits) {
+            if (!source.has_subject() || source.matches().size() > limits.maximum_scan_matches) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "scan response is invalid"));
+            }
+            auto subject = from_wire(*source.subject(), limits);
+            if (!subject) return std::unexpected(std::move(subject.error()));
+            ScanResponse result {.request_id = RequestId {text(source.request_id())},
+                                 .subject = std::move(*subject),
+                                 .status = static_cast<FactTerminalStatus>(source.status()),
+                                 .matches = {},
+                                 .truncated = source.truncated(),
+                                 .diagnostic = std::nullopt,
+                                 .mode = static_cast<ScanResultMode>(source.result_mode())};
+            result.matches.reserve(source.matches().size());
+            for (const auto &match : source.matches()) {
+                auto decoded = from_wire(match, limits);
+                if (!decoded) return std::unexpected(std::move(decoded.error()));
+                result.matches.push_back(std::move(*decoded));
+            }
+            if (source.has_diagnostic()) {
+                auto diagnostic = from_wire(*source.diagnostic());
+                if (!diagnostic) return std::unexpected(std::move(diagnostic.error()));
+                result.diagnostic = std::move(*diagnostic);
+            }
+            Context ctx = make_context(limits);
+            auto probe = wire::ScanResponse<>::create(ctx);
+            if (auto valid = to_wire(probe, result, ctx, limits); !valid)
+                return std::unexpected(std::move(valid.error()));
+            return result;
+        }
+
+        template<typename WireHello>
+        [[nodiscard]] std::expected<void, ProtocolError>
+        append_advertisements(WireHello &target, const std::span<const SchemaAdvertisement> schemas,
+                              const std::span<const CapabilityAdvertisement> capabilities, Context &ctx) {
+            std::unordered_set<std::string_view> schema_ids;
             for (const auto &schema : schemas) {
-                if (schema.schema.empty() || schema.major == 0 || schema.canonical_hash.empty() ||
-                    !schema_ids.insert(schema.schema.value).second) {
-                    return std::unexpected(codec_error(ProtocolErrorCode::schema_mismatch,
-                                                       "schema advertisement is invalid or duplicated"));
+                if (!schema_ids.insert(schema.schema.value).second) {
+                    return std::unexpected(codec_error(ProtocolErrorCode::duplicate_item, "schema is duplicated"));
                 }
+                if (auto status = append_message(target.mutable_schemas(), ctx,
+                                                 [&](auto &item) { return to_wire(item, schema); });
+                    !status)
+                    return status;
             }
-            std::unordered_set<std::string> capability_ids;
+            std::unordered_set<std::string_view> capability_ids;
             for (const auto &capability : capabilities) {
-                if (capability.capability.empty() || capability.version == 0 || capability.request_schema.empty() ||
-                    capability.response_schema.empty() || !capability_ids.insert(capability.capability.value).second) {
-                    return std::unexpected(codec_error(ProtocolErrorCode::capability_mismatch,
-                                                       "capability advertisement is invalid or duplicated"));
+                if (!capability_ids.insert(capability.capability.value).second) {
+                    return std::unexpected(codec_error(ProtocolErrorCode::duplicate_item, "capability is duplicated"));
                 }
+                if (auto status = append_message(target.mutable_capabilities(), ctx,
+                                                 [&](auto &item) { return to_wire(item, capability); });
+                    !status)
+                    return status;
             }
             return {};
         }
 
+        template<typename WireHello>
+        void read_advertisements(const WireHello &source, std::vector<SchemaAdvertisement> &schemas,
+                                 std::vector<CapabilityAdvertisement> &capabilities) {
+            schemas.reserve(source.schemas().size());
+            for (const auto &schema : source.schemas()) schemas.push_back(from_wire(schema));
+            capabilities.reserve(source.capabilities().size());
+            for (const auto &capability : source.capabilities()) capabilities.push_back(from_wire(capability));
+        }
+
         [[nodiscard]] std::expected<void, ProtocolError>
-        encode_agent_hello(Writer &writer, const AgentHelloMessage &hello, const ProtocolLimits &limits) {
-            if (hello.minimum_minor > hello.maximum_minor || hello.agent_version.empty() || hello.agent_epoch.empty() ||
-                hello.next_sequence == 0) {
+        to_wire(wire::AgentHello<> &target, const AgentHelloMessage &source, Context &ctx,
+                const ProtocolLimits &) {
+            if (source.minimum_minor > source.maximum_minor || source.agent_version.empty() ||
+                source.agent_epoch.empty() || source.next_sequence == 0) {
                 return std::unexpected(codec_error(ProtocolErrorCode::malformed, "agent hello is incomplete"));
             }
-            if (auto valid = validate_advertisements(hello.schemas, hello.capabilities, limits); !valid) {
-                return valid;
-            }
-            writer.unsigned_field(1, hello.minimum_minor);
-            writer.unsigned_field(2, hello.maximum_minor);
-            writer.string_field(3, hello.agent_version);
-            writer.string_field(4, hello.agent_epoch);
-            writer.unsigned_field(5, hello.next_sequence);
-            for (const auto &schema : hello.schemas) {
-                Writer nested;
-                encode_schema(nested, schema);
-                writer.message_field(6, nested);
-            }
-            for (const auto &capability : hello.capabilities) {
-                Writer nested;
-                encode_capability(nested, capability);
-                writer.message_field(7, nested);
-            }
-            Writer credit;
-            encode_credit(credit, hello.receive_limit);
-            writer.message_field(8, credit);
+            target.set_minimum_minor(source.minimum_minor);
+            target.set_maximum_minor(source.maximum_minor);
+            if (auto status = checked(target.set_agent_version(source.agent_version), "set agent version"); !status)
+                return status;
+            if (auto status = checked(target.set_agent_epoch(source.agent_epoch), "set agent epoch"); !status)
+                return status;
+            target.set_next_sequence(source.next_sequence);
+            if (auto status = append_advertisements(target, source.schemas, source.capabilities, ctx); !status)
+                return status;
+            auto credit = target.ensure_receive_limit();
+            if (!credit) return std::unexpected(wire_error(credit.error(), "allocate hello receive limit"));
+            to_wire(*credit, source.receive_limit);
             return {};
         }
 
-        [[nodiscard]] std::expected<AgentHelloMessage, ProtocolError> decode_agent_hello(Reader &reader) {
-            AgentHelloMessage result;
-            SeenFields seen;
-            bool minimum_seen {};
-            bool maximum_seen {};
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field == 6 || tag->field == 7) {
-                    if (auto counted = count_collection(reader); !counted) {
-                        return std::unexpected(std::move(counted.error()));
-                    }
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    if (tag->field == 6) {
-                        auto schema = decode_schema(*nested);
-                        if (!schema) {
-                            return std::unexpected(std::move(schema.error()));
-                        }
-                        result.schemas.push_back(std::move(*schema));
-                    } else {
-                        auto capability = decode_capability(*nested);
-                        if (!capability) {
-                            return std::unexpected(std::move(capability.error()));
-                        }
-                        result.capabilities.push_back(std::move(*capability));
-                    }
-                    continue;
-                }
-                if (tag->field > 8) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 1 || tag->field == 2 || tag->field == 5) {
-                    auto number = reader.read_unsigned(*tag);
-                    if (!number) {
-                        return std::unexpected(std::move(number.error()));
-                    }
-                    if ((tag->field == 1 || tag->field == 2) && *number > std::numeric_limits<std::uint16_t>::max()) {
-                        return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                           "protocol minor exceeds uint16", reader.offset));
-                    }
-                    if (tag->field == 1) {
-                        result.minimum_minor = static_cast<std::uint16_t>(*number);
-                        minimum_seen = true;
-                    } else if (tag->field == 2) {
-                        result.maximum_minor = static_cast<std::uint16_t>(*number);
-                        maximum_seen = true;
-                    } else {
-                        result.next_sequence = *number;
-                    }
-                } else if (tag->field == 3 || tag->field == 4) {
-                    auto text = read_string(reader, *tag);
-                    if (!text) {
-                        return std::unexpected(std::move(text.error()));
-                    }
-                    if (tag->field == 3) {
-                        result.agent_version = std::move(*text);
-                    } else {
-                        result.agent_epoch = std::move(*text);
-                    }
-                } else if (tag->field == 8) {
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    auto credit = decode_credit(*nested);
-                    if (!credit) {
-                        return std::unexpected(std::move(credit.error()));
-                    }
-                    result.receive_limit = *credit;
-                } else {
-                    return std::unexpected(
-                        codec_error(ProtocolErrorCode::malformed, "unexpected agent hello field", reader.offset));
-                }
+        [[nodiscard]] std::expected<AgentHelloMessage, ProtocolError>
+        from_wire(const wire::AgentHello<> &source, const ProtocolLimits &limits) {
+            if (!source.has_receive_limit()) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "agent hello credit is absent"));
             }
-            if (!minimum_seen || !maximum_seen || result.minimum_minor > result.maximum_minor ||
-                result.agent_version.empty() || result.agent_epoch.empty() || result.next_sequence == 0) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::malformed, "decoded agent hello is incomplete", reader.offset));
-            }
-            if (auto valid = validate_advertisements(result.schemas, result.capabilities, *reader.limits); !valid) {
+            AgentHelloMessage result {.minimum_minor = static_cast<std::uint16_t>(source.minimum_minor()),
+                                      .maximum_minor = static_cast<std::uint16_t>(source.maximum_minor()),
+                                      .agent_version = text(source.agent_version()),
+                                      .agent_epoch = text(source.agent_epoch()),
+                                      .next_sequence = source.next_sequence(),
+                                      .schemas = {},
+                                      .capabilities = {},
+                                      .receive_limit = from_wire(*source.receive_limit())};
+            read_advertisements(source, result.schemas, result.capabilities);
+            Context ctx = make_context(limits);
+            auto probe = wire::AgentHello<>::create(ctx);
+            if (auto valid = to_wire(probe, result, ctx, limits); !valid)
                 return std::unexpected(std::move(valid.error()));
-            }
             return result;
         }
 
         [[nodiscard]] std::expected<void, ProtocolError>
-        encode_server_hello(Writer &writer, const ServerHelloMessage &hello, const ProtocolLimits &limits) {
-            if (hello.selected_minor != initial_minor_version || hello.session.empty() || hello.peer.empty() ||
-                hello.session_fence == 0 || hello.heartbeat_interval_ms == 0) {
+        to_wire(wire::ServerHello<> &target, const ServerHelloMessage &source, Context &ctx,
+                const ProtocolLimits &) {
+            if (source.selected_minor != initial_minor_version || source.session.empty() || source.peer.empty() ||
+                source.session_fence == 0 || source.heartbeat_interval_ms == 0) {
                 return std::unexpected(codec_error(ProtocolErrorCode::malformed, "server hello is incomplete"));
             }
-            if (auto valid = validate_advertisements(hello.schemas, hello.capabilities, limits); !valid) {
-                return valid;
-            }
-            writer.unsigned_field(1, hello.selected_minor);
-            writer.string_field(2, hello.session.value);
-            writer.string_field(3, hello.peer.value);
-            writer.unsigned_field(4, hello.session_fence);
-            writer.unsigned_field(5, hello.acknowledged_sequence);
-            for (const auto &schema : hello.schemas) {
-                Writer nested;
-                encode_schema(nested, schema);
-                writer.message_field(6, nested);
-            }
-            for (const auto &capability : hello.capabilities) {
-                Writer nested;
-                encode_capability(nested, capability);
-                writer.message_field(7, nested);
-            }
-            Writer credit;
-            encode_credit(credit, hello.credit);
-            writer.message_field(8, credit);
-            writer.unsigned_field(9, hello.heartbeat_interval_ms);
+            target.set_selected_minor(source.selected_minor);
+            if (auto status = checked(target.set_session(source.session.value), "set server session"); !status)
+                return status;
+            if (auto status = checked(target.set_peer(source.peer.value), "set server peer"); !status) return status;
+            target.set_session_fence(source.session_fence);
+            target.set_acknowledged_sequence(source.acknowledged_sequence);
+            if (auto status = append_advertisements(target, source.schemas, source.capabilities, ctx); !status)
+                return status;
+            auto credit = target.ensure_credit();
+            if (!credit) return std::unexpected(wire_error(credit.error(), "allocate server credit"));
+            to_wire(*credit, source.credit);
+            target.set_heartbeat_interval_ms(source.heartbeat_interval_ms);
             return {};
         }
 
-        [[nodiscard]] std::expected<ServerHelloMessage, ProtocolError> decode_server_hello(Reader &reader) {
-            ServerHelloMessage result;
-            SeenFields seen;
-            bool minor_seen {};
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field == 6 || tag->field == 7) {
-                    if (auto counted = count_collection(reader); !counted) {
-                        return std::unexpected(std::move(counted.error()));
-                    }
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    if (tag->field == 6) {
-                        auto schema = decode_schema(*nested);
-                        if (!schema) {
-                            return std::unexpected(std::move(schema.error()));
-                        }
-                        result.schemas.push_back(std::move(*schema));
-                    } else {
-                        auto capability = decode_capability(*nested);
-                        if (!capability) {
-                            return std::unexpected(std::move(capability.error()));
-                        }
-                        result.capabilities.push_back(std::move(*capability));
-                    }
-                    continue;
-                }
-                if (tag->field > 9) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 2 || tag->field == 3) {
-                    auto text = read_string(reader, *tag);
-                    if (!text) {
-                        return std::unexpected(std::move(text.error()));
-                    }
-                    if (tag->field == 2) {
-                        result.session = SessionId {std::move(*text)};
-                    } else {
-                        result.peer = PeerId {std::move(*text)};
-                    }
-                } else if (tag->field == 8) {
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    auto credit = decode_credit(*nested);
-                    if (!credit) {
-                        return std::unexpected(std::move(credit.error()));
-                    }
-                    result.credit = *credit;
-                } else {
-                    auto number = reader.read_unsigned(*tag);
-                    if (!number) {
-                        return std::unexpected(std::move(number.error()));
-                    }
-                    switch (tag->field) {
-                        case 1:
-                            if (*number > std::numeric_limits<std::uint16_t>::max()) {
-                                return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                                   "protocol minor exceeds uint16", reader.offset));
-                            }
-                            result.selected_minor = static_cast<std::uint16_t>(*number);
-                            minor_seen = true;
-                            break;
-                        case 4: result.session_fence = *number; break;
-                        case 5: result.acknowledged_sequence = *number; break;
-                        case 9: result.heartbeat_interval_ms = *number; break;
-                        default:
-                            return std::unexpected(codec_error(ProtocolErrorCode::malformed,
-                                                               "unexpected server hello field", reader.offset));
-                    }
-                }
+        [[nodiscard]] std::expected<ServerHelloMessage, ProtocolError>
+        from_wire(const wire::ServerHello<> &source, const ProtocolLimits &limits) {
+            if (!source.has_credit()) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "server hello credit is absent"));
             }
-            if (!minor_seen || result.selected_minor != initial_minor_version || result.session.empty() ||
-                result.peer.empty() || result.session_fence == 0 || result.heartbeat_interval_ms == 0) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::malformed, "decoded server hello is incomplete", reader.offset));
-            }
-            if (auto valid = validate_advertisements(result.schemas, result.capabilities, *reader.limits); !valid) {
+            ServerHelloMessage result {.selected_minor = static_cast<std::uint16_t>(source.selected_minor()),
+                                       .session = SessionId {text(source.session())},
+                                       .peer = PeerId {text(source.peer())},
+                                       .session_fence = source.session_fence(),
+                                       .acknowledged_sequence = source.acknowledged_sequence(),
+                                       .schemas = {},
+                                       .capabilities = {},
+                                       .credit = from_wire(*source.credit()),
+                                       .heartbeat_interval_ms = source.heartbeat_interval_ms()};
+            read_advertisements(source, result.schemas, result.capabilities);
+            Context ctx = make_context(limits);
+            auto probe = wire::ServerHello<>::create(ctx);
+            if (auto valid = to_wire(probe, result, ctx, limits); !valid)
                 return std::unexpected(std::move(valid.error()));
-            }
             return result;
         }
 
         [[nodiscard]] bool unique_request_ids(const std::span<const FactRequest> facts,
                                               const std::span<const ScanRequest> scans) {
-            std::unordered_set<std::string> ids;
-            ids.reserve(facts.size() + scans.size());
-            for (const auto &request : facts) {
-                if (!ids.insert(request.request_id.value).second) {
-                    return false;
-                }
-            }
-            for (const auto &request : scans) {
-                if (!ids.insert(request.request_id.value).second) {
-                    return false;
-                }
-            }
+            std::unordered_set<std::string_view> ids;
+            for (const auto &request : facts)
+                if (!ids.insert(request.request_id.value).second) return false;
+            for (const auto &request : scans)
+                if (!ids.insert(request.request_id.value).second) return false;
             return true;
         }
 
-        [[nodiscard]] std::expected<void, ProtocolError> validate_work_lease(const WorkLeaseMessage &work,
-                                                                             const ProtocolLimits &limits) {
-            if (work.session.empty() || work.peer.empty() || work.session_fence == 0 || work.work_id.empty() ||
-                work.attempt_id.empty() || work.work_fence == 0 || work.generation == 0 || work.server_sequence == 0 ||
-                work.route.empty() || (work.facts.empty() && work.scans.empty()) ||
-                work.facts.size() > limits.maximum_fact_requests || work.scans.size() > limits.maximum_scan_requests ||
-                !unique_request_ids(work.facts, work.scans)) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::malformed, "work lease identity, count, or sequence is invalid"));
+        [[nodiscard]] std::expected<void, ProtocolError>
+        to_wire(wire::WorkLease<> &target, const WorkLeaseMessage &source, Context &ctx, const ProtocolLimits &limits) {
+            if (source.session.empty() || source.peer.empty() || source.session_fence == 0 || source.work_id.empty() ||
+                source.attempt_id.empty() || source.work_fence == 0 || source.generation == 0 ||
+                source.server_sequence == 0 || source.route.empty() || (source.facts.empty() && source.scans.empty()) ||
+                source.facts.size() > limits.maximum_fact_requests || source.scans.size() > limits.maximum_scan_requests ||
+                !unique_request_ids(source.facts, source.scans)) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "work lease is incomplete"));
             }
-            for (const auto &request : work.facts) {
-                if (request.subject.peer != work.peer || request.route.provider != work.route) {
-                    return std::unexpected(
-                        codec_error(ProtocolErrorCode::malformed, "fact request escapes the work peer or route"));
+            if (auto status = checked(target.set_session(source.session.value), "set work session"); !status)
+                return status;
+            if (auto status = checked(target.set_peer(source.peer.value), "set work peer"); !status) return status;
+            target.set_session_fence(source.session_fence);
+            if (auto status = checked(target.set_work_id(source.work_id), "set work ID"); !status) return status;
+            if (auto status = checked(target.set_attempt_id(source.attempt_id), "set attempt ID"); !status) return status;
+            target.set_work_fence(source.work_fence);
+            target.set_generation(source.generation);
+            target.set_server_sequence(source.server_sequence);
+            if (auto status = checked(target.set_route(source.route), "set work route"); !status) return status;
+            for (const auto &request : source.facts) {
+                if (request.subject.peer != source.peer || request.route.provider != source.route) {
+                    return std::unexpected(codec_error(ProtocolErrorCode::malformed, "fact escapes work route"));
                 }
+                if (auto status = append_message(target.mutable_facts(), ctx, [&](auto &item) {
+                        return to_wire(item, request, ctx, limits);
+                    });
+                    !status)
+                    return status;
             }
-            for (const auto &request : work.scans) {
-                if (request.subject.peer != work.peer) {
-                    return std::unexpected(
-                        codec_error(ProtocolErrorCode::malformed, "scan request escapes the work peer"));
+            for (const auto &request : source.scans) {
+                if (request.subject.peer != source.peer) {
+                    return std::unexpected(codec_error(ProtocolErrorCode::malformed, "scan escapes work peer"));
                 }
-            }
-            return {};
-        }
-
-        [[nodiscard]] std::expected<void, ProtocolError> encode_work_lease(Writer &writer, const WorkLeaseMessage &work,
-                                                                           const ProtocolLimits &limits) {
-            if (auto valid = validate_work_lease(work, limits); !valid) {
-                return valid;
-            }
-            writer.string_field(1, work.session.value);
-            writer.string_field(2, work.peer.value);
-            writer.unsigned_field(3, work.session_fence);
-            writer.string_field(4, work.work_id);
-            writer.string_field(5, work.attempt_id);
-            writer.unsigned_field(6, work.work_fence);
-            writer.unsigned_field(7, work.generation);
-            writer.unsigned_field(8, work.server_sequence);
-            writer.string_field(9, work.route);
-            for (const auto &request : work.facts) {
-                Writer nested;
-                if (auto encoded = encode_fact_request(nested, request, limits); !encoded) {
-                    return encoded;
-                }
-                writer.message_field(10, nested);
-            }
-            for (const auto &request : work.scans) {
-                Writer nested;
-                if (auto encoded = encode_scan_request(nested, request, limits); !encoded) {
-                    return encoded;
-                }
-                writer.message_field(11, nested);
+                if (auto status = append_message(target.mutable_scans(), ctx, [&](auto &item) {
+                        return to_wire(item, request, ctx, limits);
+                    });
+                    !status)
+                    return status;
             }
             return {};
         }
 
-        [[nodiscard]] std::expected<WorkLeaseMessage, ProtocolError> decode_work_lease(Reader &reader) {
-            WorkLeaseMessage result;
-            SeenFields seen;
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field == 10 || tag->field == 11) {
-                    if (auto counted = count_collection(reader); !counted) {
-                        return std::unexpected(std::move(counted.error()));
-                    }
-                    if ((tag->field == 10 && result.facts.size() >= reader.limits->maximum_fact_requests) ||
-                        (tag->field == 11 && result.scans.size() >= reader.limits->maximum_scan_requests)) {
-                        return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                           "work request count exceeds the limit", reader.offset));
-                    }
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    if (tag->field == 10) {
-                        auto request = decode_fact_request(*nested);
-                        if (!request) {
-                            return std::unexpected(std::move(request.error()));
-                        }
-                        result.facts.push_back(std::move(*request));
-                    } else {
-                        auto request = decode_scan_request(*nested);
-                        if (!request) {
-                            return std::unexpected(std::move(request.error()));
-                        }
-                        result.scans.push_back(std::move(*request));
-                    }
-                    continue;
-                }
-                if (tag->field > 11) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 1 || tag->field == 2 || tag->field == 4 || tag->field == 5 || tag->field == 9) {
-                    auto text = read_string(reader, *tag);
-                    if (!text) {
-                        return std::unexpected(std::move(text.error()));
-                    }
-                    switch (tag->field) {
-                        case 1: result.session = SessionId {std::move(*text)}; break;
-                        case 2: result.peer = PeerId {std::move(*text)}; break;
-                        case 4: result.work_id = std::move(*text); break;
-                        case 5: result.attempt_id = std::move(*text); break;
-                        case 9: result.route = std::move(*text); break;
-                        default: break;
-                    }
-                } else {
-                    auto number = reader.read_unsigned(*tag);
-                    if (!number) {
-                        return std::unexpected(std::move(number.error()));
-                    }
-                    switch (tag->field) {
-                        case 3: result.session_fence = *number; break;
-                        case 6: result.work_fence = *number; break;
-                        case 7: result.generation = *number; break;
-                        case 8: result.server_sequence = *number; break;
-                        default:
-                            return std::unexpected(codec_error(ProtocolErrorCode::malformed,
-                                                               "unexpected work lease field", reader.offset));
-                    }
-                }
+        [[nodiscard]] std::expected<WorkLeaseMessage, ProtocolError>
+        from_wire(const wire::WorkLease<> &source, const ProtocolLimits &limits) {
+            WorkLeaseMessage result {.session = SessionId {text(source.session())},
+                                     .peer = PeerId {text(source.peer())},
+                                     .session_fence = source.session_fence(),
+                                     .work_id = text(source.work_id()),
+                                     .attempt_id = text(source.attempt_id()),
+                                     .work_fence = source.work_fence(),
+                                     .generation = source.generation(),
+                                     .server_sequence = source.server_sequence(),
+                                     .route = text(source.route()),
+                                     .facts = {},
+                                     .scans = {}};
+            result.facts.reserve(source.facts().size());
+            for (const auto &request : source.facts()) {
+                auto decoded = from_wire(request, limits);
+                if (!decoded) return std::unexpected(std::move(decoded.error()));
+                result.facts.push_back(std::move(*decoded));
             }
-            if (auto valid = validate_work_lease(result, *reader.limits); !valid) {
+            result.scans.reserve(source.scans().size());
+            for (const auto &request : source.scans()) {
+                auto decoded = from_wire(request, limits);
+                if (!decoded) return std::unexpected(std::move(decoded.error()));
+                result.scans.push_back(std::move(*decoded));
+            }
+            Context ctx = make_context(limits);
+            auto probe = wire::WorkLease<>::create(ctx);
+            if (auto valid = to_wire(probe, result, ctx, limits); !valid)
                 return std::unexpected(std::move(valid.error()));
-            }
             return result;
-        }
-
-        [[nodiscard]] std::expected<void, ProtocolError> validate_work_result(const WorkResultMessage &result,
-                                                                              const ProtocolLimits &limits) {
-            if (result.originating_session.empty() || result.peer.empty() || result.originating_session_fence == 0 ||
-                result.work_id.empty() || result.attempt_id.empty() || result.work_fence == 0 ||
-                result.generation == 0 || result.facts.size() > limits.maximum_fact_requests ||
-                result.scans.size() > limits.maximum_scan_requests || (result.facts.empty() && result.scans.empty())) {
-                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "work result is incomplete"));
-            }
-            std::unordered_set<std::string> ids;
-            for (const auto &response : result.facts) {
-                if (response.request_id.empty() || response.subject.peer != result.peer ||
-                    !ids.insert(response.request_id.value).second) {
-                    return std::unexpected(codec_error(ProtocolErrorCode::provider_violation,
-                                                       "fact result request identity is invalid or duplicated"));
-                }
-            }
-            for (const auto &response : result.scans) {
-                if (response.request_id.empty() || response.subject.peer != result.peer ||
-                    !ids.insert(response.request_id.value).second) {
-                    return std::unexpected(codec_error(ProtocolErrorCode::provider_violation,
-                                                       "scan result request identity is invalid or duplicated"));
-                }
-            }
-            return {};
         }
 
         [[nodiscard]] std::expected<void, ProtocolError>
-        encode_work_result(Writer &writer, const WorkResultMessage &result, const ProtocolLimits &limits) {
-            if (auto valid = validate_work_result(result, limits); !valid) {
-                return valid;
+        to_wire(wire::WorkResult<> &target, const WorkResultMessage &source, Context &ctx,
+                const ProtocolLimits &limits) {
+            if (source.originating_session.empty() || source.peer.empty() || source.originating_session_fence == 0 ||
+                source.work_id.empty() || source.attempt_id.empty() || source.work_fence == 0 || source.generation == 0 ||
+                (source.facts.empty() && source.scans.empty()) || source.facts.size() > limits.maximum_fact_requests ||
+                source.scans.size() > limits.maximum_scan_requests) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "work result is incomplete"));
             }
-            writer.string_field(1, result.originating_session.value);
-            writer.string_field(2, result.peer.value);
-            writer.unsigned_field(3, result.originating_session_fence);
-            writer.string_field(4, result.work_id);
-            writer.string_field(5, result.attempt_id);
-            writer.unsigned_field(6, result.work_fence);
-            writer.unsigned_field(7, result.generation);
-            for (const auto &response : result.facts) {
-                Writer nested;
-                if (auto encoded = encode_fact_response(nested, response, limits); !encoded) {
-                    return encoded;
+            if (auto status = checked(target.set_originating_session(source.originating_session.value),
+                                      "set result session");
+                !status)
+                return status;
+            if (auto status = checked(target.set_peer(source.peer.value), "set result peer"); !status) return status;
+            target.set_originating_session_fence(source.originating_session_fence);
+            if (auto status = checked(target.set_work_id(source.work_id), "set result work ID"); !status) return status;
+            if (auto status = checked(target.set_attempt_id(source.attempt_id), "set result attempt ID"); !status)
+                return status;
+            target.set_work_fence(source.work_fence);
+            target.set_generation(source.generation);
+            for (const auto &response : source.facts) {
+                if (response.subject.peer != source.peer) {
+                    return std::unexpected(codec_error(ProtocolErrorCode::malformed, "fact result escapes work peer"));
                 }
-                writer.message_field(8, nested);
+                if (auto status = append_message(target.mutable_facts(), ctx, [&](auto &item) {
+                        return to_wire(item, response, ctx, limits);
+                    });
+                    !status)
+                    return status;
             }
-            for (const auto &response : result.scans) {
-                Writer nested;
-                if (auto encoded = encode_scan_response(nested, response, limits); !encoded) {
-                    return encoded;
+            for (const auto &response : source.scans) {
+                if (response.subject.peer != source.peer) {
+                    return std::unexpected(codec_error(ProtocolErrorCode::malformed, "scan result escapes work peer"));
                 }
-                writer.message_field(9, nested);
+                if (auto status = append_message(target.mutable_scans(), ctx, [&](auto &item) {
+                        return to_wire(item, response, ctx, limits);
+                    });
+                    !status)
+                    return status;
             }
             return {};
         }
 
-        [[nodiscard]] std::expected<WorkResultMessage, ProtocolError> decode_work_result(Reader &reader) {
-            WorkResultMessage result;
-            SeenFields seen;
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field == 8 || tag->field == 9) {
-                    if (auto counted = count_collection(reader); !counted) {
-                        return std::unexpected(std::move(counted.error()));
-                    }
-                    if ((tag->field == 8 && result.facts.size() >= reader.limits->maximum_fact_requests) ||
-                        (tag->field == 9 && result.scans.size() >= reader.limits->maximum_scan_requests)) {
-                        return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                           "work result count exceeds the limit", reader.offset));
-                    }
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    if (tag->field == 8) {
-                        auto response = decode_fact_response(*nested);
-                        if (!response) {
-                            return std::unexpected(std::move(response.error()));
-                        }
-                        result.facts.push_back(std::move(*response));
-                    } else {
-                        auto response = decode_scan_response(*nested);
-                        if (!response) {
-                            return std::unexpected(std::move(response.error()));
-                        }
-                        result.scans.push_back(std::move(*response));
-                    }
-                    continue;
-                }
-                if (tag->field > 9) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 1 || tag->field == 2 || tag->field == 4 || tag->field == 5) {
-                    auto text = read_string(reader, *tag);
-                    if (!text) {
-                        return std::unexpected(std::move(text.error()));
-                    }
-                    switch (tag->field) {
-                        case 1: result.originating_session = SessionId {std::move(*text)}; break;
-                        case 2: result.peer = PeerId {std::move(*text)}; break;
-                        case 4: result.work_id = std::move(*text); break;
-                        case 5: result.attempt_id = std::move(*text); break;
-                        default: break;
-                    }
-                } else {
-                    auto number = reader.read_unsigned(*tag);
-                    if (!number) {
-                        return std::unexpected(std::move(number.error()));
-                    }
-                    switch (tag->field) {
-                        case 3: result.originating_session_fence = *number; break;
-                        case 6: result.work_fence = *number; break;
-                        case 7: result.generation = *number; break;
-                        default:
-                            return std::unexpected(codec_error(ProtocolErrorCode::malformed,
-                                                               "unexpected work result field", reader.offset));
-                    }
-                }
+        [[nodiscard]] std::expected<WorkResultMessage, ProtocolError>
+        from_wire(const wire::WorkResult<> &source, const ProtocolLimits &limits) {
+            WorkResultMessage result {.originating_session = SessionId {text(source.originating_session())},
+                                      .peer = PeerId {text(source.peer())},
+                                      .originating_session_fence = source.originating_session_fence(),
+                                      .work_id = text(source.work_id()),
+                                      .attempt_id = text(source.attempt_id()),
+                                      .work_fence = source.work_fence(),
+                                      .generation = source.generation(),
+                                      .facts = {},
+                                      .scans = {}};
+            for (const auto &response : source.facts()) {
+                auto decoded = from_wire(response, limits);
+                if (!decoded) return std::unexpected(std::move(decoded.error()));
+                result.facts.push_back(std::move(*decoded));
             }
-            if (auto valid = validate_work_result(result, *reader.limits); !valid) {
+            for (const auto &response : source.scans()) {
+                auto decoded = from_wire(response, limits);
+                if (!decoded) return std::unexpected(std::move(decoded.error()));
+                result.scans.push_back(std::move(*decoded));
+            }
+            Context ctx = make_context(limits);
+            auto probe = wire::WorkResult<>::create(ctx);
+            if (auto valid = to_wire(probe, result, ctx, limits); !valid)
                 return std::unexpected(std::move(valid.error()));
-            }
             return result;
         }
 
-        [[nodiscard]] std::expected<void, ProtocolError> encode_cancel(Writer &writer, const CancelWorkMessage &cancel,
-                                                                       const ProtocolLimits &limits) {
-            if (cancel.session.empty() || cancel.peer.empty() || cancel.session_fence == 0 || cancel.work_id.empty() ||
-                cancel.attempt_id.empty() || cancel.work_fence == 0 || cancel.server_sequence == 0 ||
-                cancel.route.empty() || cancel.requests.size() > limits.maximum_collection_items) {
-                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "cancel message is incomplete"));
+        [[nodiscard]] std::expected<void, ProtocolError>
+        to_wire(wire::CancelWork<> &target, const CancelWorkMessage &source, Context &ctx,
+                const ProtocolLimits &limits) {
+            if (source.session.empty() || source.peer.empty() || source.session_fence == 0 || source.work_id.empty() ||
+                source.attempt_id.empty() || source.work_fence == 0 || source.server_sequence == 0 ||
+                source.route.empty() || source.requests.empty() ||
+                source.requests.size() > limits.maximum_fact_requests + limits.maximum_scan_requests) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "cancellation is incomplete"));
             }
-            std::unordered_set<std::string> ids;
-            for (const auto &request : cancel.requests) {
+            if (auto status = checked(target.set_session(source.session.value), "set cancel session"); !status)
+                return status;
+            if (auto status = checked(target.set_peer(source.peer.value), "set cancel peer"); !status) return status;
+            target.set_session_fence(source.session_fence);
+            if (auto status = checked(target.set_work_id(source.work_id), "set cancel work ID"); !status) return status;
+            if (auto status = checked(target.set_attempt_id(source.attempt_id), "set cancel attempt ID"); !status)
+                return status;
+            target.set_work_fence(source.work_fence);
+            target.set_server_sequence(source.server_sequence);
+            if (auto status = checked(target.set_route(source.route), "set cancel route"); !status) return status;
+            std::unordered_set<std::string_view> ids;
+            for (const auto &request : source.requests) {
                 if (request.empty() || !ids.insert(request.value).second) {
-                    return std::unexpected(codec_error(ProtocolErrorCode::duplicate_item,
-                                                       "cancel request identity is empty or duplicated"));
+                    return std::unexpected(
+                        codec_error(ProtocolErrorCode::duplicate_item, "cancel request is empty or duplicated"));
                 }
+                if (auto status = append_text(target.mutable_requests(), ctx, request.value); !status) return status;
             }
-            writer.string_field(1, cancel.session.value);
-            writer.string_field(2, cancel.peer.value);
-            writer.unsigned_field(3, cancel.session_fence);
-            writer.string_field(4, cancel.work_id);
-            writer.string_field(5, cancel.attempt_id);
-            writer.unsigned_field(6, cancel.work_fence);
-            writer.unsigned_field(7, cancel.server_sequence);
-            writer.string_field(8, cancel.route);
-            for (const auto &request : cancel.requests) { writer.string_field(9, request.value); }
             return {};
         }
 
-        [[nodiscard]] std::expected<CancelWorkMessage, ProtocolError> decode_cancel(Reader &reader) {
-            CancelWorkMessage result;
-            SeenFields seen;
-            std::unordered_set<std::string> ids;
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field == 9) {
-                    if (auto counted = count_collection(reader); !counted) {
-                        return std::unexpected(std::move(counted.error()));
-                    }
-                    auto id = read_string(reader, *tag);
-                    if (!id) {
-                        return std::unexpected(std::move(id.error()));
-                    }
-                    if (id->empty() || !ids.insert(*id).second) {
-                        return std::unexpected(codec_error(ProtocolErrorCode::duplicate_item,
-                                                           "cancel request is empty or duplicated", reader.offset));
-                    }
-                    result.requests.push_back(RequestId {std::move(*id)});
-                    continue;
-                }
-                if (tag->field > 9) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 1 || tag->field == 2 || tag->field == 4 || tag->field == 5 || tag->field == 8) {
-                    auto text = read_string(reader, *tag);
-                    if (!text) {
-                        return std::unexpected(std::move(text.error()));
-                    }
-                    switch (tag->field) {
-                        case 1: result.session = SessionId {std::move(*text)}; break;
-                        case 2: result.peer = PeerId {std::move(*text)}; break;
-                        case 4: result.work_id = std::move(*text); break;
-                        case 5: result.attempt_id = std::move(*text); break;
-                        case 8: result.route = std::move(*text); break;
-                        default: break;
-                    }
-                } else {
-                    auto number = reader.read_unsigned(*tag);
-                    if (!number) {
-                        return std::unexpected(std::move(number.error()));
-                    }
-                    if (tag->field == 3) {
-                        result.session_fence = *number;
-                    } else if (tag->field == 6) {
-                        result.work_fence = *number;
-                    } else if (tag->field == 7) {
-                        result.server_sequence = *number;
-                    } else {
-                        return std::unexpected(
-                            codec_error(ProtocolErrorCode::malformed, "unexpected cancel field", reader.offset));
-                    }
-                }
-            }
-            if (result.session.empty() || result.peer.empty() || result.session_fence == 0 || result.work_id.empty() ||
-                result.attempt_id.empty() || result.work_fence == 0 || result.server_sequence == 0 ||
-                result.route.empty()) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::malformed, "decoded cancel message is incomplete", reader.offset));
-            }
+        [[nodiscard]] std::expected<CancelWorkMessage, ProtocolError>
+        from_wire(const wire::CancelWork<> &source, const ProtocolLimits &limits) {
+            CancelWorkMessage result {.session = SessionId {text(source.session())},
+                                      .peer = PeerId {text(source.peer())},
+                                      .session_fence = source.session_fence(),
+                                      .work_id = text(source.work_id()),
+                                      .attempt_id = text(source.attempt_id()),
+                                      .work_fence = source.work_fence(),
+                                      .server_sequence = source.server_sequence(),
+                                      .route = text(source.route()),
+                                      .requests = {}};
+            for (const auto &request : source.requests()) result.requests.push_back(RequestId {text(request.view())});
+            Context ctx = make_context(limits);
+            auto probe = wire::CancelWork<>::create(ctx);
+            if (auto valid = to_wire(probe, result, ctx, limits); !valid)
+                return std::unexpected(std::move(valid.error()));
             return result;
         }
 
-        [[nodiscard]] bool valid_sha256(const std::string_view digest) noexcept {
-            return digest.size() == 71 && digest.starts_with("sha256:") &&
-                   std::ranges::all_of(digest.substr(7), [](const char value) {
-                       return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f');
+        [[nodiscard]] bool valid_sha256(const std::string_view value) noexcept {
+            return value.size() == 71 && value.starts_with("sha256:") &&
+                   std::all_of(value.begin() + 7, value.end(), [](const char ch) {
+                       return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
                    });
         }
 
-        [[nodiscard]] std::expected<void, ProtocolError>
-        validate_snapshot_begin(const AuthoritativeSnapshotBegin &message, const ProtocolLimits &limits) {
-            if (message.session.empty() || message.peer.empty() || message.session_fence == 0 ||
-                message.snapshot_id.empty() || message.subject_schema.empty() || message.generation == 0 ||
-                message.expected_count > limits.maximum_snapshot_items || !valid_sha256(message.expected_digest) ||
-                (message.parent.has_value() && (!message.parent->valid() || message.parent->peer != message.peer))) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::malformed, "snapshot begin identity, count, or digest is invalid"));
+        template<typename Snapshot>
+        [[nodiscard]] std::expected<void, ProtocolError> set_snapshot_identity(auto &target, const Snapshot &source) {
+            if (source.session.empty() || source.peer.empty() || source.session_fence == 0 || source.snapshot_id.empty() ||
+                source.generation == 0) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "snapshot identity is incomplete"));
             }
+            if (auto status = checked(target.set_session(source.session.value), "set snapshot session"); !status)
+                return status;
+            if (auto status = checked(target.set_peer(source.peer.value), "set snapshot peer"); !status) return status;
+            target.set_session_fence(source.session_fence);
+            if (auto status = checked(target.set_snapshot_id(source.snapshot_id), "set snapshot ID"); !status)
+                return status;
+            target.set_generation(source.generation);
             return {};
         }
 
         [[nodiscard]] std::expected<void, ProtocolError>
-        encode_snapshot_begin(Writer &writer, const AuthoritativeSnapshotBegin &message, const ProtocolLimits &limits) {
-            if (auto valid = validate_snapshot_begin(message, limits); !valid) {
-                return valid;
+        to_wire(wire::SnapshotBegin<> &target, const AuthoritativeSnapshotBegin &source, Context &ctx,
+                const ProtocolLimits &limits) {
+            if (source.subject_schema.empty() || !valid_sha256(source.expected_digest) ||
+                source.expected_count > limits.maximum_snapshot_items) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "snapshot begin is invalid"));
             }
-            writer.string_field(1, message.session.value);
-            writer.string_field(2, message.peer.value);
-            writer.unsigned_field(3, message.session_fence);
-            writer.string_field(4, message.snapshot_id);
-            if (message.parent.has_value()) {
-                Writer parent;
-                encode_subject(parent, *message.parent);
-                writer.message_field(5, parent);
+            if (auto status = set_snapshot_identity(target, source); !status) return status;
+            if (source.parent) {
+                auto parent = target.ensure_parent();
+                if (!parent) return std::unexpected(wire_error(parent.error(), "allocate snapshot parent"));
+                if (auto status = to_wire(*parent, *source.parent, ctx, limits); !status) return status;
             }
-            writer.string_field(6, message.subject_schema.value);
-            writer.unsigned_field(7, message.generation);
-            writer.unsigned_field(8, message.expected_count);
-            writer.string_field(9, message.expected_digest);
-            return {};
+            if (auto status = checked(target.set_subject_schema(source.subject_schema.value), "set snapshot schema");
+                !status)
+                return status;
+            target.set_expected_count(source.expected_count);
+            return checked(target.set_expected_digest(source.expected_digest), "set snapshot digest");
         }
 
-        [[nodiscard]] std::expected<AuthoritativeSnapshotBegin, ProtocolError> decode_snapshot_begin(Reader &reader) {
-            AuthoritativeSnapshotBegin result;
-            SeenFields seen;
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field > 9) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 5) {
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_subject_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    auto parent = decode_subject(*nested);
-                    if (!parent) {
-                        return std::unexpected(std::move(parent.error()));
-                    }
-                    result.parent = std::move(*parent);
-                } else if (tag->field == 1 || tag->field == 2 || tag->field == 4 || tag->field == 6 ||
-                           tag->field == 9) {
-                    auto text = read_string(reader, *tag);
-                    if (!text) {
-                        return std::unexpected(std::move(text.error()));
-                    }
-                    switch (tag->field) {
-                        case 1: result.session = SessionId {std::move(*text)}; break;
-                        case 2: result.peer = PeerId {std::move(*text)}; break;
-                        case 4: result.snapshot_id = std::move(*text); break;
-                        case 6: result.subject_schema = SchemaId {std::move(*text)}; break;
-                        case 9: result.expected_digest = std::move(*text); break;
-                        default: break;
-                    }
-                } else {
-                    auto number = reader.read_unsigned(*tag);
-                    if (!number) {
-                        return std::unexpected(std::move(number.error()));
-                    }
-                    if (tag->field == 3) {
-                        result.session_fence = *number;
-                    } else if (tag->field == 7) {
-                        result.generation = *number;
-                    } else if (tag->field == 8) {
-                        result.expected_count = *number;
-                    } else {
-                        return std::unexpected(codec_error(ProtocolErrorCode::malformed,
-                                                           "unexpected snapshot begin field", reader.offset));
-                    }
-                }
+        [[nodiscard]] std::expected<AuthoritativeSnapshotBegin, ProtocolError>
+        from_wire(const wire::SnapshotBegin<> &source, const ProtocolLimits &limits) {
+            AuthoritativeSnapshotBegin result {.session = SessionId {text(source.session())},
+                                               .peer = PeerId {text(source.peer())},
+                                               .session_fence = source.session_fence(),
+                                               .snapshot_id = text(source.snapshot_id()),
+                                               .parent = std::nullopt,
+                                               .subject_schema = SchemaId {text(source.subject_schema())},
+                                               .generation = source.generation(),
+                                               .expected_count = source.expected_count(),
+                                               .expected_digest = text(source.expected_digest())};
+            if (source.has_parent()) {
+                auto parent = from_wire(*source.parent(), limits);
+                if (!parent) return std::unexpected(std::move(parent.error()));
+                result.parent = std::move(*parent);
             }
-            if (auto valid = validate_snapshot_begin(result, *reader.limits); !valid) {
+            Context ctx = make_context(limits);
+            auto probe = wire::SnapshotBegin<>::create(ctx);
+            if (auto valid = to_wire(probe, result, ctx, limits); !valid)
                 return std::unexpected(std::move(valid.error()));
-            }
             return result;
         }
 
         [[nodiscard]] std::expected<void, ProtocolError>
-        validate_snapshot_chunk(const AuthoritativeSnapshotChunk &message, const ProtocolLimits &limits) {
-            if (message.session.empty() || message.peer.empty() || message.session_fence == 0 ||
-                message.snapshot_id.empty() || message.generation == 0 ||
-                message.subjects.size() > limits.maximum_snapshot_items) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::malformed, "snapshot chunk identity or count is invalid"));
+        to_wire(wire::SnapshotChunk<> &target, const AuthoritativeSnapshotChunk &source, Context &ctx,
+                const ProtocolLimits &limits) {
+            if (source.subjects.empty() || source.subjects.size() > limits.maximum_snapshot_items) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "snapshot chunk is empty or oversized"));
             }
-            std::unordered_set<std::string> keys;
-            std::size_t bytes {};
-            for (const auto &subject : message.subjects) {
-                const auto key = canonical_subject_key(subject);
-                if (key.empty() || subject.peer != message.peer || !keys.insert(key).second ||
-                    key.size() > limits.maximum_snapshot_bytes - bytes) {
-                    return std::unexpected(codec_error(ProtocolErrorCode::invalid_identity,
-                                                       "snapshot chunk subject is invalid, duplicate, or oversized"));
+            if (auto status = set_snapshot_identity(target, source); !status) return status;
+            target.set_chunk_index(source.chunk_index);
+            for (const auto &subject : source.subjects) {
+                if (subject.peer != source.peer) {
+                    return std::unexpected(codec_error(ProtocolErrorCode::malformed, "snapshot subject escapes peer"));
                 }
-                bytes += key.size();
-            }
-            return {};
-        }
-
-        [[nodiscard]] std::expected<void, ProtocolError>
-        encode_snapshot_chunk(Writer &writer, const AuthoritativeSnapshotChunk &message, const ProtocolLimits &limits) {
-            if (auto valid = validate_snapshot_chunk(message, limits); !valid) {
-                return valid;
-            }
-            writer.string_field(1, message.session.value);
-            writer.string_field(2, message.peer.value);
-            writer.unsigned_field(3, message.session_fence);
-            writer.string_field(4, message.snapshot_id);
-            writer.unsigned_field(5, message.generation);
-            writer.unsigned_field(6, message.chunk_index);
-            for (const auto &subject : message.subjects) {
-                Writer nested;
-                encode_subject(nested, subject);
-                writer.message_field(7, nested);
+                if (auto status = append_message(target.mutable_subjects(), ctx, [&](auto &item) {
+                        return to_wire(item, subject, ctx, limits);
+                    });
+                    !status)
+                    return status;
             }
             return {};
         }
 
-        [[nodiscard]] std::expected<AuthoritativeSnapshotChunk, ProtocolError> decode_snapshot_chunk(Reader &reader) {
-            AuthoritativeSnapshotChunk result;
-            SeenFields seen;
-            bool chunk_seen {};
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field == 7) {
-                    if (auto counted = count_collection(reader); !counted) {
-                        return std::unexpected(std::move(counted.error()));
-                    }
-                    if (result.subjects.size() >= reader.limits->maximum_snapshot_items) {
-                        return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                           "snapshot chunk exceeds the item limit", reader.offset));
-                    }
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_subject_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    auto subject = decode_subject(*nested);
-                    if (!subject) {
-                        return std::unexpected(std::move(subject.error()));
-                    }
-                    result.subjects.push_back(std::move(*subject));
-                    continue;
-                }
-                if (tag->field > 7) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 1 || tag->field == 2 || tag->field == 4) {
-                    auto text = read_string(reader, *tag);
-                    if (!text) {
-                        return std::unexpected(std::move(text.error()));
-                    }
-                    if (tag->field == 1) {
-                        result.session = SessionId {std::move(*text)};
-                    } else if (tag->field == 2) {
-                        result.peer = PeerId {std::move(*text)};
-                    } else {
-                        result.snapshot_id = std::move(*text);
-                    }
-                } else {
-                    auto number = reader.read_unsigned(*tag);
-                    if (!number) {
-                        return std::unexpected(std::move(number.error()));
-                    }
-                    if (tag->field == 3) {
-                        result.session_fence = *number;
-                    } else if (tag->field == 5) {
-                        result.generation = *number;
-                    } else if (tag->field == 6) {
-                        if (*number > std::numeric_limits<std::uint32_t>::max()) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                               "snapshot chunk index exceeds uint32", reader.offset));
-                        }
-                        result.chunk_index = static_cast<std::uint32_t>(*number);
-                        chunk_seen = true;
-                    } else {
-                        return std::unexpected(codec_error(ProtocolErrorCode::malformed,
-                                                           "unexpected snapshot chunk field", reader.offset));
-                    }
-                }
+        [[nodiscard]] std::expected<AuthoritativeSnapshotChunk, ProtocolError>
+        from_wire(const wire::SnapshotChunk<> &source, const ProtocolLimits &limits) {
+            AuthoritativeSnapshotChunk result {.session = SessionId {text(source.session())},
+                                               .peer = PeerId {text(source.peer())},
+                                               .session_fence = source.session_fence(),
+                                               .snapshot_id = text(source.snapshot_id()),
+                                               .generation = source.generation(),
+                                               .chunk_index = source.chunk_index(),
+                                               .subjects = {}};
+            for (const auto &subject : source.subjects()) {
+                auto decoded = from_wire(subject, limits);
+                if (!decoded) return std::unexpected(std::move(decoded.error()));
+                result.subjects.push_back(std::move(*decoded));
             }
-            if (!chunk_seen) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::malformed, "snapshot chunk index is absent", reader.offset));
-            }
-            if (auto valid = validate_snapshot_chunk(result, *reader.limits); !valid) {
+            Context ctx = make_context(limits);
+            auto probe = wire::SnapshotChunk<>::create(ctx);
+            if (auto valid = to_wire(probe, result, ctx, limits); !valid)
                 return std::unexpected(std::move(valid.error()));
-            }
             return result;
         }
 
         [[nodiscard]] std::expected<void, ProtocolError>
-        encode_snapshot_commit(Writer &writer, const AuthoritativeSnapshotCommit &message) {
-            if (message.session.empty() || message.peer.empty() || message.session_fence == 0 ||
-                message.snapshot_id.empty() || message.generation == 0 || !valid_sha256(message.canonical_digest)) {
-                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "snapshot commit is invalid"));
+        to_wire(wire::SnapshotCommit<> &target, const AuthoritativeSnapshotCommit &source) {
+            if (!valid_sha256(source.canonical_digest)) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "snapshot commit digest is invalid"));
             }
-            writer.string_field(1, message.session.value);
-            writer.string_field(2, message.peer.value);
-            writer.unsigned_field(3, message.session_fence);
-            writer.string_field(4, message.snapshot_id);
-            writer.unsigned_field(5, message.generation);
-            writer.unsigned_field(6, message.item_count);
-            writer.string_field(7, message.canonical_digest);
-            return {};
+            if (auto status = set_snapshot_identity(target, source); !status) return status;
+            target.set_item_count(source.item_count);
+            return checked(target.set_canonical_digest(source.canonical_digest), "set snapshot commit digest");
         }
 
-        [[nodiscard]] std::expected<AuthoritativeSnapshotCommit, ProtocolError> decode_snapshot_commit(Reader &reader) {
-            AuthoritativeSnapshotCommit result;
-            SeenFields seen;
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field > 7) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 1 || tag->field == 2 || tag->field == 4 || tag->field == 7) {
-                    auto text = read_string(reader, *tag);
-                    if (!text) {
-                        return std::unexpected(std::move(text.error()));
-                    }
-                    if (tag->field == 1) {
-                        result.session = SessionId {std::move(*text)};
-                    } else if (tag->field == 2) {
-                        result.peer = PeerId {std::move(*text)};
-                    } else if (tag->field == 4) {
-                        result.snapshot_id = std::move(*text);
-                    } else {
-                        result.canonical_digest = std::move(*text);
-                    }
-                } else {
-                    auto number = reader.read_unsigned(*tag);
-                    if (!number) {
-                        return std::unexpected(std::move(number.error()));
-                    }
-                    if (tag->field == 3) {
-                        result.session_fence = *number;
-                    } else if (tag->field == 5) {
-                        result.generation = *number;
-                    } else if (tag->field == 6) {
-                        result.item_count = *number;
-                    } else {
-                        return std::unexpected(codec_error(ProtocolErrorCode::malformed,
-                                                           "unexpected snapshot commit field", reader.offset));
-                    }
-                }
-            }
-            if (result.session.empty() || result.peer.empty() || result.session_fence == 0 ||
-                result.snapshot_id.empty() || result.generation == 0 ||
-                result.item_count > reader.limits->maximum_snapshot_items || !valid_sha256(result.canonical_digest)) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::malformed, "decoded snapshot commit is invalid", reader.offset));
-            }
+        [[nodiscard]] std::expected<AuthoritativeSnapshotCommit, ProtocolError>
+        from_wire(const wire::SnapshotCommit<> &source) {
+            AuthoritativeSnapshotCommit result {.session = SessionId {text(source.session())},
+                                                .peer = PeerId {text(source.peer())},
+                                                .session_fence = source.session_fence(),
+                                                .snapshot_id = text(source.snapshot_id()),
+                                                .generation = source.generation(),
+                                                .item_count = source.item_count(),
+                                                .canonical_digest = text(source.canonical_digest())};
+            Context ctx = make_context({});
+            auto probe = wire::SnapshotCommit<>::create(ctx);
+            if (auto valid = to_wire(probe, result); !valid) return std::unexpected(std::move(valid.error()));
             return result;
         }
 
-        void encode_ack(Writer &writer, const AckMessage &message) {
-            writer.string_field(1, message.agent_epoch);
-            writer.unsigned_field(2, message.acknowledged_through);
-            Writer credit;
-            encode_credit(credit, message.credit);
-            writer.message_field(3, credit);
+        [[nodiscard]] std::expected<void, ProtocolError> to_wire(wire::Ack<> &target, const AckMessage &source) {
+            if (source.agent_epoch.empty()) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "ACK epoch is absent"));
+            }
+            if (auto status = checked(target.set_agent_epoch(source.agent_epoch), "set ACK epoch"); !status)
+                return status;
+            target.set_acknowledged_through(source.acknowledged_through);
+            auto credit = target.ensure_credit();
+            if (!credit) return std::unexpected(wire_error(credit.error(), "allocate ACK credit"));
+            to_wire(*credit, source.credit);
+            return {};
         }
 
-        [[nodiscard]] std::expected<AckMessage, ProtocolError> decode_ack(Reader &reader) {
-            AckMessage result;
-            SeenFields seen;
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field > 3) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 1) {
-                    auto epoch = read_string(reader, *tag);
-                    if (!epoch) {
-                        return std::unexpected(std::move(epoch.error()));
-                    }
-                    result.agent_epoch = std::move(*epoch);
-                } else if (tag->field == 2) {
-                    auto sequence = reader.read_unsigned(*tag);
-                    if (!sequence) {
-                        return std::unexpected(std::move(sequence.error()));
-                    }
-                    result.acknowledged_through = *sequence;
-                } else {
-                    auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
-                    if (!nested) {
-                        return std::unexpected(std::move(nested.error()));
-                    }
-                    auto credit = decode_credit(*nested);
-                    if (!credit) {
-                        return std::unexpected(std::move(credit.error()));
-                    }
-                    result.credit = *credit;
-                }
+        [[nodiscard]] std::expected<AckMessage, ProtocolError> from_wire(const wire::Ack<> &source) {
+            if (!source.has_credit()) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "ACK credit is absent"));
             }
+            AckMessage result {.agent_epoch = text(source.agent_epoch()),
+                               .acknowledged_through = source.acknowledged_through(),
+                               .credit = from_wire(*source.credit())};
             if (result.agent_epoch.empty()) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::malformed, "acknowledgement epoch is absent", reader.offset));
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "ACK epoch is absent"));
             }
             return result;
         }
 
-        [[nodiscard]] std::expected<void, ProtocolError> encode_nack(Writer &writer, const NackMessage &message) {
-            if (message.agent_epoch.empty() || message.sequence == 0 || message.diagnostic.empty() ||
-                !valid_utf8(message.diagnostic)) {
+        [[nodiscard]] std::expected<void, ProtocolError> to_wire(wire::Nack<> &target, const NackMessage &source) {
+            if (source.agent_epoch.empty() || source.sequence == 0 || source.diagnostic.empty()) {
                 return std::unexpected(codec_error(ProtocolErrorCode::malformed, "NACK is incomplete"));
             }
-            writer.string_field(1, message.agent_epoch);
-            writer.unsigned_field(2, message.sequence);
-            writer.unsigned_field(3, static_cast<std::uint8_t>(message.reason));
-            writer.boolean_field(4, message.permanent);
-            writer.string_field(5, message.diagnostic);
-            return {};
+            if (auto status = checked(target.set_agent_epoch(source.agent_epoch), "set NACK epoch"); !status)
+                return status;
+            target.set_sequence(source.sequence);
+            target.set_reason(static_cast<std::uint32_t>(source.reason));
+            target.set_permanent(source.permanent);
+            return checked(target.set_diagnostic(source.diagnostic), "set NACK diagnostic");
         }
 
-        [[nodiscard]] std::expected<NackMessage, ProtocolError> decode_nack(Reader &reader) {
-            NackMessage result;
-            SeenFields seen;
-            bool reason_seen {};
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field > 5) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                if (tag->field == 1 || tag->field == 5) {
-                    auto text = read_string(reader, *tag);
-                    if (!text) {
-                        return std::unexpected(std::move(text.error()));
-                    }
-                    if (tag->field == 1) {
-                        result.agent_epoch = std::move(*text);
-                    } else {
-                        result.diagnostic = std::move(*text);
-                    }
-                } else if (tag->field == 4) {
-                    auto permanent = reader.read_boolean(*tag);
-                    if (!permanent) {
-                        return std::unexpected(std::move(permanent.error()));
-                    }
-                    result.permanent = *permanent;
-                } else {
-                    auto number = reader.read_unsigned(*tag);
-                    if (!number) {
-                        return std::unexpected(std::move(number.error()));
-                    }
-                    if (tag->field == 2) {
-                        result.sequence = *number;
-                    } else if (tag->field == 3) {
-                        if (*number > static_cast<std::uint8_t>(ProtocolErrorCode::timed_out)) {
-                            return std::unexpected(
-                                codec_error(ProtocolErrorCode::malformed, "NACK reason is invalid", reader.offset));
-                        }
-                        result.reason = static_cast<ProtocolErrorCode>(*number);
-                        reason_seen = true;
-                    } else {
-                        return std::unexpected(
-                            codec_error(ProtocolErrorCode::malformed, "unexpected NACK field", reader.offset));
-                    }
-                }
+        [[nodiscard]] std::expected<NackMessage, ProtocolError> from_wire(const wire::Nack<> &source) {
+            if (source.reason() > static_cast<std::uint32_t>(ProtocolErrorCode::timed_out)) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "NACK reason is invalid"));
             }
-            if (!reason_seen || result.agent_epoch.empty() || result.sequence == 0 || result.diagnostic.empty()) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::malformed, "decoded NACK is incomplete", reader.offset));
-            }
+            NackMessage result {.agent_epoch = text(source.agent_epoch()),
+                                .sequence = source.sequence(),
+                                .reason = static_cast<ProtocolErrorCode>(source.reason()),
+                                .permanent = source.permanent(),
+                                .diagnostic = text(source.diagnostic())};
+            Context ctx = make_context({});
+            auto probe = wire::Nack<>::create(ctx);
+            if (auto valid = to_wire(probe, result); !valid) return std::unexpected(std::move(valid.error()));
             return result;
         }
 
-        void encode_credit_update(Writer &writer, const CreditUpdateMessage &message) {
-            Writer credit;
-            encode_credit(credit, message.credit);
-            writer.message_field(1, credit);
+        void to_wire(wire::CreditUpdate<> &target, const CreditUpdateMessage &source) {
+            if (auto credit = target.ensure_credit(); credit) to_wire(*credit, source.credit);
         }
 
-        [[nodiscard]] std::expected<CreditUpdateMessage, ProtocolError> decode_credit_update(Reader &reader) {
-            CreditUpdateMessage result;
-            SeenFields seen;
-            bool credit_seen {};
-            while (!reader.eof()) {
-                auto tag = reader.next_tag();
-                if (!tag) {
-                    return std::unexpected(std::move(tag.error()));
-                }
-                if (tag->field != 1) {
-                    if (auto skipped = reader.skip(*tag); !skipped) {
-                        return std::unexpected(std::move(skipped.error()));
-                    }
-                    continue;
-                }
-                if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                    return std::unexpected(std::move(marked.error()));
-                }
-                auto nested = child_reader(reader, *tag, reader.limits->maximum_value_depth);
-                if (!nested) {
-                    return std::unexpected(std::move(nested.error()));
-                }
-                auto credit = decode_credit(*nested);
-                if (!credit) {
-                    return std::unexpected(std::move(credit.error()));
-                }
-                result.credit = *credit;
-                credit_seen = true;
+        [[nodiscard]] std::expected<CreditUpdateMessage, ProtocolError>
+        from_wire(const wire::CreditUpdate<> &source) {
+            if (!source.has_credit()) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "credit update is empty"));
             }
-            if (!credit_seen) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::malformed, "credit update is empty", reader.offset));
-            }
-            return result;
+            return CreditUpdateMessage {.credit = from_wire(*source.credit())};
         }
 
-        [[nodiscard]] std::expected<void, ProtocolError> encode_body(Writer &writer, const MessageBody &body,
-                                                                     const ProtocolLimits &limits) {
+        [[nodiscard]] std::expected<void, ProtocolError>
+        to_wire(wire::MessageBody<> &target, const MessageBody &source, Context &ctx, const ProtocolLimits &limits) {
             return std::visit(
                 [&](const auto &message) -> std::expected<void, ProtocolError> {
                     using Message = std::remove_cvref_t<decltype(message)>;
-                    if constexpr (std::is_same_v<Message, AgentHelloMessage>) {
-                        return encode_agent_hello(writer, message, limits);
-                    } else if constexpr (std::is_same_v<Message, ServerHelloMessage>) {
-                        return encode_server_hello(writer, message, limits);
-                    } else if constexpr (std::is_same_v<Message, WorkLeaseMessage>) {
-                        return encode_work_lease(writer, message, limits);
-                    } else if constexpr (std::is_same_v<Message, WorkResultMessage>) {
-                        return encode_work_result(writer, message, limits);
-                    } else if constexpr (std::is_same_v<Message, CancelWorkMessage>) {
-                        return encode_cancel(writer, message, limits);
-                    } else if constexpr (std::is_same_v<Message, AuthoritativeSnapshotBegin>) {
-                        return encode_snapshot_begin(writer, message, limits);
-                    } else if constexpr (std::is_same_v<Message, AuthoritativeSnapshotChunk>) {
-                        return encode_snapshot_chunk(writer, message, limits);
-                    } else if constexpr (std::is_same_v<Message, AuthoritativeSnapshotCommit>) {
-                        return encode_snapshot_commit(writer, message);
-                    } else if constexpr (std::is_same_v<Message, AckMessage>) {
-                        if (message.agent_epoch.empty()) {
-                            return std::unexpected(
-                                codec_error(ProtocolErrorCode::malformed, "acknowledgement epoch is absent"));
-                        }
-                        encode_ack(writer, message);
+                    auto result = [&]() {
+                        if constexpr (std::is_same_v<Message, AgentHelloMessage>) return target.ensure_agent_hello();
+                        else if constexpr (std::is_same_v<Message, ServerHelloMessage>) return target.ensure_server_hello();
+                        else if constexpr (std::is_same_v<Message, WorkLeaseMessage>) return target.ensure_work_lease();
+                        else if constexpr (std::is_same_v<Message, WorkResultMessage>) return target.ensure_work_result();
+                        else if constexpr (std::is_same_v<Message, CancelWorkMessage>) return target.ensure_cancel_work();
+                        else if constexpr (std::is_same_v<Message, AuthoritativeSnapshotBegin>)
+                            return target.ensure_snapshot_begin();
+                        else if constexpr (std::is_same_v<Message, AuthoritativeSnapshotChunk>)
+                            return target.ensure_snapshot_chunk();
+                        else if constexpr (std::is_same_v<Message, AuthoritativeSnapshotCommit>)
+                            return target.ensure_snapshot_commit();
+                        else if constexpr (std::is_same_v<Message, AckMessage>) return target.ensure_ack();
+                        else if constexpr (std::is_same_v<Message, NackMessage>) return target.ensure_nack();
+                        else return target.ensure_credit_update();
+                    }();
+                    if (!result) return std::unexpected(wire_error(result.error(), "allocate protocol body"));
+                    if constexpr (std::is_same_v<Message, AuthoritativeSnapshotCommit> ||
+                                  std::is_same_v<Message, AckMessage> || std::is_same_v<Message, NackMessage>) {
+                        return to_wire(*result, message);
+                    } else if constexpr (std::is_same_v<Message, CreditUpdateMessage>) {
+                        to_wire(*result, message);
                         return {};
-                    } else if constexpr (std::is_same_v<Message, NackMessage>) {
-                        return encode_nack(writer, message);
                     } else {
-                        encode_credit_update(writer, message);
-                        return {};
+                        return to_wire(*result, message, ctx, limits);
                     }
                 },
-                body);
+                source);
         }
 
-        [[nodiscard]] std::expected<MessageBody, ProtocolError> decode_body(const MessageKind kind, Reader &reader) {
-            switch (kind) {
-                case MessageKind::agent_hello: {
-                    auto message = decode_agent_hello(reader);
-                    if (!message)
-                        return std::unexpected(std::move(message.error()));
-                    return MessageBody {std::move(*message)};
+        [[nodiscard]] std::expected<MessageBody, ProtocolError>
+        from_wire(const wire::MessageBody<> &source, const ProtocolLimits &limits) {
+            switch (source.value_case()) {
+                case wire::MessageBody<>::ValueCase::agent_hello: {
+                    auto value = from_wire(*source.agent_hello(), limits);
+                    if (!value) return std::unexpected(std::move(value.error()));
+                    return MessageBody {std::move(*value)};
                 }
-                case MessageKind::server_hello: {
-                    auto message = decode_server_hello(reader);
-                    if (!message)
-                        return std::unexpected(std::move(message.error()));
-                    return MessageBody {std::move(*message)};
+                case wire::MessageBody<>::ValueCase::server_hello: {
+                    auto value = from_wire(*source.server_hello(), limits);
+                    if (!value) return std::unexpected(std::move(value.error()));
+                    return MessageBody {std::move(*value)};
                 }
-                case MessageKind::work_lease: {
-                    auto message = decode_work_lease(reader);
-                    if (!message)
-                        return std::unexpected(std::move(message.error()));
-                    return MessageBody {std::move(*message)};
+                case wire::MessageBody<>::ValueCase::work_lease: {
+                    auto value = from_wire(*source.work_lease(), limits);
+                    if (!value) return std::unexpected(std::move(value.error()));
+                    return MessageBody {std::move(*value)};
                 }
-                case MessageKind::work_result: {
-                    auto message = decode_work_result(reader);
-                    if (!message)
-                        return std::unexpected(std::move(message.error()));
-                    return MessageBody {std::move(*message)};
+                case wire::MessageBody<>::ValueCase::work_result: {
+                    auto value = from_wire(*source.work_result(), limits);
+                    if (!value) return std::unexpected(std::move(value.error()));
+                    return MessageBody {std::move(*value)};
                 }
-                case MessageKind::cancel_work: {
-                    auto message = decode_cancel(reader);
-                    if (!message)
-                        return std::unexpected(std::move(message.error()));
-                    return MessageBody {std::move(*message)};
+                case wire::MessageBody<>::ValueCase::cancel_work: {
+                    auto value = from_wire(*source.cancel_work(), limits);
+                    if (!value) return std::unexpected(std::move(value.error()));
+                    return MessageBody {std::move(*value)};
                 }
-                case MessageKind::snapshot_begin: {
-                    auto message = decode_snapshot_begin(reader);
-                    if (!message)
-                        return std::unexpected(std::move(message.error()));
-                    return MessageBody {std::move(*message)};
+                case wire::MessageBody<>::ValueCase::snapshot_begin: {
+                    auto value = from_wire(*source.snapshot_begin(), limits);
+                    if (!value) return std::unexpected(std::move(value.error()));
+                    return MessageBody {std::move(*value)};
                 }
-                case MessageKind::snapshot_chunk: {
-                    auto message = decode_snapshot_chunk(reader);
-                    if (!message)
-                        return std::unexpected(std::move(message.error()));
-                    return MessageBody {std::move(*message)};
+                case wire::MessageBody<>::ValueCase::snapshot_chunk: {
+                    auto value = from_wire(*source.snapshot_chunk(), limits);
+                    if (!value) return std::unexpected(std::move(value.error()));
+                    return MessageBody {std::move(*value)};
                 }
-                case MessageKind::snapshot_commit: {
-                    auto message = decode_snapshot_commit(reader);
-                    if (!message)
-                        return std::unexpected(std::move(message.error()));
-                    return MessageBody {std::move(*message)};
+                case wire::MessageBody<>::ValueCase::snapshot_commit: {
+                    auto value = from_wire(*source.snapshot_commit());
+                    if (!value) return std::unexpected(std::move(value.error()));
+                    return MessageBody {std::move(*value)};
                 }
-                case MessageKind::ack: {
-                    auto message = decode_ack(reader);
-                    if (!message)
-                        return std::unexpected(std::move(message.error()));
-                    return MessageBody {std::move(*message)};
+                case wire::MessageBody<>::ValueCase::ack: {
+                    auto value = from_wire(*source.ack());
+                    if (!value) return std::unexpected(std::move(value.error()));
+                    return MessageBody {std::move(*value)};
                 }
-                case MessageKind::nack: {
-                    auto message = decode_nack(reader);
-                    if (!message)
-                        return std::unexpected(std::move(message.error()));
-                    return MessageBody {std::move(*message)};
+                case wire::MessageBody<>::ValueCase::nack: {
+                    auto value = from_wire(*source.nack());
+                    if (!value) return std::unexpected(std::move(value.error()));
+                    return MessageBody {std::move(*value)};
                 }
-                case MessageKind::credit_update: {
-                    auto message = decode_credit_update(reader);
-                    if (!message)
-                        return std::unexpected(std::move(message.error()));
-                    return MessageBody {std::move(*message)};
+                case wire::MessageBody<>::ValueCase::credit_update: {
+                    auto value = from_wire(*source.credit_update());
+                    if (!value) return std::unexpected(std::move(value.error()));
+                    return MessageBody {std::move(*value)};
                 }
-                default: break;
+                case wire::MessageBody<>::ValueCase::none:
+                default:
+                    return std::unexpected(
+                        codec_error(ProtocolErrorCode::unexpected_message, "protocol body is absent"));
             }
-            return std::unexpected(codec_error(ProtocolErrorCode::unexpected_message, "unknown protocol message kind"));
         }
 
         [[nodiscard]] bool durable_agent_message(const MessageKind kind) noexcept {
@@ -3247,95 +1665,115 @@ namespace rule_engine::python::protocol_v2 {
                 return std::unexpected(
                     codec_error(ProtocolErrorCode::unsupported_version, "protocol version is not supported"));
             }
-            if (envelope.message_id.empty() || envelope.message_id.size() > limits.maximum_string_bytes ||
-                !valid_utf8(envelope.message_id)) {
+            if (envelope.message_id.empty() || envelope.message_id.size() > limits.maximum_string_bytes) {
                 return std::unexpected(codec_error(ProtocolErrorCode::malformed, "message ID is invalid"));
             }
             const auto kind = message_kind(envelope.body);
             if (kind == MessageKind::agent_hello) {
                 const auto &hello = std::get<AgentHelloMessage>(envelope.body);
-                if (envelope.session.has_value() || envelope.agent_sequence != 0 ||
-                    envelope.agent_epoch != hello.agent_epoch) {
-                    return std::unexpected(codec_error(ProtocolErrorCode::malformed,
-                                                       "agent hello envelope has session or sequence state"));
+                if (envelope.session || envelope.agent_sequence != 0 || envelope.agent_epoch != hello.agent_epoch) {
+                    return std::unexpected(codec_error(ProtocolErrorCode::malformed, "agent hello envelope is invalid"));
                 }
                 return {};
             }
-            if (!envelope.session.has_value() || envelope.session->empty() || envelope.agent_epoch.empty() ||
-                envelope.agent_epoch.size() > limits.maximum_string_bytes || !valid_utf8(envelope.agent_epoch)) {
-                return std::unexpected(codec_error(ProtocolErrorCode::stale_session,
-                                                   "post-handshake envelope lacks session or agent epoch"));
+            if (!envelope.session || envelope.session->empty() || envelope.agent_epoch.empty()) {
+                return std::unexpected(
+                    codec_error(ProtocolErrorCode::stale_session, "post-handshake envelope lacks session state"));
             }
             if (durable_agent_message(kind) != (envelope.agent_sequence != 0)) {
                 return std::unexpected(
                     codec_error(ProtocolErrorCode::malformed, "durable sequence does not match message direction"));
             }
             if (kind == MessageKind::server_hello &&
-                *envelope.session != std::get<ServerHelloMessage>(envelope.body).session) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::stale_session, "server hello envelope session does not match"));
-            }
+                *envelope.session != std::get<ServerHelloMessage>(envelope.body).session)
+                return std::unexpected(codec_error(ProtocolErrorCode::stale_session, "server session mismatch"));
             if (kind == MessageKind::work_lease &&
-                *envelope.session != std::get<WorkLeaseMessage>(envelope.body).session) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::stale_session, "work envelope session does not match"));
-            }
+                *envelope.session != std::get<WorkLeaseMessage>(envelope.body).session)
+                return std::unexpected(codec_error(ProtocolErrorCode::stale_session, "work session mismatch"));
             if (kind == MessageKind::cancel_work &&
-                *envelope.session != std::get<CancelWorkMessage>(envelope.body).session) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::stale_session, "cancel envelope session does not match"));
-            }
-            if (kind == MessageKind::ack && envelope.agent_epoch != std::get<AckMessage>(envelope.body).agent_epoch) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::stale_session, "ACK envelope epoch does not match"));
-            }
-            if (kind == MessageKind::nack && envelope.agent_epoch != std::get<NackMessage>(envelope.body).agent_epoch) {
-                return std::unexpected(
-                    codec_error(ProtocolErrorCode::stale_session, "NACK envelope epoch does not match"));
-            }
+                *envelope.session != std::get<CancelWorkMessage>(envelope.body).session)
+                return std::unexpected(codec_error(ProtocolErrorCode::stale_session, "cancel session mismatch"));
+            if (kind == MessageKind::ack && envelope.agent_epoch != std::get<AckMessage>(envelope.body).agent_epoch)
+                return std::unexpected(codec_error(ProtocolErrorCode::stale_session, "ACK epoch mismatch"));
+            if (kind == MessageKind::nack && envelope.agent_epoch != std::get<NackMessage>(envelope.body).agent_epoch)
+                return std::unexpected(codec_error(ProtocolErrorCode::stale_session, "NACK epoch mismatch"));
             return {};
         }
 
+        [[nodiscard]] std::expected<void, ProtocolError>
+        to_wire(wire::PeerEnvelope<> &target, const PeerEnvelope &source, Context &ctx, const ProtocolLimits &limits) {
+            if (auto valid = validate_envelope(source, limits); !valid) return valid;
+            target.set_protocol_major(source.protocol_major);
+            target.set_protocol_minor(source.protocol_minor);
+            if (auto status = checked(target.set_message_id(source.message_id), "set message ID"); !status)
+                return status;
+            if (source.session) {
+                if (auto status = checked(target.set_session(source.session->value), "set envelope session"); !status)
+                    return status;
+            }
+            if (auto status = checked(target.set_agent_epoch(source.agent_epoch), "set envelope epoch"); !status)
+                return status;
+            target.set_agent_sequence(source.agent_sequence);
+            target.set_acknowledged_agent_sequence(source.acknowledged_agent_sequence);
+            target.set_message_kind(static_cast<std::uint32_t>(message_kind(source.body)));
+            auto body = target.ensure_body();
+            if (!body) return std::unexpected(wire_error(body.error(), "allocate envelope body"));
+            return to_wire(*body, source.body, ctx, limits);
+        }
+
+        [[nodiscard]] std::expected<PeerEnvelope, ProtocolError>
+        from_wire(const wire::PeerEnvelope<> &source, const ProtocolLimits &limits) {
+            if (!source.has_body() || source.protocol_major() > std::numeric_limits<std::uint16_t>::max() ||
+                source.protocol_minor() > std::numeric_limits<std::uint16_t>::max()) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "protocol envelope is incomplete"));
+            }
+            auto body = from_wire(*source.body(), limits);
+            if (!body) return std::unexpected(std::move(body.error()));
+            if (source.message_kind() != static_cast<std::uint32_t>(message_kind(*body))) {
+                return std::unexpected(
+                    codec_error(ProtocolErrorCode::unexpected_message, "message kind and generated oneof disagree"));
+            }
+            PeerEnvelope result {.protocol_major = static_cast<std::uint16_t>(source.protocol_major()),
+                                 .protocol_minor = static_cast<std::uint16_t>(source.protocol_minor()),
+                                 .message_id = text(source.message_id()),
+                                 .session = source.has_session()
+                                                ? std::optional<SessionId> {SessionId {text(source.session())}}
+                                                : std::nullopt,
+                                 .agent_epoch = text(source.agent_epoch()),
+                                 .agent_sequence = source.agent_sequence(),
+                                 .acknowledged_agent_sequence = source.acknowledged_agent_sequence(),
+                                 .body = std::move(*body)};
+            if (auto valid = validate_envelope(result, limits); !valid) return std::unexpected(std::move(valid.error()));
+            return result;
+        }
+
+        template<typename WireMessage>
+        [[nodiscard]] std::expected<std::vector<std::byte>, ProtocolError>
+        serialize_generated(const WireMessage &message, const ProtocolLimits &limits) {
+            auto size = message.encoded_size();
+            if (!size) return std::unexpected(wire_error(size.error(), "Protocyte encoded_size"));
+            if (*size == 0 || *size > limits.maximum_frame_bytes) {
+                return std::unexpected(
+                    codec_error(ProtocolErrorCode::limit_exceeded, "generated protocol payload exceeds the limit"));
+            }
+            std::vector<std::byte> output(*size);
+            auto written = message.serialize(
+                protocyte::Span<protocyte::u8> {reinterpret_cast<protocyte::u8 *>(output.data()), output.size()});
+            if (!written) return std::unexpected(wire_error(written.error(), "Protocyte serialize"));
+            if (*written != output.size()) {
+                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "Protocyte wrote a partial payload"));
+            }
+            return output;
+        }
     } // namespace
 
     std::expected<std::vector<std::byte>, ProtocolError> encode_payload(const PeerEnvelope &envelope,
                                                                         const ProtocolLimits &limits) {
-        if (auto valid = validate_envelope(envelope, limits); !valid) {
-            return std::unexpected(std::move(valid.error()));
-        }
-        Writer writer;
-        writer.unsigned_field(1, envelope.protocol_major);
-        writer.unsigned_field(2, envelope.protocol_minor);
-        writer.string_field(3, envelope.message_id);
-        if (envelope.session.has_value()) {
-            writer.string_field(4, envelope.session->value);
-        }
-        if (!envelope.agent_epoch.empty()) {
-            writer.string_field(5, envelope.agent_epoch);
-        }
-        if (envelope.agent_sequence != 0) {
-            writer.unsigned_field(6, envelope.agent_sequence);
-        }
-        if (envelope.acknowledged_agent_sequence != 0) {
-            writer.unsigned_field(7, envelope.acknowledged_agent_sequence);
-        }
-        writer.unsigned_field(8, static_cast<std::uint8_t>(message_kind(envelope.body)));
-        Writer body;
-        if (auto encoded = encode_body(body, envelope.body, limits); !encoded) {
-            return std::unexpected(std::move(encoded.error()));
-        }
-        writer.message_field(9, body);
-        if (writer.bytes.size() > limits.maximum_frame_bytes) {
-            return std::unexpected(
-                codec_error(ProtocolErrorCode::limit_exceeded, "protocol payload exceeds the frame limit"));
-        }
-        // Decode our own canonical output once so encoder-side callers receive the
-        // same per-field/depth/count validation as untrusted inputs.
-        auto validated = decode_payload(writer.bytes, limits);
-        if (!validated) {
-            return std::unexpected(std::move(validated.error()));
-        }
-        return writer.bytes;
+        Context ctx = make_context(limits);
+        auto generated = wire::PeerEnvelope<>::create(ctx);
+        if (auto converted = to_wire(generated, envelope, ctx, limits); !converted)
+            return std::unexpected(std::move(converted.error()));
+        return serialize_generated(generated, limits);
     }
 
     std::expected<PeerEnvelope, ProtocolError> decode_payload(const std::span<const std::byte> payload,
@@ -3345,106 +1783,18 @@ namespace rule_engine::python::protocol_v2 {
                 codec_error(payload.empty() ? ProtocolErrorCode::truncated : ProtocolErrorCode::limit_exceeded,
                             "protocol payload is empty or oversized"));
         }
-        DecodeBudget budget;
-        Reader reader {.bytes = payload, .limits = &limits, .budget = &budget, .depth = 0, .offset = 0};
-        PeerEnvelope result;
-        SeenFields seen;
-        std::optional<MessageKind> kind;
-        std::optional<std::span<const std::byte>> body_bytes;
-        bool major_seen {};
-        bool minor_seen {};
-        while (!reader.eof()) {
-            auto tag = reader.next_tag();
-            if (!tag) {
-                return std::unexpected(std::move(tag.error()));
-            }
-            if (tag->field > 9) {
-                if (auto skipped = reader.skip(*tag); !skipped) {
-                    return std::unexpected(std::move(skipped.error()));
-                }
-                continue;
-            }
-            if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                return std::unexpected(std::move(marked.error()));
-            }
-            if (tag->field == 3 || tag->field == 4 || tag->field == 5) {
-                auto text = read_string(reader, *tag);
-                if (!text) {
-                    return std::unexpected(std::move(text.error()));
-                }
-                if (tag->field == 3) {
-                    result.message_id = std::move(*text);
-                } else if (tag->field == 4) {
-                    result.session = SessionId {std::move(*text)};
-                } else {
-                    result.agent_epoch = std::move(*text);
-                }
-            } else if (tag->field == 9) {
-                auto bytes = reader.read_bytes(*tag, limits.maximum_frame_bytes);
-                if (!bytes) {
-                    return std::unexpected(std::move(bytes.error()));
-                }
-                body_bytes = *bytes;
-            } else {
-                auto number = reader.read_unsigned(*tag);
-                if (!number) {
-                    return std::unexpected(std::move(number.error()));
-                }
-                switch (tag->field) {
-                    case 1:
-                        if (*number > std::numeric_limits<std::uint16_t>::max()) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                               "protocol major exceeds uint16", reader.offset));
-                        }
-                        result.protocol_major = static_cast<std::uint16_t>(*number);
-                        major_seen = true;
-                        break;
-                    case 2:
-                        if (*number > std::numeric_limits<std::uint16_t>::max()) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded,
-                                                               "protocol minor exceeds uint16", reader.offset));
-                        }
-                        result.protocol_minor = static_cast<std::uint16_t>(*number);
-                        minor_seen = true;
-                        break;
-                    case 6: result.agent_sequence = *number; break;
-                    case 7: result.acknowledged_agent_sequence = *number; break;
-                    case 8:
-                        if (*number < static_cast<std::uint8_t>(MessageKind::agent_hello) ||
-                            *number > static_cast<std::uint8_t>(MessageKind::credit_update)) {
-                            return std::unexpected(codec_error(ProtocolErrorCode::unexpected_message,
-                                                               "protocol message kind is unknown", reader.offset));
-                        }
-                        kind = static_cast<MessageKind>(*number);
-                        break;
-                    default:
-                        return std::unexpected(
-                            codec_error(ProtocolErrorCode::malformed, "unexpected envelope field", reader.offset));
-                }
-            }
-        }
-        if (!major_seen || !minor_seen || !kind.has_value() || !body_bytes.has_value()) {
-            return std::unexpected(
-                codec_error(ProtocolErrorCode::malformed, "protocol envelope is incomplete", reader.offset));
-        }
-        Reader body_reader {.bytes = *body_bytes, .limits = &limits, .budget = &budget, .depth = 1, .offset = 0};
-        auto body = decode_body(*kind, body_reader);
-        if (!body) {
-            return std::unexpected(std::move(body.error()));
-        }
-        result.body = std::move(*body);
-        if (auto valid = validate_envelope(result, limits); !valid) {
+        if (auto valid = preflight_generated_message(payload, PreflightShape::peer_envelope); !valid)
             return std::unexpected(std::move(valid.error()));
-        }
-        return result;
+        Context ctx = make_context(limits);
+        auto generated = wire::PeerEnvelope<>::parse(ctx, byte_view(payload));
+        if (!generated) return std::unexpected(wire_error(generated.error(), "Protocyte parse"));
+        return from_wire(*generated, limits);
     }
 
     std::expected<std::vector<std::byte>, ProtocolError> encode_frame(const PeerEnvelope &envelope,
                                                                       const ProtocolLimits &limits) {
         auto payload = encode_payload(envelope, limits);
-        if (!payload) {
-            return std::unexpected(std::move(payload.error()));
-        }
+        if (!payload) return std::unexpected(std::move(payload.error()));
         if (payload->size() > std::numeric_limits<std::uint32_t>::max()) {
             return std::unexpected(codec_error(ProtocolErrorCode::limit_exceeded, "protocol frame exceeds uint32"));
         }
@@ -3459,126 +1809,82 @@ namespace rule_engine::python::protocol_v2 {
         return frame;
     }
 
-    std::expected<std::vector<std::byte>, ProtocolError> encode_durable_body(const DurableAgentBody &body,
-                                                                             const ProtocolLimits &limits) {
-        const auto message = std::visit([](const auto &value) -> MessageBody { return value; }, body);
-        const auto kind = message_kind(message);
-        if (!durable_agent_message(kind)) {
-            return std::unexpected(
-                codec_error(ProtocolErrorCode::unexpected_message, "spool body is not durable agent data"));
-        }
-
-        Writer body_writer;
-        if (auto encoded = encode_body(body_writer, message, limits); !encoded) {
-            return std::unexpected(std::move(encoded.error()));
-        }
-        Writer writer;
-        writer.unsigned_field(1, static_cast<std::uint8_t>(kind));
-        writer.message_field(2, body_writer);
-        if (writer.bytes.empty() || writer.bytes.size() > limits.maximum_frame_bytes) {
-            return std::unexpected(
-                codec_error(ProtocolErrorCode::limit_exceeded, "durable spool body exceeds the frame limit"));
-        }
-        auto validated = decode_durable_body(writer.bytes, limits);
-        if (!validated) {
-            return std::unexpected(std::move(validated.error()));
-        }
-        return writer.bytes;
-    }
-
-    std::expected<DurableAgentBody, ProtocolError> decode_durable_body(const std::span<const std::byte> bytes,
-                                                                       const ProtocolLimits &limits) {
-        if (bytes.empty() || bytes.size() > limits.maximum_frame_bytes) {
-            return std::unexpected(
-                codec_error(bytes.empty() ? ProtocolErrorCode::truncated : ProtocolErrorCode::limit_exceeded,
-                            "durable spool body is empty or oversized"));
-        }
-        DecodeBudget budget;
-        Reader reader {.bytes = bytes, .limits = &limits, .budget = &budget, .depth = 0, .offset = 0};
-        SeenFields seen;
-        std::optional<MessageKind> kind;
-        std::optional<std::span<const std::byte>> body_bytes;
-        while (!reader.eof()) {
-            auto tag = reader.next_tag();
-            if (!tag) {
-                return std::unexpected(std::move(tag.error()));
-            }
-            if (tag->field > 2) {
-                if (auto skipped = reader.skip(*tag); !skipped) {
-                    return std::unexpected(std::move(skipped.error()));
-                }
-                continue;
-            }
-            if (auto marked = seen.mark(tag->field, reader.offset); !marked) {
-                return std::unexpected(std::move(marked.error()));
-            }
-            if (tag->field == 1) {
-                auto number = reader.read_unsigned(*tag);
-                if (!number || *number > static_cast<std::uint8_t>(MessageKind::credit_update)) {
-                    return std::unexpected(number ? codec_error(ProtocolErrorCode::unexpected_message,
-                                                                "durable spool message kind is unknown") :
-                                                    std::move(number.error()));
-                }
-                kind = static_cast<MessageKind>(*number);
-                continue;
-            }
-            auto encoded = reader.read_bytes(*tag, limits.maximum_frame_bytes);
-            if (!encoded) {
-                return std::unexpected(std::move(encoded.error()));
-            }
-            body_bytes = *encoded;
-        }
-        if (!kind.has_value() || !body_bytes.has_value() || !durable_agent_message(*kind)) {
-            return std::unexpected(
-                codec_error(ProtocolErrorCode::unexpected_message, "durable spool body kind is missing or invalid"));
-        }
-        Reader body_reader {.bytes = *body_bytes, .limits = &limits, .budget = &budget, .depth = 1, .offset = 0};
-        auto decoded = decode_body(*kind, body_reader);
-        if (!decoded) {
-            return std::unexpected(std::move(decoded.error()));
-        }
-        switch (*kind) {
-            case MessageKind::work_result: return DurableAgentBody {std::get<WorkResultMessage>(std::move(*decoded))};
-            case MessageKind::snapshot_begin:
-                return DurableAgentBody {std::get<AuthoritativeSnapshotBegin>(std::move(*decoded))};
-            case MessageKind::snapshot_chunk:
-                return DurableAgentBody {std::get<AuthoritativeSnapshotChunk>(std::move(*decoded))};
-            case MessageKind::snapshot_commit:
-                return DurableAgentBody {std::get<AuthoritativeSnapshotCommit>(std::move(*decoded))};
-            case MessageKind::agent_hello:
-            case MessageKind::server_hello:
-            case MessageKind::work_lease:
-            case MessageKind::cancel_work:
-            case MessageKind::ack:
-            case MessageKind::nack:
-            case MessageKind::credit_update: break;
-            default: break;
-        }
-        return std::unexpected(
-            codec_error(ProtocolErrorCode::unexpected_message, "durable spool body kind is not supported"));
-    }
-
-    std::expected<DecodedFrame, ProtocolError> decode_frame(const std::span<const std::byte> bytes,
+    std::expected<DecodedFrame, ProtocolError> decode_frame(const std::span<const std::byte> input,
                                                             const ProtocolLimits &limits) {
-        if (bytes.size() < 4) {
+        if (input.size() < 4) {
             return std::unexpected(codec_error(ProtocolErrorCode::truncated, "frame header is truncated"));
         }
-        const auto size = (std::to_integer<std::uint32_t>(bytes[0]) << 24U) |
-                          (std::to_integer<std::uint32_t>(bytes[1]) << 16U) |
-                          (std::to_integer<std::uint32_t>(bytes[2]) << 8U) | std::to_integer<std::uint32_t>(bytes[3]);
+        const auto size = (std::to_integer<std::uint32_t>(input[0]) << 24U) |
+                          (std::to_integer<std::uint32_t>(input[1]) << 16U) |
+                          (std::to_integer<std::uint32_t>(input[2]) << 8U) |
+                          std::to_integer<std::uint32_t>(input[3]);
         if (size == 0 || size > limits.maximum_frame_bytes) {
             return std::unexpected(
                 codec_error(size == 0 ? ProtocolErrorCode::malformed : ProtocolErrorCode::limit_exceeded,
                             "frame length is zero or exceeds the limit"));
         }
-        if (size > bytes.size() - 4) {
+        if (size > input.size() - 4) {
             return std::unexpected(codec_error(ProtocolErrorCode::truncated, "frame payload is truncated"));
         }
-        auto envelope = decode_payload(bytes.subspan(4, size), limits);
-        if (!envelope) {
-            return std::unexpected(std::move(envelope.error()));
-        }
+        auto envelope = decode_payload(input.subspan(4, size), limits);
+        if (!envelope) return std::unexpected(std::move(envelope.error()));
         return DecodedFrame {.envelope = std::move(*envelope), .bytes_consumed = static_cast<std::size_t>(size) + 4};
+    }
+
+    std::expected<std::vector<std::byte>, ProtocolError> encode_durable_body(const DurableAgentBody &body,
+                                                                             const ProtocolLimits &limits) {
+        const MessageBody message = std::visit([](const auto &value) -> MessageBody { return value; }, body);
+        const auto kind = message_kind(message);
+        if (!durable_agent_message(kind)) {
+            return std::unexpected(
+                codec_error(ProtocolErrorCode::unexpected_message, "spool body is not durable agent data"));
+        }
+        Context ctx = make_context(limits);
+        auto generated = wire::DurableAgentEnvelope<>::create(ctx);
+        generated.set_message_kind(static_cast<std::uint32_t>(kind));
+        auto generated_body = generated.ensure_body();
+        if (!generated_body)
+            return std::unexpected(wire_error(generated_body.error(), "allocate durable protocol body"));
+        if (auto converted = to_wire(*generated_body, message, ctx, limits); !converted)
+            return std::unexpected(std::move(converted.error()));
+        return serialize_generated(generated, limits);
+    }
+
+    std::expected<DurableAgentBody, ProtocolError> decode_durable_body(const std::span<const std::byte> input,
+                                                                       const ProtocolLimits &limits) {
+        if (input.empty() || input.size() > limits.maximum_frame_bytes) {
+            return std::unexpected(
+                codec_error(input.empty() ? ProtocolErrorCode::truncated : ProtocolErrorCode::limit_exceeded,
+                            "durable spool body is empty or oversized"));
+        }
+        if (auto valid = preflight_generated_message(input, PreflightShape::durable_envelope); !valid)
+            return std::unexpected(std::move(valid.error()));
+        Context ctx = make_context(limits);
+        auto generated = wire::DurableAgentEnvelope<>::parse(ctx, byte_view(input));
+        if (!generated) return std::unexpected(wire_error(generated.error(), "Protocyte durable parse"));
+        if (!generated->has_body()) {
+            return std::unexpected(
+                codec_error(ProtocolErrorCode::unexpected_message, "durable protocol body is absent"));
+        }
+        auto message = from_wire(*generated->body(), limits);
+        if (!message) return std::unexpected(std::move(message.error()));
+        const auto kind = message_kind(*message);
+        if (!durable_agent_message(kind) || generated->message_kind() != static_cast<std::uint32_t>(kind)) {
+            return std::unexpected(
+                codec_error(ProtocolErrorCode::unexpected_message, "durable body kind is invalid"));
+        }
+        switch (kind) {
+            case MessageKind::work_result: return DurableAgentBody {std::get<WorkResultMessage>(std::move(*message))};
+            case MessageKind::snapshot_begin:
+                return DurableAgentBody {std::get<AuthoritativeSnapshotBegin>(std::move(*message))};
+            case MessageKind::snapshot_chunk:
+                return DurableAgentBody {std::get<AuthoritativeSnapshotChunk>(std::move(*message))};
+            case MessageKind::snapshot_commit:
+                return DurableAgentBody {std::get<AuthoritativeSnapshotCommit>(std::move(*message))};
+            default:
+                return std::unexpected(
+                    codec_error(ProtocolErrorCode::unexpected_message, "durable body kind is unsupported"));
+        }
     }
 
 } // namespace rule_engine::python::protocol_v2

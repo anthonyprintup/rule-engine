@@ -1,5 +1,18 @@
+protocyte_generate(
+    TARGET rule_engine_python_protocol_wire_codegen
+    PROTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/proto"
+    OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    DISCOVER
+    OPTIONS
+        "clang_format_config=${PROJECT_SOURCE_DIR}/.clang-format"
+    GENERATED_HEADERS_VAR rule_engine_python_protocol_wire_headers
+    GENERATED_SOURCES_VAR rule_engine_python_protocol_wire_sources
+)
+
 add_library(
     rule_engine_python_protocol
+    ${rule_engine_python_protocol_wire_headers}
+    ${rule_engine_python_protocol_wire_sources}
     types.cpp
     codec.cpp
     network.cpp
@@ -10,7 +23,12 @@ add_library(
     transport.cpp
 )
 add_library(rule_engine::python_protocol ALIAS rule_engine_python_protocol)
-target_include_directories(rule_engine_python_protocol PUBLIC "${PROJECT_SOURCE_DIR}/include")
+add_dependencies(rule_engine_python_protocol rule_engine_python_protocol_wire_codegen)
+target_include_directories(
+    rule_engine_python_protocol
+    PUBLIC "${PROJECT_SOURCE_DIR}/include"
+    PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated"
+)
 target_link_libraries(
     rule_engine_python_protocol
     PUBLIC
@@ -82,6 +100,7 @@ endif()
 target_compile_definitions(
     rule_engine_python_protocol
     PRIVATE
+        PROTOCYTE_ENABLE_HOSTED_ALLOCATOR=1
         RULE_ENGINE_PROTOCOL_HAS_OPENSSL=$<BOOL:${rule_engine_protocol_has_openssl}>
         RULE_ENGINE_PROTOCOL_HAS_SQLITE=$<BOOL:${rule_engine_protocol_has_sqlite}>
         RULE_ENGINE_PROTOCOL_USE_WINSQLITE=$<BOOL:${rule_engine_protocol_use_winsqlite}>

@@ -52,7 +52,7 @@ if(WIN32)
     target_link_libraries(rule_engine_asio INTERFACE ws2_32)
 endif()
 
-set(PROTOCYTE_FETCH_PROTOBUF OFF CACHE BOOL "Rule Engine consumes only the Protocyte runtime" FORCE)
+set(PROTOCYTE_FETCH_PROTOBUF ON CACHE BOOL "Rule Engine generates its typed Protocol v2 wire model" FORCE)
 set(PROTOCYTE_INSTALL OFF CACHE BOOL "Protocyte is a private Rule Engine build dependency" FORCE)
 FetchContent_Declare(
     protocyte
