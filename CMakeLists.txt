@@ -52,6 +52,16 @@ if(WIN32)
     target_link_libraries(rule_engine_asio INTERFACE ws2_32)
 endif()
 
+set(PROTOCYTE_FETCH_PROTOBUF OFF CACHE BOOL "Rule Engine consumes only the Protocyte runtime" FORCE)
+set(PROTOCYTE_INSTALL OFF CACHE BOOL "Protocyte is a private Rule Engine build dependency" FORCE)
+FetchContent_Declare(
+    protocyte
+    SYSTEM
+    GIT_REPOSITORY https://github.com/anthonyprintup/protocyte.git
+    GIT_TAG ec9dada8df14306dadffaa9e00853d2e39ade83f
+)
+FetchContent_MakeAvailable(protocyte)
+
 if(BUILD_TESTING)
     FetchContent_Declare(
         Catch2

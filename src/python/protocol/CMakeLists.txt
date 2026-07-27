@@ -18,6 +18,7 @@ target_link_libraries(
     PRIVATE
         rule_engine::project_options
         asio::asio
+        "$<BUILD_INTERFACE:protocyte::runtime>"
 )
 
 option(RULE_ENGINE_PROTOCOL_ENABLE_SECURE_RUNTIME "Build OpenSSL transport and SQLite agent spool backends" ON)

@@ -1,10 +1,13 @@
 #include "rule_engine/python/protocol/codec.hpp"
 
+#include <protocyte/runtime/runtime.hpp>
+
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <expected>
 #include <limits>
 #include <optional>
@@ -32,12 +35,15 @@ namespace rule_engine::python::protocol_v2 {
         struct Writer {
             std::vector<std::byte> bytes;
 
-            void varint(std::uint64_t value) {
-                while (value >= 0x80U) {
-                    bytes.push_back(static_cast<std::byte>((value & 0x7fU) | 0x80U));
-                    value >>= 7U;
-                }
+            [[nodiscard]] protocyte::Status write_byte(const protocyte::u8 value) noexcept {
                 bytes.push_back(static_cast<std::byte>(value));
+                return {};
+            }
+
+            void varint(std::uint64_t value) {
+                if (const auto status = protocyte::write_varint(*this, value); !status) {
+                    std::terminate();
+                }
             }
 
             void tag(const std::uint32_t field, const WireType wire) {
@@ -86,31 +92,30 @@ namespace rule_engine::python::protocol_v2 {
             std::size_t offset {};
 
             [[nodiscard]] bool eof() const noexcept { return offset == bytes.size(); }
+            [[nodiscard]] std::size_t position() const noexcept { return offset; }
+
+            [[nodiscard]] protocyte::Result<protocyte::u8> read_byte() noexcept {
+                if (offset >= bytes.size()) {
+                    return protocyte::unexpected(protocyte::ErrorCode::unexpected_eof, offset);
+                }
+                return std::to_integer<protocyte::u8>(bytes[offset++]);
+            }
 
             [[nodiscard]] std::expected<std::uint64_t, ProtocolError> varint() {
                 const auto start = offset;
-                std::uint64_t value {};
-                for (std::uint32_t index = 0; index < 10; ++index) {
-                    if (offset >= bytes.size()) {
-                        return std::unexpected(codec_error(ProtocolErrorCode::truncated, "truncated varint", offset));
-                    }
-                    const auto octet = std::to_integer<std::uint8_t>(bytes[offset++]);
-                    if (index == 9 && (octet & 0xfeU) != 0) {
-                        return std::unexpected(
-                            codec_error(ProtocolErrorCode::malformed, "varint overflows uint64", start));
-                    }
-                    value |= static_cast<std::uint64_t>(octet & 0x7fU) << (index * 7U);
-                    if ((octet & 0x80U) == 0) {
-                        std::size_t minimum_bytes {1};
-                        for (auto remaining = value; remaining >= 0x80U; remaining >>= 7U) { ++minimum_bytes; }
-                        if (offset - start != minimum_bytes) {
-                            return std::unexpected(
-                                codec_error(ProtocolErrorCode::malformed, "non-canonical overlong varint", start));
-                        }
-                        return value;
-                    }
+                auto value = protocyte::read_varint(*this);
+                if (!value) {
+                    const auto truncated = value.error().code == protocyte::ErrorCode::unexpected_eof;
+                    return std::unexpected(codec_error(truncated ? ProtocolErrorCode::truncated :
+                                                                   ProtocolErrorCode::malformed,
+                                                       truncated ? "truncated varint" : "malformed varint",
+                                                       value.error().offset));
                 }
-                return std::unexpected(codec_error(ProtocolErrorCode::malformed, "unterminated varint", start));
+                if (offset - start != protocyte::varint_size(*value)) {
+                    return std::unexpected(
+                        codec_error(ProtocolErrorCode::malformed, "non-canonical overlong varint", start));
+                }
+                return *value;
             }
 
             [[nodiscard]] std::expected<Tag, ProtocolError> next_tag() {

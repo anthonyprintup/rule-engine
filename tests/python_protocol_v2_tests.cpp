@@ -278,6 +278,15 @@ namespace {
 
         auto payload = encode_payload(envelope(work_lease()));
         REQUIRE(payload.has_value());
+
+        auto overlong = *payload;
+        REQUIRE(overlong.front() == std::byte {0x08});
+        overlong.front() = std::byte {0x88};
+        overlong.insert(overlong.begin() + 1, std::byte {0x00});
+        const auto non_canonical = decode_payload(overlong);
+        REQUIRE_FALSE(non_canonical.has_value());
+        REQUIRE(non_canonical.error().code == ProtocolErrorCode::malformed);
+
         payload->push_back(std::byte {0x08});
         payload->push_back(std::byte {0x02});
         const auto duplicate = decode_payload(*payload);

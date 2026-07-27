@@ -25,8 +25,8 @@ file(
     "${source_root}/tests/*"
     "${source_root}/examples/*"
     "${source_root}/sdk/*"
-    "${source_root}/CMakeLists.txt"
 )
+list(APPEND live_files "${source_root}/CMakeLists.txt")
 
 set(forbidden_content
     "YARA"

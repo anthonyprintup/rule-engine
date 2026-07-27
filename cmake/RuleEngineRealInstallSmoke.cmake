@@ -109,6 +109,7 @@ if(NOT DEFINED RULE_ENGINE_REAL_INSTALL_SMOKE_WORK_ROOT)
         RULE_ENGINE_ASIO_SOURCE_DIR
         RULE_ENGINE_ABSEIL_SOURCE_DIR
         RULE_ENGINE_RE2_SOURCE_DIR
+        RULE_ENGINE_PROTOCYTE_SOURCE_DIR
         RULE_ENGINE_EXPECTED_TOOL_NAMES
     )
         if(DEFINED ${input})
@@ -245,16 +246,19 @@ foreach(pair IN ITEMS
     endif()
 endforeach()
 set(fetchcontent_args -DFETCHCONTENT_FULLY_DISCONNECTED=ON)
-foreach(dependency IN ITEMS ASIO RULE_ENGINE_ABSEIL RULE_ENGINE_RE2)
+foreach(dependency IN ITEMS ASIO RULE_ENGINE_ABSEIL RULE_ENGINE_RE2 PROTOCYTE)
     if(dependency STREQUAL "ASIO")
         set(input_name RULE_ENGINE_ASIO_SOURCE_DIR)
         set(marker asio/include/asio.hpp)
     elseif(dependency STREQUAL "RULE_ENGINE_ABSEIL")
         set(input_name RULE_ENGINE_ABSEIL_SOURCE_DIR)
         set(marker absl/base/config.h)
-    else()
+    elseif(dependency STREQUAL "RULE_ENGINE_RE2")
         set(input_name RULE_ENGINE_RE2_SOURCE_DIR)
         set(marker re2/re2.h)
+    else()
+        set(input_name RULE_ENGINE_PROTOCYTE_SOURCE_DIR)
+        set(marker src/protocyte/runtime/runtime.hpp)
     endif()
     if(NOT DEFINED ${input_name} OR "${${input_name}}" STREQUAL "")
         message(FATAL_ERROR

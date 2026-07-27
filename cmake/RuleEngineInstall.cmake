@@ -659,6 +659,11 @@ function(rule_engine_configure_install)
             re2/re2.h
             real_smoke_re2_source
         )
+        _rule_engine_get_populated_dependency_source(
+            protocyte
+            src/protocyte/runtime/runtime.hpp
+            real_smoke_protocyte_source
+        )
         set(expected_tool_names "")
         foreach(target IN LISTS install_executables)
             get_target_property(tool_name "${target}" OUTPUT_NAME)
@@ -683,6 +688,7 @@ function(rule_engine_configure_install)
                 "-DRULE_ENGINE_ASIO_SOURCE_DIR=${real_smoke_asio_source}"
                 "-DRULE_ENGINE_ABSEIL_SOURCE_DIR=${real_smoke_abseil_source}"
                 "-DRULE_ENGINE_RE2_SOURCE_DIR=${real_smoke_re2_source}"
+                "-DRULE_ENGINE_PROTOCYTE_SOURCE_DIR=${real_smoke_protocyte_source}"
                 "-DRULE_ENGINE_EXPECTED_TOOL_NAMES=${expected_tool_names_argument}"
                 -P "${source_root}/cmake/RuleEngineRealInstallSmoke.cmake"
         )
