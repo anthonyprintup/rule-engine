@@ -683,6 +683,184 @@ namespace rule_engine::python::cluster {
 #endif
     }
 
+    std::expected<std::uint64_t, StoreError>
+    PostgreSqlRuntimeStore::load_agent_receipt(const AgentStreamId &stream) const {
+#if defined(RULE_ENGINE_HAS_POSTGRESQL)
+        if (stream.tenant.empty() || stream.peer.empty() || stream.agent_epoch.empty()) {
+            return std::unexpected(postgres_shape("agent stream is invalid"));
+        }
+        const std::scoped_lock lock {impl_->mutex};
+        auto result =
+            execute_params(impl_->connection,
+                           "SELECT acknowledged_through FROM re_agent_receipts "
+                           "WHERE tenant_id=$1 AND peer_id=$2 AND agent_epoch=$3",
+                           {stream.tenant.value, stream.peer.value, stream.agent_epoch});
+        if (!result) {
+            return std::unexpected(result.error());
+        }
+        if (PQntuples(result->value) == 0) {
+            return 0U;
+        }
+        return parse_unsigned(field(*result, 0, 0), "agent receipt");
+#else
+        static_cast<void>(stream);
+        return std::unexpected(postgres_unavailable("PostgreSQL runtime store is not connected"));
+#endif
+    }
+
+    std::expected<AgentMessageReceipt, StoreError>
+    PostgreSqlRuntimeStore::transact_agent_message(const AgentMessageCommit &message) {
+#if defined(RULE_ENGINE_HAS_POSTGRESQL)
+        if (message.stream.tenant.empty() || message.stream.peer.empty() || message.stream.agent_epoch.empty() ||
+            message.session.empty() || message.session_fence == 0 || message.sequence == 0 ||
+            message.body_kind == 0 || message.body.empty()) {
+            return std::unexpected(postgres_shape("agent message is invalid"));
+        }
+        const std::scoped_lock lock {impl_->mutex};
+        if (auto started = begin(impl_->connection); !started) {
+            return std::unexpected(started.error());
+        }
+        RollbackGuard guard {.connection = impl_->connection, .active = true};
+        const auto resource_key = message.stream.tenant.value + "/" + message.stream.peer.value;
+        const auto stream_lock =
+            message.stream.tenant.value + "\n" + message.stream.peer.value + "\n" + message.stream.agent_epoch;
+        auto locked =
+            execute_params(impl_->connection,
+                           "SELECT pg_advisory_xact_lock(hashtextextended($1,7275017013371665))", {stream_lock});
+        if (!locked) {
+            return std::unexpected(locked.error());
+        }
+        auto lease =
+            execute_params(impl_->connection,
+                           "SELECT owner,fence,lease_until_unix_ms,held FROM re_resource_leases "
+                           "WHERE scope='agent-session' AND resource_key=$1 FOR SHARE",
+                           {resource_key});
+        if (!lease) {
+            return std::unexpected(lease.error());
+        }
+        if (PQntuples(lease->value) != 1) {
+            return std::unexpected(StoreError {.code = StoreErrorCode::stale_fence,
+                                               .message = "agent session lease is stale",
+                                               .retryable = false});
+        }
+        auto lease_fence = parse_unsigned(field(*lease, 0, 1), "agent session fence");
+        auto lease_until = parse_unsigned(field(*lease, 0, 2), "agent session lease expiry");
+        if (!lease_fence || !lease_until) {
+            return std::unexpected(!lease_fence ? lease_fence.error() : lease_until.error());
+        }
+        if (field(*lease, 0, 0) != message.session.value || *lease_fence != message.session_fence ||
+            *lease_until < message.received_at_unix_ms || field(*lease, 0, 3) != "t") {
+            return std::unexpected(StoreError {.code = StoreErrorCode::stale_fence,
+                                               .message = "agent session lease is stale",
+                                               .retryable = false});
+        }
+        auto created =
+            execute_params(impl_->connection,
+                           "INSERT INTO re_agent_receipts(tenant_id,peer_id,agent_epoch,acknowledged_through) "
+                           "VALUES($1,$2,$3,0) ON CONFLICT(tenant_id,peer_id,agent_epoch) DO NOTHING",
+                           {message.stream.tenant.value, message.stream.peer.value, message.stream.agent_epoch});
+        if (!created) {
+            return std::unexpected(created.error());
+        }
+        auto receipt =
+            execute_params(impl_->connection,
+                           "SELECT acknowledged_through FROM re_agent_receipts "
+                           "WHERE tenant_id=$1 AND peer_id=$2 AND agent_epoch=$3 FOR UPDATE",
+                           {message.stream.tenant.value, message.stream.peer.value, message.stream.agent_epoch});
+        if (!receipt) {
+            return std::unexpected(receipt.error());
+        }
+        if (PQntuples(receipt->value) != 1) {
+            return std::unexpected(postgres_shape("agent receipt disappeared"));
+        }
+        auto acknowledged = parse_unsigned(field(*receipt, 0, 0), "agent receipt");
+        if (!acknowledged) {
+            return std::unexpected(acknowledged.error());
+        }
+        if (message.sequence <= *acknowledged) {
+            auto prior =
+                execute_params(impl_->connection,
+                               "SELECT body_kind,encode(body,'hex') FROM re_agent_messages "
+                               "WHERE tenant_id=$1 AND peer_id=$2 AND agent_epoch=$3 AND sequence=$4::bigint",
+                               {message.stream.tenant.value, message.stream.peer.value, message.stream.agent_epoch,
+                                std::to_string(message.sequence)});
+            if (!prior) {
+                return std::unexpected(prior.error());
+            }
+            if (PQntuples(prior->value) != 1) {
+                return std::unexpected(postgres_shape("agent sequence replay has no durable body"));
+            }
+            auto prior_kind = parse_unsigned(field(*prior, 0, 0), "agent body kind");
+            if (!prior_kind) {
+                return std::unexpected(prior_kind.error());
+            }
+            auto prior_body = parse_bytea("\\x" + field(*prior, 0, 1));
+            if (!prior_body) {
+                return std::unexpected(prior_body.error());
+            }
+            if (*prior_kind != message.body_kind || *prior_body != message.body) {
+                return std::unexpected(postgres_shape("agent sequence replay does not match its durable body"));
+            }
+            return AgentMessageReceipt {.acknowledged_through = *acknowledged, .duplicate = true};
+        }
+        if (*acknowledged == std::numeric_limits<std::uint64_t>::max() ||
+            message.sequence != *acknowledged + 1U) {
+            return std::unexpected(
+                StoreError {.code = StoreErrorCode::conflict,
+                            .message = "agent message sequence is not contiguous",
+                            .retryable = true});
+        }
+        auto inserted =
+            execute_params(impl_->connection,
+                           "INSERT INTO re_agent_messages(tenant_id,peer_id,agent_epoch,sequence,session_id,"
+                           "session_fence,received_at_unix_ms,body_kind,body) "
+                           "VALUES($1,$2,$3,$4::bigint,$5,$6::bigint,$7::bigint,$8::smallint,$9::bytea)",
+                           {message.stream.tenant.value, message.stream.peer.value, message.stream.agent_epoch,
+                            std::to_string(message.sequence), message.session.value,
+                            std::to_string(message.session_fence), std::to_string(message.received_at_unix_ms),
+                            std::to_string(message.body_kind), bytea_text(message.body)});
+        if (!inserted) {
+            return std::unexpected(inserted.error());
+        }
+        auto updated =
+            execute_params(impl_->connection,
+                           "UPDATE re_agent_receipts SET acknowledged_through=$4::bigint "
+                           "WHERE tenant_id=$1 AND peer_id=$2 AND agent_epoch=$3 "
+                           "AND acknowledged_through=$5::bigint RETURNING acknowledged_through",
+                           {message.stream.tenant.value, message.stream.peer.value, message.stream.agent_epoch,
+                            std::to_string(message.sequence), std::to_string(*acknowledged)});
+        if (!updated) {
+            return std::unexpected(updated.error());
+        }
+        if (PQntuples(updated->value) != 1) {
+            return std::unexpected(
+                StoreError {.code = StoreErrorCode::conflict,
+                            .message = "agent receipt compare-and-swap failed",
+                            .retryable = true});
+        }
+        auto audit =
+            execute_params(impl_->connection,
+                           "INSERT INTO re_audit(at_unix_ms,actor,action,resource,outcome,detail) "
+                           "VALUES($1::bigint,$2,$3,$4,$5,$6)",
+                           {std::to_string(message.received_at_unix_ms), message.session.value,
+                            "agent.message.commit", resource_key, "committed", std::to_string(message.sequence)});
+        if (!audit) {
+            return std::unexpected(audit.error());
+        }
+        if (auto committed = commit(impl_->connection); !committed) {
+            return std::unexpected(committed.error());
+        }
+        guard.active = false;
+        static_cast<void>(impl_->audit->append(message.received_at_unix_ms, message.session.value,
+                                               "agent.message.commit", resource_key, "committed",
+                                               std::to_string(message.sequence)));
+        return AgentMessageReceipt {.acknowledged_through = message.sequence, .duplicate = false};
+#else
+        static_cast<void>(message);
+        return std::unexpected(postgres_unavailable("PostgreSQL runtime store is not connected"));
+#endif
+    }
+
     std::expected<std::optional<TransactionReceipt>, StoreError>
     PostgreSqlRuntimeStore::load_receipt(const EventId &input) const {
 #if defined(RULE_ENGINE_HAS_POSTGRESQL)
@@ -1202,6 +1380,41 @@ namespace rule_engine::python::cluster {
                 return std::unexpected(value.error());
             }
             snapshot.receipts.push_back(std::move(*value));
+        }
+        auto agent_messages =
+            execute(impl_->connection,
+                    "SELECT tenant_id,peer_id,agent_epoch,session_id,session_fence,sequence,received_at_unix_ms,"
+                    "body_kind,encode(body,'hex') FROM re_agent_messages "
+                    "ORDER BY tenant_id,peer_id,agent_epoch,sequence");
+        if (!agent_messages) {
+            return std::unexpected(agent_messages.error());
+        }
+        for (int row = 0; row < PQntuples(agent_messages->value); ++row) {
+            auto session_fence = parse_unsigned(field(*agent_messages, row, 4), "agent session fence");
+            auto sequence = parse_unsigned(field(*agent_messages, row, 5), "agent sequence");
+            auto received_at = parse_unsigned(field(*agent_messages, row, 6), "agent received time");
+            auto body_kind = parse_unsigned(field(*agent_messages, row, 7), "agent body kind");
+            auto body = parse_bytea("\\x" + field(*agent_messages, row, 8));
+            if (!session_fence || !sequence || !received_at || !body_kind || !body) {
+                return std::unexpected(!session_fence ? session_fence.error() :
+                                       !sequence       ? sequence.error() :
+                                       !received_at    ? received_at.error() :
+                                       !body_kind      ? body_kind.error() :
+                                                         body.error());
+            }
+            snapshot.agent_messages.push_back(StoredAgentMessage {
+                .commit = {
+                    .stream = {.tenant = TenantId {field(*agent_messages, row, 0)},
+                               .peer = PeerId {field(*agent_messages, row, 1)},
+                               .agent_epoch = field(*agent_messages, row, 2)},
+                    .session = SessionId {field(*agent_messages, row, 3)},
+                    .session_fence = *session_fence,
+                    .sequence = *sequence,
+                    .received_at_unix_ms = *received_at,
+                    .body_kind = static_cast<std::uint8_t>(*body_kind),
+                    .body = std::move(*body),
+                },
+            });
         }
         return snapshot;
 #else

@@ -93,6 +93,33 @@ namespace rule_engine::python::cluster {
         bool held {};
     };
 
+    struct AgentStreamId {
+        TenantId tenant;
+        PeerId peer;
+        std::string agent_epoch;
+
+        auto operator<=>(const AgentStreamId &) const = default;
+    };
+
+    struct AgentMessageCommit {
+        AgentStreamId stream;
+        SessionId session;
+        std::uint64_t session_fence {};
+        std::uint64_t sequence {};
+        std::uint64_t received_at_unix_ms {};
+        std::uint8_t body_kind {};
+        std::vector<std::byte> body;
+    };
+
+    struct AgentMessageReceipt {
+        std::uint64_t acknowledged_through {};
+        bool duplicate {};
+    };
+
+    struct StoredAgentMessage {
+        AgentMessageCommit commit;
+    };
+
     struct RuntimeStoreSnapshot {
         std::vector<EventEnvelope> events;
         std::vector<std::pair<std::string, std::uint64_t>> cursors;
@@ -101,6 +128,7 @@ namespace rule_engine::python::cluster {
         std::vector<EffectIntent> journal;
         std::vector<StoredOutboxRecord> outbox;
         std::vector<TransactionReceipt> receipts;
+        std::vector<StoredAgentMessage> agent_messages;
     };
 
     struct RuntimeStoreHealth {
@@ -127,6 +155,10 @@ namespace rule_engine::python::cluster {
                                                                                      std::uint64_t fence) = 0;
         [[nodiscard]] virtual std::expected<std::uint64_t, StoreError>
         load_consumer_fence(std::string_view consumer) const = 0;
+        [[nodiscard]] virtual std::expected<std::uint64_t, StoreError>
+        load_agent_receipt(const AgentStreamId &stream) const = 0;
+        [[nodiscard]] virtual std::expected<AgentMessageReceipt, StoreError>
+        transact_agent_message(const AgentMessageCommit &message) = 0;
         [[nodiscard]] virtual std::expected<std::optional<TransactionReceipt>, StoreError>
         load_receipt(const EventId &input) const = 0;
         [[nodiscard]] virtual std::expected<std::optional<StoredStateCell>, StoreError>
@@ -169,6 +201,10 @@ namespace rule_engine::python::cluster {
                                                                              std::uint64_t fence) override;
         [[nodiscard]] std::expected<std::uint64_t, StoreError>
         load_consumer_fence(std::string_view consumer) const override;
+        [[nodiscard]] std::expected<std::uint64_t, StoreError>
+        load_agent_receipt(const AgentStreamId &stream) const override;
+        [[nodiscard]] std::expected<AgentMessageReceipt, StoreError>
+        transact_agent_message(const AgentMessageCommit &message) override;
         [[nodiscard]] std::uint64_t consumer_fence(std::string_view consumer) const;
 
         [[nodiscard]] std::expected<std::optional<TransactionReceipt>, StoreError>
@@ -227,6 +263,8 @@ namespace rule_engine::python::cluster {
         std::map<std::string, StoredOutboxRecord, std::less<>> outbox_;
         std::map<std::string, ReceiptEntry, std::less<>> receipts_;
         std::map<std::string, std::uint64_t, std::less<>> consumer_fences_;
+        std::map<AgentStreamId, std::uint64_t> agent_receipts_;
+        std::map<std::pair<AgentStreamId, std::uint64_t>, StoredAgentMessage> agent_messages_;
         struct LeaseRecord {
             std::string owner;
             std::uint64_t fence {};
@@ -251,6 +289,10 @@ namespace rule_engine::python::cluster {
                                                                              std::uint64_t fence) override;
         [[nodiscard]] std::expected<std::uint64_t, StoreError>
         load_consumer_fence(std::string_view consumer) const override;
+        [[nodiscard]] std::expected<std::uint64_t, StoreError>
+        load_agent_receipt(const AgentStreamId &stream) const override;
+        [[nodiscard]] std::expected<AgentMessageReceipt, StoreError>
+        transact_agent_message(const AgentMessageCommit &message) override;
         [[nodiscard]] std::expected<std::optional<TransactionReceipt>, StoreError>
         load_receipt(const EventId &input) const override;
         [[nodiscard]] std::expected<std::optional<StoredStateCell>, StoreError>
@@ -299,6 +341,10 @@ namespace rule_engine::python::cluster {
                                                                              std::uint64_t fence) override;
         [[nodiscard]] std::expected<std::uint64_t, StoreError>
         load_consumer_fence(std::string_view consumer) const override;
+        [[nodiscard]] std::expected<std::uint64_t, StoreError>
+        load_agent_receipt(const AgentStreamId &stream) const override;
+        [[nodiscard]] std::expected<AgentMessageReceipt, StoreError>
+        transact_agent_message(const AgentMessageCommit &message) override;
         [[nodiscard]] std::expected<std::optional<TransactionReceipt>, StoreError>
         load_receipt(const EventId &input) const override;
         [[nodiscard]] std::expected<std::optional<StoredStateCell>, StoreError>

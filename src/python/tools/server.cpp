@@ -82,10 +82,9 @@ are rule-engine.trusted-signers.v1 and rule-engine.revocations.v1.
 
 Authenticated application sessions run on a fixed owned worker pool with a
 bounded queue and memory reservation. Agent ACKs require a backend-declared
-durable receipt. The current production composition has no durable agent-receipt
-table or activated event-to-work scheduler, so it establishes fenced sessions
-with zero work and zero durable-message credit; a peer that ignores credit is
-transiently NACKed without advancing ACK. The
+durable receipt. Agent message bodies and their cumulative receipts commit in
+one fenced store transaction before an ACK is emitted. The current production
+composition does not yet assign event-to-pack work. The
 bounded admin wire surface currently supports pack/operation reads and the
 final activation flip; other control-plane operations remain CLI/backend work.
 )";
@@ -1058,8 +1057,11 @@ final activation flip; other control-plane operations remain CLI/backend work.
 
         struct StoreBackedAgentSessionBackend final: IResidentAgentBackend {
             StoreBackedAgentSessionBackend(cluster::IClusterRuntimeStore &store, std::string node_id,
-                                           const std::chrono::milliseconds lease_duration) noexcept:
-                store_ {store}, node_id_ {std::move(node_id)}, lease_duration_ {lease_duration} {}
+                                           const std::chrono::milliseconds lease_duration,
+                                           const protocol_v2::CreditWindow credit,
+                                           const std::size_t maximum_frame_bytes) noexcept:
+                store_ {store}, node_id_ {std::move(node_id)}, lease_duration_ {lease_duration}, credit_ {credit},
+                protocol_limits_ {.maximum_frame_bytes = maximum_frame_bytes} {}
 
             [[nodiscard]] std::expected<ResidentAgentSession, protocol_v2::ProtocolError>
             establish(const protocol_v2::AuthenticatedPeer &peer, const protocol_v2::AgentHelloMessage &hello,
@@ -1083,8 +1085,12 @@ final activation flip; other control-plane operations remain CLI/backend work.
                         .message = "current peer session lease has not expired",
                     });
                 }
-                const auto consumer = receipt_key(peer, hello.agent_epoch);
-                auto acknowledged = store_.load_consumer_fence(consumer);
+                const cluster::AgentStreamId stream {
+                    .tenant = peer.tenant,
+                    .peer = peer.peer,
+                    .agent_epoch = hello.agent_epoch,
+                };
+                auto acknowledged = store_.load_agent_receipt(stream);
                 if (!acknowledged) {
                     static_cast<void>(store_.release_lease(*lease, now_unix_ms()));
                     return std::unexpected(protocol_v2::ProtocolError {
@@ -1102,7 +1108,7 @@ final activation flip; other control-plane operations remain CLI/backend work.
                     .session_fence = lease->fence,
                     .agent_epoch = hello.agent_epoch,
                     .acknowledged_through = *acknowledged,
-                    .credit = {},
+                    .credit = credit_,
                 };
             }
 
@@ -1120,15 +1126,33 @@ final activation flip; other control-plane operations remain CLI/backend work.
             }
 
             [[nodiscard]] std::expected<DurableAgentReceipt, protocol_v2::ProtocolError>
-            persist(const ResidentAgentSession &, const std::uint64_t, const protocol_v2::DurableAgentBody &,
-                    const std::stop_token) noexcept override {
-                // IClusterRuntimeStore has no peer_sessions/agent_receipts
-                // transaction and no authoritative snapshot persistence seam.
-                // Never manufacture a cumulative ACK from an in-memory result.
-                return std::unexpected(protocol_v2::ProtocolError {
-                    .code = protocol_v2::ProtocolErrorCode::dependency_unavailable,
-                    .message = "durable protocol-v2 agent receipt backend is not implemented",
-                });
+            persist(const ResidentAgentSession &session, const std::uint64_t sequence,
+                    const protocol_v2::DurableAgentBody &body, const std::stop_token cancellation) noexcept override {
+                if (cancellation.stop_requested()) {
+                    return std::unexpected(
+                        protocol_v2::ProtocolError {.code = protocol_v2::ProtocolErrorCode::canceled,
+                                                    .message = "agent message persistence canceled"});
+                }
+                auto encoded = protocol_v2::encode_durable_body(body, protocol_limits_);
+                if (!encoded) {
+                    return std::unexpected(std::move(encoded.error()));
+                }
+                const cluster::AgentMessageCommit commit {
+                    .stream = {.tenant = session.authenticated_peer.tenant,
+                               .peer = session.authenticated_peer.peer,
+                               .agent_epoch = session.agent_epoch},
+                    .session = session.session,
+                    .session_fence = session.session_fence,
+                    .sequence = sequence,
+                    .received_at_unix_ms = now_unix_ms(),
+                    .body_kind = durable_body_kind(body),
+                    .body = std::move(*encoded),
+                };
+                auto receipt = store_.transact_agent_message(commit);
+                if (!receipt) {
+                    return std::unexpected(store_protocol_error(receipt.error()));
+                }
+                return DurableAgentReceipt {.acknowledged_through = receipt->acknowledged_through, .credit = credit_};
             }
 
             void close(const ResidentAgentSession &session) noexcept override {
@@ -1147,14 +1171,36 @@ final activation flip; other control-plane operations remain CLI/backend work.
             }
 
         private:
-            [[nodiscard]] static std::string receipt_key(const protocol_v2::AuthenticatedPeer &peer,
-                                                         const std::string_view epoch) {
-                return "agent-receipt/" + peer.tenant.value + '/' + peer.peer.value + '/' + std::string {epoch};
+            [[nodiscard]] static std::uint8_t durable_body_kind(const protocol_v2::DurableAgentBody &body) noexcept {
+                if (std::holds_alternative<protocol_v2::WorkResultMessage>(body)) {
+                    return static_cast<std::uint8_t>(protocol_v2::MessageKind::work_result);
+                }
+                if (std::holds_alternative<protocol_v2::AuthoritativeSnapshotBegin>(body)) {
+                    return static_cast<std::uint8_t>(protocol_v2::MessageKind::snapshot_begin);
+                }
+                if (std::holds_alternative<protocol_v2::AuthoritativeSnapshotChunk>(body)) {
+                    return static_cast<std::uint8_t>(protocol_v2::MessageKind::snapshot_chunk);
+                }
+                return static_cast<std::uint8_t>(protocol_v2::MessageKind::snapshot_commit);
+            }
+
+            [[nodiscard]] static protocol_v2::ProtocolError store_protocol_error(const StoreError &failure) {
+                auto code = protocol_v2::ProtocolErrorCode::persistence_error;
+                if (failure.code == StoreErrorCode::stale_fence) {
+                    code = protocol_v2::ProtocolErrorCode::stale_fence;
+                } else if (failure.code == StoreErrorCode::conflict) {
+                    code = protocol_v2::ProtocolErrorCode::sequence_gap;
+                } else if (failure.code == StoreErrorCode::constraint_violation) {
+                    code = protocol_v2::ProtocolErrorCode::malformed;
+                }
+                return {.code = code, .message = failure.message};
             }
 
             cluster::IClusterRuntimeStore &store_;
             std::string node_id_;
             std::chrono::milliseconds lease_duration_;
+            protocol_v2::CreditWindow credit_;
+            protocol_v2::ProtocolLimits protocol_limits_;
             std::atomic<std::uint64_t> next_session_ {};
             std::mutex mutex_;
             std::map<std::string, cluster::FencedLease, std::less<>> sessions_;
@@ -2164,7 +2210,9 @@ final activation flip; other control-plane operations remain CLI/backend work.
         if (!health.driver_available || !health.connected || !health.migrations_compatible) {
             return failure_output(unavailable("SRV-STORE-NOT-READY", health.detail));
         }
-        StoreBackedAgentSessionBackend agent_backend {**store, config->node_id, config->lease_duration};
+        StoreBackedAgentSessionBackend agent_backend {**store, config->node_id, config->lease_duration,
+                                                       config->service.inbound_credit,
+                                                       config->service.maximum_frame_bytes};
         FileAdminSecurityAudit admin_security_audit {config->audit_path};
         AuthorizedResidentAdminBackend admin_backend {**activation_store, **operator_bindings, &admin_security_audit};
         const ResidentServerContext context {

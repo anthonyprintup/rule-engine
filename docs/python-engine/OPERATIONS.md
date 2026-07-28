@@ -187,10 +187,12 @@ available. Listener accept and TLS handshake are serial before admission to the
 bounded worker queue, so their configured deadlines also bound head-of-line
 delay.
 
-The current default store composition deliberately advertises zero work and
-zero durable-message credit because it cannot atomically commit an agent body
-and cumulative receipt. A peer that ignores credit is transiently NACKed and
-never receives an invented ACK; see [L-031](LIMITATIONS.md#l-031--resident-application-composition-cannot-yet-durably-accept-agent-records).
+The default store composition grants only the configured durable-message
+credit. Every accepted body and cumulative receipt commit atomically under the
+current session lease before ACK; a gap, changed replay, stale lease, or failed
+commit is NACKed without advancing the receipt. Detection work remains disabled
+until the activated pack/snapshot scheduler is composed; see
+[L-031](LIMITATIONS.md#l-031--resident-agent-ingress-is-durable-but-not-yet-scheduled).
 
 ## 5. Configure the Windows agent
 

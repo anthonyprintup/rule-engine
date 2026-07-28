@@ -499,6 +499,69 @@ namespace {
                     .has_value());
     }
 
+    void verify_agent_ingress_contract(IClusterRuntimeStore &store) {
+        const AgentStreamId stream {
+            .tenant = TenantId {"tenant-agent"},
+            .peer = PeerId {"peer-agent"},
+            .agent_epoch = "epoch-1",
+        };
+        const LeaseResource resource {.scope = "agent-session", .key = "tenant-agent/peer-agent"};
+        const auto lease = store.claim_lease(resource, "session-1", 100, 100);
+        REQUIRE(lease.has_value());
+        REQUIRE(store.load_agent_receipt(stream) == 0);
+
+        const AgentMessageCommit first {
+            .stream = stream,
+            .session = SessionId {"session-1"},
+            .session_fence = lease->fence,
+            .sequence = 1,
+            .received_at_unix_ms = 101,
+            .body_kind = 4,
+            .body = {std::byte {0x01}, std::byte {0x02}},
+        };
+        const auto first_receipt = store.transact_agent_message(first);
+        REQUIRE(first_receipt.has_value());
+        REQUIRE(first_receipt->acknowledged_through == 1);
+        REQUIRE_FALSE(first_receipt->duplicate);
+
+        auto second = first;
+        second.sequence = 2;
+        second.received_at_unix_ms = 102;
+        second.body = {std::byte {0x03}};
+        REQUIRE(store.transact_agent_message(second)->acknowledged_through == 2);
+        REQUIRE(store.load_agent_receipt(stream) == 2);
+
+        const auto duplicate = store.transact_agent_message(first);
+        REQUIRE(duplicate.has_value());
+        REQUIRE(duplicate->acknowledged_through == 2);
+        REQUIRE(duplicate->duplicate);
+
+        auto changed_replay = first;
+        changed_replay.body = {std::byte {0x7f}};
+        const auto changed = store.transact_agent_message(changed_replay);
+        REQUIRE_FALSE(changed.has_value());
+        REQUIRE(changed.error().code == StoreErrorCode::constraint_violation);
+
+        auto gap = second;
+        gap.sequence = 4;
+        gap.body = {std::byte {0x04}};
+        const auto skipped = store.transact_agent_message(gap);
+        REQUIRE_FALSE(skipped.has_value());
+        REQUIRE(skipped.error().code == StoreErrorCode::conflict);
+
+        auto expired = second;
+        expired.sequence = 3;
+        expired.received_at_unix_ms = 201;
+        expired.body = {std::byte {0x05}};
+        const auto stale = store.transact_agent_message(expired);
+        REQUIRE_FALSE(stale.has_value());
+        REQUIRE(stale.error().code == StoreErrorCode::stale_fence);
+
+        const auto snapshot = store.inspect();
+        REQUIRE(snapshot.has_value());
+        REQUIRE(snapshot->agent_messages.size() == 2);
+    }
+
     TEST_CASE("backend contracts distinguish production intent from implemented adapters") {
         const auto postgres = validate_store_backend(PostgreSql17Config {
             .connection_reference = "secret://runtime/postgres",
@@ -668,6 +731,7 @@ namespace {
             AuditTrail audit;
             InMemoryRuntimeStore store {audit};
             verify_runtime_store_contract(store);
+            verify_agent_ingress_contract(store);
         }
         SECTION("SQLite durable adapter") {
             TemporaryDatabase database;
@@ -675,6 +739,7 @@ namespace {
             const auto store = open_sqlite(database, audit);
             REQUIRE(store.has_value());
             verify_runtime_store_contract(**store);
+            verify_agent_ingress_contract(**store);
         }
     }
 
@@ -687,6 +752,23 @@ namespace {
             REQUIRE((*store)->install_consumer_fence("durable:peer", 3).has_value());
             REQUIRE((*store)
                         ->transact_event(transaction("durable-event", "durable:peer", 0, 3, 0, true, true))
+                        .has_value());
+            const auto agent_lease = (*store)->claim_lease(
+                LeaseResource {.scope = "agent-session", .key = "tenant-durable/peer-durable"},
+                "session-durable", 10, 100);
+            REQUIRE(agent_lease.has_value());
+            REQUIRE((*store)
+                        ->transact_agent_message(AgentMessageCommit {
+                            .stream = {.tenant = TenantId {"tenant-durable"},
+                                       .peer = PeerId {"peer-durable"},
+                                       .agent_epoch = "epoch-durable"},
+                            .session = SessionId {"session-durable"},
+                            .session_fence = agent_lease->fence,
+                            .sequence = 1,
+                            .received_at_unix_ms = 11,
+                            .body_kind = 4,
+                            .body = {std::byte {0x2a}},
+                        })
                         .has_value());
             REQUIRE((*store)->health().schema_version == runtime_store_schema_version);
         }
@@ -714,6 +796,11 @@ namespace {
                     })
                     ->size() == 2);
         REQUIRE((*reopened)->inspect()->outbox.size() == 1);
+        const AgentStreamId durable_stream {.tenant = TenantId {"tenant-durable"},
+                                            .peer = PeerId {"peer-durable"},
+                                            .agent_epoch = "epoch-durable"};
+        REQUIRE((*reopened)->load_agent_receipt(durable_stream) == 1);
+        REQUIRE((*reopened)->inspect()->agent_messages.size() == 1);
     }
 
     TEST_CASE("SQLite runtime and activation stores coexist on one durable authority") {
@@ -1221,6 +1308,42 @@ namespace {
         REQUIRE_FALSE(arbitrary_event.has_value());
         REQUIRE(arbitrary_event.error().code == StoreErrorCode::constraint_violation);
         REQUIRE(store.snapshot().events.size() == 2);
+    }
+
+    TEST_CASE("agent ACK boundary survives failure before commit and retry after recovery") {
+        AuditTrail audit;
+        InMemoryRuntimeStore store {audit};
+        const AgentStreamId stream {
+            .tenant = TenantId {"tenant-crash"},
+            .peer = PeerId {"peer-crash"},
+            .agent_epoch = "epoch-crash",
+        };
+        const auto lease = store.claim_lease(
+            LeaseResource {.scope = "agent-session", .key = "tenant-crash/peer-crash"}, "session-crash", 10, 100);
+        REQUIRE(lease.has_value());
+        const AgentMessageCommit message {
+            .stream = stream,
+            .session = SessionId {"session-crash"},
+            .session_fence = lease->fence,
+            .sequence = 1,
+            .received_at_unix_ms = 11,
+            .body_kind = 4,
+            .body = {std::byte {0x2a}},
+        };
+
+        store.fail_next_commit(
+            StoreError {.code = StoreErrorCode::unavailable, .message = "injected crash", .retryable = true});
+        const auto failed = store.transact_agent_message(message);
+        REQUIRE_FALSE(failed.has_value());
+        REQUIRE(store.load_agent_receipt(stream) == 0);
+        REQUIRE(store.inspect()->agent_messages.empty());
+
+        const auto retried = store.transact_agent_message(message);
+        REQUIRE(retried.has_value());
+        REQUIRE(retried->acknowledged_through == 1);
+        REQUIRE_FALSE(retried->duplicate);
+        REQUIRE(store.load_agent_receipt(stream) == 1);
+        REQUIRE(store.inspect()->agent_messages.size() == 1);
     }
 
     TEST_CASE("runtime store rollback CAS and stale fence failures publish nothing") {

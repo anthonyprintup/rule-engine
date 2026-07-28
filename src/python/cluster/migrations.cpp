@@ -168,11 +168,63 @@ CREATE TABLE IF NOT EXISTS re_audit(
 );
 )sql";
 
+        constexpr std::string_view sqlite_v2 = R"sql(
+CREATE TABLE IF NOT EXISTS re_agent_receipts(
+    tenant_id TEXT NOT NULL,
+    peer_id TEXT NOT NULL,
+    agent_epoch TEXT NOT NULL,
+    acknowledged_through INTEGER NOT NULL CHECK(acknowledged_through >= 0),
+    PRIMARY KEY(tenant_id, peer_id, agent_epoch)
+);
+CREATE TABLE IF NOT EXISTS re_agent_messages(
+    tenant_id TEXT NOT NULL,
+    peer_id TEXT NOT NULL,
+    agent_epoch TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK(sequence > 0),
+    session_id TEXT NOT NULL,
+    session_fence INTEGER NOT NULL CHECK(session_fence > 0),
+    received_at_unix_ms INTEGER NOT NULL CHECK(received_at_unix_ms >= 0),
+    body_kind INTEGER NOT NULL CHECK(body_kind > 0),
+    body BLOB NOT NULL,
+    PRIMARY KEY(tenant_id, peer_id, agent_epoch, sequence),
+    FOREIGN KEY(tenant_id, peer_id, agent_epoch)
+        REFERENCES re_agent_receipts(tenant_id, peer_id, agent_epoch)
+);
+)sql";
+
+        constexpr std::string_view postgresql_v2 = R"sql(
+CREATE TABLE IF NOT EXISTS re_agent_receipts(
+    tenant_id TEXT NOT NULL,
+    peer_id TEXT NOT NULL,
+    agent_epoch TEXT NOT NULL,
+    acknowledged_through BIGINT NOT NULL CHECK(acknowledged_through >= 0),
+    PRIMARY KEY(tenant_id, peer_id, agent_epoch)
+);
+CREATE TABLE IF NOT EXISTS re_agent_messages(
+    tenant_id TEXT NOT NULL,
+    peer_id TEXT NOT NULL,
+    agent_epoch TEXT NOT NULL,
+    sequence BIGINT NOT NULL CHECK(sequence > 0),
+    session_id TEXT NOT NULL,
+    session_fence BIGINT NOT NULL CHECK(session_fence > 0),
+    received_at_unix_ms BIGINT NOT NULL CHECK(received_at_unix_ms >= 0),
+    body_kind SMALLINT NOT NULL CHECK(body_kind > 0),
+    body BYTEA NOT NULL,
+    PRIMARY KEY(tenant_id, peer_id, agent_epoch, sequence),
+    FOREIGN KEY(tenant_id, peer_id, agent_epoch)
+        REFERENCES re_agent_receipts(tenant_id, peer_id, agent_epoch)
+);
+)sql";
+
         constexpr std::array migrations {
             SchemaMigration {.version = 1,
                              .name = "runtime-store-foundation",
                              .sqlite_sql = sqlite_v1,
                              .postgresql_sql = postgresql_v1},
+            SchemaMigration {.version = 2,
+                             .name = "durable-agent-ingress",
+                             .sqlite_sql = sqlite_v2,
+                             .postgresql_sql = postgresql_v2},
         };
 
     } // namespace

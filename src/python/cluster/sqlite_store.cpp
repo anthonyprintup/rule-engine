@@ -900,6 +900,216 @@ namespace rule_engine::python::cluster {
         return *row ? static_cast<std::uint64_t>(sqlite3_column_int64(statement->value, 0)) : 0U;
     }
 
+    std::expected<std::uint64_t, StoreError>
+    SqliteRuntimeStore::load_agent_receipt(const AgentStreamId &stream) const {
+        if (stream.tenant.empty() || stream.peer.empty() || stream.agent_epoch.empty()) {
+            return std::unexpected(shape_error("agent stream is invalid"));
+        }
+        const std::scoped_lock lock {impl_->mutex};
+        auto statement = prepare(impl_->database,
+                                 "SELECT acknowledged_through FROM re_agent_receipts "
+                                 "WHERE tenant_id=?1 AND peer_id=?2 AND agent_epoch=?3");
+        if (!statement) {
+            return std::unexpected(statement.error());
+        }
+        const std::array values {std::string_view {stream.tenant.value}, std::string_view {stream.peer.value},
+                                 std::string_view {stream.agent_epoch}};
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            if (auto bound = bind_text(impl_->database, *statement, static_cast<int>(index + 1U), values[index]);
+                !bound) {
+                return std::unexpected(bound.error());
+            }
+        }
+        auto row = step_row(impl_->database, *statement);
+        if (!row) {
+            return std::unexpected(row.error());
+        }
+        return *row ? static_cast<std::uint64_t>(sqlite3_column_int64(statement->value, 0)) : 0U;
+    }
+
+    std::expected<AgentMessageReceipt, StoreError>
+    SqliteRuntimeStore::transact_agent_message(const AgentMessageCommit &message) {
+        if (message.stream.tenant.empty() || message.stream.peer.empty() || message.stream.agent_epoch.empty() ||
+            message.session.empty() || message.session_fence == 0 || message.sequence == 0 ||
+            message.body_kind == 0 || message.body.empty()) {
+            return std::unexpected(shape_error("agent message is invalid"));
+        }
+        const auto sequence = sqlite_integer(message.sequence, "agent sequence");
+        const auto session_fence = sqlite_integer(message.session_fence, "agent session fence");
+        const auto received_at = sqlite_integer(message.received_at_unix_ms, "agent received time");
+        if (!sequence || !session_fence || !received_at) {
+            return std::unexpected(!sequence       ? sequence.error() :
+                                   !session_fence ? session_fence.error() :
+                                                    received_at.error());
+        }
+
+        const std::scoped_lock lock {impl_->mutex};
+        auto transaction = SqlTransaction::begin(impl_->database);
+        if (!transaction) {
+            return std::unexpected(transaction.error());
+        }
+
+        auto lease = prepare(impl_->database,
+                             "SELECT owner,fence,lease_until_unix_ms,held FROM re_resource_leases "
+                             "WHERE scope='agent-session' AND resource_key=?1");
+        if (!lease) {
+            return std::unexpected(lease.error());
+        }
+        const auto resource_key = message.stream.tenant.value + "/" + message.stream.peer.value;
+        if (auto bound = bind_text(impl_->database, *lease, 1, resource_key); !bound) {
+            return std::unexpected(bound.error());
+        }
+        auto lease_row = step_row(impl_->database, *lease);
+        if (!lease_row) {
+            return std::unexpected(lease_row.error());
+        }
+        if (!*lease_row || column_text(*lease, 0) != message.session.value ||
+            static_cast<std::uint64_t>(sqlite3_column_int64(lease->value, 1)) != message.session_fence ||
+            static_cast<std::uint64_t>(sqlite3_column_int64(lease->value, 2)) < message.received_at_unix_ms ||
+            sqlite3_column_int(lease->value, 3) == 0) {
+            return std::unexpected(stale_error("agent session lease is stale"));
+        }
+
+        auto create_receipt =
+            prepare(impl_->database,
+                    "INSERT INTO re_agent_receipts(tenant_id,peer_id,agent_epoch,acknowledged_through) "
+                    "VALUES(?1,?2,?3,0) ON CONFLICT(tenant_id,peer_id,agent_epoch) DO NOTHING");
+        if (!create_receipt) {
+            return std::unexpected(create_receipt.error());
+        }
+        const std::array stream_values {
+            std::string_view {message.stream.tenant.value},
+            std::string_view {message.stream.peer.value},
+            std::string_view {message.stream.agent_epoch},
+        };
+        for (std::size_t index = 0; index < stream_values.size(); ++index) {
+            if (auto bound =
+                    bind_text(impl_->database, *create_receipt, static_cast<int>(index + 1U), stream_values[index]);
+                !bound) {
+                return std::unexpected(bound.error());
+            }
+        }
+        if (auto created = expect_done(impl_->database, *create_receipt); !created) {
+            return std::unexpected(created.error());
+        }
+
+        auto receipt =
+            prepare(impl_->database,
+                    "SELECT acknowledged_through FROM re_agent_receipts "
+                    "WHERE tenant_id=?1 AND peer_id=?2 AND agent_epoch=?3");
+        if (!receipt) {
+            return std::unexpected(receipt.error());
+        }
+        for (std::size_t index = 0; index < stream_values.size(); ++index) {
+            if (auto bound = bind_text(impl_->database, *receipt, static_cast<int>(index + 1U), stream_values[index]);
+                !bound) {
+                return std::unexpected(bound.error());
+            }
+        }
+        auto receipt_row = step_row(impl_->database, *receipt);
+        if (!receipt_row || !*receipt_row) {
+            return std::unexpected(receipt_row ? shape_error("agent receipt disappeared") : receipt_row.error());
+        }
+        const auto acknowledged = static_cast<std::uint64_t>(sqlite3_column_int64(receipt->value, 0));
+        if (message.sequence <= acknowledged) {
+            auto prior =
+                prepare(impl_->database,
+                        "SELECT body_kind,body FROM re_agent_messages "
+                        "WHERE tenant_id=?1 AND peer_id=?2 AND agent_epoch=?3 AND sequence=?4");
+            if (!prior) {
+                return std::unexpected(prior.error());
+            }
+            for (std::size_t index = 0; index < stream_values.size(); ++index) {
+                if (auto bound =
+                        bind_text(impl_->database, *prior, static_cast<int>(index + 1U), stream_values[index]);
+                    !bound) {
+                    return std::unexpected(bound.error());
+                }
+            }
+            sqlite3_bind_int64(prior->value, 4, *sequence);
+            auto prior_row = step_row(impl_->database, *prior);
+            if (!prior_row) {
+                return std::unexpected(prior_row.error());
+            }
+            if (!*prior_row || sqlite3_column_int(prior->value, 0) != static_cast<int>(message.body_kind) ||
+                column_blob(*prior, 1) != message.body) {
+                return std::unexpected(shape_error("agent sequence replay does not match its durable body"));
+            }
+            return AgentMessageReceipt {.acknowledged_through = acknowledged, .duplicate = true};
+        }
+        if (acknowledged == std::numeric_limits<std::uint64_t>::max() || message.sequence != acknowledged + 1U) {
+            return std::unexpected(
+                StoreError {.code = StoreErrorCode::conflict,
+                            .message = "agent message sequence is not contiguous",
+                            .retryable = true});
+        }
+
+        auto insert =
+            prepare(impl_->database,
+                    "INSERT INTO re_agent_messages(tenant_id,peer_id,agent_epoch,sequence,session_id,session_fence,"
+                    "received_at_unix_ms,body_kind,body) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)");
+        if (!insert) {
+            return std::unexpected(insert.error());
+        }
+        for (std::size_t index = 0; index < stream_values.size(); ++index) {
+            if (auto bound = bind_text(impl_->database, *insert, static_cast<int>(index + 1U), stream_values[index]);
+                !bound) {
+                return std::unexpected(bound.error());
+            }
+        }
+        sqlite3_bind_int64(insert->value, 4, *sequence);
+        if (auto bound = bind_text(impl_->database, *insert, 5, message.session.value); !bound) {
+            return std::unexpected(bound.error());
+        }
+        sqlite3_bind_int64(insert->value, 6, *session_fence);
+        sqlite3_bind_int64(insert->value, 7, *received_at);
+        sqlite3_bind_int(insert->value, 8, static_cast<int>(message.body_kind));
+        if (auto bound = bind_blob(impl_->database, *insert, 9, message.body); !bound) {
+            return std::unexpected(bound.error());
+        }
+        if (auto inserted = expect_done(impl_->database, *insert); !inserted) {
+            return std::unexpected(inserted.error());
+        }
+
+        auto update =
+            prepare(impl_->database,
+                    "UPDATE re_agent_receipts SET acknowledged_through=?4 "
+                    "WHERE tenant_id=?1 AND peer_id=?2 AND agent_epoch=?3 AND acknowledged_through=?5");
+        if (!update) {
+            return std::unexpected(update.error());
+        }
+        for (std::size_t index = 0; index < stream_values.size(); ++index) {
+            if (auto bound = bind_text(impl_->database, *update, static_cast<int>(index + 1U), stream_values[index]);
+                !bound) {
+                return std::unexpected(bound.error());
+            }
+        }
+        sqlite3_bind_int64(update->value, 4, *sequence);
+        sqlite3_bind_int64(update->value, 5, static_cast<sqlite3_int64>(acknowledged));
+        if (auto updated = expect_done(impl_->database, *update); !updated) {
+            return std::unexpected(updated.error());
+        }
+        if (sqlite3_changes(impl_->database) != 1) {
+            return std::unexpected(
+                StoreError {.code = StoreErrorCode::conflict,
+                            .message = "agent receipt compare-and-swap failed",
+                            .retryable = true});
+        }
+        if (auto audited = append_durable_audit(impl_->database, message.received_at_unix_ms, message.session.value,
+                                                "agent.message.commit", resource_key, "committed",
+                                                std::to_string(message.sequence));
+            !audited) {
+            return std::unexpected(audited.error());
+        }
+        if (auto committed = (*transaction)->commit(); !committed) {
+            return std::unexpected(committed.error());
+        }
+        static_cast<void>(impl_->audit->append(message.received_at_unix_ms, message.session.value,
+                                               "agent.message.commit", resource_key, "committed",
+                                               std::to_string(message.sequence)));
+        return AgentMessageReceipt {.acknowledged_through = message.sequence, .duplicate = false};
+    }
+
     std::expected<std::optional<TransactionReceipt>, StoreError>
     SqliteRuntimeStore::load_receipt(const EventId &input) const {
         const std::scoped_lock lock {impl_->mutex};
@@ -1549,6 +1759,37 @@ namespace rule_engine::python::cluster {
                            [&snapshot](TransactionReceipt value) { snapshot.receipts.push_back(std::move(value)); });
             !read) {
             return std::unexpected(read.error());
+        }
+        auto agent_messages =
+            prepare(impl_->database,
+                    "SELECT tenant_id,peer_id,agent_epoch,session_id,session_fence,sequence,received_at_unix_ms,"
+                    "body_kind,body FROM re_agent_messages ORDER BY tenant_id,peer_id,agent_epoch,sequence");
+        if (!agent_messages) {
+            return std::unexpected(agent_messages.error());
+        }
+        while (true) {
+            auto row = step_row(impl_->database, *agent_messages);
+            if (!row) {
+                return std::unexpected(row.error());
+            }
+            if (!*row) {
+                break;
+            }
+            snapshot.agent_messages.push_back(StoredAgentMessage {
+                .commit = {
+                    .stream = {.tenant = TenantId {column_text(*agent_messages, 0)},
+                               .peer = PeerId {column_text(*agent_messages, 1)},
+                               .agent_epoch = column_text(*agent_messages, 2)},
+                    .session = SessionId {column_text(*agent_messages, 3)},
+                    .session_fence =
+                        static_cast<std::uint64_t>(sqlite3_column_int64(agent_messages->value, 4)),
+                    .sequence = static_cast<std::uint64_t>(sqlite3_column_int64(agent_messages->value, 5)),
+                    .received_at_unix_ms =
+                        static_cast<std::uint64_t>(sqlite3_column_int64(agent_messages->value, 6)),
+                    .body_kind = static_cast<std::uint8_t>(sqlite3_column_int(agent_messages->value, 7)),
+                    .body = column_blob(*agent_messages, 8),
+                },
+            });
         }
         return snapshot;
     }

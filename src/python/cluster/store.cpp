@@ -1,5 +1,6 @@
 #include "rule_engine/python/cluster/store.hpp"
 
+#include "rule_engine/python/cluster/migrations.hpp"
 #include "rule_engine/python/contract/subject.hpp"
 
 #include "serialization.hpp"
@@ -393,6 +394,67 @@ namespace rule_engine::python::cluster {
         return consumer_fence(consumer);
     }
 
+    std::expected<std::uint64_t, StoreError>
+    InMemoryRuntimeStore::load_agent_receipt(const AgentStreamId &stream) const {
+        if (stream.tenant.empty() || stream.peer.empty() || stream.agent_epoch.empty()) {
+            return std::unexpected(store_error(StoreErrorCode::constraint_violation, "agent stream is invalid"));
+        }
+        const std::scoped_lock lock {mutex_};
+        const auto receipt = agent_receipts_.find(stream);
+        return receipt == agent_receipts_.end() ? 0U : receipt->second;
+    }
+
+    std::expected<AgentMessageReceipt, StoreError>
+    InMemoryRuntimeStore::transact_agent_message(const AgentMessageCommit &message) {
+        if (message.stream.tenant.empty() || message.stream.peer.empty() || message.stream.agent_epoch.empty() ||
+            message.session.empty() || message.session_fence == 0 || message.sequence == 0 ||
+            message.body_kind == 0 || message.body.empty()) {
+            return std::unexpected(store_error(StoreErrorCode::constraint_violation, "agent message is invalid"));
+        }
+
+        std::unique_lock lock {mutex_};
+        const LeaseResource resource {
+            .scope = "agent-session",
+            .key = message.stream.tenant.value + "/" + message.stream.peer.value,
+        };
+        const auto lease = leases_.find(resource);
+        if (lease == leases_.end() || !lease->second.held || lease->second.owner != message.session.value ||
+            lease->second.fence != message.session_fence ||
+            lease->second.lease_until_unix_ms < message.received_at_unix_ms) {
+            return std::unexpected(store_error(StoreErrorCode::stale_fence, "agent session lease is stale"));
+        }
+
+        const auto receipt = agent_receipts_.find(message.stream);
+        const auto acknowledged = receipt == agent_receipts_.end() ? 0U : receipt->second;
+        const auto key = std::pair {message.stream, message.sequence};
+        if (message.sequence <= acknowledged) {
+            const auto prior = agent_messages_.find(key);
+            if (prior == agent_messages_.end() || prior->second.commit.body_kind != message.body_kind ||
+                prior->second.commit.body != message.body) {
+                return std::unexpected(store_error(StoreErrorCode::constraint_violation,
+                                                   "agent sequence replay does not match its durable body"));
+            }
+            return AgentMessageReceipt {.acknowledged_through = acknowledged, .duplicate = true};
+        }
+        if (acknowledged == std::numeric_limits<std::uint64_t>::max() || message.sequence != acknowledged + 1U) {
+            return std::unexpected(
+                store_error(StoreErrorCode::conflict, "agent message sequence is not contiguous", true));
+        }
+        if (fail_next_commit_) {
+            auto error = std::move(*fail_next_commit_);
+            fail_next_commit_.reset();
+            return std::unexpected(std::move(error));
+        }
+
+        agent_messages_.emplace(key, StoredAgentMessage {.commit = message});
+        agent_receipts_[message.stream] = message.sequence;
+        lock.unlock();
+        static_cast<void>(audit_.append(message.received_at_unix_ms, message.session.value, "agent.message.commit",
+                                        message.stream.tenant.value + "/" + message.stream.peer.value,
+                                        "committed", std::to_string(message.sequence)));
+        return AgentMessageReceipt {.acknowledged_through = message.sequence, .duplicate = false};
+    }
+
     std::expected<std::optional<TransactionReceipt>, StoreError>
     InMemoryRuntimeStore::load_receipt(const EventId &input) const {
         return lookup_receipt(input);
@@ -655,6 +717,7 @@ namespace rule_engine::python::cluster {
         result.journal.reserve(journal_.size());
         result.outbox.reserve(outbox_.size());
         result.receipts.reserve(receipts_.size());
+        result.agent_messages.reserve(agent_messages_.size());
         for (const auto &[_, event] : events_) { result.events.push_back(event); }
         for (const auto &[consumer, cursor] : cursors_) { result.cursors.emplace_back(consumer, cursor); }
         for (const auto &[_, value] : state_) { result.state.push_back(value); }
@@ -662,6 +725,7 @@ namespace rule_engine::python::cluster {
         for (const auto &[_, value] : journal_) { result.journal.push_back(value); }
         for (const auto &[_, value] : outbox_) { result.outbox.push_back(value); }
         for (const auto &[_, value] : receipts_) { result.receipts.push_back(value.receipt); }
+        for (const auto &[_, value] : agent_messages_) { result.agent_messages.push_back(value); }
         return result;
     }
 
@@ -673,8 +737,8 @@ namespace rule_engine::python::cluster {
             .driver_available = true,
             .connected = true,
             .migrations_compatible = true,
-            .schema_version = 1,
-            .server_version = "reference-v1",
+            .schema_version = runtime_store_schema_version,
+            .server_version = "reference-v2",
             .detail = "single-process deterministic reference store",
         };
     }

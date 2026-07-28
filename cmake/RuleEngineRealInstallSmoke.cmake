@@ -110,6 +110,7 @@ if(NOT DEFINED RULE_ENGINE_REAL_INSTALL_SMOKE_WORK_ROOT)
         RULE_ENGINE_ABSEIL_SOURCE_DIR
         RULE_ENGINE_RE2_SOURCE_DIR
         RULE_ENGINE_PROTOCYTE_SOURCE_DIR
+        RULE_ENGINE_PROTOBUF_SOURCE_DIR
         RULE_ENGINE_EXPECTED_TOOL_NAMES
     )
         if(DEFINED ${input})
@@ -246,19 +247,22 @@ foreach(pair IN ITEMS
     endif()
 endforeach()
 set(fetchcontent_args -DFETCHCONTENT_FULLY_DISCONNECTED=ON)
-foreach(dependency IN ITEMS ASIO RULE_ENGINE_ABSEIL RULE_ENGINE_RE2 PROTOCYTE)
+foreach(dependency IN ITEMS ASIO ABSL RULE_ENGINE_RE2 PROTOCYTE PROTOBUF)
     if(dependency STREQUAL "ASIO")
         set(input_name RULE_ENGINE_ASIO_SOURCE_DIR)
         set(marker asio/include/asio.hpp)
-    elseif(dependency STREQUAL "RULE_ENGINE_ABSEIL")
+    elseif(dependency STREQUAL "ABSL")
         set(input_name RULE_ENGINE_ABSEIL_SOURCE_DIR)
         set(marker absl/base/config.h)
     elseif(dependency STREQUAL "RULE_ENGINE_RE2")
         set(input_name RULE_ENGINE_RE2_SOURCE_DIR)
         set(marker re2/re2.h)
-    else()
+    elseif(dependency STREQUAL "PROTOCYTE")
         set(input_name RULE_ENGINE_PROTOCYTE_SOURCE_DIR)
         set(marker src/protocyte/runtime/runtime.hpp)
+    else()
+        set(input_name RULE_ENGINE_PROTOBUF_SOURCE_DIR)
+        set(marker src/google/protobuf/descriptor.proto)
     endif()
     if(NOT DEFINED ${input_name} OR "${${input_name}}" STREQUAL "")
         message(FATAL_ERROR

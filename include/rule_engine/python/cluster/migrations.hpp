@@ -6,7 +6,7 @@
 
 namespace rule_engine::python::cluster {
 
-    inline constexpr std::uint32_t runtime_store_schema_version = 1;
+    inline constexpr std::uint32_t runtime_store_schema_version = 2;
 
     struct SchemaMigration {
         std::uint32_t version {};
