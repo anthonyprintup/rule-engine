@@ -199,30 +199,33 @@ namespace rule_engine::python::tools {
                 request.upload_offset == 0U && request.upload_total_bytes == 0U && request.payload.empty();
             const auto no_stage =
                 request.source_digest.empty() && request.state_schema_hash.empty() && request.state_namespace.empty();
+            const auto no_rollback = request.rollback_source_generation == 0U;
             switch (request.kind) {
                 case ResidentAdminRequestKind::pack_snapshot:
                     return request.operation_id.empty() && request.idempotency_key.empty() &&
                            request.expected_pack_version == 0U && request.reason.empty() &&
                            request.target_generation == 0U && request.drain_boundary == 0U &&
-                           request.work_ids.empty() && no_upload && no_stage;
+                           request.work_ids.empty() && no_upload && no_stage && no_rollback;
                 case ResidentAdminRequestKind::operation_snapshot:
                     return !request.operation_id.empty() && request.idempotency_key.empty() &&
                            request.expected_pack_version == 0U && printable_ascii(request.operation_id, false) &&
                            request.reason.empty() && request.target_generation == 0U && request.drain_boundary == 0U &&
-                           request.work_ids.empty() && no_upload && no_stage;
+                           request.work_ids.empty() && no_upload && no_stage && no_rollback;
                 case ResidentAdminRequestKind::activation_flip:
                     return mutation_identity() && request.reason.empty() && request.target_generation == 0U &&
-                           request.drain_boundary == 0U && request.work_ids.empty() && no_upload && no_stage;
+                           request.drain_boundary == 0U && request.work_ids.empty() && no_upload && no_stage &&
+                           no_rollback;
                 case ResidentAdminRequestKind::activation_preview:
                     return mutation_identity() && printable_ascii(request.reason, false) &&
                            request.target_generation != 0U && request.drain_boundary == 0U &&
-                           request.work_ids.empty() && no_upload && no_stage;
+                           request.work_ids.empty() && no_upload && no_stage && no_rollback;
                 case ResidentAdminRequestKind::activation_drain:
                     return mutation_identity() && request.reason.empty() && request.target_generation == 0U &&
-                           request.drain_boundary != 0U && request.work_ids.empty() && no_upload && no_stage;
+                           request.drain_boundary != 0U && request.work_ids.empty() && no_upload && no_stage &&
+                           no_rollback;
                 case ResidentAdminRequestKind::activation_fence:
                     return mutation_identity() && request.reason.empty() && request.target_generation == 0U &&
-                           request.drain_boundary == 0U && work_ids_valid && no_upload && no_stage;
+                           request.drain_boundary == 0U && work_ids_valid && no_upload && no_stage && no_rollback;
                 case ResidentAdminRequestKind::upload_begin:
                     return !request.operation_id.empty() && request.idempotency_key.empty() &&
                            printable_ascii(request.operation_id, false) && printable_ascii(request.reason, false) &&
@@ -230,7 +233,7 @@ namespace rule_engine::python::tools {
                            request.drain_boundary == 0U && request.work_ids.empty() && request.upload_offset == 0U &&
                            request.upload_total_bytes != 0U &&
                            request.upload_total_bytes <= maximum_admin_upload_bytes && request.payload.empty() &&
-                           no_stage;
+                           no_stage && no_rollback;
                 case ResidentAdminRequestKind::upload_chunk:
                     return !request.operation_id.empty() && request.idempotency_key.empty() &&
                            printable_ascii(request.operation_id, false) && request.reason.empty() &&
@@ -240,7 +243,7 @@ namespace rule_engine::python::tools {
                            request.upload_total_bytes <= maximum_admin_upload_bytes &&
                            request.upload_offset <= request.upload_total_bytes &&
                            request.payload.size() <= request.upload_total_bytes - request.upload_offset &&
-                           !request.payload.empty() && no_stage;
+                           !request.payload.empty() && no_stage && no_rollback;
                 case ResidentAdminRequestKind::upload_finalize:
                     return !request.operation_id.empty() && request.idempotency_key.empty() &&
                            printable_ascii(request.operation_id, false) && request.reason.empty() &&
@@ -248,19 +251,28 @@ namespace rule_engine::python::tools {
                            request.drain_boundary == 0U && request.work_ids.empty() &&
                            request.upload_total_bytes != 0U &&
                            request.upload_total_bytes <= maximum_admin_upload_bytes &&
-                           request.upload_offset == request.upload_total_bytes && request.payload.empty() && no_stage;
+                           request.upload_offset == request.upload_total_bytes && request.payload.empty() && no_stage &&
+                           no_rollback;
                 case ResidentAdminRequestKind::stage_preview:
                     return mutation_identity() && printable_ascii(request.reason, false) &&
                            request.target_generation != 0U && request.drain_boundary == 0U &&
                            request.work_ids.empty() && no_upload && canonical_source_digest(request.source_digest) &&
                            printable_ascii(request.state_schema_hash, false) &&
-                           printable_ascii(request.state_namespace, false);
+                           printable_ascii(request.state_namespace, false) && no_rollback;
                 case ResidentAdminRequestKind::stage_apply:
                     return mutation_identity() && request.reason.empty() && request.target_generation != 0U &&
                            request.drain_boundary == 0U && request.work_ids.empty() && no_upload &&
                            canonical_source_digest(request.source_digest) &&
                            printable_ascii(request.state_schema_hash, false) &&
-                           printable_ascii(request.state_namespace, false);
+                           printable_ascii(request.state_namespace, false) && no_rollback;
+                case ResidentAdminRequestKind::rollback_preview:
+                    return mutation_identity() && printable_ascii(request.reason, false) &&
+                           request.target_generation != 0U && request.rollback_source_generation != 0U &&
+                           request.drain_boundary == 0U && request.work_ids.empty() && no_upload && no_stage;
+                case ResidentAdminRequestKind::rollback_apply:
+                    return mutation_identity() && request.reason.empty() && request.target_generation != 0U &&
+                           request.rollback_source_generation != 0U && request.drain_boundary == 0U &&
+                           request.work_ids.empty() && no_upload && no_stage;
                 default: return false;
             }
         }
@@ -447,12 +459,13 @@ namespace rule_engine::python::tools {
             return std::unexpected(error(protocol_v2::ProtocolErrorCode::malformed, "admin request is invalid"));
         }
         Writer writer {.bytes = {}, .maximum = maximum_frame_bytes};
-        if (!writer.append_u8(4U) || !writer.append_u8(static_cast<std::uint8_t>(request.kind)) ||
+        if (!writer.append_u8(5U) || !writer.append_u8(static_cast<std::uint8_t>(request.kind)) ||
             !writer.append_string(request.request_id) || !writer.append_string(request.tenant.value) ||
             !writer.append_string(request.pack.value) || !writer.append_string(request.operation_id) ||
             !writer.append_string(request.idempotency_key) || !writer.append_u64(request.expected_pack_version) ||
             !writer.append_u64(request.at_unix_ms) || !writer.append_string(request.reason) ||
-            !writer.append_u64(request.target_generation) || !writer.append_u64(request.drain_boundary) ||
+            !writer.append_u64(request.target_generation) || !writer.append_u64(request.rollback_source_generation) ||
+            !writer.append_u64(request.drain_boundary) ||
             request.work_ids.size() > (std::numeric_limits<std::uint32_t>::max)() ||
             !writer.append_u32(static_cast<std::uint32_t>(request.work_ids.size())) ||
             !std::ranges::all_of(request.work_ids,
@@ -485,6 +498,7 @@ namespace rule_engine::python::tools {
         const auto at = reader.read_u64();
         const auto reason = reader.read_string();
         const auto target_generation = reader.read_u64();
+        const auto rollback_source_generation = reader.read_u64();
         const auto drain_boundary = reader.read_u64();
         const auto work_count = reader.read_u32();
         std::vector<std::string> work_ids;
@@ -504,10 +518,11 @@ namespace rule_engine::python::tools {
         auto source_digest = reader.read_string();
         auto state_schema_hash = reader.read_string();
         auto state_namespace = reader.read_string();
-        if (!version || *version != 4U || !kind || *kind < 1U || *kind > 11U || !request_id || !tenant || !pack ||
+        if (!version || *version != 5U || !kind || *kind < 1U || *kind > 13U || !request_id || !tenant || !pack ||
             !operation || !idempotency || !expected || !at || !reason || !target_generation || !drain_boundary ||
-            !work_count || work_ids.size() != *work_count || !upload_offset || !upload_total || !upload_payload ||
-            !source_digest || !state_schema_hash || !state_namespace || reader.offset != payload.size()) {
+            !rollback_source_generation || !work_count || work_ids.size() != *work_count || !upload_offset ||
+            !upload_total || !upload_payload || !source_digest || !state_schema_hash || !state_namespace ||
+            reader.offset != payload.size()) {
             return std::unexpected(
                 error(protocol_v2::ProtocolErrorCode::malformed, "admin request frame is malformed"));
         }
@@ -522,6 +537,7 @@ namespace rule_engine::python::tools {
             .at_unix_ms = *at,
             .reason = std::move(*reason),
             .target_generation = *target_generation,
+            .rollback_source_generation = *rollback_source_generation,
             .drain_boundary = *drain_boundary,
             .work_ids = std::move(work_ids),
             .upload_offset = *upload_offset,
@@ -778,7 +794,7 @@ namespace rule_engine::python::tools {
                     .resource_version = 0U,
                     .active_generation =
                         *operation ? std::optional<std::uint64_t> {(*operation)->target_generation} : std::nullopt,
-                    .previous_active_generation = std::nullopt,
+                    .previous_active_generation = *operation ? (*operation)->rollback_source_generation : std::nullopt,
                     .operation_phase =
                         *operation ? std::string {operation_phase_name((*operation)->phase)} : std::string {},
                     .target_generation = *operation ? (*operation)->target_generation : 0U,
@@ -875,6 +891,80 @@ namespace rule_engine::python::tools {
                     .resource_version = *resource_version,
                     .active_generation = std::nullopt,
                     .previous_active_generation = std::nullopt,
+                    .operation_phase = "previewed",
+                    .target_generation = compiling->request.generation,
+                    .drain_boundary = 0U,
+                    .assignment_fence = 0U,
+                    .work_ids = compiling->target_nodes,
+                    .upload_received_bytes = 0U,
+                    .upload_total_bytes = 0U,
+                    .source_digest = compiling->request.source_digest};
+        }
+        if (request.kind == ResidentAdminRequestKind::rollback_preview ||
+            request.kind == ResidentAdminRequestKind::rollback_apply) {
+            const auto apply_rollback = request.kind == ResidentAdminRequestKind::rollback_apply;
+            if (!apply_rollback) {
+                const cluster::AdminMutationRequest mutation {
+                    .operation_id = request.operation_id,
+                    .request_id = RequestId {request.request_id},
+                    .idempotency_key = request.idempotency_key,
+                    .actor = {},
+                    .reason = request.reason,
+                    .expected_pack_version = request.expected_pack_version,
+                    .at_unix_ms = request.at_unix_ms,
+                };
+                auto preview =
+                    admin.preview_rollback(context, request.tenant, mutation, request.pack,
+                                           request.rollback_source_generation, request.target_generation,
+                                           cluster::StateTransitionPlan {.mode = cluster::StateTransitionMode::carry,
+                                                                         .source_namespace = {},
+                                                                         .target_namespace = {},
+                                                                         .migration_id = {},
+                                                                         .reset_authorized = false,
+                                                                         .accept_state_gap = false});
+                if (!preview) {
+                    return rejected_response(request, preview.error());
+                }
+                return {.status = ResidentAdminResponseStatus::ok,
+                        .request_id = request.request_id,
+                        .code = "OK",
+                        .diagnostic = {},
+                        .storage_revision = 0U,
+                        .resource_version = preview->expected_pack_version,
+                        .active_generation = std::nullopt,
+                        .previous_active_generation = preview->rollback_source_generation,
+                        .operation_phase = std::string {operation_phase_name(preview->phase)},
+                        .target_generation = preview->target_generation,
+                        .drain_boundary = 0U,
+                        .assignment_fence = 0U,
+                        .work_ids = {},
+                        .upload_received_bytes = 0U,
+                        .upload_total_bytes = 0U,
+                        .source_digest = std::nullopt};
+            }
+            const cluster::AdminApplyRequest apply {
+                .operation_id = request.operation_id,
+                .idempotency_key = request.idempotency_key,
+                .expected_pack_version = request.expected_pack_version,
+                .at_unix_ms = request.at_unix_ms,
+            };
+            auto compiling = admin.begin_server_rollback(context, request.tenant, request.pack, apply,
+                                                         request.rollback_source_generation, request.target_generation);
+            if (!compiling) {
+                return rejected_response(request, compiling.error());
+            }
+            const auto resource_version = operation_version(request.operation_id);
+            if (!resource_version) {
+                return unavailable_after_commit();
+            }
+            return {.status = ResidentAdminResponseStatus::ok,
+                    .request_id = request.request_id,
+                    .code = "OK",
+                    .diagnostic = {},
+                    .storage_revision = 0U,
+                    .resource_version = *resource_version,
+                    .active_generation = std::nullopt,
+                    .previous_active_generation = compiling->request.rollback_from,
                     .operation_phase = "previewed",
                     .target_generation = compiling->request.generation,
                     .drain_boundary = 0U,

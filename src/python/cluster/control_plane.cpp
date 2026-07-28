@@ -674,8 +674,10 @@ namespace rule_engine::python::cluster {
         if (!operation) {
             return std::unexpected(operation.error());
         }
-        if (!*operation || (*operation)->kind != AdminOperationKind::stage || at_unix_ms == 0U) {
-            return std::unexpected(invalid("server compilation report does not name a stage operation"));
+        if (!*operation ||
+            ((*operation)->kind != AdminOperationKind::stage && (*operation)->kind != AdminOperationKind::rollback) ||
+            at_unix_ms == 0U) {
+            return std::unexpected(invalid("server compilation report does not name a compilation operation"));
         }
         auto state = store_.load_state();
         if (!state) {
@@ -726,6 +728,17 @@ namespace rule_engine::python::cluster {
              }))) {
             return std::unexpected(invalid("successful server compilation report is incomplete"));
         }
+        if (canonical_report.success && (*operation)->kind == AdminOperationKind::rollback) {
+            const auto *source =
+                (*operation)->rollback_source_generation ?
+                    find_generation(*state, (*operation)->pack, *(*operation)->rollback_source_generation) :
+                    nullptr;
+            if (source == nullptr || source->phase != GenerationPhase::retired ||
+                source->semantic_hash != canonical_report.semantic_hash ||
+                source->binding_hash != canonical_report.binding_hash) {
+                canonical_report.success = false;
+            }
+        }
         if (canonical_report.success && !generation->reports.empty() &&
             (generation->semantic_hash != canonical_report.semantic_hash ||
              generation->binding_hash != canonical_report.binding_hash)) {
@@ -756,8 +769,9 @@ namespace rule_engine::python::cluster {
         const auto outcome = (*operation)->phase == AdminOperationPhase::failed ? "failed" :
                              (*operation)->phase == AdminOperationPhase::staged ? "staged" :
                                                                                   "compiling";
-        auto audit = admin_audit(at_unix_ms, **operation, "resident.pack.stage.report", outcome,
-                                 std::to_string(generation->reports.size()));
+        const auto event = (*operation)->kind == AdminOperationKind::rollback ? "resident.pack.rollback.report" :
+                                                                                "resident.pack.stage.report";
+        auto audit = admin_audit(at_unix_ms, **operation, event, outcome, std::to_string(generation->reports.size()));
         auto result = *generation;
         if (auto committed =
                 commit_transition(store_, expected_storage_revision, std::move(*state), **operation, std::move(audit));
@@ -1140,6 +1154,111 @@ namespace rule_engine::python::cluster {
             return std::unexpected(committed.error());
         }
         return operation;
+    }
+
+    std::expected<GenerationSnapshot, StoreError> DurableActivationAdmin::begin_server_rollback(
+        const AdminApplyRequest &request, const std::uint64_t source_generation, const std::uint64_t new_generation) {
+        auto operation = load_apply_operation(store_, request);
+        if (!operation) {
+            return std::unexpected(operation.error());
+        }
+        if (operation->kind != AdminOperationKind::rollback || !operation->rollback_source_generation ||
+            *operation->rollback_source_generation != source_generation ||
+            operation->target_generation != new_generation) {
+            return std::unexpected(invalid("operation is not a server-owned rollback preview"));
+        }
+        auto state = store_.load_state();
+        if (!state) {
+            return std::unexpected(state.error());
+        }
+        const auto *source = find_generation(*state, operation->pack, *operation->rollback_source_generation);
+        if (source == nullptr || source->phase != GenerationPhase::retired || !source->request.signature_verified) {
+            return std::unexpected(invalid("retained rollback source is absent or no longer eligible"));
+        }
+        auto rollback_request = canonical_request(source->request);
+        rollback_request.generation = operation->target_generation;
+        rollback_request.state_namespace = operation->state_transition.target_namespace;
+        rollback_request.state_transition = operation->state_transition;
+        rollback_request.rollback_from = operation->rollback_source_generation;
+
+        if (const auto *existing = find_generation(*state, operation->pack, operation->target_generation);
+            existing != nullptr) {
+            if (existing->request.pack != rollback_request.pack ||
+                existing->request.generation != rollback_request.generation ||
+                existing->request.version != rollback_request.version ||
+                existing->request.source_digest != rollback_request.source_digest ||
+                existing->request.state_schema_hash != rollback_request.state_schema_hash ||
+                existing->request.state_namespace != rollback_request.state_namespace ||
+                existing->request.rollback_from != rollback_request.rollback_from ||
+                !transition_matches(existing->request.state_transition, rollback_request.state_transition)) {
+                return std::unexpected(invalid("server-owned rollback retry changed durable generation metadata"));
+            }
+            return *existing;
+        }
+        if (operation->phase != AdminOperationPhase::previewed ||
+            request.expected_pack_version != operation->expected_pack_version ||
+            pack_version(*state, operation->pack) != request.expected_pack_version ||
+            !generation_number_available(*state, operation->pack, operation->target_generation)) {
+            return std::unexpected(stale("server-owned rollback apply uses a stale pack version or generation"));
+        }
+        if (rollback_request.pack.empty() || rollback_request.version.empty() ||
+            rollback_request.source_digest.empty() || rollback_request.generation == 0U ||
+            rollback_request.state_schema_hash.empty() || rollback_request.state_namespace.empty() ||
+            rollback_request.state_transition.target_namespace != rollback_request.state_namespace) {
+            return std::unexpected(invalid("server-owned rollback source metadata is incomplete"));
+        }
+        if (auto transition = validate_state_transition(*state, rollback_request); !transition) {
+            return std::unexpected(transition.error());
+        }
+        auto nodes = store_.node_snapshot();
+        if (!nodes) {
+            return std::unexpected(nodes.error());
+        }
+        GenerationSnapshot snapshot {.request = std::move(rollback_request),
+                                     .phase = GenerationPhase::compiling,
+                                     .target_nodes = {},
+                                     .targets = {},
+                                     .reports = {},
+                                     .semantic_hash = {},
+                                     .binding_hash = {},
+                                     .requeued_work = {},
+                                     .failure = {}};
+        for (const auto &node : *nodes) {
+            const auto capabilities_match =
+                std::ranges::all_of(snapshot.request.required_capability_hashes, [&](const auto &required) {
+                    return std::ranges::binary_search(node.capability_hashes, required);
+                });
+            if (!node.serving || node.lease_until_unix_ms <= request.at_unix_ms || !capabilities_match) {
+                continue;
+            }
+            snapshot.target_nodes.push_back(node.node_id);
+            snapshot.targets.push_back(StageTargetNode {.node_id = node.node_id,
+                                                        .platform_abi = node.platform_abi,
+                                                        .lease_fence = node.lease_fence,
+                                                        .lease_until_unix_ms = node.lease_until_unix_ms,
+                                                        .capability_hashes = node.capability_hashes});
+        }
+        snapshot = canonical_generation(std::move(snapshot));
+        if (snapshot.targets.empty()) {
+            return std::unexpected(control_error(
+                StoreErrorCode::unavailable, "no eligible serving resident nodes are available for rollback", true));
+        }
+        auto &pack = ensure_pack(*state, operation->pack);
+        if (auto advanced = advance_pack(pack); !advanced) {
+            return std::unexpected(advanced.error());
+        }
+        state->generations.push_back(snapshot);
+        operation->expected_pack_version = pack.resource_version;
+        operation->updated_at_unix_ms = request.at_unix_ms;
+        const auto expected_storage_revision = state->storage_revision;
+        auto audit = admin_audit(request.at_unix_ms, *operation, "admin.pack.rollback.apply", "compiling",
+                                 std::to_string(snapshot.targets.size()));
+        if (auto committed =
+                commit_transition(store_, expected_storage_revision, std::move(*state), *operation, std::move(audit));
+            !committed) {
+            return std::unexpected(committed.error());
+        }
+        return snapshot;
     }
 
     std::expected<GenerationSnapshot, StoreError>

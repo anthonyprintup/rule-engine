@@ -175,14 +175,16 @@ namespace rule_engine::python::tools {
                     failure(ToolFailureKind::operation, "ADMIN-TENANT", "admin command requires --tenant ID"));
             }
             if (command.action != AdminAction::packs && command.action != AdminAction::operation &&
-                command.action != AdminAction::stage && command.action != AdminAction::activate) {
+                command.action != AdminAction::stage && command.action != AdminAction::activate &&
+                command.action != AdminAction::rollback) {
                 return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-NOT-IMPLEMENTED",
-                                               "admin command is not available on the resident v3 control channel"));
+                                               "admin command is not available on the resident v5 control channel"));
             }
-            if ((command.action == AdminAction::stage || command.action == AdminAction::activate) &&
+            if ((command.action == AdminAction::stage || command.action == AdminAction::activate ||
+                 command.action == AdminAction::rollback) &&
                 !command.options.contains("expected-version")) {
                 return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-EXPECTED-VERSION",
-                                               "activation mutation requires --expected-version N"));
+                                               "admin mutation requires --expected-version N"));
             }
             const auto expected_version = unsigned_option(command, "expected-version");
             if (!expected_version) {
@@ -201,6 +203,7 @@ namespace rule_engine::python::tools {
                 .at_unix_ms = at_unix_ms,
                 .reason = {},
                 .target_generation = 0U,
+                .rollback_source_generation = 0U,
                 .drain_boundary = 0U,
                 .work_ids = {},
                 .upload_offset = 0U,
@@ -258,6 +261,41 @@ namespace rule_engine::python::tools {
                 request.source_digest = SourceDigest {command.operands[1]};
                 request.state_schema_hash = state_schema;
                 request.state_namespace = state_namespace;
+                return request;
+            }
+
+            if (command.action == AdminAction::rollback) {
+                if (command.operands.size() != 3U || command.request_id.empty() ||
+                    (command.preview && command.reason.empty()) || (!command.preview && !command.reason.empty()) ||
+                    (command.preview && command.wait) || !option(command, "state-schema").empty() ||
+                    !option(command, "state-namespace").empty()) {
+                    return std::unexpected(failure(
+                        ToolFailureKind::operation, "ADMIN-ARGUMENT",
+                        "rollback requires PACK_ID, SOURCE_GENERATION, NEW_GENERATION, --request-id, and a preview "
+                        "reason; the authenticated runtime currently supports carry state only"));
+                }
+                std::uint64_t source_generation {};
+                std::uint64_t new_generation {};
+                const auto source = std::string_view {command.operands[1]};
+                const auto target = std::string_view {command.operands[2]};
+                const auto parsed_source =
+                    std::from_chars(source.data(), source.data() + source.size(), source_generation);
+                const auto parsed_target =
+                    std::from_chars(target.data(), target.data() + target.size(), new_generation);
+                if (parsed_source.ec != std::errc {} || parsed_source.ptr != source.data() + source.size() ||
+                    parsed_target.ec != std::errc {} || parsed_target.ptr != target.data() + target.size() ||
+                    source_generation == 0U || new_generation == 0U || source_generation == new_generation) {
+                    return std::unexpected(
+                        failure(ToolFailureKind::operation, "ADMIN-ARGUMENT", "rollback generations are invalid"));
+                }
+                request.kind = command.preview ? ResidentAdminRequestKind::rollback_preview :
+                                                 ResidentAdminRequestKind::rollback_apply;
+                request.pack = PackId {command.operands[0]};
+                request.operation_id = option(command, "operation-id", command.request_id);
+                request.idempotency_key = option(command, "idempotency-key", command.request_id);
+                request.reason = command.reason;
+                request.target_generation = new_generation;
+                request.rollback_source_generation = source_generation;
                 return request;
             }
 
@@ -509,6 +547,7 @@ namespace rule_engine::python::tools {
                 .at_unix_ms = now_unix_ms(),
                 .reason = std::move(reason),
                 .target_generation = 0U,
+                .rollback_source_generation = 0U,
                 .drain_boundary = 0U,
                 .work_ids = {},
                 .upload_offset = offset,
@@ -599,7 +638,7 @@ namespace rule_engine::python::tools {
                            const AdminCommand &command, const ResidentAdminRequest &initial_request,
                            ResidentAdminResponse response) {
             if (command.action != AdminAction::operation && command.action != AdminAction::stage &&
-                command.action != AdminAction::activate) {
+                command.action != AdminAction::rollback && command.action != AdminAction::activate) {
                 return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-WAIT-ARGUMENT",
                                                "--wait requires an operation or activation command"));
             }
@@ -635,6 +674,7 @@ namespace rule_engine::python::tools {
                 .at_unix_ms = 0U,
                 .reason = {},
                 .target_generation = 0U,
+                .rollback_source_generation = 0U,
                 .drain_boundary = 0U,
                 .work_ids = {},
                 .upload_offset = 0U,
@@ -678,7 +718,7 @@ namespace rule_engine::python::tools {
             return upload_archive(transport_, endpoint, command);
         }
         if (command.wait && command.action != AdminAction::operation && command.action != AdminAction::stage &&
-            command.action != AdminAction::activate) {
+            command.action != AdminAction::rollback && command.action != AdminAction::activate) {
             return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-WAIT-ARGUMENT",
                                            "--wait requires an operation or activation command"));
         }

@@ -115,6 +115,8 @@ namespace rule_engine::python::tools {
         upload_finalize = 9,
         stage_preview = 10,
         stage_apply = 11,
+        rollback_preview = 12,
+        rollback_apply = 13,
     };
 
     struct ResidentAdminRequest {
@@ -128,6 +130,7 @@ namespace rule_engine::python::tools {
         std::uint64_t at_unix_ms {};
         std::string reason;
         std::uint64_t target_generation {};
+        std::uint64_t rollback_source_generation {};
         std::uint64_t drain_boundary {};
         std::vector<std::string> work_ids;
         std::uint64_t upload_offset {};

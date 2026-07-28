@@ -291,6 +291,22 @@ namespace rule_engine::python::cluster {
         return mapped(admin_.preview_rollback(attributed, pack, source_generation, new_generation, state_transition));
     }
 
+    std::expected<GenerationSnapshot, AuthorizedAdminError> AuthorizedActivationAdmin::begin_server_rollback(
+        const AdminCallContext &context, const TenantId &tenant, const PackId &pack, const AdminApplyRequest &request,
+        const std::uint64_t source_generation, const std::uint64_t new_generation) {
+        const AdminAuthorizationRequest authorization {
+            .operation = AdminControlOperation::rollback_stage_apply,
+            .resource = operation_resource(tenant, pack, request.operation_id),
+        };
+        if (auto authorized = authorize(context, authorization); !authorized) {
+            return std::unexpected(authorized.error());
+        }
+        if (auto verified = verify_operation_pack(request, pack); !verified) {
+            return std::unexpected(verified.error());
+        }
+        return mapped(admin_.begin_server_rollback(request, source_generation, new_generation));
+    }
+
     std::expected<GenerationSnapshot, AuthorizedAdminError>
     AuthorizedActivationAdmin::apply_rollback_stage(const AdminCallContext &context, const TenantId &tenant,
                                                     const AdminApplyRequest &request,

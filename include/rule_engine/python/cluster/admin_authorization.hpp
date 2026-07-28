@@ -168,6 +168,10 @@ namespace rule_engine::python::cluster {
                          const PackId &pack, std::uint64_t source_generation, std::uint64_t new_generation,
                          const StateTransitionPlan &state_transition);
         [[nodiscard]] std::expected<GenerationSnapshot, AuthorizedAdminError>
+        begin_server_rollback(const AdminCallContext &context, const TenantId &tenant, const PackId &pack,
+                              const AdminApplyRequest &request, std::uint64_t source_generation,
+                              std::uint64_t new_generation);
+        [[nodiscard]] std::expected<GenerationSnapshot, AuthorizedAdminError>
         apply_rollback_stage(const AdminCallContext &context, const TenantId &tenant, const AdminApplyRequest &request,
                              const GenerationSnapshot &generation);
 

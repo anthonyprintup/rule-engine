@@ -272,12 +272,13 @@ bounded snapshot whose first line is `rule-engine.operator-bindings.v1` and
 whose remaining tab-separated rows contain tenant, peer, principal, principal
 kind, home tenant, pack prefix, and an explicit comma-separated capability
 set. Peers and principals are unique; tenant, pack prefix, principal kind, and
-capability must all authorize the exact resource. The version-4 canonical
+capability must all authorize the exact resource. The version-5 canonical
 request wire and standalone client expose pack/operation reads, verified
 resumable upload, server-owned distributed stage, bounded operation polling,
-and activation preview, drain, explicit straggler fencing, and atomic flip.
-The client pins the configured server URI SAN and correlates one bounded
-request/response per mTLS connection.
+forward rollback restaging, and activation preview, drain, explicit straggler
+fencing, and atomic flip. `pack.stage`, `pack.activate`, and `pack.rollback`
+are separate binding capabilities. The client pins the configured server URI
+SAN and correlates one bounded request/response per mTLS connection.
 
 For example:
 
@@ -300,6 +301,16 @@ rule_engine_admin stage com.example.cheat `
   --operation-id stage-1042 --idempotency-key stage-1042 `
   --apply --wait --config admin.conf
 
+rule_engine_admin rollback com.example.cheat 5 8 --tenant tenant-a `
+  --expected-version 12 --request-id rollback-1042 `
+  --reason "restore retained generation 5 as forward generation 8" `
+  --config admin.conf
+
+rule_engine_admin rollback com.example.cheat 5 8 --tenant tenant-a `
+  --expected-version 12 --request-id rollback-1042-apply `
+  --operation-id rollback-1042 --idempotency-key rollback-1042 `
+  --apply --wait --config admin.conf
+
 rule_engine_admin activate com.example.cheat 7 --tenant tenant-a `
   --expected-version 3 --request-id change-1042 `
   --reason "approved detection rollout" --config admin.conf
@@ -310,11 +321,13 @@ rule_engine_admin activate com.example.cheat --tenant tenant-a `
   --request-id change-1042-drain --apply --config admin.conf
 ```
 
-Preview does not mutate the pack version. Stage apply freezes the eligible
-serving targets and returns the new resource version; `--wait` follows the
-durable operation through `staged` or `failed`. Each activation phase then uses
-the updated resource version returned by the previous phase. Rollback
-restaging and policy mutation still fail closed with `ADMIN-NOT-IMPLEMENTED`.
+Preview does not mutate the pack version. Stage or rollback apply freezes the
+eligible serving targets and returns the new resource version; `--wait` follows
+the durable operation through `staged` or `failed`. Each activation phase then
+uses the updated resource version returned by the previous phase. Rollback is a
+forward restage and currently accepts carry state only: the retained and active
+state schema must match, and no reset/migration flag can be supplied. Policy
+mutation still fails closed with `ADMIN-NOT-IMPLEMENTED`.
 
 Use the configured JSON log, security audit, readiness, and Prometheus outputs
 for operations. Logs and diagnostics record identities, hashes, limits, and

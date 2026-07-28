@@ -1059,6 +1059,44 @@ namespace {
         REQUIRE_FALSE(admin.state_snapshot()->packs.front().active_generation.has_value());
     }
 
+    TEST_CASE("server-owned rollback rejects semantic drift from retained source") {
+        TemporaryDatabase database;
+        const auto store = open_control(database);
+        REQUIRE(store.has_value());
+        DurableActivationAdmin admin {**store};
+        const auto retained = ready_generation(1, "sha256:source-one");
+        const auto active = ready_generation(2, "sha256:source-two");
+        auto pack_version = stage_and_activate(admin, retained, 0, "rollback-drift-retained", 10);
+        pack_version = stage_and_activate(admin, active, pack_version, "rollback-drift-active", 30);
+        REQUIRE(pack_version == 8);
+        REQUIRE((*store)
+                    ->upsert_node(DurableResidentNode {.node_id = "node-a",
+                                                       .platform_abi = "windows-x64-v1",
+                                                       .lease_fence = 21,
+                                                       .lease_until_unix_ms = 10'000,
+                                                       .updated_at_unix_ms = 49,
+                                                       .serving = true,
+                                                       .capability_hashes = {}})
+                    .has_value());
+        const StateTransitionPlan carry {.mode = StateTransitionMode::carry,
+                                         .source_namespace = {},
+                                         .target_namespace = {},
+                                         .migration_id = {},
+                                         .reset_authorized = false,
+                                         .accept_state_gap = false};
+        const auto preview =
+            admin.preview_rollback(mutation_request("rollback-drift", 8, 50), retained.request.pack, 1, 3, carry);
+        REQUIRE(preview.has_value());
+        REQUIRE(admin.begin_server_rollback(apply_request(*preview, 8, 51), 1, 3).has_value());
+        const auto drifted = admin.report_server_compilation(
+            preview->operation_id, compilation(node("node-a", 21), "sha256:changed-semantics", retained.binding_hash),
+            52);
+        REQUIRE(drifted.has_value());
+        REQUIRE(drifted->phase == GenerationPhase::failed);
+        REQUIRE(admin.operation_snapshot(preview->operation_id)->value().phase == AdminOperationPhase::failed);
+        REQUIRE(admin.state_snapshot()->packs.front().active_generation == 2);
+    }
+
     TEST_CASE("durable activation operations are idempotent and resume across SQLite restarts") {
         TemporaryDatabase database;
         const auto first_generation = ready_generation(1, "sha256:source-one");
@@ -1367,7 +1405,6 @@ namespace {
         const auto second_generation = ready_generation(2, "sha256:source-two");
         AdminMutationRequest rollback_request;
         StateTransitionPlan rollback_transition;
-        GenerationSnapshot rollback_generation;
 
         {
             const auto store = open_control(database);
@@ -1391,14 +1428,27 @@ namespace {
             REQUIRE(preview->state_transition.target_namespace == "state-live");
             REQUIRE(admin.state_snapshot()->generations.size() == 2);
 
-            rollback_generation = first_generation;
-            rollback_generation.request.generation = 3;
-            rollback_generation.request.rollback_from = 1;
-            rollback_generation.request.state_transition = preview->state_transition;
-            const auto staged = admin.apply_rollback_stage(apply_request(*preview, 8, 51), rollback_generation);
-            REQUIRE(staged.has_value());
-            REQUIRE(staged->request.rollback_from == 1);
+            REQUIRE((*store)
+                        ->upsert_node(DurableResidentNode {.node_id = "node-a",
+                                                           .platform_abi = "windows-x64-v1",
+                                                           .lease_fence = 21,
+                                                           .lease_until_unix_ms = 10'000,
+                                                           .updated_at_unix_ms = 49,
+                                                           .serving = true,
+                                                           .capability_hashes = {}})
+                        .has_value());
+            const auto compiling = admin.begin_server_rollback(apply_request(*preview, 8, 51), 1, 3);
+            REQUIRE(compiling.has_value());
+            REQUIRE(compiling->phase == GenerationPhase::compiling);
+            REQUIRE(compiling->request.rollback_from == 1);
             REQUIRE(admin.state_snapshot()->packs.front().resource_version == 9);
+            const auto staged = admin.report_server_compilation(
+                preview->operation_id,
+                compilation(node("node-a", 21), first_generation.semantic_hash, first_generation.binding_hash), 52);
+            REQUIRE(staged.has_value());
+            REQUIRE(staged->phase == GenerationPhase::ready);
+            REQUIRE(admin.operation_snapshot(preview->operation_id)->value().phase == AdminOperationPhase::staged);
+            REQUIRE(admin.state_snapshot()->packs.front().resource_version == 10);
         }
 
         {
@@ -1409,9 +1459,9 @@ namespace {
                 admin.preview_rollback(rollback_request, first_generation.request.pack, 1, 3, rollback_transition);
             REQUIRE(preview.has_value());
             REQUIRE(preview->phase == AdminOperationPhase::staged);
-            REQUIRE(admin.apply_rollback_stage(apply_request(*preview, 8, 52), rollback_generation).has_value());
+            REQUIRE(admin.begin_server_rollback(apply_request(*preview, 8, 52), 1, 3).has_value());
 
-            const auto drained = admin.begin_drain(apply_request(*preview, 9, 53), 900);
+            const auto drained = admin.begin_drain(apply_request(*preview, 10, 53), 900);
             REQUIRE(drained.has_value());
             REQUIRE(drained->old_generation == 2);
             REQUIRE(drained->target_generation == 3);
@@ -1424,8 +1474,8 @@ namespace {
             const auto operation = admin.operation_snapshot(rollback_request.operation_id);
             REQUIRE(operation.has_value());
             REQUIRE(operation->has_value());
-            REQUIRE(admin.fence_stragglers(apply_request(**operation, 10, 54), {"rollback-work"}).has_value());
-            const auto activated = admin.flip(apply_request(**operation, 11, 55));
+            REQUIRE(admin.fence_stragglers(apply_request(**operation, 11, 54), {"rollback-work"}).has_value());
+            const auto activated = admin.flip(apply_request(**operation, 12, 55));
             REQUIRE(activated.has_value());
             REQUIRE(activated->retired_generation == 2);
             REQUIRE(activated->active_generation == 3);
@@ -1433,7 +1483,7 @@ namespace {
 
             const auto inspection = admin.inspect();
             REQUIRE(inspection.has_value());
-            REQUIRE(inspection->state.packs.front().resource_version == 12);
+            REQUIRE(inspection->state.packs.front().resource_version == 13);
             REQUIRE(inspection->state.packs.front().active_generation == 3);
             REQUIRE(inspection->state.packs.front().accepting_assignments);
             REQUIRE(inspection->state.generations.size() == 3);

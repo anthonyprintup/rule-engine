@@ -73,6 +73,8 @@ Commands:
                        Read one authorized durable operation snapshot
   stage PACK_ID SOURCE_DIGEST GENERATION
                        Preview or begin server-owned distributed compilation
+  rollback PACK_ID SOURCE_GENERATION NEW_GENERATION
+                       Preview or restage retained source as a new generation
   activate PACK_ID GENERATION
                        Preview activation (requires --request-id and --reason)
   activate PACK_ID --phase drain|fence|flip --apply
@@ -102,8 +104,9 @@ Options:
 
 Upload is resumable when retried with the same request ID. Stage defaults to
 preview; repeat it with --apply and the preview's expected version to freeze
-eligible resident targets. Rollback-restage and policy mutation remain reserved
-and fail closed with ADMIN-NOT-IMPLEMENTED.
+eligible resident targets. Rollback also defaults to preview and currently
+permits only schema-compatible state carry. Policy mutation remains reserved
+and fails closed with ADMIN-NOT-IMPLEMENTED.
 )";
 
         struct ParseError {

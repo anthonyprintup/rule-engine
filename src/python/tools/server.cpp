@@ -920,9 +920,9 @@ versioned policy/registry administration remain fail-closed.
                 case activation_fence:
                 case activation_flip: return "pack.activate";
                 case stage_preview:
-                case stage_apply:
+                case stage_apply: return "pack.stage";
                 case rollback_preview:
-                case rollback_stage_apply: return {};
+                case rollback_stage_apply: return "pack.rollback";
                 default: return {};
             }
         }
@@ -1018,7 +1018,8 @@ versioned policy/registry administration remain fail-closed.
                 std::set<std::string, std::less<>> named;
                 for (const auto capability : capabilities) {
                     if ((capability != "pack.read" && capability != "pack.upload" && capability != "operation.read" &&
-                         capability != "pack.activate") ||
+                         capability != "pack.stage" && capability != "pack.activate" &&
+                         capability != "pack.rollback") ||
                         !named.insert(std::string {capability}).second) {
                         return std::unexpected(unavailable("SRV-OPERATOR-BINDING-MALFORMED",
                                                            "operator binding capability is unknown or duplicated"));
@@ -1741,13 +1742,14 @@ versioned policy/registry administration remain fail-closed.
             return result;
         }
 
-        [[nodiscard]] bool process_resident_stage_once(const ResidentServerContext &context) {
+        [[nodiscard]] bool process_resident_compilation_once(const ResidentServerContext &context) {
             auto inspection = context.activation_store.inspect();
             if (!inspection) {
                 return false;
             }
             for (const auto &operation : inspection->operations) {
-                if (operation.kind != cluster::AdminOperationKind::stage ||
+                if ((operation.kind != cluster::AdminOperationKind::stage &&
+                     operation.kind != cluster::AdminOperationKind::rollback) ||
                     operation.phase != cluster::AdminOperationPhase::previewed) {
                     continue;
                 }
@@ -2308,7 +2310,7 @@ versioned policy/registry administration remain fail-closed.
         std::optional<cluster::FencedLease> node_lease;
         std::unique_ptr<ResidentApplicationService> application;
         std::unique_ptr<ResidentServiceScheduler> scheduler;
-        std::jthread stage_worker;
+        std::jthread control_worker;
         cluster::IClusterRuntimeStore *runtime_store {};
         cluster::IActivationControlStore *activation_store {};
         const protocol_v2::ITrustPolicy *peer_trust_policy {};
@@ -2385,9 +2387,9 @@ versioned policy/registry administration remain fail-closed.
         }
 
         void stop_services() noexcept {
-            if (stage_worker.joinable()) {
-                stage_worker.request_stop();
-                stage_worker.join();
+            if (control_worker.joinable()) {
+                control_worker.request_stop();
+                control_worker.join();
             }
             if (scheduler) {
                 scheduler->request_stop();
@@ -2567,10 +2569,10 @@ versioned policy/registry administration remain fail-closed.
             return std::unexpected(recorded.error());
         }
         auto initial_active_identity = stable_active_identity(*control_state).value_or(std::string {});
-        impl_->stage_worker = std::jthread {[&context, active_identity = std::move(initial_active_identity)](
-                                                const std::stop_token cancellation) mutable {
+        impl_->control_worker = std::jthread {[&context, active_identity = std::move(initial_active_identity)](
+                                                  const std::stop_token cancellation) mutable {
             while (!cancellation.stop_requested()) {
-                const auto progressed = process_resident_stage_once(context);
+                const auto progressed = process_resident_compilation_once(context);
                 auto state = context.activation_store.load_state();
                 auto identity = state ? stable_active_identity(*state) : std::optional<std::string> {};
                 if (identity && *identity != active_identity) {

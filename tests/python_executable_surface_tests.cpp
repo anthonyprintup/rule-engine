@@ -1401,6 +1401,18 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
                 py::SourceDigest {"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
             .state_schema_hash = "sha256:state",
             .state_namespace = "state:live"},
+        tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::rollback_preview,
+                                     .request_id = "request:rollback:preview",
+                                     .tenant = py::TenantId {"tenant:test"},
+                                     .pack = py::PackId {"pack:test"},
+                                     .operation_id = "operation:rollback",
+                                     .idempotency_key = "idempotency:rollback",
+                                     .expected_pack_version = 8U,
+                                     .at_unix_ms = 10U,
+                                     .reason = "approved rollback",
+                                     .target_generation = 3U,
+                                     .rollback_source_generation = 1U,
+                                     .payload = {}},
     };
     for (const auto &request : requests) {
         auto encoded = tools::encode_resident_admin_request(request, 4U * py::kibibyte);
@@ -1411,6 +1423,7 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
         CHECK(decoded->request_id == request.request_id);
         CHECK(decoded->reason == request.reason);
         CHECK(decoded->target_generation == request.target_generation);
+        CHECK(decoded->rollback_source_generation == request.rollback_source_generation);
         CHECK(decoded->drain_boundary == request.drain_boundary);
         CHECK(decoded->work_ids == request.work_ids);
         CHECK(decoded->upload_offset == request.upload_offset);
@@ -1509,6 +1522,25 @@ TEST_CASE("standalone admin client maps explicit lifecycle commands without trus
     const auto stage_apply = tools::build_resident_admin_request(stage, 100U);
     REQUIRE(stage_apply);
     CHECK(stage_apply->kind == tools::ResidentAdminRequestKind::stage_apply);
+
+    tools::AdminCommand rollback {.action = tools::AdminAction::rollback,
+                                  .operands = {"pack:test", "4", "7"},
+                                  .options = {{"tenant", "tenant:test"}, {"expected-version", "8"}},
+                                  .request_id = "request:rollback",
+                                  .reason = "restore retained detection semantics",
+                                  .preview = true};
+    const auto rollback_request = tools::build_resident_admin_request(rollback, 100U);
+    REQUIRE(rollback_request);
+    CHECK(rollback_request->kind == tools::ResidentAdminRequestKind::rollback_preview);
+    CHECK(rollback_request->rollback_source_generation == 4U);
+    CHECK(rollback_request->target_generation == 7U);
+
+    rollback.preview = false;
+    rollback.reason.clear();
+    rollback.options["expected-version"] = "9";
+    const auto rollback_apply = tools::build_resident_admin_request(rollback, 101U);
+    REQUIRE(rollback_apply);
+    CHECK(rollback_apply->kind == tools::ResidentAdminRequestKind::rollback_apply);
 
     tools::AdminCommand preview {.action = tools::AdminAction::activate,
                                  .operands = {"pack:test", "7"},
@@ -1910,6 +1942,75 @@ TEST_CASE("resident admin stage resolves trusted server metadata and freezes dur
                                    py::cluster::AdminControlOperation::stage_preview,
                                    py::cluster::AdminControlOperation::stage_apply,
                                });
+}
+
+TEST_CASE("resident admin rollback reconstructs retained source and begins a forward restage") {
+    StatefulControlStore store;
+    auto retained = resident_ready_generation();
+    retained.phase = py::cluster::GenerationPhase::retired;
+    auto active = resident_ready_generation();
+    active.request.version = py::PackVersion {"2.0.0"};
+    active.request.source_digest = py::SourceDigest {"sha256:source:active"};
+    active.request.generation = 8U;
+    active.phase = py::cluster::GenerationPhase::active;
+    active.semantic_hash = "sha256:semantic:active";
+    active.binding_hash = "sha256:binding:active";
+    store.state = {.storage_revision = 0U,
+                   .generations = {retained, active},
+                   .packs = {{.pack = py::PackId {"pack:test"},
+                              .resource_version = 8U,
+                              .active_generation = 8U,
+                              .assignment_fence = 4U,
+                              .accepting_assignments = true,
+                              .drain_boundary = std::nullopt,
+                              .drain_target = std::nullopt,
+                              .pending_requeues = {}}}};
+    store.nodes = {{.node_id = "node:test",
+                    .platform_abi = "windows-x64-v1",
+                    .lease_fence = 4U,
+                    .lease_until_unix_ms = 10'000U,
+                    .updated_at_unix_ms = 1U,
+                    .serving = true,
+                    .capability_hashes = {}}};
+    AllowAdminPolicy policy;
+    tools::AuthorizedResidentAdminBackend backend {store, policy};
+    const proto::AuthenticatedPeer peer {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:admin"}};
+    const tools::ResidentAdminRequest preview {
+        .kind = tools::ResidentAdminRequestKind::rollback_preview,
+        .request_id = "request:rollback:preview",
+        .tenant = py::TenantId {"tenant:test"},
+        .pack = py::PackId {"pack:test"},
+        .operation_id = "operation:rollback",
+        .idempotency_key = "idempotency:rollback",
+        .expected_pack_version = 8U,
+        .at_unix_ms = 10U,
+        .reason = "restore retained generation",
+        .target_generation = 9U,
+        .rollback_source_generation = 7U,
+        .payload = {},
+    };
+    const auto previewed = backend.execute(peer, preview);
+    REQUIRE(previewed.status == tools::ResidentAdminResponseStatus::ok);
+    CHECK(previewed.operation_phase == "previewed");
+    CHECK(previewed.previous_active_generation == 7U);
+
+    auto apply = preview;
+    apply.kind = tools::ResidentAdminRequestKind::rollback_apply;
+    apply.request_id = "request:rollback:apply";
+    apply.at_unix_ms = 11U;
+    apply.reason.clear();
+    const auto compiling = backend.execute(peer, apply);
+    REQUIRE(compiling.status == tools::ResidentAdminResponseStatus::ok);
+    CHECK(compiling.resource_version == 9U);
+    CHECK(compiling.target_generation == 9U);
+    CHECK(compiling.previous_active_generation == 7U);
+    REQUIRE(store.state.generations.size() == 3U);
+    const auto &forward = store.state.generations.back();
+    CHECK(forward.phase == py::cluster::GenerationPhase::compiling);
+    CHECK(forward.request.generation == 9U);
+    CHECK(forward.request.rollback_from == 7U);
+    CHECK(forward.request.source_digest == retained.request.source_digest);
+    CHECK(forward.targets.front().lease_fence == 4U);
 }
 
 TEST_CASE("resident scheduler rejects overload and joins owned workers on shutdown") {

@@ -103,6 +103,17 @@ from crossing the activation epoch into the old scheduler; an exactly
 concurrent committed message is replayed after reconnect. This remains
 Windows-local component and process-restart evidence, not the required live
 multi-node network, Linux, or PostgreSQL qualification.
+The forward rollback slice then passed the complete 38-test Debug graph in
+170.03 seconds. Cluster restart coverage proves that rollback preview selects a
+retired source, apply reconstructs a new compiling generation on the server,
+fresh leased targets are frozen, compilation resumes after restart, and the
+existing drain/fence/flip lifecycle activates the new forward generation.
+Negative coverage proves that a report whose semantic hash differs from the
+retained generation fails the rollback without changing the active generation.
+Executable-surface coverage proves v5 codec and CLI mappings plus the
+authenticated backend transition; production operator bindings now authorize
+stage and rollback only through separate `pack.stage` and `pack.rollback`
+capabilities. Non-carry state transitions remain deliberately unavailable.
 This evidence does not qualify live
 PostgreSQL, multiple server processes, network partitions, Linux, or mixed-OS
 operation.

@@ -78,7 +78,7 @@ The bounded tab-separated binding snapshot is:
 
 ```text
 rule-engine.operator-bindings.v1
-tenant<TAB>peer<TAB>principal<TAB>administrator|automation|pack_signer<TAB>home-tenant<TAB>pack-prefix<TAB>pack.read,operation.read,pack.activate
+tenant<TAB>peer<TAB>principal<TAB>administrator|automation|pack_signer<TAB>home-tenant<TAB>pack-prefix<TAB>pack.read,operation.read,pack.stage,pack.activate,pack.rollback
 ```
 
 Each peer and principal is unique. Capabilities are named explicitly, tenant
@@ -101,12 +101,13 @@ OpenSSL allocator overhead, or backend-internal caches.
 - The worker's process and resource limits contain ordinary failure and abuse;
   they are not a hostile-code sandbox for a trusted generator.
 - The authenticated activation lifecycle and reads are connected end to end.
-  Verified resumable upload, server-owned distributed stage compilation,
-  bounded durable-operation polling, and live activation refresh are also
-  connected. Rollback restaging and policy mutation still fail closed with
-  `ADMIN-NOT-IMPLEMENTED`; no command accepts client-supplied compilation
-  evidence. The offline file signer is currently implemented only on Windows;
-  HSM/KMS/PKCS#11 providers remain deployment integrations.
+  Verified resumable upload, server-owned distributed stage and forward
+  rollback compilation, bounded durable-operation polling, and live activation
+  refresh are also connected. Rollback currently permits carry state only;
+  policy mutation still fails closed with `ADMIN-NOT-IMPLEMENTED`. No command
+  accepts client-supplied compilation evidence. The offline file signer is
+  currently implemented only on Windows; HSM/KMS/PKCS#11 providers remain
+  deployment integrations.
 - The resident listener currently requires mTLS even when development
   configuration permits loopback plaintext; startup fails closed instead of
   dereferencing a missing TLS context. Accept and TLS handshake are serialized
