@@ -142,6 +142,12 @@ namespace rule_engine::python::cluster {
         [[nodiscard]] std::expected<GenerationSnapshot, AuthorizedAdminError>
         apply_stage(const AdminCallContext &context, const TenantId &tenant, const AdminApplyRequest &request,
                     const GenerationSnapshot &generation);
+        [[nodiscard]] std::expected<AdminOperationRecord, AuthorizedAdminError>
+        preview_server_stage(const AdminCallContext &context, const TenantId &tenant,
+                             const AdminMutationRequest &request, const GenerationRequest &generation);
+        [[nodiscard]] std::expected<GenerationSnapshot, AuthorizedAdminError>
+        begin_server_stage(const AdminCallContext &context, const TenantId &tenant, const AdminApplyRequest &request,
+                           const GenerationRequest &generation);
 
         [[nodiscard]] std::expected<AdminOperationRecord, AuthorizedAdminError>
         preview_activation(const AdminCallContext &context, const TenantId &tenant, const AdminMutationRequest &request,

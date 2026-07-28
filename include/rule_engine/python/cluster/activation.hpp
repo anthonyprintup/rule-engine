@@ -60,10 +60,19 @@ namespace rule_engine::python::cluster {
         DiagnosticSet diagnostics;
     };
 
+    struct StageTargetNode {
+        std::string node_id;
+        std::string platform_abi;
+        std::uint64_t lease_fence {};
+        std::uint64_t lease_until_unix_ms {};
+        std::vector<std::string> capability_hashes;
+    };
+
     struct GenerationSnapshot {
         GenerationRequest request;
         GenerationPhase phase {GenerationPhase::compiling};
         std::vector<std::string> target_nodes;
+        std::vector<StageTargetNode> targets;
         std::vector<CompilationReport> reports;
         std::string semantic_hash;
         std::string binding_hash;

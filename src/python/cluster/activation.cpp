@@ -204,6 +204,7 @@ namespace rule_engine::python::cluster {
             .request = std::move(canonical_request),
             .phase = GenerationPhase::compiling,
             .target_nodes = std::move(targets),
+            .targets = {},
             .reports = {},
             .semantic_hash = {},
             .binding_hash = {},

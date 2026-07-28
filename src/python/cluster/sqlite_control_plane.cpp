@@ -8,6 +8,7 @@
 #include <sqlite3.h>
 #endif
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -20,7 +21,7 @@
 namespace rule_engine::python::cluster {
     namespace {
 
-        constexpr std::uint32_t control_schema_version = 1;
+        constexpr std::uint32_t control_schema_version = 2;
 
         StoreError sqlite_control_error(sqlite3 *database, const int result, std::string context) {
             const auto primary = result & 0xff;
@@ -300,6 +301,34 @@ CREATE TABLE IF NOT EXISTS re_audit(
                     return std::unexpected(inserted.error());
                 }
             }
+            if (current < 2) {
+                constexpr std::string_view node_schema = R"sql(
+CREATE TABLE IF NOT EXISTS re_control_nodes(
+    node_id TEXT PRIMARY KEY,
+    platform_abi TEXT NOT NULL,
+    lease_fence INTEGER NOT NULL CHECK(lease_fence>0),
+    lease_until_unix_ms INTEGER NOT NULL CHECK(lease_until_unix_ms>0),
+    updated_at_unix_ms INTEGER NOT NULL CHECK(updated_at_unix_ms>0),
+    serving INTEGER NOT NULL CHECK(serving IN (0,1)),
+    payload BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS re_control_nodes_lease
+    ON re_control_nodes(lease_until_unix_ms,node_id);
+)sql";
+                if (auto applied = execute(database, node_schema); !applied) {
+                    return std::unexpected(applied.error());
+                }
+                auto record =
+                    prepare(database, "INSERT INTO re_control_schema_migrations(version,name,applied_unix_ms) "
+                                      "VALUES(2,'durable-resident-node-evidence',"
+                                      "CAST(strftime('%s','now') AS INTEGER)*1000)");
+                if (!record) {
+                    return std::unexpected(record.error());
+                }
+                if (auto inserted = expect_done(database, *record); !inserted) {
+                    return std::unexpected(inserted.error());
+                }
+            }
             return (*transaction)->commit();
         }
 
@@ -484,6 +513,111 @@ CREATE TABLE IF NOT EXISTS re_audit(
     SqliteActivationControlStore::find_operation_by_idempotency(const std::string_view idempotency_key) const {
         const std::scoped_lock lock {impl_->mutex};
         return find_operation_unlocked(impl_->database, "idempotency_key", idempotency_key);
+    }
+
+    std::expected<void, StoreError> SqliteActivationControlStore::upsert_node(const DurableResidentNode &node) {
+        if (node.node_id.empty() || node.platform_abi.empty() || node.lease_fence == 0 ||
+            node.updated_at_unix_ms == 0 || node.lease_until_unix_ms <= node.updated_at_unix_ms ||
+            !std::ranges::is_sorted(node.capability_hashes) ||
+            std::ranges::adjacent_find(node.capability_hashes) != node.capability_hashes.end() ||
+            std::ranges::any_of(node.capability_hashes, [](const auto &hash) { return hash.empty(); })) {
+            return std::unexpected(control_shape("durable resident node shape is invalid"));
+        }
+        auto encoded = encode_control(node);
+        if (!encoded) {
+            return std::unexpected(encoded.error());
+        }
+
+        const std::scoped_lock lock {impl_->mutex};
+        auto transaction = SqlTransaction::begin(impl_->database);
+        if (!transaction) {
+            return std::unexpected(transaction.error());
+        }
+        auto existing = prepare(impl_->database, "SELECT payload FROM re_control_nodes WHERE node_id=?1");
+        if (!existing) {
+            return std::unexpected(existing.error());
+        }
+        if (auto bound = bind_text(impl_->database, *existing, 1, node.node_id); !bound) {
+            return std::unexpected(bound.error());
+        }
+        auto row = step_row(impl_->database, *existing);
+        if (!row) {
+            return std::unexpected(row.error());
+        }
+        if (*row) {
+            auto previous =
+                decode_control<DurableResidentNode>(column_blob(*existing, 0), control_serialization::decode_node);
+            if (!previous) {
+                return std::unexpected(previous.error());
+            }
+            if (node.lease_fence < previous->lease_fence || node.updated_at_unix_ms < previous->updated_at_unix_ms ||
+                (node.lease_fence == previous->lease_fence &&
+                 (node.platform_abi != previous->platform_abi ||
+                  node.capability_hashes != previous->capability_hashes ||
+                  node.lease_until_unix_ms < previous->lease_until_unix_ms))) {
+                return std::unexpected(StoreError {.code = StoreErrorCode::stale_fence,
+                                                   .message = "durable resident node evidence is stale or changed "
+                                                              "within one lease fence",
+                                                   .retryable = false});
+            }
+        }
+
+        auto statement = prepare(
+            impl_->database,
+            "INSERT INTO re_control_nodes(node_id,platform_abi,lease_fence,lease_until_unix_ms,updated_at_unix_ms,"
+            "serving,payload) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(node_id) DO UPDATE SET "
+            "platform_abi=excluded.platform_abi,lease_fence=excluded.lease_fence,"
+            "lease_until_unix_ms=excluded.lease_until_unix_ms,updated_at_unix_ms=excluded.updated_at_unix_ms,"
+            "serving=excluded.serving,payload=excluded.payload");
+        if (!statement) {
+            return std::unexpected(statement.error());
+        }
+        if (auto bound = bind_text(impl_->database, *statement, 1, node.node_id); !bound) {
+            return std::unexpected(bound.error());
+        }
+        if (auto bound = bind_text(impl_->database, *statement, 2, node.platform_abi); !bound) {
+            return std::unexpected(bound.error());
+        }
+        const std::array numbers {node.lease_fence, node.lease_until_unix_ms, node.updated_at_unix_ms};
+        for (std::size_t index = 0; index < numbers.size(); ++index) {
+            if (auto bound = bind_i64(impl_->database, *statement, static_cast<int>(index + 3U), numbers[index],
+                                      "resident node value");
+                !bound) {
+                return std::unexpected(bound.error());
+            }
+        }
+        sqlite3_bind_int(statement->value, 6, node.serving ? 1 : 0);
+        if (auto bound = bind_blob(impl_->database, *statement, 7, *encoded); !bound) {
+            return std::unexpected(bound.error());
+        }
+        if (auto updated = expect_done(impl_->database, *statement); !updated) {
+            return std::unexpected(updated.error());
+        }
+        return (*transaction)->commit();
+    }
+
+    std::expected<std::vector<DurableResidentNode>, StoreError> SqliteActivationControlStore::node_snapshot() const {
+        const std::scoped_lock lock {impl_->mutex};
+        auto statement = prepare(impl_->database, "SELECT payload FROM re_control_nodes ORDER BY node_id");
+        if (!statement) {
+            return std::unexpected(statement.error());
+        }
+        std::vector<DurableResidentNode> nodes;
+        while (true) {
+            auto row = step_row(impl_->database, *statement);
+            if (!row) {
+                return std::unexpected(row.error());
+            }
+            if (!*row) {
+                return nodes;
+            }
+            auto node =
+                decode_control<DurableResidentNode>(column_blob(*statement, 0), control_serialization::decode_node);
+            if (!node) {
+                return std::unexpected(node.error());
+            }
+            nodes.push_back(std::move(*node));
+        }
     }
 
     std::expected<void, StoreError> SqliteActivationControlStore::commit(const ControlPlaneCommit &commit) {

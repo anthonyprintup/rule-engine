@@ -2029,7 +2029,10 @@ final activation flip; other control-plane operations remain CLI/backend work.
         std::unique_ptr<ResidentApplicationService> application;
         std::unique_ptr<ResidentServiceScheduler> scheduler;
         cluster::IClusterRuntimeStore *runtime_store {};
+        cluster::IActivationControlStore *activation_store {};
         const protocol_v2::ITrustPolicy *peer_trust_policy {};
+        std::string node_id;
+        std::string platform_abi;
         std::chrono::steady_clock::time_point renew_at {};
         bool qualified {};
         bool accept_agent {true};
@@ -2046,15 +2049,45 @@ final activation flip; other control-plane operations remain CLI/backend work.
             static_cast<void>(release_node_lease());
         }
 
+        [[nodiscard]] std::expected<void, ToolFailure> record_node(const bool serving,
+                                                                   const std::uint64_t at_unix_ms) noexcept {
+            if (activation_store == nullptr || !node_lease) {
+                return std::unexpected(
+                    unavailable("SRV-NODE-EVIDENCE-STATE", "resident node evidence is not initialized"));
+            }
+            const auto evidence_at =
+                std::min(at_unix_ms, node_lease->lease_until_unix_ms > 0U ? node_lease->lease_until_unix_ms - 1U : 0U);
+            auto recorded = activation_store->upsert_node(cluster::DurableResidentNode {
+                .node_id = node_id,
+                .platform_abi = platform_abi,
+                .lease_fence = node_lease->fence,
+                .lease_until_unix_ms = node_lease->lease_until_unix_ms,
+                .updated_at_unix_ms = evidence_at,
+                .serving = serving,
+                .capability_hashes = {},
+            });
+            if (!recorded) {
+                return std::unexpected(
+                    unavailable("SRV-NODE-EVIDENCE-WRITE", "durable resident node evidence could not be recorded"));
+            }
+            return {};
+        }
+
         [[nodiscard]] std::expected<void, ToolFailure> release_node_lease() noexcept {
             if (runtime_store == nullptr || !node_lease) {
                 return {};
             }
-            auto released = runtime_store->release_lease(*node_lease, now_unix_ms());
+            const auto at = now_unix_ms();
+            const auto retired = record_node(false, at);
+            auto released = runtime_store->release_lease(*node_lease, at);
             node_lease.reset();
+            activation_store = nullptr;
             if (!released) {
                 return std::unexpected(
                     unavailable("SRV-NODE-LEASE-RELEASE", "the fenced node lease could not be released"));
+            }
+            if (!retired) {
+                return std::unexpected(retired.error());
             }
             return {};
         }
@@ -2127,16 +2160,25 @@ final activation flip; other control-plane operations remain CLI/backend work.
         }
 
         impl_->runtime_store = std::addressof(context.store);
+        impl_->activation_store = std::addressof(context.activation_store);
+        impl_->node_id = context.config.node_id;
+        impl_->platform_abi = context.config.platform_abi;
+        const auto lease_claimed_at = now_unix_ms();
         const cluster::LeaseResource resource {.scope = "server-node", .key = context.config.node_id};
-        auto lease = context.store.claim_lease(resource, context.config.node_id, now_unix_ms(),
+        auto lease = context.store.claim_lease(resource, context.config.node_id, lease_claimed_at,
                                                static_cast<std::uint64_t>(context.config.lease_duration.count()));
         if (!lease) {
             impl_->runtime_store = nullptr;
+            impl_->activation_store = nullptr;
             return std::unexpected(
                 unavailable("SRV-NODE-LEASE-UNAVAILABLE", "the durable node lease could not be claimed"));
         }
         impl_->node_lease = std::move(*lease);
         impl_->renew_at = std::chrono::steady_clock::now() + context.config.lease_renew_interval;
+        if (auto recorded = impl_->record_node(false, lease_claimed_at); !recorded) {
+            static_cast<void>(impl_->release_node_lease());
+            return std::unexpected(recorded.error());
+        }
 
         auto control_state = context.activation_store.load_state();
         if (!control_state) {
@@ -2233,6 +2275,12 @@ final activation flip; other control-plane operations remain CLI/backend work.
         }
         impl_->scheduler = std::move(*scheduler);
 
+        if (auto recorded = impl_->record_node(true, now_unix_ms()); !recorded) {
+            impl_->stop_services();
+            impl_->close_listeners();
+            static_cast<void>(impl_->release_node_lease());
+            return std::unexpected(recorded.error());
+        }
         impl_->peer_trust_policy = std::addressof(context.peer_trust_policy);
         impl_->qualified = true;
         return {};
@@ -2275,6 +2323,13 @@ final activation flip; other control-plane operations remain CLI/backend work.
                         unavailable("SRV-NODE-LEASE-RENEWAL", "the durable node lease could not be renewed"));
                 }
                 impl_->node_lease = std::move(*renewed);
+                if (auto recorded = impl_->record_node(true, at); !recorded) {
+                    impl_->close_listeners();
+                    impl_->stop_services();
+                    static_cast<void>(impl_->release_node_lease());
+                    impl_->qualified = false;
+                    return std::unexpected(recorded.error());
+                }
                 impl_->renew_at = std::chrono::steady_clock::now() + context.config.lease_renew_interval;
             }
 

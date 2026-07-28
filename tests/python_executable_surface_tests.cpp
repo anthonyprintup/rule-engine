@@ -271,6 +271,13 @@ TEST_CASE("resident backend seam remains injectable and stop-aware") {
         find_operation_by_idempotency(std::string_view) const override {
             return std::optional<cluster::AdminOperationRecord> {};
         }
+        [[nodiscard]] std::expected<void, StoreError> upsert_node(const cluster::DurableResidentNode &) override {
+            return {};
+        }
+        [[nodiscard]] std::expected<std::vector<cluster::DurableResidentNode>, StoreError>
+        node_snapshot() const override {
+            return std::vector<cluster::DurableResidentNode> {};
+        }
         [[nodiscard]] std::expected<void, StoreError> commit(const cluster::ControlPlaneCommit &) override {
             return {};
         }
@@ -816,6 +823,15 @@ namespace {
             ++reads;
             return std::optional<py::cluster::AdminOperationRecord> {};
         }
+        [[nodiscard]] std::expected<void, py::StoreError>
+        upsert_node(const py::cluster::DurableResidentNode &) override {
+            return {};
+        }
+        [[nodiscard]] std::expected<std::vector<py::cluster::DurableResidentNode>, py::StoreError>
+        node_snapshot() const override {
+            ++reads;
+            return std::vector<py::cluster::DurableResidentNode> {};
+        }
         [[nodiscard]] std::expected<void, py::StoreError> commit(const py::cluster::ControlPlaneCommit &) override {
             ++commits;
             return {};
@@ -1055,6 +1071,16 @@ namespace {
                 operations, [&](const auto &entry) { return entry.second.idempotency_key == idempotency_key; });
             return found == operations.end() ? std::optional<py::cluster::AdminOperationRecord> {} :
                                                std::optional<py::cluster::AdminOperationRecord> {found->second};
+        }
+
+        [[nodiscard]] std::expected<void, py::StoreError>
+        upsert_node(const py::cluster::DurableResidentNode &) override {
+            return {};
+        }
+
+        [[nodiscard]] std::expected<std::vector<py::cluster::DurableResidentNode>, py::StoreError>
+        node_snapshot() const override {
+            return std::vector<py::cluster::DurableResidentNode> {};
         }
 
         [[nodiscard]] std::expected<void, py::StoreError>

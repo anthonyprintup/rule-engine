@@ -20,6 +20,9 @@ namespace rule_engine::python::cluster::control_serialization {
             operation = 3,
             activation_fingerprint = 4,
             rollback_fingerprint = 5,
+            node = 6,
+            generation_v2 = 7,
+            stage_fingerprint = 8,
         };
 
         struct Writer {
@@ -333,10 +336,28 @@ namespace rule_engine::python::cluster::control_serialization {
             return result;
         }
 
-        void write_generation(Writer &writer, const GenerationSnapshot &generation) {
+        void write_target(Writer &writer, const StageTargetNode &target) {
+            writer.string(target.node_id);
+            writer.string(target.platform_abi);
+            writer.number(target.lease_fence);
+            writer.number(target.lease_until_unix_ms);
+            write_strings(writer, target.capability_hashes);
+        }
+
+        StageTargetNode read_target(Reader &reader) {
+            return StageTargetNode {.node_id = reader.string(),
+                                    .platform_abi = reader.string(),
+                                    .lease_fence = reader.number<std::uint64_t>(),
+                                    .lease_until_unix_ms = reader.number<std::uint64_t>(),
+                                    .capability_hashes = read_strings(reader)};
+        }
+
+        void write_generation_v2(Writer &writer, const GenerationSnapshot &generation) {
             write_request(writer, generation.request);
             writer.u8(static_cast<std::uint8_t>(generation.phase));
             write_strings(writer, generation.target_nodes);
+            writer.number(writer.count(generation.targets.size()));
+            for (const auto &target : generation.targets) { write_target(writer, target); }
             writer.number(writer.count(generation.reports.size()));
             for (const auto &report : generation.reports) { write_report(writer, report); }
             writer.string(generation.semantic_hash);
@@ -345,10 +366,11 @@ namespace rule_engine::python::cluster::control_serialization {
             writer.string(generation.failure);
         }
 
-        GenerationSnapshot read_generation(Reader &reader) {
+        GenerationSnapshot read_generation_v1(Reader &reader) {
             GenerationSnapshot result {.request = read_request(reader),
                                        .phase = GenerationPhase::compiling,
                                        .target_nodes = {},
+                                       .targets = {},
                                        .reports = {},
                                        .semantic_hash = {},
                                        .binding_hash = {},
@@ -363,6 +385,39 @@ namespace rule_engine::python::cluster::control_serialization {
             const auto count = reader.count();
             result.reports.reserve(count);
             for (std::uint32_t index = 0; index < count; ++index) { result.reports.push_back(read_report(reader)); }
+            result.semantic_hash = reader.string();
+            result.binding_hash = reader.string();
+            result.requeued_work = read_strings(reader);
+            result.failure = reader.string();
+            return result;
+        }
+
+        GenerationSnapshot read_generation_v2(Reader &reader) {
+            GenerationSnapshot result {.request = read_request(reader),
+                                       .phase = GenerationPhase::compiling,
+                                       .target_nodes = {},
+                                       .targets = {},
+                                       .reports = {},
+                                       .semantic_hash = {},
+                                       .binding_hash = {},
+                                       .requeued_work = {},
+                                       .failure = {}};
+            const auto phase = reader.u8();
+            if (phase > static_cast<std::uint8_t>(GenerationPhase::failed) && reader.error.empty()) {
+                reader.error = "control-plane generation phase is invalid";
+            }
+            result.phase = static_cast<GenerationPhase>(phase);
+            result.target_nodes = read_strings(reader);
+            const auto target_count = reader.count();
+            result.targets.reserve(target_count);
+            for (std::uint32_t index = 0; index < target_count; ++index) {
+                result.targets.push_back(read_target(reader));
+            }
+            const auto report_count = reader.count();
+            result.reports.reserve(report_count);
+            for (std::uint32_t index = 0; index < report_count; ++index) {
+                result.reports.push_back(read_report(reader));
+            }
             result.semantic_hash = reader.string();
             result.binding_hash = reader.string();
             result.requeued_work = read_strings(reader);
@@ -390,6 +445,26 @@ namespace rule_engine::python::cluster::control_serialization {
                                                .drain_boundary = read_optional_u64(reader),
                                                .drain_target = read_optional_u64(reader),
                                                .pending_requeues = read_strings(reader)};
+        }
+
+        void write_node(Writer &writer, const DurableResidentNode &node) {
+            writer.string(node.node_id);
+            writer.string(node.platform_abi);
+            writer.number(node.lease_fence);
+            writer.number(node.lease_until_unix_ms);
+            writer.number(node.updated_at_unix_ms);
+            writer.boolean(node.serving);
+            write_strings(writer, node.capability_hashes);
+        }
+
+        DurableResidentNode read_node(Reader &reader) {
+            return DurableResidentNode {.node_id = reader.string(),
+                                        .platform_abi = reader.string(),
+                                        .lease_fence = reader.number<std::uint64_t>(),
+                                        .lease_until_unix_ms = reader.number<std::uint64_t>(),
+                                        .updated_at_unix_ms = reader.number<std::uint64_t>(),
+                                        .serving = reader.boolean(),
+                                        .capability_hashes = read_strings(reader)};
         }
 
         void write_receipt(Writer &writer, const ActivationReceipt &receipt) {
@@ -511,11 +586,18 @@ namespace rule_engine::python::cluster::control_serialization {
     } // namespace
 
     std::expected<std::vector<std::byte>, CodecError> encode(const GenerationSnapshot &value) {
-        return encode_value(PayloadKind::generation, value, write_generation);
+        return encode_value(PayloadKind::generation_v2, value, write_generation_v2);
     }
 
     std::expected<GenerationSnapshot, CodecError> decode_generation(const std::span<const std::byte> bytes) {
-        return decode_value<GenerationSnapshot>(bytes, PayloadKind::generation, read_generation);
+        if (bytes.size() < sizeof(std::uint32_t) + sizeof(std::uint8_t)) {
+            return std::unexpected(CodecError {.message = "control-plane payload is truncated"});
+        }
+        const auto kind = static_cast<PayloadKind>(std::to_integer<std::uint8_t>(bytes[sizeof(std::uint32_t)]));
+        if (kind == PayloadKind::generation) {
+            return decode_value<GenerationSnapshot>(bytes, PayloadKind::generation, read_generation_v1);
+        }
+        return decode_value<GenerationSnapshot>(bytes, PayloadKind::generation_v2, read_generation_v2);
     }
 
     std::expected<std::vector<std::byte>, CodecError> encode(const DurablePackControlSnapshot &value) {
@@ -524,6 +606,14 @@ namespace rule_engine::python::cluster::control_serialization {
 
     std::expected<DurablePackControlSnapshot, CodecError> decode_pack(const std::span<const std::byte> bytes) {
         return decode_value<DurablePackControlSnapshot>(bytes, PayloadKind::pack, read_pack);
+    }
+
+    std::expected<std::vector<std::byte>, CodecError> encode(const DurableResidentNode &value) {
+        return encode_value(PayloadKind::node, value, write_node);
+    }
+
+    std::expected<DurableResidentNode, CodecError> decode_node(const std::span<const std::byte> bytes) {
+        return decode_value<DurableResidentNode>(bytes, PayloadKind::node, read_node);
     }
 
     std::expected<std::vector<std::byte>, CodecError> encode(const AdminOperationRecord &value) {
@@ -541,6 +631,11 @@ namespace rule_engine::python::cluster::control_serialization {
                                 write_id(writer, pack);
                                 writer.number(generation);
                             });
+    }
+
+    std::expected<std::vector<std::byte>, CodecError> stage_fingerprint(const GenerationRequest &request) {
+        return encode_value(PayloadKind::stage_fingerprint, request,
+                            [](Writer &writer, const GenerationRequest &value) { write_request(writer, value); });
     }
 
     std::expected<std::vector<std::byte>, CodecError>

@@ -175,6 +175,40 @@ namespace rule_engine::python::cluster {
     }
 
     std::expected<AdminOperationRecord, AuthorizedAdminError>
+    AuthorizedActivationAdmin::preview_server_stage(const AdminCallContext &context, const TenantId &tenant,
+                                                    const AdminMutationRequest &request,
+                                                    const GenerationRequest &generation) {
+        const AdminAuthorizationRequest authorization {
+            .operation = AdminControlOperation::stage_preview,
+            .resource = operation_resource(tenant, generation.pack, request.operation_id),
+        };
+        const auto principal = authorize(context, authorization);
+        if (!principal) {
+            return std::unexpected(principal.error());
+        }
+        auto attributed = request;
+        attributed.actor = (*principal)->principal_id;
+        return mapped(admin_.preview_server_stage(attributed, generation));
+    }
+
+    std::expected<GenerationSnapshot, AuthorizedAdminError>
+    AuthorizedActivationAdmin::begin_server_stage(const AdminCallContext &context, const TenantId &tenant,
+                                                  const AdminApplyRequest &request,
+                                                  const GenerationRequest &generation) {
+        const AdminAuthorizationRequest authorization {
+            .operation = AdminControlOperation::stage_apply,
+            .resource = operation_resource(tenant, generation.pack, request.operation_id),
+        };
+        if (auto authorized = authorize(context, authorization); !authorized) {
+            return std::unexpected(authorized.error());
+        }
+        if (auto verified = verify_operation_pack(request, generation.pack); !verified) {
+            return std::unexpected(verified.error());
+        }
+        return mapped(admin_.begin_server_stage(request, generation));
+    }
+
+    std::expected<AdminOperationRecord, AuthorizedAdminError>
     AuthorizedActivationAdmin::preview_activation(const AdminCallContext &context, const TenantId &tenant,
                                                   const AdminMutationRequest &request, const PackId &pack,
                                                   const std::uint64_t target_generation) {

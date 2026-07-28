@@ -34,6 +34,10 @@ namespace rule_engine::python::cluster {
                 generation.request.state_transition.target_namespace = generation.request.state_namespace;
             }
             generation.target_nodes = normalized(std::move(generation.target_nodes));
+            for (auto &target : generation.targets) {
+                target.capability_hashes = normalized(std::move(target.capability_hashes));
+            }
+            std::ranges::sort(generation.targets, {}, &StageTargetNode::node_id);
             for (auto &report : generation.reports) {
                 report.capability_hashes = normalized(std::move(report.capability_hashes));
             }
@@ -75,6 +79,44 @@ namespace rule_engine::python::cluster {
                             invalid("a staged node does not provide every required capability hash"));
                     }
                 }
+            }
+            if (!generation.targets.empty()) {
+                if (generation.targets.size() != generation.target_nodes.size()) {
+                    return std::unexpected(invalid("staged target evidence does not match the target node set"));
+                }
+                for (std::size_t index = 0; index < generation.targets.size(); ++index) {
+                    const auto &target = generation.targets[index];
+                    if (target.node_id != generation.target_nodes[index] || target.platform_abi.empty() ||
+                        target.lease_fence == 0 || target.lease_until_unix_ms == 0) {
+                        return std::unexpected(invalid("staged target evidence is incomplete or inconsistent"));
+                    }
+                    for (const auto &required : request.required_capability_hashes) {
+                        if (!std::ranges::binary_search(target.capability_hashes, required)) {
+                            return std::unexpected(
+                                invalid("a staged target does not advertise every required capability hash"));
+                        }
+                    }
+                }
+            }
+            return {};
+        }
+
+        GenerationRequest canonical_request(GenerationRequest request) {
+            request.required_capability_hashes = normalized(std::move(request.required_capability_hashes));
+            if (request.state_transition.target_namespace.empty()) {
+                request.state_transition.target_namespace = request.state_namespace;
+            }
+            return request;
+        }
+
+        std::expected<void, StoreError> validate_server_stage_request(const GenerationRequest &request) {
+            if (request.pack.empty() || request.version.empty() || request.source_digest.empty() ||
+                request.generation == 0 || request.state_schema_hash.empty() || request.state_namespace.empty() ||
+                !request.signature_verified || request.rollback_from ||
+                request.state_transition.target_namespace != request.state_namespace ||
+                std::ranges::any_of(request.required_capability_hashes,
+                                    [](const auto &capability) { return capability.empty(); })) {
+                return std::unexpected(invalid("server-owned stage request metadata is incomplete"));
             }
             return {};
         }
@@ -472,6 +514,257 @@ namespace rule_engine::python::cluster {
             return std::unexpected(committed.error());
         }
         return canonical;
+    }
+
+    std::expected<AdminOperationRecord, StoreError>
+    DurableActivationAdmin::preview_server_stage(const AdminMutationRequest &request,
+                                                 const GenerationRequest &generation) {
+        if (auto valid = validate_mutation_request(request); !valid) {
+            return std::unexpected(valid.error());
+        }
+        auto canonical = canonical_request(generation);
+        if (auto valid = validate_server_stage_request(canonical); !valid) {
+            return std::unexpected(valid.error());
+        }
+        auto fingerprint = control_serialization::stage_fingerprint(canonical);
+        if (!fingerprint) {
+            return std::unexpected(invalid("server-owned stage preview could not be canonicalized"));
+        }
+        auto idempotent =
+            resolve_preview_idempotency(store_, request, AdminOperationKind::stage, canonical.pack, *fingerprint);
+        if (!idempotent) {
+            return std::unexpected(idempotent.error());
+        }
+        if (*idempotent) {
+            return **idempotent;
+        }
+        auto state = store_.load_state();
+        if (!state) {
+            return std::unexpected(state.error());
+        }
+        if (pack_version(*state, canonical.pack) != request.expected_pack_version ||
+            !generation_number_available(*state, canonical.pack, canonical.generation)) {
+            return std::unexpected(stale("server-owned stage preview uses a stale pack version or generation"));
+        }
+        if (auto transition = validate_state_transition(*state, canonical); !transition) {
+            return std::unexpected(transition.error());
+        }
+        AdminOperationRecord operation {.operation_id = request.operation_id,
+                                        .request_id = request.request_id,
+                                        .idempotency_key = request.idempotency_key,
+                                        .request_fingerprint = std::move(*fingerprint),
+                                        .actor = request.actor,
+                                        .reason = request.reason,
+                                        .kind = AdminOperationKind::stage,
+                                        .phase = AdminOperationPhase::previewed,
+                                        .pack = canonical.pack,
+                                        .target_generation = canonical.generation,
+                                        .rollback_source_generation = std::nullopt,
+                                        .previous_active_generation = std::nullopt,
+                                        .state_transition = canonical.state_transition,
+                                        .expected_pack_version = request.expected_pack_version,
+                                        .created_at_unix_ms = request.at_unix_ms,
+                                        .updated_at_unix_ms = request.at_unix_ms,
+                                        .drain_boundary = std::nullopt,
+                                        .requeued_work = {},
+                                        .result = std::nullopt,
+                                        .failure = {}};
+        const auto expected_storage_revision = state->storage_revision;
+        auto audit =
+            admin_audit(request.at_unix_ms, operation, "admin.pack.stage.preview", "previewed", request.reason);
+        if (auto committed =
+                commit_transition(store_, expected_storage_revision, std::move(*state), operation, std::move(audit));
+            !committed) {
+            return std::unexpected(committed.error());
+        }
+        return operation;
+    }
+
+    std::expected<GenerationSnapshot, StoreError>
+    DurableActivationAdmin::begin_server_stage(const AdminApplyRequest &request, const GenerationRequest &generation) {
+        auto operation = load_apply_operation(store_, request);
+        if (!operation) {
+            return std::unexpected(operation.error());
+        }
+        auto canonical = canonical_request(generation);
+        auto fingerprint = control_serialization::stage_fingerprint(canonical);
+        if (!fingerprint || operation->request_fingerprint != *fingerprint ||
+            operation->kind != AdminOperationKind::stage) {
+            return std::unexpected(invalid("server-owned stage apply does not match its preview"));
+        }
+        auto state = store_.load_state();
+        if (!state) {
+            return std::unexpected(state.error());
+        }
+        if (const auto *existing = find_generation(*state, operation->pack, operation->target_generation);
+            existing != nullptr) {
+            if (existing->request.pack != canonical.pack || existing->request.generation != canonical.generation ||
+                existing->request.source_digest != canonical.source_digest) {
+                return std::unexpected(invalid("server-owned stage retry changed durable generation metadata"));
+            }
+            return *existing;
+        }
+        if (operation->phase != AdminOperationPhase::previewed ||
+            request.expected_pack_version != operation->expected_pack_version ||
+            pack_version(*state, operation->pack) != request.expected_pack_version ||
+            !generation_number_available(*state, operation->pack, operation->target_generation)) {
+            return std::unexpected(stale("server-owned stage apply uses a stale pack version or generation"));
+        }
+        if (auto valid = validate_server_stage_request(canonical); !valid) {
+            return std::unexpected(valid.error());
+        }
+        if (auto transition = validate_state_transition(*state, canonical); !transition) {
+            return std::unexpected(transition.error());
+        }
+        auto nodes = store_.node_snapshot();
+        if (!nodes) {
+            return std::unexpected(nodes.error());
+        }
+        GenerationSnapshot snapshot {.request = canonical,
+                                     .phase = GenerationPhase::compiling,
+                                     .target_nodes = {},
+                                     .targets = {},
+                                     .reports = {},
+                                     .semantic_hash = {},
+                                     .binding_hash = {},
+                                     .requeued_work = {},
+                                     .failure = {}};
+        for (const auto &node : *nodes) {
+            const auto capabilities_match =
+                std::ranges::all_of(canonical.required_capability_hashes, [&](const auto &required) {
+                    return std::ranges::binary_search(node.capability_hashes, required);
+                });
+            if (!node.serving || node.lease_until_unix_ms <= request.at_unix_ms || !capabilities_match) {
+                continue;
+            }
+            snapshot.target_nodes.push_back(node.node_id);
+            snapshot.targets.push_back(StageTargetNode {.node_id = node.node_id,
+                                                        .platform_abi = node.platform_abi,
+                                                        .lease_fence = node.lease_fence,
+                                                        .lease_until_unix_ms = node.lease_until_unix_ms,
+                                                        .capability_hashes = node.capability_hashes});
+        }
+        snapshot = canonical_generation(std::move(snapshot));
+        if (snapshot.targets.empty()) {
+            return std::unexpected(
+                control_error(StoreErrorCode::unavailable, "no eligible serving resident nodes are available", true));
+        }
+        auto &pack = ensure_pack(*state, operation->pack);
+        if (auto advanced = advance_pack(pack); !advanced) {
+            return std::unexpected(advanced.error());
+        }
+        state->generations.push_back(snapshot);
+        operation->expected_pack_version = pack.resource_version;
+        operation->updated_at_unix_ms = request.at_unix_ms;
+        const auto expected_storage_revision = state->storage_revision;
+        auto audit = admin_audit(request.at_unix_ms, *operation, "admin.pack.stage.apply", "compiling",
+                                 std::to_string(snapshot.targets.size()));
+        if (auto committed =
+                commit_transition(store_, expected_storage_revision, std::move(*state), *operation, std::move(audit));
+            !committed) {
+            return std::unexpected(committed.error());
+        }
+        return snapshot;
+    }
+
+    std::expected<GenerationSnapshot, StoreError>
+    DurableActivationAdmin::report_server_compilation(const std::string_view operation_id,
+                                                      const CompilationReport &report, const std::uint64_t at_unix_ms) {
+        auto operation = store_.find_operation(operation_id);
+        if (!operation) {
+            return std::unexpected(operation.error());
+        }
+        if (!*operation || (*operation)->kind != AdminOperationKind::stage || at_unix_ms == 0U) {
+            return std::unexpected(invalid("server compilation report does not name a stage operation"));
+        }
+        auto state = store_.load_state();
+        if (!state) {
+            return std::unexpected(state.error());
+        }
+        auto *generation = find_generation(*state, (*operation)->pack, (*operation)->target_generation);
+        auto *pack = find_pack(*state, (*operation)->pack);
+        if (generation == nullptr || pack == nullptr) {
+            return std::unexpected(invalid("server compilation report generation is missing"));
+        }
+        auto canonical_report = report;
+        canonical_report.capability_hashes = normalized(std::move(canonical_report.capability_hashes));
+        const auto target = std::ranges::find(generation->targets, canonical_report.node_id, &StageTargetNode::node_id);
+        if (target == generation->targets.end() || canonical_report.node_lease_fence != target->lease_fence) {
+            return std::unexpected(stale("server compilation report does not match the frozen target lease"));
+        }
+        const auto existing =
+            std::ranges::find(generation->reports, canonical_report.node_id, &CompilationReport::node_id);
+        if (existing != generation->reports.end()) {
+            if (existing->node_lease_fence != canonical_report.node_lease_fence ||
+                existing->success != canonical_report.success ||
+                existing->semantic_hash != canonical_report.semantic_hash ||
+                existing->binding_hash != canonical_report.binding_hash ||
+                existing->executable_hash != canonical_report.executable_hash ||
+                existing->capability_hashes != canonical_report.capability_hashes) {
+                return std::unexpected(invalid("server compilation report retry changed durable evidence"));
+            }
+            return *generation;
+        }
+        if ((*operation)->phase != AdminOperationPhase::previewed || generation->phase != GenerationPhase::compiling) {
+            return std::unexpected(invalid("stage operation no longer accepts compilation reports"));
+        }
+        auto nodes = store_.node_snapshot();
+        if (!nodes) {
+            return std::unexpected(nodes.error());
+        }
+        const auto node = std::ranges::find(*nodes, canonical_report.node_id, &DurableResidentNode::node_id);
+        if (node == nodes->end() || !node->serving || node->lease_fence != target->lease_fence ||
+            node->lease_until_unix_ms <= at_unix_ms || node->platform_abi != target->platform_abi ||
+            node->capability_hashes != target->capability_hashes) {
+            return std::unexpected(stale("server compilation report target lease is no longer current"));
+        }
+        if (canonical_report.success &&
+            (canonical_report.semantic_hash.empty() || canonical_report.binding_hash.empty() ||
+             canonical_report.executable_hash.empty() ||
+             !std::ranges::all_of(generation->request.required_capability_hashes, [&](const auto &required) {
+                 return std::ranges::binary_search(canonical_report.capability_hashes, required);
+             }))) {
+            return std::unexpected(invalid("successful server compilation report is incomplete"));
+        }
+        if (canonical_report.success && !generation->reports.empty() &&
+            (generation->semantic_hash != canonical_report.semantic_hash ||
+             generation->binding_hash != canonical_report.binding_hash)) {
+            canonical_report.success = false;
+        }
+        generation->reports.push_back(std::move(canonical_report));
+        std::ranges::sort(generation->reports, {}, &CompilationReport::node_id);
+        if (!generation->reports.back().success ||
+            std::ranges::any_of(generation->reports, [](const auto &candidate) { return !candidate.success; })) {
+            generation->phase = GenerationPhase::failed;
+            generation->failure = "resident compilation failed or disagreed";
+            (*operation)->phase = AdminOperationPhase::failed;
+            (*operation)->failure = generation->failure;
+        } else {
+            generation->semantic_hash = generation->reports.front().semantic_hash;
+            generation->binding_hash = generation->reports.front().binding_hash;
+            if (generation->reports.size() == generation->targets.size()) {
+                generation->phase = GenerationPhase::ready;
+                (*operation)->phase = AdminOperationPhase::staged;
+            }
+        }
+        if (auto advanced = advance_pack(*pack); !advanced) {
+            return std::unexpected(advanced.error());
+        }
+        (*operation)->expected_pack_version = pack->resource_version;
+        (*operation)->updated_at_unix_ms = at_unix_ms;
+        const auto expected_storage_revision = state->storage_revision;
+        const auto outcome = (*operation)->phase == AdminOperationPhase::failed ? "failed" :
+                             (*operation)->phase == AdminOperationPhase::staged ? "staged" :
+                                                                                  "compiling";
+        auto audit = admin_audit(at_unix_ms, **operation, "resident.pack.stage.report", outcome,
+                                 std::to_string(generation->reports.size()));
+        auto result = *generation;
+        if (auto committed =
+                commit_transition(store_, expected_storage_revision, std::move(*state), **operation, std::move(audit));
+            !committed) {
+            return std::unexpected(committed.error());
+        }
+        return result;
     }
 
     std::expected<AdminOperationRecord, StoreError>

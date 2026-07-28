@@ -70,6 +70,16 @@ namespace rule_engine::python::cluster {
         std::vector<std::string> pending_requeues;
     };
 
+    struct DurableResidentNode {
+        std::string node_id;
+        std::string platform_abi;
+        std::uint64_t lease_fence {};
+        std::uint64_t lease_until_unix_ms {};
+        std::uint64_t updated_at_unix_ms {};
+        bool serving {};
+        std::vector<std::string> capability_hashes;
+    };
+
     struct DurableControlState {
         std::uint64_t storage_revision {};
         std::vector<GenerationSnapshot> generations;
@@ -97,6 +107,8 @@ namespace rule_engine::python::cluster {
         find_operation(std::string_view operation_id) const = 0;
         [[nodiscard]] virtual std::expected<std::optional<AdminOperationRecord>, StoreError>
         find_operation_by_idempotency(std::string_view idempotency_key) const = 0;
+        [[nodiscard]] virtual std::expected<void, StoreError> upsert_node(const DurableResidentNode &node) = 0;
+        [[nodiscard]] virtual std::expected<std::vector<DurableResidentNode>, StoreError> node_snapshot() const = 0;
         [[nodiscard]] virtual std::expected<void, StoreError> commit(const ControlPlaneCommit &commit) = 0;
         [[nodiscard]] virtual std::expected<ControlPlaneInspection, StoreError> inspect() const = 0;
         [[nodiscard]] virtual RuntimeStoreHealth health() const = 0;
@@ -115,6 +127,8 @@ namespace rule_engine::python::cluster {
         find_operation(std::string_view operation_id) const override;
         [[nodiscard]] std::expected<std::optional<AdminOperationRecord>, StoreError>
         find_operation_by_idempotency(std::string_view idempotency_key) const override;
+        [[nodiscard]] std::expected<void, StoreError> upsert_node(const DurableResidentNode &node) override;
+        [[nodiscard]] std::expected<std::vector<DurableResidentNode>, StoreError> node_snapshot() const override;
         [[nodiscard]] std::expected<void, StoreError> commit(const ControlPlaneCommit &commit) override;
         [[nodiscard]] std::expected<ControlPlaneInspection, StoreError> inspect() const override;
         [[nodiscard]] RuntimeStoreHealth health() const override;
@@ -140,6 +154,8 @@ namespace rule_engine::python::cluster {
         find_operation(std::string_view operation_id) const override;
         [[nodiscard]] std::expected<std::optional<AdminOperationRecord>, StoreError>
         find_operation_by_idempotency(std::string_view idempotency_key) const override;
+        [[nodiscard]] std::expected<void, StoreError> upsert_node(const DurableResidentNode &node) override;
+        [[nodiscard]] std::expected<std::vector<DurableResidentNode>, StoreError> node_snapshot() const override;
         [[nodiscard]] std::expected<void, StoreError> commit(const ControlPlaneCommit &commit) override;
         [[nodiscard]] std::expected<ControlPlaneInspection, StoreError> inspect() const override;
         [[nodiscard]] RuntimeStoreHealth health() const override;
@@ -160,6 +176,13 @@ namespace rule_engine::python::cluster {
         preview_stage(const AdminMutationRequest &request, const GenerationSnapshot &generation);
         [[nodiscard]] std::expected<GenerationSnapshot, StoreError> apply_stage(const AdminApplyRequest &request,
                                                                                 const GenerationSnapshot &generation);
+        [[nodiscard]] std::expected<AdminOperationRecord, StoreError>
+        preview_server_stage(const AdminMutationRequest &request, const GenerationRequest &generation);
+        [[nodiscard]] std::expected<GenerationSnapshot, StoreError>
+        begin_server_stage(const AdminApplyRequest &request, const GenerationRequest &generation);
+        [[nodiscard]] std::expected<GenerationSnapshot, StoreError>
+        report_server_compilation(std::string_view operation_id, const CompilationReport &report,
+                                  std::uint64_t at_unix_ms);
 
         [[nodiscard]] std::expected<AdminOperationRecord, StoreError>
         preview_activation(const AdminMutationRequest &request, const PackId &pack, std::uint64_t target_generation);

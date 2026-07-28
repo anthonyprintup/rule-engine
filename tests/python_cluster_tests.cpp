@@ -352,6 +352,12 @@ namespace {
             return operation;
         }
 
+        [[nodiscard]] std::expected<void, StoreError> upsert_node(const DurableResidentNode &) override { return {}; }
+
+        [[nodiscard]] std::expected<std::vector<DurableResidentNode>, StoreError> node_snapshot() const override {
+            return std::vector<DurableResidentNode> {};
+        }
+
         [[nodiscard]] std::expected<void, StoreError> commit(const ControlPlaneCommit &) override {
             ++commit_calls;
             return {};
@@ -877,6 +883,180 @@ namespace {
         REQUIRE(inspection.has_value());
         REQUIRE(inspection->state.generations.size() == 1);
         REQUIRE(inspection->audit.size() == 2);
+    }
+
+    TEST_CASE("durable resident node evidence survives restart and rejects stale lease identity") {
+        TemporaryDatabase database;
+        const DurableResidentNode first {
+            .node_id = "resident-a",
+            .platform_abi = "windows-x86_64-msvc-v1",
+            .lease_fence = 7,
+            .lease_until_unix_ms = 2'000,
+            .updated_at_unix_ms = 1'000,
+            .serving = true,
+            .capability_hashes = {"sha256:capability-a", "sha256:capability-b"},
+        };
+
+        {
+            const auto store = open_control(database);
+            REQUIRE(store.has_value());
+            REQUIRE((*store)->health().schema_version == 2);
+            REQUIRE((*store)->upsert_node(first).has_value());
+
+            auto heartbeat = first;
+            heartbeat.lease_until_unix_ms = 2'500;
+            heartbeat.updated_at_unix_ms = 1'500;
+            REQUIRE((*store)->upsert_node(heartbeat).has_value());
+
+            auto changed_within_fence = heartbeat;
+            changed_within_fence.platform_abi = "linux-x86_64-gnu-v1";
+            changed_within_fence.updated_at_unix_ms = 1'600;
+            const auto rejected = (*store)->upsert_node(changed_within_fence);
+            REQUIRE_FALSE(rejected.has_value());
+            REQUIRE(rejected.error().code == StoreErrorCode::stale_fence);
+        }
+
+        {
+            const auto store = open_control(database);
+            REQUIRE(store.has_value());
+            const auto snapshot = (*store)->node_snapshot();
+            REQUIRE(snapshot.has_value());
+            REQUIRE(snapshot->size() == 1);
+            REQUIRE(snapshot->front().node_id == first.node_id);
+            REQUIRE(snapshot->front().lease_fence == first.lease_fence);
+            REQUIRE(snapshot->front().lease_until_unix_ms == 2'500);
+            REQUIRE(snapshot->front().capability_hashes == first.capability_hashes);
+
+            auto stale = snapshot->front();
+            stale.lease_fence = 6;
+            stale.updated_at_unix_ms = 1'700;
+            const auto rejected = (*store)->upsert_node(stale);
+            REQUIRE_FALSE(rejected.has_value());
+            REQUIRE(rejected.error().code == StoreErrorCode::stale_fence);
+
+            auto successor = snapshot->front();
+            successor.lease_fence = 8;
+            successor.lease_until_unix_ms = 3'000;
+            successor.updated_at_unix_ms = 2'000;
+            successor.serving = false;
+            successor.platform_abi = "windows-x86_64-msvc-v2";
+            successor.capability_hashes = {"sha256:capability-c"};
+            REQUIRE((*store)->upsert_node(successor).has_value());
+            REQUIRE((*store)->node_snapshot()->front().lease_fence == 8);
+            REQUIRE_FALSE((*store)->node_snapshot()->front().serving);
+        }
+    }
+
+    TEST_CASE("server-owned stage freezes resident leases and finalizes only matching reports") {
+        TemporaryDatabase database;
+        const auto requested = generation(1, "sha256:server-owned-source");
+        const auto preview_request = mutation_request("server-owned-stage", 0, 1'000);
+        AdminOperationRecord preview;
+
+        {
+            const auto store = open_control(database);
+            REQUIRE(store.has_value());
+            REQUIRE((*store)
+                        ->upsert_node(DurableResidentNode {.node_id = "node-a",
+                                                           .platform_abi = "windows-x64-v1",
+                                                           .lease_fence = 11,
+                                                           .lease_until_unix_ms = 10'000,
+                                                           .updated_at_unix_ms = 900,
+                                                           .serving = true,
+                                                           .capability_hashes = {}})
+                        .has_value());
+            REQUIRE((*store)
+                        ->upsert_node(DurableResidentNode {.node_id = "node-b",
+                                                           .platform_abi = "linux-x64-v1",
+                                                           .lease_fence = 12,
+                                                           .lease_until_unix_ms = 10'000,
+                                                           .updated_at_unix_ms = 900,
+                                                           .serving = true,
+                                                           .capability_hashes = {}})
+                        .has_value());
+
+            DurableActivationAdmin admin {**store};
+            const auto created = admin.preview_server_stage(preview_request, requested);
+            REQUIRE(created.has_value());
+            preview = *created;
+            const auto compiling = admin.begin_server_stage(apply_request(preview, 0, 1'001), requested);
+            REQUIRE(compiling.has_value());
+            REQUIRE(compiling->phase == GenerationPhase::compiling);
+            REQUIRE(compiling->target_nodes == std::vector<std::string> {"node-a", "node-b"});
+            REQUIRE(compiling->targets.size() == 2);
+            REQUIRE(compiling->targets.front().lease_fence == 11);
+        }
+
+        {
+            const auto store = open_control(database);
+            REQUIRE(store.has_value());
+            DurableActivationAdmin admin {**store};
+
+            auto stale_report = compilation(node("node-a", 10), "sha256:semantic", "sha256:binding");
+            const auto stale = admin.report_server_compilation(preview.operation_id, stale_report, 1'100);
+            REQUIRE_FALSE(stale.has_value());
+            REQUIRE(stale.error().code == StoreErrorCode::stale_fence);
+
+            const auto first = admin.report_server_compilation(
+                preview.operation_id, compilation(node("node-a", 11), "sha256:semantic", "sha256:binding"), 1'101);
+            REQUIRE(first.has_value());
+            REQUIRE(first->phase == GenerationPhase::compiling);
+            REQUIRE(first->reports.size() == 1);
+
+            const auto finalized = admin.report_server_compilation(
+                preview.operation_id, compilation(node("node-b", 12), "sha256:semantic", "sha256:binding"), 1'102);
+            REQUIRE(finalized.has_value());
+            REQUIRE(finalized->phase == GenerationPhase::ready);
+            REQUIRE(finalized->semantic_hash == "sha256:semantic");
+            REQUIRE(finalized->binding_hash == "sha256:binding");
+            REQUIRE(admin.operation_snapshot(preview.operation_id)->value().phase == AdminOperationPhase::staged);
+
+            const auto state = admin.state_snapshot();
+            REQUIRE(state.has_value());
+            REQUIRE(state->packs.front().resource_version == 3);
+            REQUIRE_FALSE(state->packs.front().active_generation.has_value());
+            REQUIRE_FALSE(state->packs.front().accepting_assignments);
+        }
+    }
+
+    TEST_CASE("server-owned stage fails closed when resident compilation disagrees") {
+        TemporaryDatabase database;
+        const auto store = open_control(database);
+        REQUIRE(store.has_value());
+        REQUIRE((*store)
+                    ->upsert_node(DurableResidentNode {.node_id = "node-a",
+                                                       .platform_abi = "windows-x64-v1",
+                                                       .lease_fence = 11,
+                                                       .lease_until_unix_ms = 10'000,
+                                                       .updated_at_unix_ms = 900,
+                                                       .serving = true,
+                                                       .capability_hashes = {}})
+                    .has_value());
+        REQUIRE((*store)
+                    ->upsert_node(DurableResidentNode {.node_id = "node-b",
+                                                       .platform_abi = "linux-x64-v1",
+                                                       .lease_fence = 12,
+                                                       .lease_until_unix_ms = 10'000,
+                                                       .updated_at_unix_ms = 900,
+                                                       .serving = true,
+                                                       .capability_hashes = {}})
+                    .has_value());
+        DurableActivationAdmin admin {**store};
+        const auto requested = generation(1, "sha256:server-owned-source");
+        const auto preview = admin.preview_server_stage(mutation_request("server-owned-mismatch", 0, 1'000), requested);
+        REQUIRE(preview.has_value());
+        REQUIRE(admin.begin_server_stage(apply_request(*preview, 0, 1'001), requested).has_value());
+        REQUIRE(admin
+                    .report_server_compilation(preview->operation_id,
+                                               compilation(node("node-a", 11), "sha256:semantic-a", "sha256:binding"),
+                                               1'100)
+                    .has_value());
+        const auto mismatch = admin.report_server_compilation(
+            preview->operation_id, compilation(node("node-b", 12), "sha256:semantic-b", "sha256:binding"), 1'101);
+        REQUIRE(mismatch.has_value());
+        REQUIRE(mismatch->phase == GenerationPhase::failed);
+        REQUIRE(admin.operation_snapshot(preview->operation_id)->value().phase == AdminOperationPhase::failed);
+        REQUIRE_FALSE(admin.state_snapshot()->packs.front().active_generation.has_value());
     }
 
     TEST_CASE("durable activation operations are idempotent and resume across SQLite restarts") {

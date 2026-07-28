@@ -78,6 +78,19 @@ reconnect polling: it follows the authenticated durable operation identity,
 uses fresh correlated request IDs, stops on staged/applied/failed phases, and
 rejects invalid timeout or interval bounds. This is deterministic client and
 codec evidence, not a live network-partition qualification.
+The activation control schema then advanced to version 2 with durable resident
+node evidence. Focused SQLite restart tests prove canonical node snapshots,
+monotonic lease fences, immutable platform/capability identity within one
+fence, renewal, successor leases, exact frozen stage targets, stale-report
+rejection, restart recovery, all-target semantic/binding agreement, and
+fail-closed disagreement without changing the active generation. The resident
+couples registration and serving-state updates to its runtime lease claim,
+renewal, and release paths. PostgreSQL implements the same transaction and
+row-lock contract, but this remains compile evidence until the live PostgreSQL
+17 qualification cell runs.
+After this schema and staging-foundation slice, the complete Debug graph passed
+38/38 tests in 270.82 seconds, including the clean-install/private-runtime
+smoke.
 This evidence does not qualify live
 PostgreSQL, multiple server processes, network partitions, Linux, or mixed-OS
 operation.

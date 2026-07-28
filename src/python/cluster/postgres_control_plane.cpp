@@ -6,6 +6,7 @@
 #include <libpq-fe.h>
 #endif
 
+#include <algorithm>
 #include <charconv>
 #include <cstdint>
 #include <limits>
@@ -26,7 +27,7 @@ namespace rule_engine::python::cluster {
 
 #if defined(RULE_ENGINE_HAS_POSTGRESQL)
 
-        constexpr std::uint32_t control_schema_version = 1;
+        constexpr std::uint32_t control_schema_version = 2;
 
         StoreError postgres_control_shape(std::string detail) {
             return StoreError {
@@ -317,6 +318,32 @@ CREATE TABLE IF NOT EXISTS re_audit(
                     return std::unexpected(recorded.error());
                 }
             }
+            if (*current < 2) {
+                constexpr std::string_view node_schema = R"sql(
+CREATE TABLE IF NOT EXISTS re_control_nodes(
+    node_id TEXT PRIMARY KEY,
+    platform_abi TEXT NOT NULL,
+    lease_fence BIGINT NOT NULL CHECK(lease_fence>0),
+    lease_until_unix_ms BIGINT NOT NULL CHECK(lease_until_unix_ms>0),
+    updated_at_unix_ms BIGINT NOT NULL CHECK(updated_at_unix_ms>0),
+    serving BOOLEAN NOT NULL,
+    payload BYTEA NOT NULL
+);
+CREATE INDEX IF NOT EXISTS re_control_nodes_lease
+    ON re_control_nodes(lease_until_unix_ms,node_id);
+)sql";
+                auto applied = execute(connection, node_schema);
+                if (!applied) {
+                    return std::unexpected(applied.error());
+                }
+                auto recorded =
+                    execute(connection, "INSERT INTO re_control_schema_migrations(version,name,applied_unix_ms) "
+                                        "VALUES(2,'durable-resident-node-evidence',"
+                                        "(EXTRACT(EPOCH FROM clock_timestamp())*1000)::bigint)");
+                if (!recorded) {
+                    return std::unexpected(recorded.error());
+                }
+            }
             if (auto committed = commit_transaction(connection); !committed) {
                 return std::unexpected(committed.error());
             }
@@ -530,6 +557,96 @@ CREATE TABLE IF NOT EXISTS re_audit(
         return find_operation_unlocked(impl_->connection, false, idempotency_key);
 #else
         static_cast<void>(idempotency_key);
+        return std::unexpected(postgres_control_unavailable("PostgreSQL control plane is not connected"));
+#endif
+    }
+
+    std::expected<void, StoreError> PostgreSqlActivationControlStore::upsert_node(const DurableResidentNode &node) {
+#if defined(RULE_ENGINE_HAS_POSTGRESQL)
+        if (node.node_id.empty() || node.platform_abi.empty() || node.lease_fence == 0 ||
+            node.updated_at_unix_ms == 0 || node.lease_until_unix_ms <= node.updated_at_unix_ms ||
+            !std::ranges::is_sorted(node.capability_hashes) ||
+            std::ranges::adjacent_find(node.capability_hashes) != node.capability_hashes.end() ||
+            std::ranges::any_of(node.capability_hashes, [](const auto &hash) { return hash.empty(); })) {
+            return std::unexpected(postgres_control_shape("durable resident node shape is invalid"));
+        }
+        auto encoded = encode_control(node);
+        if (!encoded) {
+            return std::unexpected(encoded.error());
+        }
+
+        const std::scoped_lock lock {impl_->mutex};
+        if (auto started = begin(impl_->connection, true); !started) {
+            return std::unexpected(started.error());
+        }
+        RollbackGuard guard {.connection = impl_->connection, .active = true};
+        auto existing = execute_params(impl_->connection,
+                                       "SELECT encode(payload,'hex') FROM re_control_nodes WHERE node_id=$1 FOR UPDATE",
+                                       {node.node_id});
+        if (!existing) {
+            return std::unexpected(existing.error());
+        }
+        if (PQntuples(existing->value) == 1) {
+            auto previous =
+                decode_control<DurableResidentNode>("\\x" + field(*existing, 0, 0), control_serialization::decode_node);
+            if (!previous) {
+                return std::unexpected(previous.error());
+            }
+            if (node.lease_fence < previous->lease_fence || node.updated_at_unix_ms < previous->updated_at_unix_ms ||
+                (node.lease_fence == previous->lease_fence &&
+                 (node.platform_abi != previous->platform_abi ||
+                  node.capability_hashes != previous->capability_hashes ||
+                  node.lease_until_unix_ms < previous->lease_until_unix_ms))) {
+                return std::unexpected(StoreError {.code = StoreErrorCode::stale_fence,
+                                                   .message = "durable resident node evidence is stale or changed "
+                                                              "within one lease fence",
+                                                   .retryable = false});
+            }
+        }
+        auto updated = execute_params(
+            impl_->connection,
+            "INSERT INTO re_control_nodes(node_id,platform_abi,lease_fence,lease_until_unix_ms,updated_at_unix_ms,"
+            "serving,payload) VALUES($1,$2,$3::bigint,$4::bigint,$5::bigint,$6::boolean,$7::bytea) "
+            "ON CONFLICT(node_id) DO UPDATE SET platform_abi=excluded.platform_abi,"
+            "lease_fence=excluded.lease_fence,lease_until_unix_ms=excluded.lease_until_unix_ms,"
+            "updated_at_unix_ms=excluded.updated_at_unix_ms,serving=excluded.serving,payload=excluded.payload",
+            {node.node_id, node.platform_abi, std::to_string(node.lease_fence),
+             std::to_string(node.lease_until_unix_ms), std::to_string(node.updated_at_unix_ms),
+             node.serving ? "true" : "false", bytea_text(*encoded)});
+        if (!updated) {
+            return std::unexpected(updated.error());
+        }
+        if (auto committed = commit_transaction(impl_->connection); !committed) {
+            return std::unexpected(committed.error());
+        }
+        guard.active = false;
+        return {};
+#else
+        static_cast<void>(node);
+        return std::unexpected(postgres_control_unavailable("PostgreSQL control plane is not connected"));
+#endif
+    }
+
+    std::expected<std::vector<DurableResidentNode>, StoreError>
+    PostgreSqlActivationControlStore::node_snapshot() const {
+#if defined(RULE_ENGINE_HAS_POSTGRESQL)
+        const std::scoped_lock lock {impl_->mutex};
+        auto result = execute(impl_->connection, "SELECT encode(payload,'hex') FROM re_control_nodes ORDER BY node_id");
+        if (!result) {
+            return std::unexpected(result.error());
+        }
+        std::vector<DurableResidentNode> nodes;
+        nodes.reserve(static_cast<std::size_t>(PQntuples(result->value)));
+        for (int row = 0; row < PQntuples(result->value); ++row) {
+            auto node =
+                decode_control<DurableResidentNode>("\\x" + field(*result, row, 0), control_serialization::decode_node);
+            if (!node) {
+                return std::unexpected(node.error());
+            }
+            nodes.push_back(std::move(*node));
+        }
+        return nodes;
+#else
         return std::unexpected(postgres_control_unavailable("PostgreSQL control plane is not connected"));
 #endif
     }
