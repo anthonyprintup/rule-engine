@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <cctype>
+#include <cerrno>
 #include <fstream>
 #include <limits>
 #include <set>
@@ -13,6 +14,9 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 namespace rule_engine::python::packaging {
@@ -35,6 +39,110 @@ namespace rule_engine::python::packaging {
         PackagingError archive_error(const PackagingErrorCode code, std::string message,
                                      std::optional<std::string> subject = std::nullopt) {
             return PackagingError {.code = code, .message = std::move(message), .subject = std::move(subject)};
+        }
+
+        std::expected<void, PackagingError> write_new_durable(const std::filesystem::path &path,
+                                                              const std::span<const std::byte> bytes) {
+#ifdef _WIN32
+            const auto handle = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW,
+                                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+            if (handle == INVALID_HANDLE_VALUE) {
+                return std::unexpected(archive_error(PackagingErrorCode::filesystem_error,
+                                                     "cannot create immutable source-pack staging file",
+                                                     path.string()));
+            }
+            std::size_t offset {};
+            bool complete {true};
+            while (offset < bytes.size()) {
+                const auto remaining = bytes.size() - offset;
+                const auto chunk = static_cast<DWORD>(
+                    (std::min) (remaining, static_cast<std::size_t>((std::numeric_limits<DWORD>::max)())));
+                DWORD written {};
+                if (WriteFile(handle, bytes.data() + offset, chunk, &written, nullptr) == 0 || written != chunk) {
+                    complete = false;
+                    break;
+                }
+                offset += written;
+            }
+            if (complete && FlushFileBuffers(handle) == 0) {
+                complete = false;
+            }
+            if (CloseHandle(handle) == 0) {
+                complete = false;
+            }
+            if (!complete) {
+                std::error_code ignored;
+                std::filesystem::remove(path, ignored);
+                return std::unexpected(archive_error(PackagingErrorCode::filesystem_error,
+                                                     "cannot durably write immutable source-pack staging file",
+                                                     path.string()));
+            }
+#else
+            const auto descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+            if (descriptor < 0) {
+                return std::unexpected(archive_error(PackagingErrorCode::filesystem_error,
+                                                     "cannot create immutable source-pack staging file",
+                                                     path.string()));
+            }
+            std::size_t offset {};
+            bool complete {true};
+            while (offset < bytes.size()) {
+                const auto written = ::write(descriptor, bytes.data() + offset, bytes.size() - offset);
+                if (written < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    complete = false;
+                    break;
+                }
+                if (written == 0) {
+                    complete = false;
+                    break;
+                }
+                offset += static_cast<std::size_t>(written);
+            }
+            if (complete && ::fsync(descriptor) != 0) {
+                complete = false;
+            }
+            if (::close(descriptor) != 0) {
+                complete = false;
+            }
+            if (!complete) {
+                std::error_code ignored;
+                std::filesystem::remove(path, ignored);
+                return std::unexpected(archive_error(PackagingErrorCode::filesystem_error,
+                                                     "cannot durably write immutable source-pack staging file",
+                                                     path.string()));
+            }
+#endif
+            return {};
+        }
+
+        std::expected<void, PackagingError> validate_registry_directory(const std::filesystem::path &root,
+                                                                        std::filesystem::path &objects) {
+            std::error_code filesystem_error;
+            const auto root_status = std::filesystem::symlink_status(root, filesystem_error);
+            if (filesystem_error || !std::filesystem::is_directory(root_status) ||
+                std::filesystem::is_symlink(root_status)) {
+                return std::unexpected(archive_error(PackagingErrorCode::filesystem_error,
+                                                     "source-pack registry root is unavailable", root.string()));
+            }
+            objects = root / "sha256";
+            if (!std::filesystem::exists(objects, filesystem_error)) {
+                filesystem_error.clear();
+                if (!std::filesystem::create_directory(objects, filesystem_error) || filesystem_error) {
+                    return std::unexpected(archive_error(PackagingErrorCode::filesystem_error,
+                                                         "source-pack object directory cannot be created",
+                                                         objects.string()));
+                }
+            }
+            const auto objects_status = std::filesystem::symlink_status(objects, filesystem_error);
+            if (filesystem_error || !std::filesystem::is_directory(objects_status) ||
+                std::filesystem::is_symlink(objects_status)) {
+                return std::unexpected(archive_error(PackagingErrorCode::filesystem_error,
+                                                     "source-pack object directory is unsafe", objects.string()));
+            }
+            return {};
         }
 
         void append_u16(std::vector<std::byte> &output, const std::uint16_t value) {
@@ -523,6 +631,140 @@ namespace rule_engine::python::packaging {
             return std::unexpected(archive.error());
         }
         return verify_and_load_source_pack(*archive, policy, signature_verifier, limits);
+    }
+
+    std::expected<LoadedSourcePack, PackagingError>
+    publish_verified_source_pack(const std::filesystem::path &root, const std::string_view publication_id,
+                                 const PackId &expected_pack, const SourcePackArchive &archive,
+                                 const TrustPolicy &policy, const SignatureVerifier &signature_verifier,
+                                 const SourcePackLimits &limits) {
+        if (root.empty() || !root.is_absolute() || publication_id.empty() || publication_id.size() > 1'024U ||
+            expected_pack.empty()) {
+            return std::unexpected(
+                archive_error(PackagingErrorCode::invalid_path, "source-pack publication identity is invalid"));
+        }
+        auto loaded = verify_and_load_source_pack(archive, policy, signature_verifier, limits);
+        if (!loaded) {
+            return std::unexpected(std::move(loaded.error()));
+        }
+        if (loaded->manifest.pack != expected_pack) {
+            return std::unexpected(archive_error(PackagingErrorCode::invalid_manifest,
+                                                 "source-pack publication does not match the authorized pack",
+                                                 loaded->manifest.pack.value));
+        }
+        auto encoded = encode_canonical_source_pack(archive, limits);
+        if (!encoded) {
+            return std::unexpected(std::move(encoded.error()));
+        }
+        std::filesystem::path objects;
+        if (auto valid = validate_registry_directory(root, objects); !valid) {
+            return std::unexpected(std::move(valid.error()));
+        }
+        auto destination = content_addressed_source_pack_path(root, loaded->closure_digest);
+        if (!destination) {
+            return std::unexpected(std::move(destination.error()));
+        }
+        const auto publication_bytes = std::as_bytes(std::span {publication_id.data(), publication_id.size()});
+        const auto staging =
+            objects / (destination->filename().string() + "." + sha256_hex(publication_bytes) + ".upload");
+
+        const auto load_existing = [&]() -> std::expected<std::optional<LoadedSourcePack>, PackagingError> {
+            std::error_code filesystem_error;
+            const auto status = std::filesystem::symlink_status(*destination, filesystem_error);
+            if (filesystem_error == std::errc::no_such_file_or_directory) {
+                return std::optional<LoadedSourcePack> {};
+            }
+            if (filesystem_error) {
+                return std::unexpected(archive_error(PackagingErrorCode::filesystem_error,
+                                                     "source-pack registry object cannot be inspected",
+                                                     destination->string()));
+            }
+            if (!std::filesystem::exists(status)) {
+                return std::optional<LoadedSourcePack> {};
+            }
+            if (!std::filesystem::is_regular_file(status) || std::filesystem::is_symlink(status)) {
+                return std::unexpected(archive_error(PackagingErrorCode::filesystem_error,
+                                                     "source-pack registry object is unsafe", destination->string()));
+            }
+            auto existing = read_verify_and_load_source_pack(*destination, policy, signature_verifier, limits);
+            if (!existing) {
+                return std::unexpected(std::move(existing.error()));
+            }
+            if (existing->manifest.pack != expected_pack || existing->closure_digest != loaded->closure_digest) {
+                return std::unexpected(archive_error(PackagingErrorCode::path_collision,
+                                                     "source-pack registry identity collision", destination->string()));
+            }
+            return std::optional<LoadedSourcePack> {std::move(*existing)};
+        };
+
+        auto existing = load_existing();
+        if (!existing) {
+            return std::unexpected(std::move(existing.error()));
+        }
+        if (*existing) {
+            std::error_code ignored;
+            std::filesystem::remove(staging, ignored);
+            return std::move(**existing);
+        }
+
+        if (auto written = write_new_durable(staging, *encoded); !written) {
+            std::error_code inspect_error;
+            const auto staging_status = std::filesystem::symlink_status(staging, inspect_error);
+            if (inspect_error || !std::filesystem::is_regular_file(staging_status) ||
+                std::filesystem::is_symlink(staging_status)) {
+                return std::unexpected(std::move(written.error()));
+            }
+            auto staged = read_canonical_source_pack(staging, limits);
+            if (!staged) {
+                return std::unexpected(std::move(written.error()));
+            }
+            auto staged_bytes = encode_canonical_source_pack(*staged, limits);
+            if (!staged_bytes || *staged_bytes != *encoded) {
+                return std::unexpected(std::move(written.error()));
+            }
+        }
+
+        std::error_code link_error;
+        std::filesystem::create_hard_link(staging, *destination, link_error);
+        if (link_error) {
+            existing = load_existing();
+            if (!existing || !*existing) {
+                std::error_code ignored;
+                std::filesystem::remove(staging, ignored);
+                return !existing ? std::unexpected(std::move(existing.error())) :
+                                   std::unexpected(archive_error(PackagingErrorCode::filesystem_error,
+                                                                 "source-pack object cannot be atomically published",
+                                                                 destination->string()));
+            }
+            std::error_code ignored;
+            std::filesystem::remove(staging, ignored);
+            return std::move(**existing);
+        }
+#ifndef _WIN32
+        const auto directory = ::open(objects.c_str(), O_RDONLY | O_CLOEXEC);
+        auto directory_synced = directory >= 0;
+        if (directory_synced && ::fsync(directory) != 0) {
+            directory_synced = false;
+        }
+        if (directory >= 0 && ::close(directory) != 0) {
+            directory_synced = false;
+        }
+        if (!directory_synced) {
+            std::error_code ignored;
+            std::filesystem::remove(staging, ignored);
+            return std::unexpected(archive_error(PackagingErrorCode::filesystem_error,
+                                                 "source-pack registry directory could not be synchronized",
+                                                 objects.string()));
+        }
+#endif
+        std::error_code remove_error;
+        std::filesystem::remove(staging, remove_error);
+        if (remove_error) {
+            return std::unexpected(archive_error(PackagingErrorCode::filesystem_error,
+                                                 "published source-pack staging link could not be removed",
+                                                 staging.string()));
+        }
+        return loaded;
     }
 
 } // namespace rule_engine::python::packaging

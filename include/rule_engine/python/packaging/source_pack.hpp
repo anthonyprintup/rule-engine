@@ -186,5 +186,14 @@ namespace rule_engine::python::packaging {
     // digest is the verified source-closure identity used by activation.
     [[nodiscard]] std::expected<std::filesystem::path, PackagingError>
     content_addressed_source_pack_path(const std::filesystem::path &root, const SourceDigest &closure_digest);
+    // Verifies provenance and canonical content before atomically publishing
+    // one immutable ROOT/sha256/<digest>.rpack object. Publication never
+    // replaces an existing object; a concurrent equivalent publication is
+    // idempotent and returns the identity actually stored.
+    [[nodiscard]] std::expected<LoadedSourcePack, PackagingError>
+    publish_verified_source_pack(const std::filesystem::path &root, std::string_view publication_id,
+                                 const PackId &expected_pack, const SourcePackArchive &archive,
+                                 const TrustPolicy &policy, const SignatureVerifier &signature_verifier,
+                                 const SourcePackLimits &limits = {});
 
 } // namespace rule_engine::python::packaging

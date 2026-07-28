@@ -1,8 +1,10 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "rule_engine/python/packaging/source_pack.hpp"
 #include "rule_engine/python/protocol/codec.hpp"
 #include "rule_engine/python/tools/admin_client.hpp"
 #include "rule_engine/python/tools/benchmark.hpp"
+#include "rule_engine/python/tools/pack_upload.hpp"
 #include "rule_engine/python/tools/server.hpp"
 
 #ifndef RULE_ENGINE_PYTHON_SERVER_PATH
@@ -723,7 +725,8 @@ namespace {
                     .storage_revision = 0U,
                     .resource_version = 0U,
                     .active_generation = std::nullopt,
-                    .previous_active_generation = std::nullopt};
+                    .previous_active_generation = std::nullopt,
+                    .source_digest = std::nullopt};
         }
     };
 
@@ -864,6 +867,139 @@ namespace {
             };
         }
     };
+
+    struct RecordingUploadBackend final: tools::IResidentPackUploadBackend {
+        std::vector<tools::ResidentAdminRequestKind> calls;
+        std::vector<std::byte> bytes;
+        std::uint64_t total_bytes {};
+
+        [[nodiscard]] std::expected<tools::ResidentPackUploadReceipt, proto::ProtocolError>
+        begin(const py::PackId &, std::string_view, const std::uint64_t total) noexcept override {
+            calls.push_back(tools::ResidentAdminRequestKind::upload_begin);
+            total_bytes = total;
+            return tools::ResidentPackUploadReceipt {
+                .received_bytes = bytes.size(), .total_bytes = total_bytes, .source_digest = std::nullopt};
+        }
+
+        [[nodiscard]] std::expected<tools::ResidentPackUploadReceipt, proto::ProtocolError>
+        append(const py::PackId &, std::string_view, const std::uint64_t offset,
+               const std::span<const std::byte> payload) noexcept override {
+            calls.push_back(tools::ResidentAdminRequestKind::upload_chunk);
+            if (offset != bytes.size() || offset > total_bytes || payload.size() > total_bytes - offset) {
+                return std::unexpected(proto::ProtocolError {.code = proto::ProtocolErrorCode::digest_mismatch,
+                                                             .message = "test upload mismatch"});
+            }
+            bytes.insert(bytes.end(), payload.begin(), payload.end());
+            return tools::ResidentPackUploadReceipt {
+                .received_bytes = bytes.size(), .total_bytes = total_bytes, .source_digest = std::nullopt};
+        }
+
+        [[nodiscard]] std::expected<tools::ResidentPackUploadReceipt, proto::ProtocolError>
+        finalize(const py::PackId &, std::string_view) noexcept override {
+            calls.push_back(tools::ResidentAdminRequestKind::upload_finalize);
+            if (bytes.size() != total_bytes) {
+                return std::unexpected(proto::ProtocolError {.code = proto::ProtocolErrorCode::digest_mismatch,
+                                                             .message = "test upload incomplete"});
+            }
+            return tools::ResidentPackUploadReceipt {
+                .received_bytes = bytes.size(),
+                .total_bytes = total_bytes,
+                .source_digest =
+                    py::SourceDigest {"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+            };
+        }
+    };
+
+    struct ResumingUploadTransport final: tools::IResidentAdminRequestTransport {
+        std::vector<tools::ResidentAdminRequest> requests;
+
+        [[nodiscard]] std::expected<tools::ResidentAdminResponse, tools::ToolFailure>
+        exchange(const tools::AdminEndpointConfiguration &, const tools::ResidentAdminRequest &request) override {
+            requests.push_back(request);
+            tools::ResidentAdminResponse response {
+                .status = tools::ResidentAdminResponseStatus::ok,
+                .request_id = request.request_id,
+                .code = "OK",
+                .diagnostic = {},
+                .storage_revision = 0U,
+                .resource_version = 0U,
+                .active_generation = std::nullopt,
+                .previous_active_generation = std::nullopt,
+                .operation_phase = {},
+                .target_generation = 0U,
+                .drain_boundary = 0U,
+                .assignment_fence = 0U,
+                .work_ids = {},
+                .upload_received_bytes = 0U,
+                .upload_total_bytes = request.upload_total_bytes,
+                .source_digest = std::nullopt,
+            };
+            if (request.kind == tools::ResidentAdminRequestKind::upload_begin) {
+                response.upload_received_bytes = 2U;
+                return response;
+            }
+            if (request.kind == tools::ResidentAdminRequestKind::upload_chunk) {
+                response.upload_received_bytes = request.upload_offset + request.payload.size();
+                return response;
+            }
+            if (request.kind == tools::ResidentAdminRequestKind::upload_finalize) {
+                response.upload_received_bytes = request.upload_total_bytes;
+                response.source_digest =
+                    py::SourceDigest {"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"};
+                return response;
+            }
+            return std::unexpected(tools::ToolFailure {
+                .kind = tools::ToolFailureKind::operation,
+                .code = "TEST-REQUEST",
+                .message = "unexpected test request",
+                .diagnostics = {},
+            });
+        }
+    };
+
+    [[nodiscard]] std::vector<std::byte> archive_bytes(const std::string_view value) {
+        return {reinterpret_cast<const std::byte *>(value.data()),
+                reinterpret_cast<const std::byte *>(value.data() + value.size())};
+    }
+
+    [[nodiscard]] py::packaging::SourcePackArchive unsigned_upload_archive() {
+        using namespace py::packaging;
+        SourcePackManifest manifest {
+            .format = 1,
+            .pack = py::PackId {"com.acme.upload"},
+            .version = py::PackVersion {"1.0.0"},
+            .kind = PackKind::rules,
+            .engine_api = 1,
+            .python_version = "3.14.6",
+            .entry_modules = {"acme.rules"},
+            .budget_profile = "balanced.v1",
+            .policy_profile = "development.v1",
+            .generator = std::nullopt,
+            .dependencies = {},
+            .required_capabilities = {},
+            .optional_capabilities = {},
+        };
+        std::vector<ArchiveEntry> payloads {
+            {.path = "rulepack.toml", .bytes = archive_bytes(canonical_manifest(manifest))},
+            {.path = "src/acme/rules.py", .bytes = archive_bytes("def sample() -> bool:\n    return True\n")},
+        };
+        std::ranges::sort(payloads, {}, &ArchiveEntry::path);
+        SourceIndex index;
+        for (const auto &payload : payloads) {
+            index.entries.push_back(SourceIndexEntry {
+                .media_type = payload.path.ends_with(".py") ? "text/x-python" : "application/toml",
+                .path = payload.path,
+                .sha256 = sha256_hex(payload.bytes),
+                .size = payload.bytes.size(),
+            });
+        }
+        SourcePackArchive archive;
+        archive.entries.push_back(
+            ArchiveEntry {.path = "META-INF/index.json", .bytes = archive_bytes(canonical_index(index))});
+        archive.entries.insert(archive.entries.end(), payloads.begin(), payloads.end());
+        std::ranges::sort(archive.entries, {}, &ArchiveEntry::path);
+        return archive;
+    }
 
     struct StatefulControlStore final: py::cluster::IActivationControlStore {
         py::cluster::DurableControlState state;
@@ -1079,13 +1215,15 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
                                      .request_id = "request:pack",
                                      .tenant = py::TenantId {"tenant:test"},
                                      .pack = py::PackId {"pack:test"},
-                                     .at_unix_ms = 10U},
+                                     .at_unix_ms = 10U,
+                                     .payload = {}},
         tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::operation_snapshot,
                                      .request_id = "request:operation",
                                      .tenant = py::TenantId {"tenant:test"},
                                      .pack = py::PackId {"pack:test"},
                                      .operation_id = "operation:test",
-                                     .at_unix_ms = 10U},
+                                     .at_unix_ms = 10U,
+                                     .payload = {}},
         tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::activation_preview,
                                      .request_id = "request:preview",
                                      .tenant = py::TenantId {"tenant:test"},
@@ -1095,7 +1233,8 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
                                      .expected_pack_version = 1U,
                                      .at_unix_ms = 10U,
                                      .reason = "test activation",
-                                     .target_generation = 2U},
+                                     .target_generation = 2U,
+                                     .payload = {}},
         tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::activation_drain,
                                      .request_id = "request:drain",
                                      .tenant = py::TenantId {"tenant:test"},
@@ -1104,7 +1243,8 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
                                      .idempotency_key = "idempotency:test",
                                      .expected_pack_version = 1U,
                                      .at_unix_ms = 10U,
-                                     .drain_boundary = 42U},
+                                     .drain_boundary = 42U,
+                                     .payload = {}},
         tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::activation_fence,
                                      .request_id = "request:fence",
                                      .tenant = py::TenantId {"tenant:test"},
@@ -1113,7 +1253,8 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
                                      .idempotency_key = "idempotency:test",
                                      .expected_pack_version = 2U,
                                      .at_unix_ms = 10U,
-                                     .work_ids = {"work:b", "work:a"}},
+                                     .work_ids = {"work:b", "work:a"},
+                                     .payload = {}},
         tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::activation_flip,
                                      .request_id = "request:flip",
                                      .tenant = py::TenantId {"tenant:test"},
@@ -1121,7 +1262,35 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
                                      .operation_id = "operation:test",
                                      .idempotency_key = "idempotency:test",
                                      .expected_pack_version = 3U,
-                                     .at_unix_ms = 10U},
+                                     .at_unix_ms = 10U,
+                                     .payload = {}},
+        tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::upload_begin,
+                                     .request_id = "request:upload:begin",
+                                     .tenant = py::TenantId {"tenant:test"},
+                                     .pack = py::PackId {"pack:test"},
+                                     .operation_id = "upload:test",
+                                     .at_unix_ms = 10U,
+                                     .reason = "approved upload",
+                                     .upload_total_bytes = 3U,
+                                     .payload = {}},
+        tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::upload_chunk,
+                                     .request_id = "request:upload:chunk",
+                                     .tenant = py::TenantId {"tenant:test"},
+                                     .pack = py::PackId {"pack:test"},
+                                     .operation_id = "upload:test",
+                                     .at_unix_ms = 10U,
+                                     .upload_offset = 0U,
+                                     .upload_total_bytes = 3U,
+                                     .payload = {std::byte {1}, std::byte {2}, std::byte {3}}},
+        tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::upload_finalize,
+                                     .request_id = "request:upload:finalize",
+                                     .tenant = py::TenantId {"tenant:test"},
+                                     .pack = py::PackId {"pack:test"},
+                                     .operation_id = "upload:test",
+                                     .at_unix_ms = 10U,
+                                     .upload_offset = 3U,
+                                     .upload_total_bytes = 3U,
+                                     .payload = {}},
     };
     for (const auto &request : requests) {
         auto encoded = tools::encode_resident_admin_request(request, 4U * py::kibibyte);
@@ -1134,6 +1303,9 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
         CHECK(decoded->target_generation == request.target_generation);
         CHECK(decoded->drain_boundary == request.drain_boundary);
         CHECK(decoded->work_ids == request.work_ids);
+        CHECK(decoded->upload_offset == request.upload_offset);
+        CHECK(decoded->upload_total_bytes == request.upload_total_bytes);
+        CHECK(decoded->payload == request.payload);
     }
     auto bytes = tools::encode_resident_admin_request(requests.back(), 4U * py::kibibyte);
     REQUIRE(bytes);
@@ -1163,6 +1335,9 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
         .drain_boundary = 99U,
         .assignment_fence = 12U,
         .work_ids = {"work:a", "work:b"},
+        .upload_received_bytes = 17U,
+        .upload_total_bytes = 17U,
+        .source_digest = py::SourceDigest {"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
     };
     const auto rich_bytes = tools::encode_resident_admin_response(rich_response, 4U * py::kibibyte);
     REQUIRE(rich_bytes);
@@ -1173,6 +1348,10 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
     CHECK(rich_decoded->drain_boundary == 99U);
     CHECK(rich_decoded->assignment_fence == 12U);
     CHECK(rich_decoded->work_ids == std::vector<std::string> {"work:a", "work:b"});
+    CHECK(rich_decoded->upload_received_bytes == 17U);
+    CHECK(rich_decoded->upload_total_bytes == 17U);
+    REQUIRE(rich_decoded->source_digest);
+    CHECK(*rich_decoded->source_digest == *rich_response.source_digest);
 
     AllowTrust trust;
     DurableFakeAgentBackend agents;
@@ -1231,6 +1410,160 @@ TEST_CASE("standalone admin client maps explicit lifecycle commands without trus
     CHECK(missing_tenant.error().code == "ADMIN-TENANT");
 }
 
+TEST_CASE("standalone admin client resumes bounded upload and returns publication identity") {
+    TemporaryDirectory temporary;
+    const auto archive_path = temporary.path / "pack.rpack";
+    write_file(archive_path, "0123456789");
+    ResumingUploadTransport transport;
+    tools::ResidentAdminClientAdapter client {&transport};
+    const tools::AdminCommand command {
+        .action = tools::AdminAction::upload,
+        .operands = {"pack:test", archive_path.string()},
+        .options = {{"tenant", "tenant:test"}},
+        .format = tools::OutputFormat::text,
+        .config_path = {},
+        .request_id = "upload:test",
+        .reason = "approved upload",
+        .wait = false,
+        .preview = false,
+    };
+    const auto result = client.execute({}, command);
+    REQUIRE(result);
+    REQUIRE(result->success);
+    REQUIRE(transport.requests.size() == 3U);
+    CHECK(transport.requests[0].kind == tools::ResidentAdminRequestKind::upload_begin);
+    CHECK(transport.requests[0].reason == "approved upload");
+    CHECK(transport.requests[0].operation_id == "upload:test");
+    CHECK(transport.requests[1].kind == tools::ResidentAdminRequestKind::upload_chunk);
+    CHECK(transport.requests[1].upload_offset == 2U);
+    CHECK(transport.requests[1].payload == archive_bytes("23456789"));
+    CHECK(transport.requests[2].kind == tools::ResidentAdminRequestKind::upload_finalize);
+    CHECK(transport.requests[2].upload_offset == 10U);
+    const auto digest = std::ranges::find(result->fields, "source_digest", &tools::DisplayField::name);
+    REQUIRE(digest != result->fields.end());
+    CHECK(digest->value == "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+}
+
+TEST_CASE("resident upload authorizes every phase before touching the bounded backend") {
+    CountingControlStore store;
+    AllowAdminPolicy policy;
+    RecordingUploadBackend uploads;
+    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, &uploads};
+    const proto::AuthenticatedPeer peer {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:admin"}};
+    tools::ResidentAdminRequest request {
+        .kind = tools::ResidentAdminRequestKind::upload_begin,
+        .request_id = "request:upload:begin",
+        .tenant = py::TenantId {"tenant:test"},
+        .pack = py::PackId {"pack:test"},
+        .operation_id = "upload:test",
+        .at_unix_ms = 10U,
+        .reason = "approved source pack",
+        .upload_total_bytes = 3U,
+        .payload = {},
+    };
+    const auto begun = backend.execute(peer, request);
+    REQUIRE(begun.status == tools::ResidentAdminResponseStatus::ok);
+    CHECK(begun.upload_received_bytes == 0U);
+    CHECK(begun.upload_total_bytes == 3U);
+
+    request.kind = tools::ResidentAdminRequestKind::upload_chunk;
+    request.request_id = "request:upload:chunk";
+    request.at_unix_ms = 11U;
+    request.reason.clear();
+    request.payload = {std::byte {1}, std::byte {2}, std::byte {3}};
+    const auto appended = backend.execute(peer, request);
+    REQUIRE(appended.status == tools::ResidentAdminResponseStatus::ok);
+    CHECK(appended.upload_received_bytes == 3U);
+
+    request.kind = tools::ResidentAdminRequestKind::upload_finalize;
+    request.request_id = "request:upload:finalize";
+    request.at_unix_ms = 12U;
+    request.upload_offset = 3U;
+    request.payload.clear();
+    const auto finalized = backend.execute(peer, request);
+    REQUIRE(finalized.status == tools::ResidentAdminResponseStatus::ok);
+    REQUIRE(finalized.source_digest);
+    CHECK(finalized.source_digest->value == "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    CHECK(uploads.calls == std::vector<tools::ResidentAdminRequestKind> {
+                               tools::ResidentAdminRequestKind::upload_begin,
+                               tools::ResidentAdminRequestKind::upload_chunk,
+                               tools::ResidentAdminRequestKind::upload_finalize,
+                           });
+    CHECK(policy.operations == std::vector<py::cluster::AdminControlOperation> {
+                                   py::cluster::AdminControlOperation::pack_upload,
+                                   py::cluster::AdminControlOperation::pack_upload,
+                                   py::cluster::AdminControlOperation::pack_upload,
+                               });
+    CHECK(store.reads == 0U);
+    CHECK(store.commits == 0U);
+}
+
+TEST_CASE("filesystem upload resumes exact bytes and replays immutable publication evidence") {
+    TemporaryDirectory temporary;
+    const std::filesystem::path crypto_library {RULE_ENGINE_PYTHON_SERVER_PATH};
+    REQUIRE_FALSE(crypto_library.empty());
+    py::packaging::TrustPolicy trust {
+        .mode = py::packaging::TrustMode::development,
+        .allow_unsigned_packs = true,
+        .allow_unsigned_generators = false,
+        .signers = {},
+    };
+    auto archive = unsigned_upload_archive();
+    auto encoded = py::packaging::encode_canonical_source_pack(archive);
+    REQUIRE(encoded);
+    auto backend = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library);
+    REQUIRE(backend);
+
+    const auto split = encoded->size() / 2U;
+    auto begun = (*backend)->begin(py::PackId {"com.acme.upload"}, "upload:restart", encoded->size());
+    REQUIRE(begun);
+    CHECK(begun->received_bytes == 0U);
+    auto first = (*backend)->append(py::PackId {"com.acme.upload"}, "upload:restart", 0U,
+                                    std::span<const std::byte> {*encoded}.first(split));
+    REQUIRE(first);
+    CHECK(first->received_bytes == split);
+    auto replayed = (*backend)->append(py::PackId {"com.acme.upload"}, "upload:restart", 0U,
+                                       std::span<const std::byte> {*encoded}.first(split));
+    REQUIRE(replayed);
+    CHECK(replayed->received_bytes == split);
+
+    backend->reset();
+    backend = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library);
+    REQUIRE(backend);
+    auto resumed = (*backend)->begin(py::PackId {"com.acme.upload"}, "upload:restart", encoded->size());
+    REQUIRE(resumed);
+    CHECK(resumed->received_bytes == split);
+    auto second = (*backend)->append(py::PackId {"com.acme.upload"}, "upload:restart", split,
+                                     std::span<const std::byte> {*encoded}.subspan(split));
+    REQUIRE(second);
+    CHECK(second->received_bytes == encoded->size());
+    auto finalized = (*backend)->finalize(py::PackId {"com.acme.upload"}, "upload:restart");
+    REQUIRE(finalized);
+    REQUIRE(finalized->source_digest);
+
+    auto destination = py::packaging::content_addressed_source_pack_path(temporary.path, *finalized->source_digest);
+    REQUIRE(destination);
+    CHECK(std::filesystem::is_regular_file(*destination));
+    backend->reset();
+    backend = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library);
+    REQUIRE(backend);
+    auto replayed_finalize = (*backend)->finalize(py::PackId {"com.acme.upload"}, "upload:restart");
+    REQUIRE(replayed_finalize);
+    CHECK(replayed_finalize->source_digest == finalized->source_digest);
+    CHECK(replayed_finalize->received_bytes == encoded->size());
+
+    std::error_code filesystem_error;
+    std::size_t partial_files {};
+    for (const auto &entry : std::filesystem::directory_iterator {temporary.path / ".uploads", filesystem_error}) {
+        REQUIRE_FALSE(filesystem_error);
+        if (entry.path().extension() == ".part" || entry.path().extension() == ".meta") {
+            ++partial_files;
+        }
+    }
+    CHECK_FALSE(filesystem_error);
+    CHECK(partial_files == 0U);
+}
+
 TEST_CASE("resident admin v2 activation sequence is durable and idempotent across lost responses") {
     StatefulControlStore store;
     store.state.storage_revision = 0U;
@@ -1256,7 +1589,8 @@ TEST_CASE("resident admin v2 activation sequence is durable and idempotent acros
                                                .expected_pack_version = 1U,
                                                .at_unix_ms = 10U,
                                                .reason = "approved rollout",
-                                               .target_generation = 7U};
+                                               .target_generation = 7U,
+                                               .payload = {}};
     const auto previewed = backend.execute(peer, preview);
     REQUIRE(previewed.status == tools::ResidentAdminResponseStatus::ok);
     CHECK(previewed.operation_phase == "previewed");

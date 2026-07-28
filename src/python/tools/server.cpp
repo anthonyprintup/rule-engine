@@ -2,6 +2,7 @@
 
 #include "rule_engine/python/cluster/configuration.hpp"
 #include "rule_engine/python/compiler.hpp"
+#include "rule_engine/python/tools/pack_upload.hpp"
 #include "rule_engine/python/tools/resident_evaluator.hpp"
 
 #include <asio/ip/address.hpp>
@@ -910,6 +911,7 @@ final activation flip; other control-plane operations remain CLI/backend work.
             using enum cluster::AdminControlOperation;
             switch (operation) {
                 case pack_read: return "pack.read";
+                case pack_upload: return "pack.upload";
                 case operation_read: return "operation.read";
                 case pack_inspect: return "pack.read";
                 case activation_preview:
@@ -1014,7 +1016,7 @@ final activation flip; other control-plane operations remain CLI/backend work.
                 auto capabilities = split_fields(fields[6], ',');
                 std::set<std::string, std::less<>> named;
                 for (const auto capability : capabilities) {
-                    if ((capability != "pack.read" && capability != "operation.read" &&
+                    if ((capability != "pack.read" && capability != "pack.upload" && capability != "operation.read" &&
                          capability != "pack.activate") ||
                         !named.insert(std::string {capability}).second) {
                         return std::unexpected(unavailable("SRV-OPERATOR-BINDING-MALFORMED",
@@ -2437,6 +2439,12 @@ final activation flip; other control-plane operations remain CLI/backend work.
         if (!activation_store) {
             return failure_output(activation_store.error());
         }
+        auto uploads = FilesystemResidentPackUploadBackend::create(config->pack_registry_path, *pack_trust_policy,
+                                                                   runtime->crypto_library);
+        if (!uploads) {
+            return failure_output(
+                unavailable("SRV-PACK-UPLOAD-UNAVAILABLE", "the verified source-pack upload registry is unavailable"));
+        }
         const auto health = (*store)->health();
         if (!health.driver_available || !health.connected || !health.migrations_compatible) {
             return failure_output(unavailable("SRV-STORE-NOT-READY", health.detail));
@@ -2448,7 +2456,8 @@ final activation flip; other control-plane operations remain CLI/backend work.
                                                       config->service.inbound_credit,
                                                       config->service.maximum_frame_bytes};
         FileAdminSecurityAudit admin_security_audit {config->audit_path};
-        AuthorizedResidentAdminBackend admin_backend {**activation_store, **operator_bindings, &admin_security_audit};
+        AuthorizedResidentAdminBackend admin_backend {**activation_store, **operator_bindings, &admin_security_audit,
+                                                      uploads->get()};
         const ResidentServerContext context {
             .config = *config,
             .store = **store,

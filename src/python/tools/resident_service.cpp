@@ -19,6 +19,7 @@ namespace rule_engine::python::tools {
 
         constexpr std::size_t maximum_admin_string_bytes = 1U * kibibyte;
         constexpr std::size_t maximum_admin_work_ids = 4'096U;
+        constexpr std::uint64_t maximum_admin_upload_bytes = balanced_v1.compile.source_closure_bytes;
         constexpr std::size_t queued_session_reservation_bytes = 16U * kibibyte;
         constexpr std::size_t worker_fixed_reservation_bytes = 64U * kibibyte;
 
@@ -26,6 +27,16 @@ namespace rule_engine::python::tools {
             return (allow_empty || !value.empty()) && std::ranges::all_of(value, [](const unsigned char character) {
                        return character >= 0x20U && character <= 0x7eU;
                    });
+        }
+
+        [[nodiscard]] bool canonical_source_digest(const SourceDigest &digest) noexcept {
+            constexpr std::string_view prefix {"sha256:"};
+            if (!digest.value.starts_with(prefix) || digest.value.size() != prefix.size() + 64U) {
+                return false;
+            }
+            return std::ranges::all_of(std::string_view {digest.value}.substr(prefix.size()), [](const char value) {
+                return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f');
+            });
         }
 
         [[nodiscard]] protocol_v2::ProtocolError error(const protocol_v2::ProtocolErrorCode code, std::string message) {
@@ -88,6 +99,16 @@ namespace rule_engine::python::tools {
                 }
                 return true;
             }
+
+            [[nodiscard]] bool append_blob(const std::span<const std::byte> value) {
+                if (value.size() > static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)()) ||
+                    maximum - bytes.size() < 4U + value.size() ||
+                    !append_u32(static_cast<std::uint32_t>(value.size()))) {
+                    return false;
+                }
+                bytes.insert(bytes.end(), value.begin(), value.end());
+                return true;
+            }
         };
 
         struct Reader {
@@ -142,6 +163,17 @@ namespace rule_engine::python::tools {
                 offset += *size;
                 return value;
             }
+
+            [[nodiscard]] std::optional<std::vector<std::byte>> read_blob() {
+                const auto size = read_u32();
+                if (!size || bytes.size() - offset < *size) {
+                    return std::nullopt;
+                }
+                std::vector<std::byte> value(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                                             bytes.begin() + static_cast<std::ptrdiff_t>(offset + *size));
+                offset += *size;
+                return value;
+            }
         };
 
         [[nodiscard]] bool common_admin_request_valid(const ResidentAdminRequest &request) noexcept {
@@ -163,28 +195,57 @@ namespace rule_engine::python::tools {
                 std::ranges::all_of(request.work_ids, [](const std::string &work_id) {
                     return work_id.size() <= maximum_admin_string_bytes && printable_ascii(work_id, false);
                 });
+            const auto no_upload =
+                request.upload_offset == 0U && request.upload_total_bytes == 0U && request.payload.empty();
             switch (request.kind) {
                 case ResidentAdminRequestKind::pack_snapshot:
                     return request.operation_id.empty() && request.idempotency_key.empty() &&
                            request.expected_pack_version == 0U && request.reason.empty() &&
-                           request.target_generation == 0U && request.drain_boundary == 0U && request.work_ids.empty();
+                           request.target_generation == 0U && request.drain_boundary == 0U &&
+                           request.work_ids.empty() && no_upload;
                 case ResidentAdminRequestKind::operation_snapshot:
                     return !request.operation_id.empty() && request.idempotency_key.empty() &&
                            request.expected_pack_version == 0U && printable_ascii(request.operation_id, false) &&
                            request.reason.empty() && request.target_generation == 0U && request.drain_boundary == 0U &&
-                           request.work_ids.empty();
+                           request.work_ids.empty() && no_upload;
                 case ResidentAdminRequestKind::activation_flip:
                     return mutation_identity() && request.reason.empty() && request.target_generation == 0U &&
-                           request.drain_boundary == 0U && request.work_ids.empty();
+                           request.drain_boundary == 0U && request.work_ids.empty() && no_upload;
                 case ResidentAdminRequestKind::activation_preview:
                     return mutation_identity() && printable_ascii(request.reason, false) &&
-                           request.target_generation != 0U && request.drain_boundary == 0U && request.work_ids.empty();
+                           request.target_generation != 0U && request.drain_boundary == 0U &&
+                           request.work_ids.empty() && no_upload;
                 case ResidentAdminRequestKind::activation_drain:
                     return mutation_identity() && request.reason.empty() && request.target_generation == 0U &&
-                           request.drain_boundary != 0U && request.work_ids.empty();
+                           request.drain_boundary != 0U && request.work_ids.empty() && no_upload;
                 case ResidentAdminRequestKind::activation_fence:
                     return mutation_identity() && request.reason.empty() && request.target_generation == 0U &&
-                           request.drain_boundary == 0U && work_ids_valid;
+                           request.drain_boundary == 0U && work_ids_valid && no_upload;
+                case ResidentAdminRequestKind::upload_begin:
+                    return !request.operation_id.empty() && request.idempotency_key.empty() &&
+                           printable_ascii(request.operation_id, false) && printable_ascii(request.reason, false) &&
+                           request.expected_pack_version == 0U && request.target_generation == 0U &&
+                           request.drain_boundary == 0U && request.work_ids.empty() && request.upload_offset == 0U &&
+                           request.upload_total_bytes != 0U &&
+                           request.upload_total_bytes <= maximum_admin_upload_bytes && request.payload.empty();
+                case ResidentAdminRequestKind::upload_chunk:
+                    return !request.operation_id.empty() && request.idempotency_key.empty() &&
+                           printable_ascii(request.operation_id, false) && request.reason.empty() &&
+                           request.expected_pack_version == 0U && request.target_generation == 0U &&
+                           request.drain_boundary == 0U && request.work_ids.empty() &&
+                           request.upload_total_bytes != 0U &&
+                           request.upload_total_bytes <= maximum_admin_upload_bytes &&
+                           request.upload_offset <= request.upload_total_bytes &&
+                           request.payload.size() <= request.upload_total_bytes - request.upload_offset &&
+                           !request.payload.empty();
+                case ResidentAdminRequestKind::upload_finalize:
+                    return !request.operation_id.empty() && request.idempotency_key.empty() &&
+                           printable_ascii(request.operation_id, false) && request.reason.empty() &&
+                           request.expected_pack_version == 0U && request.target_generation == 0U &&
+                           request.drain_boundary == 0U && request.work_ids.empty() &&
+                           request.upload_total_bytes != 0U &&
+                           request.upload_total_bytes <= maximum_admin_upload_bytes &&
+                           request.upload_offset == request.upload_total_bytes && request.payload.empty();
                 default: return false;
             }
         }
@@ -234,6 +295,9 @@ namespace rule_engine::python::tools {
                 .drain_boundary = 0U,
                 .assignment_fence = 0U,
                 .work_ids = {},
+                .upload_received_bytes = 0U,
+                .upload_total_bytes = 0U,
+                .source_digest = std::nullopt,
             };
         }
 
@@ -365,7 +429,7 @@ namespace rule_engine::python::tools {
             return std::unexpected(error(protocol_v2::ProtocolErrorCode::malformed, "admin request is invalid"));
         }
         Writer writer {.bytes = {}, .maximum = maximum_frame_bytes};
-        if (!writer.append_u8(2U) || !writer.append_u8(static_cast<std::uint8_t>(request.kind)) ||
+        if (!writer.append_u8(3U) || !writer.append_u8(static_cast<std::uint8_t>(request.kind)) ||
             !writer.append_string(request.request_id) || !writer.append_string(request.tenant.value) ||
             !writer.append_string(request.pack.value) || !writer.append_string(request.operation_id) ||
             !writer.append_string(request.idempotency_key) || !writer.append_u64(request.expected_pack_version) ||
@@ -374,7 +438,9 @@ namespace rule_engine::python::tools {
             request.work_ids.size() > (std::numeric_limits<std::uint32_t>::max)() ||
             !writer.append_u32(static_cast<std::uint32_t>(request.work_ids.size())) ||
             !std::ranges::all_of(request.work_ids,
-                                 [&](const std::string &work_id) { return writer.append_string(work_id); })) {
+                                 [&](const std::string &work_id) { return writer.append_string(work_id); }) ||
+            !writer.append_u64(request.upload_offset) || !writer.append_u64(request.upload_total_bytes) ||
+            !writer.append_blob(request.payload)) {
             return std::unexpected(
                 error(protocol_v2::ProtocolErrorCode::limit_exceeded, "admin request exceeds its frame bound"));
         }
@@ -413,9 +479,13 @@ namespace rule_engine::python::tools {
                 work_ids.push_back(std::move(*work_id));
             }
         }
-        if (!version || *version != 2U || !kind || *kind < 1U || *kind > 6U || !request_id || !tenant || !pack ||
+        const auto upload_offset = reader.read_u64();
+        const auto upload_total = reader.read_u64();
+        auto upload_payload = reader.read_blob();
+        if (!version || *version != 3U || !kind || *kind < 1U || *kind > 9U || !request_id || !tenant || !pack ||
             !operation || !idempotency || !expected || !at || !reason || !target_generation || !drain_boundary ||
-            !work_count || work_ids.size() != *work_count || reader.offset != payload.size()) {
+            !work_count || work_ids.size() != *work_count || !upload_offset || !upload_total || !upload_payload ||
+            reader.offset != payload.size()) {
             return std::unexpected(
                 error(protocol_v2::ProtocolErrorCode::malformed, "admin request frame is malformed"));
         }
@@ -432,6 +502,9 @@ namespace rule_engine::python::tools {
             .target_generation = *target_generation,
             .drain_boundary = *drain_boundary,
             .work_ids = std::move(work_ids),
+            .upload_offset = *upload_offset,
+            .upload_total_bytes = *upload_total,
+            .payload = std::move(*upload_payload),
         };
         auto canonical = encode_resident_admin_request(request, maximum_frame_bytes);
         if (!canonical || *canonical != std::vector<std::byte> {payload.begin(), payload.end()}) {
@@ -447,9 +520,11 @@ namespace rule_engine::python::tools {
             response.code.size() > maximum_admin_string_bytes ||
             response.diagnostic.size() > maximum_admin_string_bytes ||
             response.operation_phase.size() > maximum_admin_string_bytes ||
+            (response.source_digest && !canonical_source_digest(*response.source_digest)) ||
             response.work_ids.size() > maximum_admin_work_ids || !printable_ascii(response.request_id, false) ||
             !printable_ascii(response.code) || !printable_ascii(response.diagnostic) ||
             !printable_ascii(response.operation_phase) ||
+            (response.source_digest && !printable_ascii(response.source_digest->value, false)) ||
             !std::ranges::all_of(response.work_ids,
                                  [](const std::string &work_id) {
                                      return work_id.size() <= maximum_admin_string_bytes &&
@@ -461,8 +536,9 @@ namespace rule_engine::python::tools {
         }
         Writer writer {.bytes = {}, .maximum = maximum_frame_bytes};
         const auto flags = static_cast<std::uint8_t>((response.active_generation ? 1U : 0U) |
-                                                     (response.previous_active_generation ? 2U : 0U));
-        if (!writer.append_u8(2U) || !writer.append_u8(static_cast<std::uint8_t>(response.status)) ||
+                                                     (response.previous_active_generation ? 2U : 0U) |
+                                                     (response.source_digest ? 4U : 0U));
+        if (!writer.append_u8(3U) || !writer.append_u8(static_cast<std::uint8_t>(response.status)) ||
             !writer.append_u8(flags) || !writer.append_string(response.request_id) ||
             !writer.append_string(response.code) || !writer.append_string(response.diagnostic) ||
             !writer.append_u64(response.storage_revision) || !writer.append_u64(response.resource_version) ||
@@ -472,7 +548,10 @@ namespace rule_engine::python::tools {
             !writer.append_u64(response.drain_boundary) || !writer.append_u64(response.assignment_fence) ||
             !writer.append_u32(static_cast<std::uint32_t>(response.work_ids.size())) ||
             !std::ranges::all_of(response.work_ids,
-                                 [&](const std::string &work_id) { return writer.append_string(work_id); })) {
+                                 [&](const std::string &work_id) { return writer.append_string(work_id); }) ||
+            !writer.append_u64(response.upload_received_bytes) || !writer.append_u64(response.upload_total_bytes) ||
+            !writer.append_string(response.source_digest ? std::string_view {response.source_digest->value} :
+                                                           std::string_view {})) {
             return std::unexpected(
                 error(protocol_v2::ProtocolErrorCode::limit_exceeded, "admin response exceeds its frame bound"));
         }
@@ -513,10 +592,14 @@ namespace rule_engine::python::tools {
                 work_ids.push_back(std::move(*work_id));
             }
         }
-        if (!version || *version != 2U || !status || *status > 2U || !flags || (*flags & 0xfcU) != 0U || !request_id ||
+        const auto upload_received = reader.read_u64();
+        const auto upload_total = reader.read_u64();
+        auto source_digest = reader.read_string();
+        if (!version || *version != 3U || !status || *status > 2U || !flags || (*flags & 0xf8U) != 0U || !request_id ||
             !code || !diagnostic || !storage || !resource || !active || !previous || !operation_phase ||
             !target_generation || !drain_boundary || !assignment_fence || !work_count ||
-            work_ids.size() != *work_count || reader.offset != payload.size()) {
+            work_ids.size() != *work_count || !upload_received || !upload_total || !source_digest ||
+            (((*flags & 4U) != 0U) == source_digest->empty()) || reader.offset != payload.size()) {
             return std::unexpected(
                 error(protocol_v2::ProtocolErrorCode::malformed, "admin response frame is malformed"));
         }
@@ -534,6 +617,11 @@ namespace rule_engine::python::tools {
             .drain_boundary = *drain_boundary,
             .assignment_fence = *assignment_fence,
             .work_ids = std::move(work_ids),
+            .upload_received_bytes = *upload_received,
+            .upload_total_bytes = *upload_total,
+            .source_digest = (*flags & 4U) != 0U ?
+                                 std::optional<SourceDigest> {SourceDigest {std::move(*source_digest)}} :
+                                 std::nullopt,
         };
         auto canonical = encode_resident_admin_response(response, maximum_frame_bytes);
         if (!canonical || *canonical != std::vector<std::byte> {payload.begin(), payload.end()}) {
@@ -542,10 +630,11 @@ namespace rule_engine::python::tools {
         return response;
     }
 
-    AuthorizedResidentAdminBackend::AuthorizedResidentAdminBackend(
-        cluster::IActivationControlStore &store, const IResidentAdminAccessPolicy &policy,
-        cluster::IAdminSecurityAuditSink *security_audit) noexcept:
-        durable_ {store}, policy_ {policy}, security_audit_ {security_audit} {}
+    AuthorizedResidentAdminBackend::AuthorizedResidentAdminBackend(cluster::IActivationControlStore &store,
+                                                                   const IResidentAdminAccessPolicy &policy,
+                                                                   cluster::IAdminSecurityAuditSink *security_audit,
+                                                                   IResidentPackUploadBackend *uploads) noexcept:
+        durable_ {store}, policy_ {policy}, security_audit_ {security_audit}, uploads_ {uploads} {}
 
     ResidentAdminResponse AuthorizedResidentAdminBackend::execute(const protocol_v2::AuthenticatedPeer &peer,
                                                                   const ResidentAdminRequest &request) noexcept {
@@ -573,8 +662,50 @@ namespace rule_engine::python::tools {
                                           .target_generation = 0U,
                                           .drain_boundary = 0U,
                                           .assignment_fence = 0U,
-                                          .work_ids = {}};
+                                          .work_ids = {},
+                                          .upload_received_bytes = 0U,
+                                          .upload_total_bytes = 0U,
+                                          .source_digest = std::nullopt};
         };
+        if (request.kind == ResidentAdminRequestKind::upload_begin ||
+            request.kind == ResidentAdminRequestKind::upload_chunk ||
+            request.kind == ResidentAdminRequestKind::upload_finalize) {
+            if (auto authorized = admin.authorize_pack_upload(context, request.tenant, request.pack); !authorized) {
+                return rejected_response(request, authorized.error());
+            }
+            if (uploads_ == nullptr) {
+                auto response = unavailable_after_commit();
+                response.code = "ADMIN-UPLOAD-UNAVAILABLE";
+                return response;
+            }
+            std::expected<ResidentPackUploadReceipt, protocol_v2::ProtocolError> uploaded =
+                request.kind == ResidentAdminRequestKind::upload_begin ?
+                    uploads_->begin(request.pack, request.operation_id, request.upload_total_bytes) :
+                request.kind == ResidentAdminRequestKind::upload_chunk ?
+                    uploads_->append(request.pack, request.operation_id, request.upload_offset, request.payload) :
+                    uploads_->finalize(request.pack, request.operation_id);
+            if (!uploaded) {
+                const auto unavailable =
+                    uploaded.error().code == protocol_v2::ProtocolErrorCode::dependency_unavailable ||
+                    uploaded.error().code == protocol_v2::ProtocolErrorCode::transport_error ||
+                    uploaded.error().code == protocol_v2::ProtocolErrorCode::timed_out;
+                auto response = unavailable_after_commit();
+                response.status =
+                    unavailable ? ResidentAdminResponseStatus::unavailable : ResidentAdminResponseStatus::rejected;
+                response.code = unavailable ? "ADMIN-UPLOAD-UNAVAILABLE" : "ADMIN-UPLOAD-REJECTED";
+                response.diagnostic =
+                    unavailable ? "authorized upload backend unavailable" : "authorized upload request rejected";
+                return response;
+            }
+            auto response = unavailable_after_commit();
+            response.status = ResidentAdminResponseStatus::ok;
+            response.code = "OK";
+            response.diagnostic.clear();
+            response.upload_received_bytes = uploaded->received_bytes;
+            response.upload_total_bytes = uploaded->total_bytes;
+            response.source_digest = std::move(uploaded->source_digest);
+            return response;
+        }
         if (request.kind == ResidentAdminRequestKind::pack_snapshot) {
             auto snapshot = admin.pack_snapshot(context, request.tenant, request.pack);
             if (!snapshot) {
@@ -592,7 +723,10 @@ namespace rule_engine::python::tools {
                                             .target_generation = 0U,
                                             .drain_boundary = 0U,
                                             .assignment_fence = 0U,
-                                            .work_ids = {}};
+                                            .work_ids = {},
+                                            .upload_received_bytes = 0U,
+                                            .upload_total_bytes = 0U,
+                                            .source_digest = std::nullopt};
             if (snapshot->control) {
                 response.resource_version = snapshot->control->resource_version;
                 response.active_generation = snapshot->control->active_generation;
@@ -618,7 +752,10 @@ namespace rule_engine::python::tools {
                     .target_generation = *operation ? (*operation)->target_generation : 0U,
                     .drain_boundary = *operation ? (*operation)->drain_boundary.value_or(0U) : 0U,
                     .assignment_fence = 0U,
-                    .work_ids = *operation ? (*operation)->requeued_work : std::vector<std::string> {}};
+                    .work_ids = *operation ? (*operation)->requeued_work : std::vector<std::string> {},
+                    .upload_received_bytes = 0U,
+                    .upload_total_bytes = 0U,
+                    .source_digest = std::nullopt};
         }
         if (request.kind == ResidentAdminRequestKind::activation_preview) {
             const cluster::AdminMutationRequest mutation {
@@ -647,7 +784,10 @@ namespace rule_engine::python::tools {
                     .target_generation = preview->target_generation,
                     .drain_boundary = preview->drain_boundary.value_or(0U),
                     .assignment_fence = 0U,
-                    .work_ids = preview->requeued_work};
+                    .work_ids = preview->requeued_work,
+                    .upload_received_bytes = 0U,
+                    .upload_total_bytes = 0U,
+                    .source_digest = std::nullopt};
         }
         const cluster::AdminApplyRequest apply {
             .operation_id = request.operation_id,
@@ -676,7 +816,10 @@ namespace rule_engine::python::tools {
                     .target_generation = drained->target_generation,
                     .drain_boundary = drained->drain_boundary,
                     .assignment_fence = drained->successor_assignment_fence,
-                    .work_ids = drained->in_flight_work};
+                    .work_ids = drained->in_flight_work,
+                    .upload_received_bytes = 0U,
+                    .upload_total_bytes = 0U,
+                    .source_digest = std::nullopt};
         }
         if (request.kind == ResidentAdminRequestKind::activation_fence) {
             auto fenced = admin.fence_stragglers(context, request.tenant, request.pack, apply, request.work_ids);
@@ -699,7 +842,10 @@ namespace rule_engine::python::tools {
                     .target_generation = 0U,
                     .drain_boundary = 0U,
                     .assignment_fence = 0U,
-                    .work_ids = std::move(*fenced)};
+                    .work_ids = std::move(*fenced),
+                    .upload_received_bytes = 0U,
+                    .upload_total_bytes = 0U,
+                    .source_digest = std::nullopt};
         }
         auto flipped = admin.flip(context, request.tenant, request.pack, apply);
         if (!flipped) {
@@ -720,7 +866,10 @@ namespace rule_engine::python::tools {
                 .target_generation = flipped->active_generation,
                 .drain_boundary = flipped->activation_cursor,
                 .assignment_fence = flipped->assignment_fence,
-                .work_ids = flipped->requeued_work};
+                .work_ids = flipped->requeued_work,
+                .upload_received_bytes = 0U,
+                .upload_total_bytes = 0U,
+                .source_digest = std::nullopt};
     }
 
     struct ResidentServiceScheduler::Impl {

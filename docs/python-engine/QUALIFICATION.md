@@ -65,6 +65,14 @@ Windows-local component, process-restart, admin-codec, and CLI-mapping evidence.
 The admin tests prove canonical request/response bounds, every activation phase,
 idempotent replay after lost preview/flip responses, and authorization denial
 before store access; they do not constitute a live certificate deployment test.
+After connecting authenticated resumable source-pack upload, the same complete
+Debug graph passed 38/38 tests in 183.92 seconds. Focused upload evidence covers
+client resume offsets and chunk identity, authorization before each backend
+phase, exact-byte retry, restart resume, canonical archive and signer/pack
+verification, cross-process spool serialization, immutable no-replace
+content-addressed publication, and lost-finalize replay from durable evidence.
+It does not qualify registry quota/retention policy or distributed stage
+compilation.
 This evidence does not qualify live
 PostgreSQL, multiple server processes, network partitions, Linux, or mixed-OS
 operation.

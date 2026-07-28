@@ -33,6 +33,7 @@ namespace rule_engine::python::cluster {
         activation_flip,
         rollback_preview,
         rollback_stage_apply,
+        pack_upload,
         pack_read,
         operation_read,
         pack_inspect,
@@ -166,6 +167,8 @@ namespace rule_engine::python::cluster {
 
         [[nodiscard]] std::expected<AuthorizedPackSnapshot, AuthorizedAdminError>
         pack_snapshot(const AdminCallContext &context, const TenantId &tenant, const PackId &pack) const;
+        [[nodiscard]] std::expected<void, AuthorizedAdminError>
+        authorize_pack_upload(const AdminCallContext &context, const TenantId &tenant, const PackId &pack) const;
         [[nodiscard]] std::expected<std::optional<AdminOperationRecord>, AuthorizedAdminError>
         operation_snapshot(const AdminCallContext &context, const TenantId &tenant, const PackId &pack,
                            std::string operation_id) const;

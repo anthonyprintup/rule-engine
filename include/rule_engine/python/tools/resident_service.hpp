@@ -109,6 +109,9 @@ namespace rule_engine::python::tools {
         activation_preview = 4,
         activation_drain = 5,
         activation_fence = 6,
+        upload_begin = 7,
+        upload_chunk = 8,
+        upload_finalize = 9,
     };
 
     struct ResidentAdminRequest {
@@ -124,6 +127,9 @@ namespace rule_engine::python::tools {
         std::uint64_t target_generation {};
         std::uint64_t drain_boundary {};
         std::vector<std::string> work_ids;
+        std::uint64_t upload_offset {};
+        std::uint64_t upload_total_bytes {};
+        std::vector<std::byte> payload;
     };
 
     enum struct ResidentAdminResponseStatus : std::uint8_t { ok = 0, rejected = 1, unavailable = 2 };
@@ -142,6 +148,9 @@ namespace rule_engine::python::tools {
         std::uint64_t drain_boundary {};
         std::uint64_t assignment_fence {};
         std::vector<std::string> work_ids;
+        std::uint64_t upload_received_bytes {};
+        std::uint64_t upload_total_bytes {};
+        std::optional<SourceDigest> source_digest;
     };
 
     [[nodiscard]] std::expected<std::vector<std::byte>, protocol_v2::ProtocolError>
@@ -164,10 +173,28 @@ namespace rule_engine::python::tools {
         principal_for(const protocol_v2::AuthenticatedPeer &peer) const noexcept = 0;
     };
 
+    struct ResidentPackUploadReceipt {
+        std::uint64_t received_bytes {};
+        std::uint64_t total_bytes {};
+        std::optional<SourceDigest> source_digest;
+    };
+
+    struct IResidentPackUploadBackend {
+        virtual ~IResidentPackUploadBackend() = default;
+        [[nodiscard]] virtual std::expected<ResidentPackUploadReceipt, protocol_v2::ProtocolError>
+        begin(const PackId &pack, std::string_view upload_id, std::uint64_t total_bytes) noexcept = 0;
+        [[nodiscard]] virtual std::expected<ResidentPackUploadReceipt, protocol_v2::ProtocolError>
+        append(const PackId &pack, std::string_view upload_id, std::uint64_t offset,
+               std::span<const std::byte> payload) noexcept = 0;
+        [[nodiscard]] virtual std::expected<ResidentPackUploadReceipt, protocol_v2::ProtocolError>
+        finalize(const PackId &pack, std::string_view upload_id) noexcept = 0;
+    };
+
     struct AuthorizedResidentAdminBackend final: IResidentAdminBackend {
         AuthorizedResidentAdminBackend(cluster::IActivationControlStore &store,
                                        const IResidentAdminAccessPolicy &policy,
-                                       cluster::IAdminSecurityAuditSink *security_audit = nullptr) noexcept;
+                                       cluster::IAdminSecurityAuditSink *security_audit = nullptr,
+                                       IResidentPackUploadBackend *uploads = nullptr) noexcept;
 
         [[nodiscard]] ResidentAdminResponse execute(const protocol_v2::AuthenticatedPeer &peer,
                                                     const ResidentAdminRequest &request) noexcept override;
@@ -176,6 +203,7 @@ namespace rule_engine::python::tools {
         cluster::DurableActivationAdmin durable_;
         const IResidentAdminAccessPolicy &policy_;
         cluster::IAdminSecurityAuditSink *security_audit_ {};
+        IResidentPackUploadBackend *uploads_ {};
     };
 
     struct ResidentSessionJob {

@@ -3,6 +3,7 @@
 #include "rule_engine/python/protocol/network.hpp"
 #include "rule_engine/python/tools/resident_service.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <fstream>
@@ -17,6 +18,8 @@ namespace rule_engine::python::tools {
 
         constexpr std::size_t maximum_pem_bytes = 1U * mebibyte;
         constexpr std::size_t maximum_admin_frame_bytes = 4U * mebibyte;
+        constexpr std::size_t upload_chunk_bytes = 1U * mebibyte;
+        constexpr std::size_t maximum_upload_identity_bytes = 960U;
 
         [[nodiscard]] ToolFailure failure(const ToolFailureKind kind, std::string code, std::string message) {
             return {.kind = kind, .code = std::move(code), .message = std::move(message), .diagnostics = {}};
@@ -39,6 +42,29 @@ namespace rule_engine::python::tools {
             if (!input || input.gcount() != static_cast<std::streamsize>(result.size())) {
                 return std::unexpected(
                     failure(ToolFailureKind::authentication, "ADMIN-MTLS", "mTLS material cannot be read completely"));
+            }
+            return result;
+        }
+
+        [[nodiscard]] std::expected<std::vector<std::byte>, ToolFailure>
+        read_upload_archive(const std::filesystem::path &path) {
+            std::error_code filesystem_error;
+            const auto status = std::filesystem::symlink_status(path, filesystem_error);
+            if (filesystem_error || !std::filesystem::is_regular_file(status) || std::filesystem::is_symlink(status)) {
+                return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-UPLOAD-FILE",
+                                               "upload archive must be a real regular file"));
+            }
+            const auto size = std::filesystem::file_size(path, filesystem_error);
+            if (filesystem_error || size == 0U || size > balanced_v1.compile.source_closure_bytes) {
+                return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-UPLOAD-SIZE",
+                                               "upload archive exceeds the balanced.v1 source-closure bound"));
+            }
+            std::ifstream input {path, std::ios::binary};
+            std::vector<std::byte> result(static_cast<std::size_t>(size));
+            input.read(reinterpret_cast<char *>(result.data()), static_cast<std::streamsize>(result.size()));
+            if (!input || input.gcount() != static_cast<std::streamsize>(result.size())) {
+                return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-UPLOAD-READ",
+                                               "upload archive cannot be read completely"));
             }
             return result;
         }
@@ -175,6 +201,9 @@ namespace rule_engine::python::tools {
                 .target_generation = 0U,
                 .drain_boundary = 0U,
                 .work_ids = {},
+                .upload_offset = 0U,
+                .upload_total_bytes = 0U,
+                .payload = {},
             };
             if (command.action == AdminAction::packs) {
                 if (command.operands.size() != 1U || *expected_version != 0U) {
@@ -255,7 +284,7 @@ namespace rule_engine::python::tools {
         }
 
         [[nodiscard]] std::expected<ResidentAdminResponse, ToolFailure>
-        exchange(const AdminEndpointConfiguration &endpoint, const ResidentAdminRequest &request) {
+        exchange_mtls(const AdminEndpointConfiguration &endpoint, const ResidentAdminRequest &request) {
             auto trust = read_pem(endpoint.trust_bundle);
             auto certificate = read_pem(endpoint.client_certificate);
             auto key = read_pem(endpoint.client_key);
@@ -328,6 +357,45 @@ namespace rule_engine::python::tools {
             return std::move(*decoded);
         }
 
+        [[nodiscard]] std::expected<ResidentAdminResponse, ToolFailure>
+        exchange_request(IResidentAdminRequestTransport *transport, const AdminEndpointConfiguration &endpoint,
+                         const ResidentAdminRequest &request) {
+            return transport == nullptr ? exchange_mtls(endpoint, request) : transport->exchange(endpoint, request);
+        }
+
+        [[nodiscard]] std::expected<ResidentAdminResponse, ToolFailure>
+        require_successful_response(std::expected<ResidentAdminResponse, ToolFailure> response) {
+            if (!response) {
+                return std::unexpected(response.error());
+            }
+            if (response->status == ResidentAdminResponseStatus::unavailable) {
+                return std::unexpected(failure(ToolFailureKind::unavailable_transport, response->code,
+                                               "authorized admin backend is unavailable"));
+            }
+            if (response->status == ResidentAdminResponseStatus::rejected &&
+                (response->code == "ADMIN-UNAUTHENTICATED" || response->code == "ADMIN-UNAUTHORIZED" ||
+                 response->code == "ADMIN-AUTHORIZER-UNAVAILABLE")) {
+                return std::unexpected(failure(response->code == "ADMIN-UNAUTHORIZED" ? ToolFailureKind::authorization :
+                                                                                        ToolFailureKind::authentication,
+                                               response->code, "admin request was not authorized"));
+            }
+            return std::move(*response);
+        }
+
+        [[nodiscard]] std::expected<ResidentAdminResponse, ToolFailure>
+        require_upload_success(std::expected<ResidentAdminResponse, ToolFailure> response) {
+            auto checked = require_successful_response(std::move(response));
+            if (!checked) {
+                return std::unexpected(checked.error());
+            }
+            if (checked->status != ResidentAdminResponseStatus::ok) {
+                return std::unexpected(
+                    failure(ToolFailureKind::operation, checked->code,
+                            checked->diagnostic.empty() ? "source-pack upload was rejected" : checked->diagnostic));
+            }
+            return checked;
+        }
+
         void add_field(std::vector<DisplayField> &fields, std::string name, std::string value) {
             fields.push_back(DisplayField {
                 .name = std::move(name), .value = std::move(value), .label = {}, .secret_reference = false});
@@ -365,6 +433,13 @@ namespace rule_engine::python::tools {
             if (!response.work_ids.empty()) {
                 add_field(result.fields, "work_count", std::to_string(response.work_ids.size()));
             }
+            if (response.upload_total_bytes != 0U) {
+                add_field(result.fields, "received_bytes", std::to_string(response.upload_received_bytes));
+                add_field(result.fields, "total_bytes", std::to_string(response.upload_total_bytes));
+            }
+            if (response.source_digest) {
+                add_field(result.fields, "source_digest", response.source_digest->value);
+            }
             if (!result.success) {
                 result.diagnostics.push_back(Diagnostic {
                     .code = response.code,
@@ -376,6 +451,98 @@ namespace rule_engine::python::tools {
             return result;
         }
 
+        [[nodiscard]] ResidentAdminRequest
+        upload_request(const ResidentAdminRequestKind kind, std::string request_id, const std::string_view tenant,
+                       const std::string_view pack, const std::string_view upload_id, const std::uint64_t total_bytes,
+                       const std::uint64_t offset, std::vector<std::byte> payload = {}, std::string reason = {}) {
+            return ResidentAdminRequest {
+                .kind = kind,
+                .request_id = std::move(request_id),
+                .tenant = TenantId {std::string {tenant}},
+                .pack = PackId {std::string {pack}},
+                .operation_id = std::string {upload_id},
+                .idempotency_key = {},
+                .expected_pack_version = 0U,
+                .at_unix_ms = now_unix_ms(),
+                .reason = std::move(reason),
+                .target_generation = 0U,
+                .drain_boundary = 0U,
+                .work_ids = {},
+                .upload_offset = offset,
+                .upload_total_bytes = total_bytes,
+                .payload = std::move(payload),
+            };
+        }
+
+        [[nodiscard]] std::expected<AdminToolResult, ToolFailure>
+        upload_archive(IResidentAdminRequestTransport *transport, const AdminEndpointConfiguration &endpoint,
+                       const AdminCommand &command) {
+            const auto tenant = option(command, "tenant");
+            if (command.operands.size() != 2U || tenant.empty() || command.request_id.empty() ||
+                command.request_id.size() > maximum_upload_identity_bytes || command.reason.empty() || command.wait ||
+                command.preview) {
+                return std::unexpected(
+                    failure(ToolFailureKind::operation, "ADMIN-UPLOAD-ARGUMENT",
+                            "upload requires PACK_ID, ARCHIVE, --tenant, --request-id, and --reason"));
+            }
+            auto archive = read_upload_archive(command.operands[1]);
+            if (!archive) {
+                return std::unexpected(archive.error());
+            }
+            const auto total_bytes = static_cast<std::uint64_t>(archive->size());
+            auto begin = require_upload_success(exchange_request(
+                transport, endpoint,
+                upload_request(ResidentAdminRequestKind::upload_begin, command.request_id + ":begin", tenant,
+                               command.operands[0], command.request_id, total_bytes, 0U, {}, command.reason)));
+            if (!begin) {
+                return std::unexpected(begin.error());
+            }
+            if (begin->upload_total_bytes != total_bytes || begin->upload_received_bytes > total_bytes ||
+                (begin->source_digest && begin->upload_received_bytes != total_bytes)) {
+                return std::unexpected(failure(ToolFailureKind::unavailable_transport, "ADMIN-UPLOAD-RESPONSE",
+                                               "upload begin returned inconsistent progress"));
+            }
+            if (begin->source_digest) {
+                return result_for(*begin);
+            }
+
+            auto offset = begin->upload_received_bytes;
+            while (offset < total_bytes) {
+                const auto count = (std::min) (upload_chunk_bytes, static_cast<std::size_t>(total_bytes - offset));
+                std::vector<std::byte> chunk(archive->begin() + static_cast<std::ptrdiff_t>(offset),
+                                             archive->begin() + static_cast<std::ptrdiff_t>(offset + count));
+                auto response = require_upload_success(exchange_request(
+                    transport, endpoint,
+                    upload_request(ResidentAdminRequestKind::upload_chunk,
+                                   command.request_id + ":chunk:" + std::to_string(offset), tenant, command.operands[0],
+                                   command.request_id, total_bytes, offset, std::move(chunk))));
+                if (!response) {
+                    return std::unexpected(response.error());
+                }
+                const auto expected = offset + count;
+                if (response->upload_total_bytes != total_bytes || response->upload_received_bytes != expected ||
+                    response->source_digest) {
+                    return std::unexpected(failure(ToolFailureKind::unavailable_transport, "ADMIN-UPLOAD-RESPONSE",
+                                                   "upload chunk returned inconsistent progress"));
+                }
+                offset = response->upload_received_bytes;
+            }
+
+            auto finalized = require_upload_success(exchange_request(
+                transport, endpoint,
+                upload_request(ResidentAdminRequestKind::upload_finalize, command.request_id + ":finalize", tenant,
+                               command.operands[0], command.request_id, total_bytes, total_bytes)));
+            if (!finalized) {
+                return std::unexpected(finalized.error());
+            }
+            if (finalized->upload_received_bytes != total_bytes || finalized->upload_total_bytes != total_bytes ||
+                !finalized->source_digest) {
+                return std::unexpected(failure(ToolFailureKind::unavailable_transport, "ADMIN-UPLOAD-RESPONSE",
+                                               "upload finalize returned inconsistent publication evidence"));
+            }
+            return result_for(*finalized);
+        }
+
     } // namespace
 
     std::expected<ResidentAdminRequest, ToolFailure> build_resident_admin_request(const AdminCommand &command,
@@ -385,24 +552,16 @@ namespace rule_engine::python::tools {
 
     std::expected<AdminToolResult, ToolFailure>
     ResidentAdminClientAdapter::execute(const AdminEndpointConfiguration &endpoint, const AdminCommand &command) {
+        if (command.action == AdminAction::upload) {
+            return upload_archive(transport_, endpoint, command);
+        }
         auto request = build_resident_admin_request(command, now_unix_ms());
         if (!request) {
             return std::unexpected(request.error());
         }
-        auto response = exchange(endpoint, *request);
+        auto response = require_successful_response(exchange_request(transport_, endpoint, *request));
         if (!response) {
             return std::unexpected(response.error());
-        }
-        if (response->status == ResidentAdminResponseStatus::unavailable) {
-            return std::unexpected(failure(ToolFailureKind::unavailable_transport, response->code,
-                                           "authorized admin backend is unavailable"));
-        }
-        if (response->status == ResidentAdminResponseStatus::rejected &&
-            (response->code == "ADMIN-UNAUTHENTICATED" || response->code == "ADMIN-UNAUTHORIZED" ||
-             response->code == "ADMIN-AUTHORIZER-UNAVAILABLE")) {
-            return std::unexpected(failure(response->code == "ADMIN-UNAUTHORIZED" ? ToolFailureKind::authorization :
-                                                                                    ToolFailureKind::authentication,
-                                           response->code, "admin request was not authorized"));
         }
         return result_for(*response);
     }

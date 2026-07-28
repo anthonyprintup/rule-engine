@@ -79,6 +79,31 @@ namespace rule_engine::python::packaging {
             return {reinterpret_cast<const char *>(value.data()), value.size()};
         }
 
+        struct TemporaryRegistry {
+            std::filesystem::path path;
+
+            TemporaryRegistry() {
+                std::error_code filesystem_error;
+                const auto root = std::filesystem::temp_directory_path(filesystem_error);
+                if (filesystem_error) {
+                    return;
+                }
+                path = root / ("rule-engine-pack-registry-" +
+                               std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+                std::filesystem::create_directory(path, filesystem_error);
+                if (filesystem_error) {
+                    path.clear();
+                }
+            }
+
+            ~TemporaryRegistry() {
+                if (!path.empty()) {
+                    std::error_code ignored;
+                    std::filesystem::remove_all(path, ignored);
+                }
+            }
+        };
+
         std::optional<std::string> environment_value(const char *name) {
 #ifdef _WIN32
             char *raw_value {};
@@ -1495,6 +1520,43 @@ namespace rule_engine::python::packaging {
                         root, SourceDigest {"sha256:ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789"})
                         .has_value());
         CHECK_FALSE(content_addressed_source_pack_path("relative", digest).has_value());
+    }
+
+    TEST_CASE("verified source-pack publication is immutable durable and idempotent") {
+        TemporaryRegistry registry;
+        REQUIRE_FALSE(registry.path.empty());
+        auto fixture = make_signed_archive();
+        FakeSignatureVerifier verifier;
+
+        const auto first = publish_verified_source_pack(registry.path, "upload:first", PackId {"com.acme.rules"},
+                                                        fixture.archive, fixture.policy, verifier);
+        REQUIRE(first);
+        const auto destination = content_addressed_source_pack_path(registry.path, first->closure_digest);
+        REQUIRE(destination);
+        REQUIRE(std::filesystem::is_regular_file(*destination));
+        const auto stored = read_verify_and_load_source_pack(*destination, fixture.policy, verifier);
+        REQUIRE(stored);
+        CHECK(stored->manifest.pack == PackId {"com.acme.rules"});
+        CHECK(stored->closure_digest == first->closure_digest);
+
+        const auto retry = publish_verified_source_pack(registry.path, "upload:first", PackId {"com.acme.rules"},
+                                                        fixture.archive, fixture.policy, verifier);
+        REQUIRE(retry);
+        CHECK(retry->closure_digest == first->closure_digest);
+        const auto concurrent = publish_verified_source_pack(registry.path, "upload:second", PackId {"com.acme.rules"},
+                                                             fixture.archive, fixture.policy, verifier);
+        REQUIRE(concurrent);
+        CHECK(concurrent->closure_digest == first->closure_digest);
+
+        const auto wrong_pack = publish_verified_source_pack(registry.path, "upload:wrong", PackId {"org.other"},
+                                                             fixture.archive, fixture.policy, verifier);
+        REQUIRE_FALSE(wrong_pack);
+        CHECK(wrong_pack.error().code == PackagingErrorCode::invalid_manifest);
+
+        const auto staging_files =
+            std::ranges::count_if(std::filesystem::directory_iterator {destination->parent_path()},
+                                  [](const auto &entry) { return entry.path().extension() == ".upload"; });
+        CHECK(staging_files == 0U);
     }
 
 } // namespace rule_engine::python::packaging

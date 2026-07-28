@@ -26,6 +26,7 @@ add_library(
     rule_engine_python_executable_support
     admin_client.cpp
     benchmark.cpp
+    pack_upload.cpp
     resident_evaluator.cpp
     resident_service.cpp
     server.cpp

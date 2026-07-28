@@ -299,6 +299,19 @@ namespace rule_engine::python::cluster {
         return result;
     }
 
+    std::expected<void, AuthorizedAdminError>
+    AuthorizedActivationAdmin::authorize_pack_upload(const AdminCallContext &context, const TenantId &tenant,
+                                                     const PackId &pack) const {
+        const AdminAuthorizationRequest authorization {
+            .operation = AdminControlOperation::pack_upload,
+            .resource = pack_resource(tenant, pack),
+        };
+        if (auto authorized = authorize(context, authorization); !authorized) {
+            return std::unexpected(authorized.error());
+        }
+        return {};
+    }
+
     std::expected<std::optional<AdminOperationRecord>, AuthorizedAdminError>
     AuthorizedActivationAdmin::operation_snapshot(const AdminCallContext &context, const TenantId &tenant,
                                                   const PackId &pack, std::string operation_id) const {

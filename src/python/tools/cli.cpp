@@ -66,6 +66,8 @@ Options:
 Operate the authenticated, audited Python rule-engine control plane.
 
 Commands:
+  upload PACK_ID ARCHIVE
+                       Stream, verify, and immutably publish one source pack
   packs PACK_ID        Read one authorized durable pack snapshot
   operation PACK_ID OPERATION_ID
                        Read one authorized durable operation snapshot
@@ -92,9 +94,9 @@ Options:
   --help               Show this help
   --version            Show the tool API version
 
-The upload, stage, rollback-restage, and policy commands are reserved until
-their server-owned compilation/registry workflows are connected; they fail
-closed with ADMIN-NOT-IMPLEMENTED.
+Upload is resumable when retried with the same request ID. Stage,
+rollback-restage, policy mutation, and bounded --wait polling remain reserved
+and fail closed with ADMIN-NOT-IMPLEMENTED.
 )";
 
         struct ParseError {
