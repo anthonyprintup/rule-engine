@@ -122,10 +122,11 @@ namespace {
 
     [[nodiscard]] std::string development_config(const TemporaryDirectory &temporary) {
         const auto database = (temporary.path / "runtime.sqlite").generic_string();
-        return "schema.version = 2\n"
+        return "schema.version = 3\n"
                "deployment.mode = \"single_node_dev\"\n"
                "node.id = \"node-dev\"\n"
                "node.platform_abi = \"windows-x86_64-clang\"\n"
+               "node.capability_inventory_path = \"missing-capabilities.policy\"\n"
                "node.lease_duration_ms = 30000\n"
                "node.lease_renew_interval_ms = 10000\n"
                "store.backend = \"sqlite_dev\"\n"
@@ -173,10 +174,11 @@ namespace {
     }
 
     [[nodiscard]] std::string production_config() {
-        return "schema.version = 2\n"
+        return "schema.version = 3\n"
                "deployment.mode = \"production_cluster\"\n"
                "node.id = \"node-production\"\n"
                "node.platform_abi = \"windows-x86_64-clang\"\n"
+               "node.capability_inventory_path = \"missing-capabilities.policy\"\n"
                "node.lease_duration_ms = 30000\n"
                "node.lease_renew_interval_ms = 10000\n"
                "store.backend = \"postgresql17\"\n"
@@ -350,6 +352,7 @@ TEST_CASE("resident backend seam remains injectable and stop-aware") {
         .version = "activation-policy.v1",
         .bundle_hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     };
+    const std::vector<std::string> resident_capabilities {"com.acme.test"};
     const protocol_v2::OperatorTrustPolicy peer_trust;
     const ResidentServerContext context {
         .config = config,
@@ -359,6 +362,7 @@ TEST_CASE("resident backend seam remains injectable and stop-aware") {
         .runtime = runtime,
         .pack_trust_policy = pack_trust,
         .activation_policy = activation_policy,
+        .resident_capabilities = resident_capabilities,
         .peer_trust_policy = peer_trust,
         .agent_tls = nullptr,
         .admin_tls = nullptr,
@@ -386,12 +390,12 @@ TEST_CASE("server configuration parser bounds hostile input and duplicate state"
     CHECK(oversized.error().code == "SRV-CONFIG-SIZE");
 
     TemporaryDirectory temporary;
-    const auto duplicate = parse_server_config(development_config(temporary) + "schema.version = 2\n");
+    const auto duplicate = parse_server_config(development_config(temporary) + "schema.version = 3\n");
     REQUIRE_FALSE(duplicate.has_value());
     CHECK(duplicate.error().code == "SRV-CONFIG-DUPLICATE-KEY");
 
     auto legacy_schema = development_config(temporary);
-    replace_once(legacy_schema, "schema.version = 2", "schema.version = 1");
+    replace_once(legacy_schema, "schema.version = 3", "schema.version = 2");
     const auto legacy = parse_server_config(legacy_schema);
     REQUIRE_FALSE(legacy.has_value());
     CHECK(legacy.error().code == "SRV-CONFIG-VERSION");
@@ -499,6 +503,7 @@ TEST_CASE("server validates explicit configuration and fails closed before resid
 TEST_CASE("activation policy snapshots bind every execution and authorization input") {
     TemporaryDirectory temporary;
     rule_engine::python::tools::ServerConfig config;
+    config.resident_capabilities_path = temporary.path / "resident-capabilities.policy";
     config.trusted_signers_path = temporary.path / "trusted-signers.policy";
     config.revocations_path = temporary.path / "revocations.policy";
     config.peer_enrollment_path = temporary.path / "peer-enrollment.policy";
@@ -511,10 +516,10 @@ TEST_CASE("activation policy snapshots bind every execution and authorization in
     config.service_profiles_path = temporary.path / "service-profiles.policy";
     config.sink_profiles_path = temporary.path / "sink-profiles.policy";
     const std::filesystem::path *paths[] {
-        &config.trusted_signers_path,    &config.revocations_path,    &config.peer_enrollment_path,
-        &config.operator_bindings_path,  &config.schema_catalog_path, &config.budget_profiles_path,
-        &config.retention_profiles_path, &config.trace_profiles_path, &config.capture_profiles_path,
-        &config.service_profiles_path,   &config.sink_profiles_path,
+        &config.trusted_signers_path,   &config.revocations_path,           &config.peer_enrollment_path,
+        &config.operator_bindings_path, &config.resident_capabilities_path, &config.schema_catalog_path,
+        &config.budget_profiles_path,   &config.retention_profiles_path,    &config.trace_profiles_path,
+        &config.capture_profiles_path,  &config.service_profiles_path,      &config.sink_profiles_path,
     };
     for (std::size_t index = 0U; index < std::size(paths); ++index) {
         write_file(*paths[index], "policy-input-" + std::to_string(index) + "\n");
@@ -533,6 +538,30 @@ TEST_CASE("activation policy snapshots bind every execution and authorization in
     REQUIRE(changed);
     CHECK(changed->version == first->version);
     CHECK(changed->bundle_hash != first->bundle_hash);
+}
+
+TEST_CASE("resident capability inventory is versioned canonical and duplicate-free") {
+    TemporaryDirectory temporary;
+    const auto inventory = temporary.path / "resident-capabilities.policy";
+    write_file(inventory, "rule-engine.resident-capabilities.v1\n"
+                          "com.acme.scan.regex\n"
+                          "com.acme.fact.process\n");
+    const auto loaded = rule_engine::python::tools::load_resident_capability_inventory(inventory);
+    REQUIRE(loaded);
+    CHECK(*loaded == std::vector<std::string> {"com.acme.fact.process", "com.acme.scan.regex"});
+
+    write_file(inventory, "rule-engine.resident-capabilities.v1\n"
+                          "com.acme.scan.regex\n"
+                          "com.acme.scan.regex\n");
+    const auto duplicate = rule_engine::python::tools::load_resident_capability_inventory(inventory);
+    REQUIRE_FALSE(duplicate);
+    CHECK(duplicate.error().code == "SRV-RESIDENT-CAPABILITY-INVENTORY");
+
+    write_file(inventory, "rule-engine.resident-capabilities.v1\n"
+                          "../invalid\n");
+    const auto malformed = rule_engine::python::tools::load_resident_capability_inventory(inventory);
+    REQUIRE_FALSE(malformed);
+    CHECK(malformed.error().code == "SRV-RESIDENT-CAPABILITY-MALFORMED");
 }
 
 TEST_CASE("production startup qualifies PostgreSQL capability and rejects inline secrets") {

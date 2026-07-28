@@ -20,10 +20,11 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace rule_engine::python::tools {
 
-    inline constexpr std::uint32_t server_config_schema_version = 2U;
+    inline constexpr std::uint32_t server_config_schema_version = 3U;
 
     enum struct ServerDeploymentMode : std::uint8_t { production_cluster, single_node_dev };
     enum struct ServerStoreKind : std::uint8_t { postgresql17, sqlite_dev };
@@ -64,6 +65,7 @@ namespace rule_engine::python::tools {
         ServerDeploymentMode mode {ServerDeploymentMode::production_cluster};
         std::string node_id;
         std::string platform_abi;
+        std::filesystem::path resident_capabilities_path;
         std::chrono::milliseconds lease_duration {30'000};
         std::chrono::milliseconds lease_renew_interval {10'000};
         ServerStoreConfig store;
@@ -109,6 +111,8 @@ namespace rule_engine::python::tools {
     [[nodiscard]] std::expected<void, ServerConfigError> validate_server_config(const ServerConfig &config);
     [[nodiscard]] std::expected<cluster::ActivationPolicySnapshot, ToolFailure>
     snapshot_activation_policy(const ServerConfig &config);
+    [[nodiscard]] std::expected<std::vector<std::string>, ToolFailure>
+    load_resident_capability_inventory(const std::filesystem::path &path);
 
     struct ResidentServerContext {
         const ServerConfig &config;
@@ -118,6 +122,7 @@ namespace rule_engine::python::tools {
         const packaging::PrivatePythonRuntime &runtime;
         const packaging::TrustPolicy &pack_trust_policy;
         const cluster::ActivationPolicySnapshot &activation_policy;
+        const std::vector<std::string> &resident_capabilities;
         const protocol_v2::ITrustPolicy &peer_trust_policy;
         protocol_v2::OpenSslTlsContext *agent_tls;
         protocol_v2::OpenSslTlsContext *admin_tls;

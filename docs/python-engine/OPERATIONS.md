@@ -123,7 +123,9 @@ named policy profile. Inline database secrets are rejected; the supported
 reference form is `env:VARIABLE_NAME`, resolved once and then wiped from the
 server-owned buffer.
 
-Server configuration schema version 2 adds explicit registry lifecycle bounds.
+Server configuration schema version 3 adds a versioned resident-capability
+inventory on top of the explicit registry lifecycle bounds introduced in
+version 2.
 The pack registry is content addressed. Authenticated upload publishes each
 canonical signed archive as
 `PACK_REGISTRY/sha256/SOURCE_CLOSURE_SHA256.rpack`, using exactly 64 lowercase
@@ -141,6 +143,7 @@ schema.version
 deployment.mode
 node.id
 node.platform_abi
+node.capability_inventory_path
 node.lease_duration_ms
 node.lease_renew_interval_ms
 store.backend
@@ -189,7 +192,8 @@ Unreferenced retention must be between one hour and 365 days. A conservative
 example is:
 
 ```text
-schema.version = 2
+schema.version = 3
+node.capability_inventory_path = C:\ProgramData\RuleEngine\resident-capabilities.policy
 pack.maximum_published_bytes = 1073741824
 pack.maximum_tenant_bytes = 268435456
 pack.partial_session_ttl_ms = 3600000
@@ -201,9 +205,27 @@ generation—compiling, ready, active, retired, or failed—keeps its source
 reachable. An uploaded object is collected only after no generation references
 it and its newest successful publication is older than the retention window.
 Abandoned reservations expire from their creation time. Upload metadata format
-v1 is not accepted by schema-v2 servers; finish uploads before upgrade or clear
+v1 is not accepted by current servers; finish uploads before upgrade or clear
 only the ACL-protected `.uploads` spool after confirming no upload is in
 progress. Never delete `sha256` objects manually to recover quota.
+
+The capability inventory is a bounded UTF-8 file whose exact first line is
+`rule-engine.resident-capabilities.v1`. Every following non-comment line is one
+canonical capability ID, for example:
+
+```text
+rule-engine.resident-capabilities.v1
+com.example.fact.process
+com.example.scan.regex
+```
+
+Entries must be unique reverse-DNS atoms. The resident sorts and records the
+inventory under its current node-lease fence, and the file is part of the
+immutable activation-policy bundle. Stage freezes only serving nodes whose
+inventory contains every capability required by the signed pack; if none
+qualify, apply fails without creating a generation. Change the inventory only
+through the same controlled restart-and-restage procedure as other policy
+inputs.
 
 Run `rule_engine_server --help` from the same installed version for the
 production-only keys. Unknown and duplicate keys fail closed. Listener hosts

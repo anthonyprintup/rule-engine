@@ -54,6 +54,7 @@ Options:
 
 Required common configuration keys:
   schema.version, deployment.mode, node.id, node.platform_abi,
+  node.capability_inventory_path,
   node.lease_duration_ms, node.lease_renew_interval_ms, store.backend,
   store.server_processes, listener.agent_endpoint, listener.admin_endpoint,
   listener.accept_timeout_ms, listener.handshake_timeout_ms,
@@ -83,7 +84,8 @@ connection references of the form env:VARIABLE_NAME.
 Listener hosts are numeric literals; resident startup performs no DNS lookup.
 Policy snapshots are bounded, versioned tab-separated UTF-8 files. The peer
 snapshot header is rule-engine.peer-enrollment.v1; signer and revocation headers
-are rule-engine.trusted-signers.v1 and rule-engine.revocations.v1.
+are rule-engine.trusted-signers.v1 and rule-engine.revocations.v1. Resident
+capabilities use rule-engine.resident-capabilities.v1.
 
 Authenticated application sessions run on a fixed owned worker pool with a
 bounded queue and memory reservation. Agent ACKs require a backend-declared
@@ -164,6 +166,7 @@ policy mutation remains fail-closed.
                 {"deployment.mode", ValueKind::text},
                 {"node.id", ValueKind::text},
                 {"node.platform_abi", ValueKind::text},
+                {"node.capability_inventory_path", ValueKind::text},
                 {"node.lease_duration_ms", ValueKind::integer},
                 {"node.lease_renew_interval_ms", ValueKind::integer},
                 {"store.backend", ValueKind::text},
@@ -507,6 +510,7 @@ policy mutation remains fail-closed.
         [[nodiscard]] std::expected<void, ToolFailure> qualify_local_references(const ServerConfig &config) {
             const std::pair<const std::filesystem::path *, std::string_view> common[] {
                 {&config.operator_bindings_path, "bindings.operator_path"},
+                {&config.resident_capabilities_path, "node.capability_inventory_path"},
                 {&config.schema_catalog_path, "schemas.catalog_path"},
                 {&config.budget_profiles_path, "profiles.budget_path"},
                 {&config.retention_profiles_path, "profiles.retention_path"},
@@ -755,6 +759,7 @@ policy mutation remains fail-closed.
                 {"revocations", &config.revocations_path},
                 {"peer-enrollment", &config.peer_enrollment_path},
                 {"operator-bindings", &config.operator_bindings_path},
+                {"resident-capabilities", &config.resident_capabilities_path},
                 {"schema-catalog", &config.schema_catalog_path},
                 {"budget-profiles", &config.budget_profiles_path},
                 {"retention-profiles", &config.retention_profiles_path},
@@ -1105,6 +1110,36 @@ policy mutation remains fail-closed.
                     unavailable("SRV-OPERATOR-BINDING-EMPTY", "operator binding snapshot has no explicit principals"));
             }
             return policy;
+        }
+
+        [[nodiscard]] std::expected<std::vector<std::string>, ToolFailure>
+        load_resident_capabilities(const ServerConfig &config) {
+            auto lines = read_policy_lines(config.resident_capabilities_path, "rule-engine.resident-capabilities.v1");
+            if (!lines) {
+                return std::unexpected(std::move(lines.error()));
+            }
+            std::vector<std::string> capabilities;
+            capabilities.reserve(lines->size());
+            for (const auto &line : *lines) {
+                const auto valid =
+                    line.size() <= 128U && safe_policy_atom(line, 128U) && line.front() != '.' && line.back() != '.' &&
+                    line.find("..") == std::string::npos && std::ranges::all_of(line, [](const char character) {
+                        return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+                               (character >= '0' && character <= '9') || character == '_' || character == '-' ||
+                               character == '.';
+                    });
+                if (!valid) {
+                    return std::unexpected(unavailable("SRV-RESIDENT-CAPABILITY-MALFORMED",
+                                                       "resident capability inventory contains an invalid entry"));
+                }
+                capabilities.push_back(line);
+            }
+            std::ranges::sort(capabilities);
+            if (capabilities.empty() || std::ranges::adjacent_find(capabilities) != capabilities.end()) {
+                return std::unexpected(unavailable("SRV-RESIDENT-CAPABILITY-INVENTORY",
+                                                   "resident capability inventory is empty or duplicated"));
+            }
+            return capabilities;
         }
 
         struct FileAdminSecurityAudit final: cluster::IAdminSecurityAuditSink {
@@ -2007,6 +2042,13 @@ policy mutation remains fail-closed.
         return compute_activation_policy_snapshot(config);
     }
 
+    std::expected<std::vector<std::string>, ToolFailure>
+    load_resident_capability_inventory(const std::filesystem::path &path) {
+        ServerConfig config;
+        config.resident_capabilities_path = path;
+        return load_resident_capabilities(config);
+    }
+
     std::expected<ServerConfig, ServerConfigError> parse_server_config(const std::string_view text) {
         auto entries = parse_entries(text);
         if (!entries) {
@@ -2017,6 +2059,7 @@ policy mutation remains fail-closed.
             "deployment.mode",
             "node.id",
             "node.platform_abi",
+            "node.capability_inventory_path",
             "node.lease_duration_ms",
             "node.lease_renew_interval_ms",
             "store.backend",
@@ -2144,6 +2187,7 @@ policy mutation remains fail-closed.
         result.schema_version = *schema_version;
         result.node_id = *entry_value<std::string>(*entries, "node.id");
         result.platform_abi = *entry_value<std::string>(*entries, "node.platform_abi");
+        result.resident_capabilities_path = *entry_value<std::string>(*entries, "node.capability_inventory_path");
         result.lease_duration = *lease_duration;
         result.lease_renew_interval = *lease_renew_interval;
         result.store.connection_reference =
@@ -2294,7 +2338,7 @@ policy mutation remains fail-closed.
     std::expected<void, ServerConfigError> validate_server_config(const ServerConfig &config) {
         if (config.schema_version != server_config_schema_version) {
             return std::unexpected(
-                config_error("SRV-CONFIG-VERSION", "only server configuration schema version 2 is supported"));
+                config_error("SRV-CONFIG-VERSION", "only server configuration schema version 3 is supported"));
         }
         if (config.node_id.empty() || config.platform_abi.empty() || config.lease_duration.count() <= 0 ||
             config.lease_renew_interval.count() <= 0 || config.lease_renew_interval >= config.lease_duration) {
@@ -2358,6 +2402,7 @@ policy mutation remains fail-closed.
         }
         const std::pair<const std::filesystem::path *, std::string_view> common_paths[] {
             {&config.runtime_root, "runtime.root"},
+            {&config.resident_capabilities_path, "node.capability_inventory_path"},
             {&config.pack_registry_path, "pack.registry_path"},
             {&config.operator_bindings_path, "bindings.operator_path"},
             {&config.schema_catalog_path, "schemas.catalog_path"},
@@ -2449,6 +2494,7 @@ policy mutation remains fail-closed.
         const protocol_v2::ITrustPolicy *peer_trust_policy {};
         std::string node_id;
         std::string platform_abi;
+        std::vector<std::string> capability_hashes;
         std::chrono::steady_clock::time_point renew_at {};
         bool qualified {};
         bool accept_agent {true};
@@ -2480,7 +2526,7 @@ policy mutation remains fail-closed.
                 .lease_until_unix_ms = node_lease->lease_until_unix_ms,
                 .updated_at_unix_ms = evidence_at,
                 .serving = serving,
-                .capability_hashes = {},
+                .capability_hashes = capability_hashes,
             });
             if (!recorded) {
                 return std::unexpected(
@@ -2583,6 +2629,7 @@ policy mutation remains fail-closed.
         impl_->activation_store = std::addressof(context.activation_store);
         impl_->node_id = context.config.node_id;
         impl_->platform_abi = context.config.platform_abi;
+        impl_->capability_hashes = context.resident_capabilities;
         const auto lease_claimed_at = now_unix_ms();
         const cluster::LeaseResource resource {.scope = "server-node", .key = context.config.node_id};
         auto lease = context.store.claim_lease(resource, context.config.node_id, lease_claimed_at,
@@ -2922,6 +2969,10 @@ policy mutation remains fail-closed.
         if (!operator_bindings) {
             return failure_output(operator_bindings.error());
         }
+        auto resident_capabilities = load_resident_capability_inventory(config->resident_capabilities_path);
+        if (!resident_capabilities) {
+            return failure_output(resident_capabilities.error());
+        }
         auto activation_policy = snapshot_activation_policy(*config);
         if (!activation_policy) {
             return failure_output(activation_policy.error());
@@ -2978,6 +3029,7 @@ policy mutation remains fail-closed.
             .runtime = *runtime,
             .pack_trust_policy = *pack_trust_policy,
             .activation_policy = *activation_policy,
+            .resident_capabilities = *resident_capabilities,
             .peer_trust_policy = **peer_trust_policy,
             .agent_tls = agent_tls->has_value() ? std::addressof(**agent_tls) : nullptr,
             .admin_tls = admin_tls->has_value() ? std::addressof(**admin_tls) : nullptr,

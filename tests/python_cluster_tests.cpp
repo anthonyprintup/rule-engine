@@ -1029,6 +1029,41 @@ namespace {
         }
     }
 
+    TEST_CASE("server-owned stage freezes only residents with the required capability inventory") {
+        TemporaryDatabase database;
+        const auto store = open_control(database);
+        REQUIRE(store);
+        REQUIRE((*store)
+                    ->upsert_node(DurableResidentNode {.node_id = "node-capable",
+                                                       .platform_abi = "windows-x64-v1",
+                                                       .lease_fence = 21,
+                                                       .lease_until_unix_ms = 10'000,
+                                                       .updated_at_unix_ms = 900,
+                                                       .serving = true,
+                                                       .capability_hashes = {"com.acme.fact.process"}})
+                    .has_value());
+        REQUIRE((*store)
+                    ->upsert_node(DurableResidentNode {.node_id = "node-incompatible",
+                                                       .platform_abi = "linux-x64-v1",
+                                                       .lease_fence = 22,
+                                                       .lease_until_unix_ms = 10'000,
+                                                       .updated_at_unix_ms = 900,
+                                                       .serving = true,
+                                                       .capability_hashes = {"com.acme.scan.regex"}})
+                    .has_value());
+
+        auto requested = generation(1, "sha256:capability-source");
+        requested.required_capability_hashes = {"com.acme.fact.process"};
+        DurableActivationAdmin admin {**store};
+        const auto preview = admin.preview_server_stage(mutation_request("capability-stage", 0, 1'000), requested);
+        REQUIRE(preview);
+        const auto compiling = admin.begin_server_stage(apply_request(*preview, 0, 1'001), requested);
+        REQUIRE(compiling);
+        CHECK(compiling->target_nodes == std::vector<std::string> {"node-capable"});
+        REQUIRE(compiling->targets.size() == 1U);
+        CHECK(compiling->targets.front().capability_hashes == std::vector<std::string> {"com.acme.fact.process"});
+    }
+
     TEST_CASE("server-owned stage fails closed when resident compilation disagrees") {
         TemporaryDatabase database;
         const auto store = open_control(database);

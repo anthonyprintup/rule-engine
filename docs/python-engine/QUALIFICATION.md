@@ -144,6 +144,18 @@ it does not qualify a remote object store, exported maintenance metrics/audit,
 generation-metadata pruning, Linux filesystem behavior, or multi-process
 failure injection.
 
+The versioned resident-capability slice then passed the complete 38-test Debug
+graph in 155.20 seconds. Executable-surface coverage proves schema-v3
+configuration, exact `rule-engine.resident-capabilities.v1` header handling,
+canonical sorting, duplicate rejection, malformed-ID rejection, and inclusion
+of the capability file in the immutable activation-policy bundle. Cluster
+coverage proves a stage freezes the eligible node and excludes an otherwise
+healthy serving node that lacks the signed-pack requirement. The production
+resident records the exact sorted inventory under its runtime lease fence.
+This does not qualify the business meaning or implementation quality of a
+declared custom capability; operators must publish only capabilities actually
+provided by the deployed resident composition.
+
 ## Artifact identity
 
 | Artifact | SHA-256 |
