@@ -440,7 +440,7 @@ namespace {
         CHECK(redispatched->empty());
     }
 
-    TEST_CASE("scheduler rebuilds snapshot work from the durable agent stream after restart") {
+    TEST_CASE("scheduler restart commits a durable provider result without redispatching agent work") {
         cluster::AuditTrail audit;
         cluster::InMemoryRuntimeStore store {audit};
         const auto agent = session();
@@ -511,7 +511,150 @@ namespace {
         auto work = (*recovered)->take_work(rebound, 1U, {});
         REQUIRE(work.has_value());
         REQUIRE(work->size() == 1U);
-        CHECK(work->front().facts.size() == 1U);
+        REQUIRE(work->front().facts.size() == 1U);
+        const auto &request = work->front().facts.front();
+        const protocol::WorkResultMessage durable_result {
+            .originating_session = rebound.session,
+            .peer = rebound.authenticated_peer.peer,
+            .originating_session_fence = rebound.session_fence,
+            .work_id = work->front().work_id,
+            .attempt_id = work->front().attempt_id,
+            .work_fence = work->front().work_fence,
+            .generation = work->front().generation,
+            .facts = {{.request_id = request.request_id,
+                       .subject = request.subject,
+                       .status = FactTerminalStatus::value,
+                       .value = make_fact(true),
+                       .returned_schema = SchemaIdentity {.id = request.expected_schema,
+                                                          .canonical_hash = request.expected_schema_hash},
+                       .diagnostic = std::nullopt}},
+            .scans = {},
+        };
+        const auto persist_result = [&](const std::uint64_t sequence, const protocol::WorkResultMessage &result) {
+            auto encoded_result = protocol::encode_durable_body(protocol::DurableAgentBody {result});
+            REQUIRE(encoded_result.has_value());
+            REQUIRE(store
+                        .transact_agent_message(cluster::AgentMessageCommit {
+                            .stream = {.tenant = rebound.authenticated_peer.tenant,
+                                       .peer = rebound.authenticated_peer.peer,
+                                       .agent_epoch = rebound.agent_epoch},
+                            .session = rebound.session,
+                            .session_fence = rebound.session_fence,
+                            .sequence = sequence,
+                            .received_at_unix_ms = sequence,
+                            .body_kind = static_cast<std::uint8_t>(protocol::MessageKind::work_result),
+                            .body = std::move(*encoded_result),
+                        })
+                        .has_value());
+        };
+
+        SECTION("valid recovered result commits without another agent round") {
+            persist_result(4U, durable_result);
+            recovered->reset();
+            recovered = tools::ResidentEvaluationScheduler::create(store, audit, "node-a", std::chrono::seconds {30},
+                                                                   {active_pack()});
+            REQUIRE(recovered.has_value());
+            rebound.acknowledged_through = 4U;
+            REQUIRE((*recovered)->bind_session(rebound).has_value());
+            auto redispatched = (*recovered)->take_work(rebound, 1U, {});
+            REQUIRE(redispatched.has_value());
+            CHECK(redispatched->empty());
+
+            const auto snapshot = store.snapshot();
+            REQUIRE(snapshot.results.size() == 1U);
+            CHECK(snapshot.results.front().evaluation.outcome == EvaluationOutcome::match);
+            CHECK(snapshot.results.front().evaluation.verdict == true);
+
+            recovered->reset();
+            recovered = tools::ResidentEvaluationScheduler::create(store, audit, "node-a", std::chrono::seconds {30},
+                                                                   {active_pack()});
+            REQUIRE(recovered.has_value());
+            REQUIRE((*recovered)->bind_session(rebound).has_value());
+            auto completed = (*recovered)->take_work(rebound, 1U, {});
+            REQUIRE(completed.has_value());
+            CHECK(completed->empty());
+        }
+
+        SECTION("changed duplicate durable round fails scheduler recovery") {
+            persist_result(4U, durable_result);
+            auto changed = durable_result;
+            changed.facts.front().value = make_fact(false);
+            persist_result(5U, changed);
+            recovered->reset();
+            recovered = tools::ResidentEvaluationScheduler::create(store, audit, "node-a", std::chrono::seconds {30},
+                                                                   {active_pack()});
+            REQUIRE_FALSE(recovered.has_value());
+            CHECK(recovered.error().code == protocol::ProtocolErrorCode::provider_violation);
+        }
+
+        SECTION("noncontiguous durable round fails scheduler recovery") {
+            auto skipped = durable_result;
+            skipped.work_id.replace(skipped.work_id.rfind(":round:") + 7U, 1U, "2");
+            skipped.attempt_id.replace(skipped.attempt_id.rfind(':') + 1U, 1U, "2");
+            persist_result(4U, skipped);
+            recovered->reset();
+            recovered = tools::ResidentEvaluationScheduler::create(store, audit, "node-a", std::chrono::seconds {30},
+                                                                   {active_pack()});
+            REQUIRE_FALSE(recovered.has_value());
+            CHECK(recovered.error().code == protocol::ProtocolErrorCode::sequence_gap);
+        }
+
+        SECTION("unknown durable work root fails scheduler recovery") {
+            auto unknown = durable_result;
+            unknown.work_id = "work:" + std::string(64U, 'f') + ":round:1";
+            persist_result(4U, unknown);
+            recovered->reset();
+            recovered = tools::ResidentEvaluationScheduler::create(store, audit, "node-a", std::chrono::seconds {30},
+                                                                   {active_pack()});
+            REQUIRE_FALSE(recovered.has_value());
+            CHECK(recovered.error().code == protocol::ProtocolErrorCode::stale_generation);
+        }
+
+        SECTION("stale durable work fence fails before VM recovery") {
+            auto stale = durable_result;
+            ++stale.work_fence;
+            persist_result(4U, stale);
+            recovered->reset();
+            recovered = tools::ResidentEvaluationScheduler::create(store, audit, "node-a", std::chrono::seconds {30},
+                                                                   {active_pack()});
+            REQUIRE(recovered.has_value());
+            rebound.acknowledged_through = 4U;
+            REQUIRE((*recovered)->bind_session(rebound).has_value());
+            auto redispatched = (*recovered)->take_work(rebound, 1U, {});
+            REQUIRE_FALSE(redispatched.has_value());
+            CHECK(redispatched.error().code == protocol::ProtocolErrorCode::stale_fence);
+            CHECK(store.snapshot().results.empty());
+        }
+
+        SECTION("malformed durable attempt identity fails scheduler recovery") {
+            auto malformed_attempt = durable_result;
+            malformed_attempt.attempt_id = "attempt:bogus:1";
+            persist_result(4U, malformed_attempt);
+            recovered->reset();
+            recovered = tools::ResidentEvaluationScheduler::create(store, audit, "node-a", std::chrono::seconds {30},
+                                                                   {active_pack()});
+            REQUIRE_FALSE(recovered.has_value());
+            CHECK(recovered.error().code == protocol::ProtocolErrorCode::invalid_identity);
+        }
+
+        SECTION("malformed recovered response commits a fault instead of a match") {
+            auto malformed = durable_result;
+            malformed.facts.front().request_id = RequestId {"wrong-request"};
+            persist_result(4U, malformed);
+            recovered->reset();
+            recovered = tools::ResidentEvaluationScheduler::create(store, audit, "node-a", std::chrono::seconds {30},
+                                                                   {active_pack()});
+            REQUIRE(recovered.has_value());
+            rebound.acknowledged_through = 4U;
+            REQUIRE((*recovered)->bind_session(rebound).has_value());
+            auto redispatched = (*recovered)->take_work(rebound, 1U, {});
+            REQUIRE(redispatched.has_value());
+            CHECK(redispatched->empty());
+            const auto snapshot = store.snapshot();
+            REQUIRE(snapshot.results.size() == 1U);
+            CHECK(snapshot.results.front().evaluation.outcome == EvaluationOutcome::faulted);
+            CHECK_FALSE(snapshot.results.front().evaluation.verdict.has_value());
+        }
     }
 
     TEST_CASE("new session reclaims unfinished work and stale close cannot abandon it") {

@@ -194,10 +194,25 @@ fresh per-attempt peaks/recovery tiers, overflow rejection, and a real register
 VM reaching zero remaining instructions. The warning-clean Debug graph passed
 all 38 tests in 173.46 seconds.
 
+The durable provider-round recovery slice covers the crash window after an
+agent result is durably accepted but before the VM transaction commits. A
+same-node scheduler restart reconstructs snapshot work, reacquires the existing
+fenced lease, indexes canonical contiguous result rounds, starts a fresh VM,
+and commits the recovered response without emitting agent work. Negative
+sections reject a changed duplicate, a skipped round, an unknown work root, a
+malformed attempt identity, and a result whose fence differs from the
+reacquired lease; a response with the wrong request identity produces a
+committed fault rather than a match. A subsequent restart proves the committed
+receipt suppresses the old durable provider result. Canonically encoded
+recovery retention is hard-capped at 16 MiB per work item and 64 MiB per
+scheduler construction. The warning-clean complete Debug graph passed all 38
+tests in 175.17 seconds.
+
 This evidence does not qualify state records or wider authoring forms,
-migration bytecode, restart-resumable captures/VM checkpoints, reset or
-retained-gap administration, exported retry metrics, live PostgreSQL, or
-multi-process state contention.
+migration bytecode, arbitrary VM checkpoints or crash-continuous resource
+accounting, immediate cross-node lease takeover, reset or retained-gap
+administration, exported retry metrics, live PostgreSQL, or multi-process state
+contention.
 
 ## Artifact identity
 

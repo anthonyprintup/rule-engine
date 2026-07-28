@@ -111,8 +111,9 @@ OpenSSL allocator overhead, or backend-internal caches.
 - The resident listener currently requires mTLS even when development
   configuration permits loopback plaintext; startup fails closed instead of
   dereferencing a missing TLS context. Accept and TLS handshake are serialized
-  before bounded worker admission, and an injected agent backend supplies one
-  initial work batch per session.
+  before bounded worker admission. The agent backend supplies an initial work
+  batch and replenishes available credit after each durable inbound message;
+  there is not yet a separate idle-session work notification path.
 - Archive publication uses a same-directory hard link to provide atomic
   no-clobber behavior. Filesystems without hard-link support fail closed.
 - `--watch` coordinates cancellation and publication generations, but a

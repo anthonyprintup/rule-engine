@@ -7,6 +7,7 @@
 #include "rule_engine/python/vm/register_vm.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <deque>
 #include <limits>
 #include <map>
@@ -78,6 +79,9 @@ namespace rule_engine::python::tools {
                    state == VmStepState::quarantined || state == VmStepState::canceled;
         }
 
+        constexpr std::size_t maximum_recovered_provider_bytes_per_work = 16U * mebibyte;
+        constexpr std::size_t maximum_recovered_provider_bytes = 64U * mebibyte;
+
     } // namespace
 
     struct ResidentEvaluationScheduler::Impl {
@@ -90,6 +94,13 @@ namespace rule_engine::python::tools {
             std::string serial_domain;
         };
 
+        struct RecoveredProviderRound {
+            HostResponses responses;
+            std::vector<std::byte> canonical_result;
+            std::uint64_t protocol_attempt {};
+            std::uint64_t work_fence {};
+        };
+
         struct ActiveEvaluation {
             struct CapturedProviderRound {
                 std::vector<std::string> fact_keys;
@@ -100,10 +111,13 @@ namespace rule_engine::python::tools {
             cluster::WorkLease lease;
             std::unique_ptr<VmSession> vm;
             std::size_t round {};
+            std::uint64_t protocol_attempt {};
             SessionId session;
             std::uint64_t session_fence {};
             std::vector<CapturedProviderRound> captured_provider_rounds;
             std::size_t replay_provider_round {};
+            std::vector<HostResponses> recovered_provider_rounds;
+            std::size_t recovered_provider_round {};
             std::uint32_t mvcc_attempt {1U};
             VmResourceUsage cumulative_usage;
             std::chrono::nanoseconds reported_elapsed {};
@@ -124,6 +138,7 @@ namespace rule_engine::python::tools {
             std::map<std::string, std::string, std::less<>> staging_snapshot_scopes;
             std::map<std::string, EvaluationDefinition, std::less<>> definitions;
             std::map<std::string, ActiveEvaluation, std::less<>> active_rounds;
+            std::map<std::string, std::vector<RecoveredProviderRound>, std::less<>> recovered_provider_rounds;
             std::deque<protocol_v2::WorkLeaseMessage> pending;
             std::map<std::string, std::uint64_t, std::less<>> processed_epochs;
             SessionId current_session;
@@ -138,6 +153,7 @@ namespace rule_engine::python::tools {
         protocol_v2::ProtocolLimits limits;
         std::map<std::string, std::uint64_t, std::less<>> reserved_cursors;
         std::map<std::string, PeerState, std::less<>> peers;
+        std::size_t recovered_provider_bytes {};
         std::mutex mutex;
 
         Impl(cluster::IClusterRuntimeStore &store_value, cluster::AuditTrail &audit_value, std::string node_id_value,
@@ -209,11 +225,83 @@ namespace rule_engine::python::tools {
             };
         }
 
+        struct WorkRoundIdentity {
+            std::string root_work_id;
+            std::size_t round {};
+        };
+
+        struct WorkAttemptIdentity {
+            std::uint64_t attempt {};
+            std::size_t round {};
+        };
+
+        [[nodiscard]] static std::optional<WorkRoundIdentity> work_round_identity(const std::string_view work_id) {
+            constexpr std::string_view marker {":round:"};
+            const auto suffix = work_id.rfind(marker);
+            if (suffix == std::string_view::npos || suffix == 0U || suffix + marker.size() == work_id.size()) {
+                return std::nullopt;
+            }
+            std::uint64_t round {};
+            const auto digits = work_id.substr(suffix + marker.size());
+            const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), round);
+            if (parsed.ec != std::errc {} || parsed.ptr != digits.data() + digits.size() || round == 0U ||
+                round > balanced_v1.normal.provider_rounds) {
+                return std::nullopt;
+            }
+            return WorkRoundIdentity {
+                .root_work_id = std::string {work_id.substr(0U, suffix)},
+                .round = static_cast<std::size_t>(round),
+            };
+        }
+
+        [[nodiscard]] static std::optional<WorkAttemptIdentity>
+        work_attempt_identity(const std::string_view attempt_id) {
+            constexpr std::string_view prefix {"attempt:"};
+            if (!attempt_id.starts_with(prefix)) {
+                return std::nullopt;
+            }
+            const auto separator = attempt_id.find(':', prefix.size());
+            if (separator == std::string_view::npos || separator == prefix.size() ||
+                separator + 1U == attempt_id.size()) {
+                return std::nullopt;
+            }
+            std::uint64_t attempt {};
+            const auto attempt_digits = attempt_id.substr(prefix.size(), separator - prefix.size());
+            const auto parsed_attempt =
+                std::from_chars(attempt_digits.data(), attempt_digits.data() + attempt_digits.size(), attempt);
+            std::uint64_t round {};
+            const auto round_digits = attempt_id.substr(separator + 1U);
+            const auto parsed_round =
+                std::from_chars(round_digits.data(), round_digits.data() + round_digits.size(), round);
+            if (parsed_attempt.ec != std::errc {} ||
+                parsed_attempt.ptr != attempt_digits.data() + attempt_digits.size() || attempt == 0U ||
+                parsed_round.ec != std::errc {} || parsed_round.ptr != round_digits.data() + round_digits.size() ||
+                round == 0U || round > balanced_v1.normal.provider_rounds) {
+                return std::nullopt;
+            }
+            return WorkAttemptIdentity {.attempt = attempt, .round = static_cast<std::size_t>(round)};
+        }
+
         [[nodiscard]] static ActiveEvaluation::CapturedProviderRound
         capture_provider_round(const ActiveEvaluation &active, HostResponses responses) {
             ActiveEvaluation::CapturedProviderRound capture {.fact_keys = active.pending_fact_keys,
                                                              .scan_keys = active.pending_scan_keys,
                                                              .responses = std::move(responses)};
+            return capture;
+        }
+
+        [[nodiscard]] static ActiveEvaluation::CapturedProviderRound capture_provider_round(const VmStep &step,
+                                                                                            HostResponses responses) {
+            ActiveEvaluation::CapturedProviderRound capture {
+                .fact_keys = {}, .scan_keys = {}, .responses = std::move(responses)};
+            capture.fact_keys.reserve(step.fact_requests.size());
+            for (const auto &request : step.fact_requests) {
+                capture.fact_keys.push_back(runtime::captured_fact_input_key(request));
+            }
+            capture.scan_keys.reserve(step.scan_requests.size());
+            for (const auto &request : step.scan_requests) {
+                capture.scan_keys.push_back(runtime::captured_scan_input_key(request));
+            }
             return capture;
         }
 
@@ -234,6 +322,102 @@ namespace rule_engine::python::tools {
                 }
             }
             return true;
+        }
+
+        [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
+        index_recovered_provider_round(PeerState &state, const ResidentAgentSession &session,
+                                       const protocol_v2::WorkResultMessage &result) {
+            if (result.originating_session != session.session ||
+                result.originating_session_fence != session.session_fence ||
+                result.peer != session.authenticated_peer.peer || result.attempt_id.empty() ||
+                result.work_fence == 0U || (result.facts.empty() && result.scans.empty())) {
+                return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::stale_fence,
+                                                      "durable provider result has inconsistent recovery identity"));
+            }
+            const auto identity = work_round_identity(result.work_id);
+            if (!identity) {
+                return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::invalid_identity,
+                                                      "durable provider result has an invalid work-round identity"));
+            }
+            const auto attempt = work_attempt_identity(result.attempt_id);
+            if (!attempt || attempt->round != identity->round) {
+                return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::invalid_identity,
+                                                      "durable provider result has an invalid attempt identity"));
+            }
+            const auto definition = state.definitions.find(identity->root_work_id);
+            if (definition == state.definitions.end()) {
+                if (!identity->root_work_id.starts_with("work:")) {
+                    return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::invalid_identity,
+                                                          "durable provider result has no deterministic work root"));
+                }
+                auto receipt = store.load_receipt(EventId {"event:" + identity->root_work_id.substr(5U)});
+                if (!receipt) {
+                    return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::persistence_error,
+                                                          "durable provider recovery receipt lookup failed"));
+                }
+                if (*receipt) {
+                    // A committed receipt suppresses its deterministic
+                    // definition during snapshot reconstruction. Its old
+                    // provider result is no longer recovery input.
+                    return {};
+                }
+                return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::stale_generation,
+                                                      "durable provider result has no recoverable work definition"));
+            }
+            if (result.generation != packs[definition->second.pack_index].generation) {
+                return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::stale_generation,
+                                                      "durable provider result targets a different generation"));
+            }
+            auto canonical = protocol_v2::encode_durable_body(protocol_v2::DurableAgentBody {result}, limits);
+            if (!canonical) {
+                return std::unexpected(std::move(canonical.error()));
+            }
+            auto &rounds = state.recovered_provider_rounds[identity->root_work_id];
+            if (!rounds.empty() && rounds.front().protocol_attempt != attempt->attempt) {
+                return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::stale_fence,
+                                                      "durable provider result changed attempt during recovery"));
+            }
+            if (identity->round <= rounds.size()) {
+                if (rounds[identity->round - 1U].canonical_result == *canonical) {
+                    return {};
+                }
+                return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::provider_violation,
+                                                      "durable provider result changed across recovery replay"));
+            }
+            if (identity->round != rounds.size() + 1U) {
+                return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::sequence_gap,
+                                                      "durable provider result rounds are not contiguous"));
+            }
+            std::size_t work_bytes {};
+            for (const auto &round : rounds) {
+                if (round.canonical_result.size() > maximum_recovered_provider_bytes_per_work - work_bytes) {
+                    return std::unexpected(
+                        protocol_error(protocol_v2::ProtocolErrorCode::limit_exceeded,
+                                       "durable provider recovery capture exceeds its per-work byte limit"));
+                }
+                work_bytes += round.canonical_result.size();
+            }
+            if (canonical->size() > maximum_recovered_provider_bytes_per_work - work_bytes ||
+                canonical->size() > maximum_recovered_provider_bytes - recovered_provider_bytes) {
+                return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::limit_exceeded,
+                                                      "durable provider recovery capture exceeds its byte limit"));
+            }
+            recovered_provider_bytes += canonical->size();
+            rounds.push_back(RecoveredProviderRound {
+                .responses =
+                    HostResponses {
+                        .facts = result.facts,
+                        .scans = result.scans,
+                        .capabilities = {},
+                        .state = {},
+                        .history = {},
+                        .cancel = false,
+                    },
+                .canonical_result = std::move(*canonical),
+                .protocol_attempt = attempt->attempt,
+                .work_fence = result.work_fence,
+            });
+            return {};
         }
 
         [[nodiscard]] std::expected<HostResponses, protocol_v2::ProtocolError>
@@ -446,6 +630,12 @@ namespace rule_engine::python::tools {
                         return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::provider_violation,
                                                               "terminal VM step has no result"));
                     }
+                    if (active.recovered_provider_round != active.recovered_provider_rounds.size()) {
+                        static_cast<void>(state.coordinator->abandon(active.lease, now_unix_ms()));
+                        return std::unexpected(protocol_error(
+                            protocol_v2::ProtocolErrorCode::provider_violation,
+                            "resident recovery terminated before consuming every durable provider round"));
+                    }
                     if (active.replaying && active.replay_provider_round != active.captured_provider_rounds.size()) {
                         static_cast<void>(state.coordinator->abandon(active.lease, now_unix_ms()));
                         return std::unexpected(protocol_error(
@@ -544,6 +734,13 @@ namespace rule_engine::python::tools {
                     responses = capture.responses;
                     continue;
                 }
+                if (active.recovered_provider_round < active.recovered_provider_rounds.size()) {
+                    auto recovered = active.recovered_provider_rounds[active.recovered_provider_round++];
+                    ++active.round;
+                    active.captured_provider_rounds.push_back(capture_provider_round(step, recovered));
+                    responses = std::move(recovered);
+                    continue;
+                }
                 std::string route {"windows"};
                 if (!step.fact_requests.empty()) {
                     route = step.fact_requests.front().route.provider;
@@ -573,7 +770,7 @@ namespace rule_engine::python::tools {
                     .session_fence = session.session_fence,
                     .work_id = protocol_work_id,
                     .attempt_id =
-                        "attempt:" + std::to_string(active.lease.attempt) + ':' + std::to_string(active.round),
+                        "attempt:" + std::to_string(active.protocol_attempt) + ':' + std::to_string(active.round),
                     .work_fence = active.lease.fence,
                     .generation = active.lease.work.generation,
                     .server_sequence = 0U,
@@ -645,7 +842,7 @@ namespace rule_engine::python::tools {
                 }
             } else if (const auto *result = std::get_if<protocol_v2::WorkResultMessage>(&body)) {
                 if (recovering) {
-                    applied = {};
+                    applied = index_recovered_provider_round(state, session, *result);
                 } else {
                     auto active = state.active_rounds.find(result->work_id);
                     if (active == state.active_rounds.end() || active->second.session != session.session ||
@@ -654,7 +851,7 @@ namespace rule_engine::python::tools {
                         result->originating_session_fence != session.session_fence ||
                         result->work_fence != active->second.lease.fence ||
                         result->generation != active->second.lease.work.generation ||
-                        result->attempt_id != "attempt:" + std::to_string(active->second.lease.attempt) + ':' +
+                        result->attempt_id != "attempt:" + std::to_string(active->second.protocol_attempt) + ':' +
                                                   std::to_string(active->second.round)) {
                         applied = std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::stale_fence,
                                                                  "work result does not match an active VM round"));
@@ -872,23 +1069,44 @@ namespace rule_engine::python::tools {
                 static_cast<void>(state.coordinator->abandon(lease, now_unix_ms()));
                 continue;
             }
-            auto driven = impl_->drive(state, session, lease.work.work_id,
-                                       Impl::ActiveEvaluation {.lease = lease,
-                                                               .vm = std::move(*vm),
-                                                               .round = 0U,
-                                                               .session = session.session,
-                                                               .session_fence = session.session_fence,
-                                                               .captured_provider_rounds = {},
-                                                               .replay_provider_round = 0U,
-                                                               .mvcc_attempt = 1U,
-                                                               .cumulative_usage = {},
-                                                               .reported_elapsed = {},
-                                                               .started = std::chrono::steady_clock::now(),
-                                                               .attempt_budget = balanced_v1,
-                                                               .replaying = false,
-                                                               .pending_fact_keys = {},
-                                                               .pending_scan_keys = {}},
-                                       {});
+            std::vector<HostResponses> recovered_provider_rounds;
+            auto protocol_attempt = lease.attempt;
+            if (const auto recovered = state.recovered_provider_rounds.find(lease.work.work_id);
+                recovered != state.recovered_provider_rounds.end()) {
+                recovered_provider_rounds.reserve(recovered->second.size());
+                protocol_attempt = recovered->second.front().protocol_attempt;
+                for (auto &round : recovered->second) {
+                    if (round.work_fence != lease.fence) {
+                        static_cast<void>(state.coordinator->abandon(lease, now_unix_ms()));
+                        return std::unexpected(
+                            protocol_error(protocol_v2::ProtocolErrorCode::stale_fence,
+                                           "durable provider result fence does not match the reacquired work lease"));
+                    }
+                    recovered_provider_rounds.push_back(std::move(round.responses));
+                }
+                state.recovered_provider_rounds.erase(recovered);
+            }
+            auto driven =
+                impl_->drive(state, session, lease.work.work_id,
+                             Impl::ActiveEvaluation {.lease = lease,
+                                                     .vm = std::move(*vm),
+                                                     .round = 0U,
+                                                     .protocol_attempt = protocol_attempt,
+                                                     .session = session.session,
+                                                     .session_fence = session.session_fence,
+                                                     .captured_provider_rounds = {},
+                                                     .replay_provider_round = 0U,
+                                                     .recovered_provider_rounds = std::move(recovered_provider_rounds),
+                                                     .recovered_provider_round = 0U,
+                                                     .mvcc_attempt = 1U,
+                                                     .cumulative_usage = {},
+                                                     .reported_elapsed = {},
+                                                     .started = std::chrono::steady_clock::now(),
+                                                     .attempt_budget = balanced_v1,
+                                                     .replaying = false,
+                                                     .pending_fact_keys = {},
+                                                     .pending_scan_keys = {}},
+                             {});
             if (!driven) {
                 return std::unexpected(std::move(driven.error()));
             }

@@ -261,8 +261,15 @@ snapshot messages.
 
 Current operations must account for three evaluator limits: one VM provider
 turn stays on one agent route, capability/service/history host turns fail
-closed, and resident retries do not survive a server process crash. A durable
-state conflict is replayed transparently at most twice: the scheduler creates a
+closed, and no VM heap/frame checkpoint survives a server process crash. A
+same-node restart can nevertheless recover an authenticated fact/scan result
+that was durable before the crash: it reconstructs deterministic work,
+reacquires its still-current fenced lease, rereads state, and validates bounded
+contiguous provider rounds through a fresh VM without endpoint redispatch. A
+different node waits for lease expiry. Canonically encoded recovery input is
+capped at 16 MiB per work and 64 MiB per scheduler construction, and normal
+resource counters restart with the fresh process. A durable state conflict is
+replayed transparently at most twice: the scheduler creates a
 fresh VM, rereads state, supplies exact captured fact/scan responses without
 agent redispatch, and applies one cumulative `balanced.v1` normal budget across
 all attempts. A changed or newly reached provider request, invalid resource

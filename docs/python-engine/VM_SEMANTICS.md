@@ -220,6 +220,23 @@ accounting. Frame depth, live heap, and active-service limits remain
 per-attempt peaks. If replay asks for an external input absent from the sealed
 capture, or if all three commit attempts conflict, evaluation fails closed.
 
+Resident restart recovery uses the same principle without persisting VM
+internals. The durable agent stream already contains each authenticated,
+fence-validated fact/scan result. A restarted scheduler reconstructs the
+deterministic work and contiguous provider rounds, reacquires a still-current
+lease only under the same stable node identity, creates a fresh VM, rereads
+state, and supplies those results only when the VM reproduces the expected
+requests. Changed or skipped rounds fail scheduler recovery; malformed
+responses become a VM fault, never a match. A different node waits for the
+lease fence to expire.
+
+This is input recovery, not a durable VM checkpoint. Frames, heap, candidate
+journals, and resource counters are not serialized. Canonically encoded
+recovery capture is capped at 16 MiB per work item and 64 MiB per scheduler
+construction. A process crash can therefore restart normal-budget accounting;
+repeated crash containment still belongs to process supervision and is not
+presented as an adversarial budget guarantee.
+
 Only after a successful commit may the outbox deliver an external effect.
 Delivery can be retried, so sinks still use stable intent IDs for idempotency.
 
