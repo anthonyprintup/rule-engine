@@ -785,6 +785,21 @@ TEST_CASE("resident runtime refreshes state while replaying captured facts after
     CHECK(fixture.transactions.proposals.back().state.front().expected_version == 1U);
 }
 
+TEST_CASE("resident runtime stops after three state-conflict attempts without redispatching captured facts") {
+    Fixture fixture {SessionScenario::state_conflict};
+    fixture.transactions.conflicts_remaining = runtime::maximum_mvcc_attempts;
+    ResidentRuntime runtime {fixture.vm_driver, fixture.ports(), fixture.control, fixture.transactions};
+
+    const auto result = runtime.evaluate(evaluation_request());
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == ResidentRuntimeErrorCode::state_conflict_exhausted);
+    CHECK(fixture.vm.starts == runtime::maximum_mvcc_attempts);
+    CHECK(fixture.providers.fact_dispatches == 1U);
+    CHECK(fixture.state.reads == runtime::maximum_mvcc_attempts);
+    CHECK(fixture.transactions.commits == runtime::maximum_mvcc_attempts);
+}
+
 TEST_CASE("MVCC retries inherit cumulative normal budgets while attempt peaks and recovery caps stay fresh") {
     Fixture fixture {SessionScenario::state_conflict};
     fixture.transactions.conflicts_remaining = 1U;

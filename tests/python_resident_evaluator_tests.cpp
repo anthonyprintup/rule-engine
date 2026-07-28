@@ -107,6 +107,23 @@ namespace {
         return result;
     }
 
+    [[nodiscard]] tools::ResidentActivePack stateful_provider_active_pack() {
+        auto result = active_pack();
+        result.compilation.pack.constants = {
+            vm::make_state_operand("state-key-v1/peer/com.example.provider-flag", "value", SchemaId {"bool"}),
+            vm::make_fact_operand(FactRoute {.provider = "windows", .fact = "process.is_signed"}, SchemaId {"bool"}),
+        };
+        auto &function = result.compilation.pack.functions.front();
+        function.register_count = 3U;
+        function.instructions = {
+            instruction(Opcode::read_state, 1U, 0U, 0U, 0U, 0U),
+            instruction(Opcode::await_fact, 2U, 0U, 0U, 1U, 1U),
+            instruction(Opcode::write_state, 0U, 2U, 0U, 0U, 2U),
+            instruction(Opcode::return_value, 0U, 2U, 0U, 0U, 3U),
+        };
+        return result;
+    }
+
     [[nodiscard]] SubjectKey subject() {
         return {
             .peer = PeerId {"peer-a"},
@@ -319,6 +336,108 @@ namespace {
             CHECK(snapshot.state[1].key.namespace_name != "state-key-v1/subject/com.example.subject-flag");
             CHECK(snapshot.state[0].key.namespace_name != snapshot.state[1].key.namespace_name);
         }
+    }
+
+    TEST_CASE("resident MVCC conflict replays captured provider input without redispatching agent work") {
+        cluster::AuditTrail audit;
+        cluster::InMemoryRuntimeStore store {audit};
+        auto scheduler = tools::ResidentEvaluationScheduler::create(store, audit, "node-a", std::chrono::seconds {30},
+                                                                    {stateful_provider_active_pack()});
+        REQUIRE(scheduler.has_value());
+        const auto agent = session();
+        REQUIRE((*scheduler)->bind_session(agent).has_value());
+
+        const std::vector subjects {subject()};
+        const auto digest = protocol::authoritative_snapshot_digest(subjects);
+        REQUIRE(digest.has_value());
+        REQUIRE((*scheduler)
+                    ->ingest(agent, 1U,
+                             protocol::AuthoritativeSnapshotBegin {
+                                 .session = agent.session,
+                                 .peer = agent.authenticated_peer.peer,
+                                 .session_fence = agent.session_fence,
+                                 .snapshot_id = "snapshot-mvcc-replay",
+                                 .parent = {},
+                                 .subject_schema = SchemaId {"windows.process.v1"},
+                                 .generation = 1U,
+                                 .expected_count = subjects.size(),
+                                 .expected_digest = *digest,
+                             },
+                             {})
+                    .has_value());
+        REQUIRE((*scheduler)
+                    ->ingest(agent, 2U,
+                             protocol::AuthoritativeSnapshotChunk {
+                                 .session = agent.session,
+                                 .peer = agent.authenticated_peer.peer,
+                                 .session_fence = agent.session_fence,
+                                 .snapshot_id = "snapshot-mvcc-replay",
+                                 .generation = 1U,
+                                 .chunk_index = 0U,
+                                 .subjects = subjects,
+                             },
+                             {})
+                    .has_value());
+        REQUIRE((*scheduler)
+                    ->ingest(agent, 3U,
+                             protocol::AuthoritativeSnapshotCommit {
+                                 .session = agent.session,
+                                 .peer = agent.authenticated_peer.peer,
+                                 .session_fence = agent.session_fence,
+                                 .snapshot_id = "snapshot-mvcc-replay",
+                                 .generation = 1U,
+                                 .item_count = subjects.size(),
+                                 .canonical_digest = *digest,
+                             },
+                             {})
+                    .has_value());
+
+        auto work = (*scheduler)->take_work(agent, 1U, {});
+        REQUIRE(work.has_value());
+        REQUIRE(work->size() == 1U);
+        REQUIRE(work->front().facts.size() == 1U);
+        const auto &request = work->front().facts.front();
+
+        store.fail_next_commit(StoreError {
+            .code = StoreErrorCode::conflict,
+            .message = "injected resident state conflict",
+            .retryable = true,
+        });
+        const auto applied =
+            (*scheduler)
+                ->ingest(
+                    agent, 4U,
+                    protocol::WorkResultMessage {
+                        .originating_session = agent.session,
+                        .peer = agent.authenticated_peer.peer,
+                        .originating_session_fence = agent.session_fence,
+                        .work_id = work->front().work_id,
+                        .attempt_id = work->front().attempt_id,
+                        .work_fence = work->front().work_fence,
+                        .generation = work->front().generation,
+                        .facts = {{.request_id = request.request_id,
+                                   .subject = request.subject,
+                                   .status = FactTerminalStatus::value,
+                                   .value = make_fact(true),
+                                   .returned_schema = SchemaIdentity {.id = request.expected_schema,
+                                                                      .canonical_hash = request.expected_schema_hash},
+                                   .diagnostic = std::nullopt}},
+                        .scans = {},
+                    },
+                    {});
+        const auto applied_message = applied ? std::string {} : applied.error().message;
+        INFO(applied_message);
+        REQUIRE(applied.has_value());
+
+        const auto snapshot = store.snapshot();
+        REQUIRE(snapshot.results.size() == 1U);
+        REQUIRE(snapshot.state.size() == 1U);
+        CHECK(snapshot.results.front().evaluation.outcome == EvaluationOutcome::match);
+        CHECK(snapshot.results.front().evaluation.verdict == true);
+        CHECK(snapshot.state.front().version == 1U);
+        auto redispatched = (*scheduler)->take_work(agent, 1U, {});
+        REQUIRE(redispatched.has_value());
+        CHECK(redispatched->empty());
     }
 
     TEST_CASE("scheduler rebuilds snapshot work from the durable agent stream after restart") {

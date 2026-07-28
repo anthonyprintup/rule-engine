@@ -41,13 +41,18 @@ flowchart TD
     E -->|"history request"| W["Yield with typed request vector"]
     E -->|"fairness yield"| H["Requeue the same session"]
 
-    F --> I["Coordinator dispatches a data-only request"]
-    W --> I
+    F --> AA{"MVCC replay?"}
+    W --> AA
+    AA -->|"no"| I["Coordinator dispatches a data-only request"]
+    AA -->|"yes"| AB{"Exact captured request identity exists?"}
+    AB -->|"yes"| K
+    AB -->|"no"| L
     G --> X{"Owner, scope, schema, and fence valid?"}
     X -->|"yes"| K
     X -->|"no"| L
     I --> J{"Identity, schema, subject, bounds, fence, and result valid?"}
-    J -->|"yes"| K["Capture response for replay"]
+    J -->|"yes"| AC["Seal external response for replay"]
+    AC --> K["Supply validated response"]
     K --> C
     J -->|"no"| L["Integrity fault"]
     H --> C
@@ -65,7 +70,10 @@ flowchart TD
     Q -->|"recovery faults or aborts"| P
     R --> S{"Atomic durable commit"}
     S -->|"success"| T["Committed receipt; outbox becomes eligible"]
-    S -->|"MVCC conflict today"| Y["Fail attempt; transparent replay is not implemented"]
+    S -->|"MVCC conflict"| Y{"Fewer than three total attempts?"}
+    Y -->|"yes"| Z["Discard candidate; charge cumulative use; create a fresh VM with remaining budget"]
+    Z --> C
+    Y -->|"no"| U["Terminal state-conflict fault"]
     P --> V["Rollback journals; terminal fault state"]
 ```
 
@@ -175,9 +183,12 @@ identity. A response is accepted only for that outstanding request and only
 after boundary validation. A malformed, oversized, stale, or mismatched
 response becomes a typed boundary or integrity failure.
 
-Accepted external inputs are captured. Replay and an MVCC retry therefore see
-the same logical facts and capability results even though the VM session is
-fresh.
+Accepted external inputs are captured. During resident state-conflict replay,
+fact and scan rounds must reproduce the exact request identities already
+captured; their authenticated responses are supplied locally and no second
+agent work item is issued. Durable state is deliberately not captured: each
+attempt reads it again. A missing, extra, reordered, or changed external
+request fails closed instead of mixing observation epochs.
 
 ## Exceptions and cleanup
 
@@ -202,7 +213,12 @@ until commit. Normal execution cannot publish them directly.
 The store atomically commits the verdict, state mutations, event/effect
 intents, and input cursor. A fault or cancellation rolls back the journals. An
 MVCC conflict can start a fresh session at most twice under `balanced.v1`;
-captured external inputs are reused and cumulative budgets are not reset.
+captured external inputs are reused and cumulative budgets are not reset. Each
+retry discards frames, heap, and candidate journals, rereads current durable
+state, and receives only the normal-budget remainder after checked cumulative
+accounting. Frame depth, live heap, and active-service limits remain
+per-attempt peaks. If replay asks for an external input absent from the sealed
+capture, or if all three commit attempts conflict, evaluation fails closed.
 
 Only after a successful commit may the outbox deliver an external effect.
 Delivery can be retried, so sinks still use stable intent IDs for idempotency.

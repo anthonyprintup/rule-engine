@@ -183,9 +183,21 @@ Durable generation codec v4 preserves each node's direct attestation, and a
 mismatched report fails before readiness. The complete Debug graph passed all
 38 tests in 157.24 seconds.
 
-This evidence does not qualify transparent MVCC replay, state records or wider
-authoring forms, migration bytecode, reset or retained-gap administration, live
-PostgreSQL, or multi-process state contention.
+The resident state-conflict replay slice uses the same canonical request keys,
+checked cumulative usage accounting, remaining-budget derivation, and shared
+three-attempt ceiling as the backend-neutral runtime. An injected resident
+commit conflict proves a fresh VM rereads state, reuses the authenticated fact
+response, commits exactly one result/state mutation, and emits no second agent
+work item. Runtime integration coverage additionally proves exhaustion after
+three commits with one fact dispatch, cumulative normal-budget subtraction,
+fresh per-attempt peaks/recovery tiers, overflow rejection, and a real register
+VM reaching zero remaining instructions. The warning-clean Debug graph passed
+all 38 tests in 173.46 seconds.
+
+This evidence does not qualify state records or wider authoring forms,
+migration bytecode, restart-resumable captures/VM checkpoints, reset or
+retained-gap administration, exported retry metrics, live PostgreSQL, or
+multi-process state contention.
 
 ## Artifact identity
 

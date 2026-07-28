@@ -14,8 +14,6 @@
 namespace rule_engine::python::runtime {
     namespace {
 
-        constexpr std::uint32_t maximum_mvcc_attempts = 3U;
-
         [[nodiscard]] ResidentRuntimeError runtime_error(const ResidentRuntimeErrorCode code, std::string message) {
             return ResidentRuntimeError {
                 .code = code,
@@ -764,6 +762,21 @@ namespace rule_engine::python::runtime {
         }
 
     } // namespace
+
+    std::string captured_fact_input_key(const FactRequest &request) { return fact_key(request); }
+
+    std::string captured_scan_input_key(const ScanRequest &request) { return scan_key(request); }
+
+    std::expected<void, ResidentRuntimeError> accumulate_vm_retry_usage(VmResourceUsage &total,
+                                                                        std::chrono::nanoseconds &reported_elapsed,
+                                                                        const VmResourceUsage &attempt,
+                                                                        const BudgetProfile &attempt_budget) {
+        return accumulate_usage(total, reported_elapsed, attempt, attempt_budget);
+    }
+
+    BudgetProfile remaining_vm_retry_budget(const BudgetProfile &original, const VmResourceUsage &usage) noexcept {
+        return remaining_budget(original, usage);
+    }
 
     std::expected<EvaluationHandle, DiagnosticSet>
     DispatchFreeRuntimeEngineDriver::start(const VmInvocation &invocation) {

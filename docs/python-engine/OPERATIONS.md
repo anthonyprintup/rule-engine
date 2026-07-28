@@ -261,10 +261,15 @@ snapshot messages.
 
 Current operations must account for three evaluator limits: one VM provider
 turn stays on one agent route, capability/service/history host turns fail
-closed, and a durable state conflict fails the attempt instead of replaying it
-transparently. Scalar module-level `StateKey` declarations with peer or subject
-scope and direct entrypoint `get`/`set`/`delete` are executable now. Reads and
-writes stay on the server and are partitioned under tenant, pack,
+closed, and resident retries do not survive a server process crash. A durable
+state conflict is replayed transparently at most twice: the scheduler creates a
+fresh VM, rereads state, supplies exact captured fact/scan responses without
+agent redispatch, and applies one cumulative `balanced.v1` normal budget across
+all attempts. A changed or newly reached provider request, invalid resource
+accounting, exhausted budget, or third conflict fails closed. Scalar
+module-level `StateKey` declarations with peer or subject scope and direct
+entrypoint `get`/`set`/`delete` are executable now. Reads and writes stay on the
+server and are partitioned under tenant, pack,
 activation-selected namespace, executable owner, and the peer or canonical
 subject; no state request is sent to an agent. Records, custom defaults,
 explicit identities, wider scopes/classifications, compare-and-set, shared

@@ -3,6 +3,7 @@
 #include "rule_engine/python/engine.hpp"
 #include "rule_engine/python/packaging/source_pack.hpp"
 #include "rule_engine/python/protocol/codec.hpp"
+#include "rule_engine/python/runtime/orchestrator.hpp"
 #include "rule_engine/python/vm/register_vm.hpp"
 
 #include <algorithm>
@@ -90,11 +91,27 @@ namespace rule_engine::python::tools {
         };
 
         struct ActiveEvaluation {
+            struct CapturedProviderRound {
+                std::vector<std::string> fact_keys;
+                std::vector<std::string> scan_keys;
+                HostResponses responses;
+            };
+
             cluster::WorkLease lease;
             std::unique_ptr<VmSession> vm;
             std::size_t round {};
             SessionId session;
             std::uint64_t session_fence {};
+            std::vector<CapturedProviderRound> captured_provider_rounds;
+            std::size_t replay_provider_round {};
+            std::uint32_t mvcc_attempt {1U};
+            VmResourceUsage cumulative_usage;
+            std::chrono::nanoseconds reported_elapsed {};
+            std::chrono::steady_clock::time_point started {std::chrono::steady_clock::now()};
+            BudgetProfile attempt_budget {balanced_v1};
+            bool replaying {};
+            std::vector<std::string> pending_fact_keys;
+            std::vector<std::string> pending_scan_keys;
         };
 
         struct SnapshotScope {
@@ -176,6 +193,47 @@ namespace rule_engine::python::tools {
                                            const ExecutableId &executable) const noexcept {
             return std::ranges::any_of(pack.compilation.pack.functions,
                                        [&executable](const auto &function) { return function.id == executable; });
+        }
+
+        [[nodiscard]] static VmInvocation invocation_for(const EvaluationDefinition &definition,
+                                                         const std::string_view work_id,
+                                                         BudgetProfile budget = balanced_v1) {
+            return {
+                .execution = ExecutionId {"execution:" + std::string {work_id}},
+                .invocation = InvocationId {"invocation:" + std::string {work_id}},
+                .root_event = definition.input.id,
+                .binding = definition.binding,
+                .subject = definition.subject,
+                .budget = std::move(budget),
+                .deterministic_hash_seed = 0U,
+            };
+        }
+
+        [[nodiscard]] static ActiveEvaluation::CapturedProviderRound
+        capture_provider_round(const ActiveEvaluation &active, HostResponses responses) {
+            ActiveEvaluation::CapturedProviderRound capture {.fact_keys = active.pending_fact_keys,
+                                                             .scan_keys = active.pending_scan_keys,
+                                                             .responses = std::move(responses)};
+            return capture;
+        }
+
+        [[nodiscard]] static bool provider_round_matches(const VmStep &step,
+                                                         const ActiveEvaluation::CapturedProviderRound &capture) {
+            if (step.fact_requests.size() != capture.fact_keys.size() ||
+                step.scan_requests.size() != capture.scan_keys.size()) {
+                return false;
+            }
+            for (std::size_t index = 0U; index < step.fact_requests.size(); ++index) {
+                if (runtime::captured_fact_input_key(step.fact_requests[index]) != capture.fact_keys[index]) {
+                    return false;
+                }
+            }
+            for (std::size_t index = 0U; index < step.scan_requests.size(); ++index) {
+                if (runtime::captured_scan_input_key(step.scan_requests[index]) != capture.scan_keys[index]) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         [[nodiscard]] std::expected<HostResponses, protocol_v2::ProtocolError>
@@ -333,7 +391,7 @@ namespace rule_engine::python::tools {
             return {};
         }
 
-        [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
+        [[nodiscard]] std::expected<bool, protocol_v2::ProtocolError>
         commit_terminal(PeerState &state, const std::string &work_id, ActiveEvaluation &active,
                         const EvaluationResult &evaluation) {
             const auto definition = state.definitions.find(work_id);
@@ -364,12 +422,15 @@ namespace rule_engine::python::tools {
             }
             auto committed = state.coordinator->commit(active.lease, std::move(*transaction), now_unix_ms());
             if (!committed) {
+                if (committed.error().code == StoreErrorCode::conflict) {
+                    return false;
+                }
                 return std::unexpected(protocol_error(committed.error().code == StoreErrorCode::stale_fence ?
                                                           protocol_v2::ProtocolErrorCode::stale_fence :
                                                           protocol_v2::ProtocolErrorCode::persistence_error,
                                                       "terminal evaluation transaction failed"));
             }
-            return {};
+            return true;
         }
 
         [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
@@ -385,7 +446,55 @@ namespace rule_engine::python::tools {
                         return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::provider_violation,
                                                               "terminal VM step has no result"));
                     }
-                    return commit_terminal(state, work_id, active, *step.result);
+                    if (active.replaying && active.replay_provider_round != active.captured_provider_rounds.size()) {
+                        static_cast<void>(state.coordinator->abandon(active.lease, now_unix_ms()));
+                        return std::unexpected(protocol_error(
+                            protocol_v2::ProtocolErrorCode::provider_violation,
+                            "resident MVCC replay terminated before consuming every captured provider round"));
+                    }
+                    auto committed = commit_terminal(state, work_id, active, *step.result);
+                    if (!committed) {
+                        return std::unexpected(std::move(committed.error()));
+                    }
+                    if (*committed) {
+                        return {};
+                    }
+                    if (active.mvcc_attempt == runtime::maximum_mvcc_attempts) {
+                        return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::persistence_error,
+                                                              "resident MVCC retry attempts are exhausted"));
+                    }
+                    const auto attempt_usage = active.vm->resource_usage();
+                    if (auto accounted = runtime::accumulate_vm_retry_usage(
+                            active.cumulative_usage, active.reported_elapsed, attempt_usage, active.attempt_budget);
+                        !accounted) {
+                        static_cast<void>(state.coordinator->abandon(active.lease, now_unix_ms()));
+                        return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::limit_exceeded,
+                                                              "resident MVCC retry resource accounting failed"));
+                    }
+                    active.cumulative_usage.elapsed =
+                        std::max(active.reported_elapsed, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                              std::chrono::steady_clock::now() - active.started));
+                    ++active.mvcc_attempt;
+                    active.attempt_budget = runtime::remaining_vm_retry_budget(balanced_v1, active.cumulative_usage);
+                    const auto definition = state.definitions.find(work_id);
+                    if (definition == state.definitions.end()) {
+                        return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::stale_generation,
+                                                              "evaluation definition is absent during MVCC retry"));
+                    }
+                    const auto &pack = packs[definition->second.pack_index];
+                    auto vm = vm::RegisterVmSession::create(
+                        pack.compilation.pack, invocation_for(definition->second, work_id, active.attempt_budget));
+                    if (!vm) {
+                        static_cast<void>(state.coordinator->abandon(active.lease, now_unix_ms()));
+                        return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::limit_exceeded,
+                                                              "resident MVCC retry VM could not start"));
+                    }
+                    active.vm = std::move(*vm);
+                    active.replaying = true;
+                    active.replay_provider_round = 0U;
+                    active.pending_fact_keys.clear();
+                    active.pending_scan_keys.clear();
+                    continue;
                 }
                 if (step.state == VmStepState::yielded && step.fact_requests.empty() && step.scan_requests.empty() &&
                     step.capability_requests.empty() && step.state_requests.empty() && step.history_requests.empty()) {
@@ -418,6 +527,23 @@ namespace rule_engine::python::tools {
                     return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::provider_violation,
                                                           "nonterminal VM step produced no provider request"));
                 }
+                if (active.replaying) {
+                    if (active.replay_provider_round >= active.captured_provider_rounds.size()) {
+                        static_cast<void>(state.coordinator->abandon(active.lease, now_unix_ms()));
+                        return std::unexpected(
+                            protocol_error(protocol_v2::ProtocolErrorCode::provider_violation,
+                                           "resident MVCC replay requested an uncaptured provider round"));
+                    }
+                    const auto &capture = active.captured_provider_rounds[active.replay_provider_round++];
+                    if (!provider_round_matches(step, capture)) {
+                        static_cast<void>(state.coordinator->abandon(active.lease, now_unix_ms()));
+                        return std::unexpected(
+                            protocol_error(protocol_v2::ProtocolErrorCode::provider_violation,
+                                           "resident MVCC replay provider request differs from its captured input"));
+                    }
+                    responses = capture.responses;
+                    continue;
+                }
                 std::string route {"windows"};
                 if (!step.fact_requests.empty()) {
                     route = step.fact_requests.front().route.provider;
@@ -431,6 +557,16 @@ namespace rule_engine::python::tools {
                 }
                 ++active.round;
                 const auto protocol_work_id = work_id + ":round:" + std::to_string(active.round);
+                active.pending_fact_keys.clear();
+                active.pending_fact_keys.reserve(step.fact_requests.size());
+                for (const auto &request : step.fact_requests) {
+                    active.pending_fact_keys.push_back(runtime::captured_fact_input_key(request));
+                }
+                active.pending_scan_keys.clear();
+                active.pending_scan_keys.reserve(step.scan_requests.size());
+                for (const auto &request : step.scan_requests) {
+                    active.pending_scan_keys.push_back(runtime::captured_scan_input_key(request));
+                }
                 protocol_v2::WorkLeaseMessage message {
                     .session = session.session,
                     .peer = session.authenticated_peer.peer,
@@ -517,7 +653,9 @@ namespace rule_engine::python::tools {
                         result->originating_session != session.session ||
                         result->originating_session_fence != session.session_fence ||
                         result->work_fence != active->second.lease.fence ||
-                        result->generation != active->second.lease.work.generation) {
+                        result->generation != active->second.lease.work.generation ||
+                        result->attempt_id != "attempt:" + std::to_string(active->second.lease.attempt) + ':' +
+                                                  std::to_string(active->second.round)) {
                         applied = std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::stale_fence,
                                                                  "work result does not match an active VM round"));
                     } else {
@@ -526,15 +664,18 @@ namespace rule_engine::python::tools {
                         const auto suffix = result->work_id.rfind(":round:");
                         const auto root =
                             suffix == std::string::npos ? std::string {} : result->work_id.substr(0U, suffix);
-                        applied = drive(state, session, root, std::move(evaluation),
-                                        HostResponses {
-                                            .facts = result->facts,
-                                            .scans = result->scans,
-                                            .capabilities = {},
-                                            .state = {},
-                                            .history = {},
-                                            .cancel = false,
-                                        });
+                        HostResponses responses {
+                            .facts = result->facts,
+                            .scans = result->scans,
+                            .capabilities = {},
+                            .state = {},
+                            .history = {},
+                            .cancel = false,
+                        };
+                        evaluation.captured_provider_rounds.push_back(capture_provider_round(evaluation, responses));
+                        evaluation.pending_fact_keys.clear();
+                        evaluation.pending_scan_keys.clear();
+                        applied = drive(state, session, root, std::move(evaluation), std::move(responses));
                     }
                 }
             }
@@ -736,7 +877,17 @@ namespace rule_engine::python::tools {
                                                                .vm = std::move(*vm),
                                                                .round = 0U,
                                                                .session = session.session,
-                                                               .session_fence = session.session_fence},
+                                                               .session_fence = session.session_fence,
+                                                               .captured_provider_rounds = {},
+                                                               .replay_provider_round = 0U,
+                                                               .mvcc_attempt = 1U,
+                                                               .cumulative_usage = {},
+                                                               .reported_elapsed = {},
+                                                               .started = std::chrono::steady_clock::now(),
+                                                               .attempt_budget = balanced_v1,
+                                                               .replaying = false,
+                                                               .pending_fact_keys = {},
+                                                               .pending_scan_keys = {}},
                                        {});
             if (!driven) {
                 return std::unexpected(std::move(driven.error()));

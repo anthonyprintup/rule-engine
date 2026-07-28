@@ -179,6 +179,18 @@ namespace rule_engine::python::runtime {
         DiagnosticSet diagnostics;
     };
 
+    // Shared retry primitives used by both the synchronous resident runtime and
+    // the asynchronous agent-backed resident scheduler. External inputs are
+    // replayed by their canonical request identity; state is deliberately not.
+    inline constexpr std::uint32_t maximum_mvcc_attempts = 3U;
+    [[nodiscard]] std::string captured_fact_input_key(const FactRequest &request);
+    [[nodiscard]] std::string captured_scan_input_key(const ScanRequest &request);
+    [[nodiscard]] std::expected<void, ResidentRuntimeError>
+    accumulate_vm_retry_usage(VmResourceUsage &total, std::chrono::nanoseconds &reported_elapsed,
+                              const VmResourceUsage &attempt, const BudgetProfile &attempt_budget);
+    [[nodiscard]] BudgetProfile remaining_vm_retry_budget(const BudgetProfile &original,
+                                                          const VmResourceUsage &usage) noexcept;
+
     struct ResidentEvaluationReceipt {
         std::uint32_t attempts {};
         std::uint64_t host_turns {};
