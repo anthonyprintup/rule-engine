@@ -173,10 +173,19 @@ same logical operand contract remains server-local and that otherwise identical
 tenant, peer, and subject scopes cannot alias physical cells. The complete-suite
 timing for this slice was 158.82 seconds: all 38 Debug tests passed.
 
-This evidence does not qualify compiler-derived state-schema attestation,
-transparent MVCC replay, state records or wider authoring forms, migration
-bytecode, reset or retained-gap administration, live PostgreSQL, or
-multi-process state contention.
+The compiler-attested state-schema slice derives one canonical SHA-256 identity
+from every typed state declaration, including keys not referenced by bytecode.
+The identity participates in semantic and platform executable evidence.
+Server-owned stage preview derives the durable value with the pinned private
+runtime, treats an optional operator value only as an equality guard, and
+resident startup rejects a fresh compilation whose state identity differs.
+Durable generation codec v4 preserves each node's direct attestation, and a
+mismatched report fails before readiness. The complete Debug graph passed all
+38 tests in 157.24 seconds.
+
+This evidence does not qualify transparent MVCC replay, state records or wider
+authoring forms, migration bytecode, reset or retained-gap administration, live
+PostgreSQL, or multi-process state contention.
 
 ## Artifact identity
 

@@ -1281,6 +1281,7 @@ namespace {
                              .node_lease_fence = 1U,
                              .success = true,
                              .semantic_hash = semantic,
+                             .state_schema_hash = "sha256:state:test",
                              .binding_hash = binding,
                              .executable_hash = "sha256:executable:test",
                              .capability_hashes = {},
@@ -1625,6 +1626,14 @@ TEST_CASE("standalone admin client maps explicit lifecycle commands without trus
     CHECK(stage_request->target_generation == 6U);
     CHECK(stage_request->state_schema_hash == "sha256:state");
     CHECK(stage_request->state_namespace == "state:live");
+
+    auto compiler_derived_stage = stage;
+    compiler_derived_stage.options.erase("state-schema");
+    const auto compiler_derived_request = tools::build_resident_admin_request(compiler_derived_stage, 99U);
+    REQUIRE(compiler_derived_request);
+    CHECK(compiler_derived_request->state_schema_hash.empty());
+    CHECK(compiler_derived_request->state_namespace == "state:live");
+    REQUIRE(tools::encode_resident_admin_request(*compiler_derived_request, 4U * py::kibibyte));
 
     stage.preview = false;
     stage.reason.clear();

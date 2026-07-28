@@ -268,10 +268,11 @@ writes stay on the server and are partitioned under tenant, pack,
 activation-selected namespace, executable owner, and the peer or canonical
 subject; no state request is sent to an agent. Records, custom defaults,
 explicit identities, wider scopes/classifications, compare-and-set, shared
-state, helpers, and migrations remain closed. The activation state-schema hash
-is still operator-supplied rather than derived from the compiled declarations,
-so it must be reviewed as a deployment invariant. Activation does not require
-a process restart: an
+state, helpers, and migrations remain closed. Stage preview compiles the trusted
+pack with the pinned private runtime and derives a SHA-256 identity from every
+declared state key, including unused keys. The optional `--state-schema` value
+is only an expected-value guard; it cannot choose the durable identity.
+Activation does not require a process restart: an
 atomic flip fences old sessions, residents verify and compile the new durable
 active identity, and new sessions are admitted only after the local scheduler
 has swapped. See
@@ -339,12 +340,16 @@ whose remaining tab-separated rows contain tenant, peer, principal, principal
 kind, home tenant, pack prefix, and an explicit comma-separated capability
 set. Peers and principals are unique; tenant, pack prefix, principal kind, and
 capability must all authorize the exact resource. The version-5 canonical
-request wire and standalone client expose pack/operation reads, verified
+admin request wire and standalone client expose pack/operation reads, verified
 resumable upload, server-owned distributed stage, bounded operation polling,
 forward rollback restaging, and activation preview, drain, explicit straggler
 fencing, and atomic flip. `pack.stage`, `pack.activate`, and `pack.rollback`
 are separate binding capabilities. The client pins the configured server URI
 SAN and correlates one bounded request/response per mTLS connection.
+
+Durable generation codec v4 records each resident's direct state-schema
+attestation. Older generation records are readable for inspection, but
+versions 1 through 3 cannot become resident-ready without restaging.
 
 For example:
 
@@ -354,15 +359,13 @@ rule_engine_admin upload C:/approved/com.example.cheat.rpack `
 
 rule_engine_admin stage com.example.cheat `
   sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 7 `
-  --tenant tenant-a --state-schema sha256:state-v1 `
-  --state-namespace state:com.example.cheat `
+  --tenant tenant-a --state-namespace state:com.example.cheat `
   --expected-version 0 --request-id stage-1042 `
   --reason "compile approved source on every resident" --config admin.conf
 
 rule_engine_admin stage com.example.cheat `
   sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 7 `
-  --tenant tenant-a --state-schema sha256:state-v1 `
-  --state-namespace state:com.example.cheat `
+  --tenant tenant-a --state-namespace state:com.example.cheat `
   --expected-version 0 --request-id stage-1042-apply `
   --operation-id stage-1042 --idempotency-key stage-1042 `
   --apply --wait --config admin.conf

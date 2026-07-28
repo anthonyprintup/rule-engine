@@ -588,6 +588,8 @@ namespace {
         INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
         REQUIRE(compiled.has_value());
         REQUIRE(compiled->functions.size() == 1U);
+        REQUIRE(compiled->state_schema_hash.size() == 71U);
+        REQUIRE(compiled->state_schema_hash.starts_with("sha256:"));
         const auto &function = compiled->functions.front();
         REQUIRE(function.parameter_count == 1U);
         REQUIRE(function.register_count == 3U);
@@ -1346,25 +1348,37 @@ namespace {
             return;
         }
 
+        const std::string unused_declaration =
+            "UNUSED_FLAG = StateKey(\"com.example.unused-flag\", int, scope=StateScope.PEER)\n";
+        const std::string source =
+            "from rule_engine import State, StateKey, StateScope, rule\n"
+            "\n"
+            "FLAG = StateKey(\"com.example.peer-flag\", bool, scope=StateScope.PEER)\n"
+            "SUBJECT_FLAG = StateKey(\"com.example.subject-flag\", bool, scope=StateScope.SUBJECT)\n" +
+            unused_declaration +
+            "\n"
+            "@rule(\"com.example.stateful\")\n"
+            "def remember(subject: bool, state: State) -> bool:\n"
+            "    previous = state.get(FLAG)\n"
+            "    state.delete(FLAG)\n"
+            "    state.set(FLAG, True)\n"
+            "    state.set(SUBJECT_FLAG, True)\n"
+            "    return previous == None\n";
         const auto compiled =
-            compile_exact_source(*runtime.runtime, runtime.temporary_parent,
-                                 "from rule_engine import State, StateKey, StateScope, rule\n"
-                                 "\n"
-                                 "FLAG = StateKey(\"com.example.peer-flag\", bool, scope=StateScope.PEER)\n"
-                                 "SUBJECT_FLAG = StateKey(\"com.example.subject-flag\", bool, "
-                                 "scope=StateScope.SUBJECT)\n"
-                                 "\n"
-                                 "@rule(\"com.example.stateful\")\n"
-                                 "def remember(subject: bool, state: State) -> bool:\n"
-                                 "    previous = state.get(FLAG)\n"
-                                 "    state.delete(FLAG)\n"
-                                 "    state.set(FLAG, True)\n"
-                                 "    state.set(SUBJECT_FLAG, True)\n"
-                                 "    return previous == None\n",
-                                 "com.example.stateful");
+            compile_exact_source(*runtime.runtime, runtime.temporary_parent, source, "com.example.stateful");
         INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
         REQUIRE(compiled.has_value());
         REQUIRE(compiled->functions.size() == 1U);
+        REQUIRE(compiled->state_schema_hash.size() == 71U);
+        REQUIRE(compiled->state_schema_hash.starts_with("sha256:"));
+        auto without_unused_source = source;
+        without_unused_source.erase(without_unused_source.find(unused_declaration), unused_declaration.size());
+        const auto without_unused = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                         without_unused_source, "com.example.stateful");
+        REQUIRE(without_unused.has_value());
+        CHECK(without_unused->state_schema_hash != compiled->state_schema_hash);
+        CHECK(without_unused->semantic_hash != compiled->semantic_hash);
+        CHECK(without_unused->constants.size() == compiled->constants.size());
         const auto &function = compiled->functions.front();
         CHECK(function.parameter_count == 1U);
         CHECK(std::ranges::count(function.instructions, Opcode::read_state, &Instruction::opcode) == 1);
@@ -2192,6 +2206,9 @@ namespace {
         REQUIRE(second.has_value());
         REQUIRE(first->canonical_form == second->canonical_form);
         REQUIRE(first->pack.semantic_hash == second->pack.semantic_hash);
+        REQUIRE(first->pack.state_schema_hash == second->pack.state_schema_hash);
+        REQUIRE(first->pack.state_schema_hash.size() == 71U);
+        REQUIRE(first->pack.state_schema_hash.starts_with("sha256:"));
 
         const auto true_payload = encode_ast_envelope(envelope(constant_rule_nodes(true)));
         REQUIRE(true_payload.has_value());
@@ -2223,6 +2240,7 @@ namespace {
             .source_digest = SourceDigest {"sha256:source"},
             .compiler_abi = std::string {python_static_compiler_abi_v1},
             .semantic_hash = "fnv1a64:0000000000000001",
+            .state_schema_hash = "sha256:state-a",
             .schemas = {.descriptors = {}, .canonical_hash = "fnv1a64:0000000000000002"},
             .constants = {},
             .functions = {},
@@ -2233,6 +2251,9 @@ namespace {
         REQUIRE(windows == compiled_pack_executable_hash(compiled, "windows-x64-v1"));
         REQUIRE(windows != compiled_pack_executable_hash(compiled, "linux-x64-v1"));
         compiled.semantic_hash = "fnv1a64:0000000000000003";
+        REQUIRE(windows != compiled_pack_executable_hash(compiled, "windows-x64-v1"));
+        compiled.semantic_hash = "fnv1a64:0000000000000001";
+        compiled.state_schema_hash = "sha256:state-b";
         REQUIRE(windows != compiled_pack_executable_hash(compiled, "windows-x64-v1"));
     }
 

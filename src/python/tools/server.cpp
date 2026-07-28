@@ -1703,6 +1703,7 @@ policy mutation remains fail-closed.
                 });
                 if (report == generation->reports.end() || !report->success || report->node_lease_fence == 0U ||
                     report->executable_hash.empty() || report->semantic_hash != generation->semantic_hash ||
+                    report->state_schema_hash != generation->request.state_schema_hash ||
                     report->binding_hash != generation->binding_hash) {
                     result.active_generation_compiled = false;
                     continue;
@@ -1905,6 +1906,7 @@ policy mutation remains fail-closed.
                                                    .node_lease_fence = target->lease_fence,
                                                    .success = false,
                                                    .semantic_hash = {},
+                                                   .state_schema_hash = {},
                                                    .binding_hash = {},
                                                    .executable_hash = {},
                                                    .capability_hashes = target->capability_hashes,
@@ -1934,6 +1936,7 @@ policy mutation remains fail-closed.
                         if (compiled) {
                             report.success = true;
                             report.semantic_hash = compiled->artifact.pack.semantic_hash;
+                            report.state_schema_hash = compiled->artifact.pack.state_schema_hash;
                             report.binding_hash = canonical_operator_bindings_hash(compiled->artifact.pack.bindings);
                             report.executable_hash =
                                 compiled_pack_executable_hash(compiled->artifact.pack, target->platform_abi);
@@ -1959,16 +1962,16 @@ policy mutation remains fail-closed.
         struct FilesystemResidentStageSourceBackend final: IResidentStageSourceBackend {
             FilesystemResidentStageSourceBackend(std::filesystem::path selected_registry,
                                                  const packaging::TrustPolicy &selected_trust,
-                                                 std::filesystem::path selected_crypto_library,
+                                                 packaging::PrivatePythonRuntime selected_runtime,
                                                  cluster::ActivationPolicySnapshot selected_policy):
                 registry {std::move(selected_registry)},
                 trust {selected_trust},
-                crypto_library {std::move(selected_crypto_library)},
+                runtime {std::move(selected_runtime)},
                 policy {std::move(selected_policy)} {}
 
             std::filesystem::path registry;
             const packaging::TrustPolicy &trust;
-            std::filesystem::path crypto_library;
+            packaging::PrivatePythonRuntime runtime;
             cluster::ActivationPolicySnapshot policy;
 
             [[nodiscard]] std::expected<cluster::GenerationRequest, protocol_v2::ProtocolError>
@@ -1990,12 +1993,36 @@ policy mutation remains fail-closed.
                     });
                 }
                 packaging::OpenSsl3Ed25519Verifier verifier;
-                verifier.crypto_library = crypto_library;
+                verifier.crypto_library = runtime.crypto_library;
                 auto loaded = packaging::verify_and_load_source_pack(*archive, trust, verifier);
                 if (!loaded || loaded->manifest.pack != pack || loaded->closure_digest != source_digest) {
                     return std::unexpected(protocol_v2::ProtocolError {
                         .code = protocol_v2::ProtocolErrorCode::invalid_identity,
                         .message = "stage source pack failed trust or identity verification",
+                    });
+                }
+                std::error_code filesystem_error;
+                const auto temporary_root = std::filesystem::temp_directory_path(filesystem_error);
+                if (filesystem_error) {
+                    return std::unexpected(protocol_v2::ProtocolError {
+                        .code = protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                        .message = "stage compiler temporary storage is unavailable",
+                    });
+                }
+                packaging::WindowsJobWorkerLauncher launcher;
+                launcher.temporary_root = temporary_root;
+                packaging::WorkerClient worker {.runtime = runtime, .launcher = launcher, .limits = {}};
+                auto compiled = compiler::compile_source_pack(*loaded, *archive, worker);
+                if (!compiled || compiled->artifact.pack.state_schema_hash.empty()) {
+                    return std::unexpected(protocol_v2::ProtocolError {
+                        .code = protocol_v2::ProtocolErrorCode::schema_mismatch,
+                        .message = "stage source pack did not produce a canonical state schema",
+                    });
+                }
+                if (!state_schema_hash.empty() && state_schema_hash != compiled->artifact.pack.state_schema_hash) {
+                    return std::unexpected(protocol_v2::ProtocolError {
+                        .code = protocol_v2::ProtocolErrorCode::schema_mismatch,
+                        .message = "expected state schema differs from compiler-derived state schema",
                     });
                 }
                 std::vector<std::string> required_capabilities;
@@ -2011,7 +2038,7 @@ policy mutation remains fail-closed.
                     .version = loaded->manifest.version,
                     .source_digest = loaded->closure_digest,
                     .generation = generation,
-                    .state_schema_hash = std::string {state_schema_hash},
+                    .state_schema_hash = compiled->artifact.pack.state_schema_hash,
                     .state_namespace = std::string {state_namespace},
                     .required_capability_hashes = std::move(required_capabilities),
                     .state_transition = cluster::StateTransitionPlan {.mode = cluster::StateTransitionMode::carry,
@@ -3017,8 +3044,8 @@ policy mutation remains fail-closed.
                                                       config->service.inbound_credit,
                                                       config->service.maximum_frame_bytes};
         FileAdminSecurityAudit admin_security_audit {config->audit_path};
-        FilesystemResidentStageSourceBackend stages {config->pack_registry_path, *pack_trust_policy,
-                                                     runtime->crypto_library, *activation_policy};
+        FilesystemResidentStageSourceBackend stages {config->pack_registry_path, *pack_trust_policy, *runtime,
+                                                     *activation_policy};
         AuthorizedResidentAdminBackend staged_admin_backend {**activation_store,     **operator_bindings,
                                                              &admin_security_audit,  uploads->get(),
                                                              std::addressof(stages), std::addressof(agent_backend)};

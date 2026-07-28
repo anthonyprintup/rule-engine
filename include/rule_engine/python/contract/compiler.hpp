@@ -194,6 +194,7 @@ namespace rule_engine::python {
         SourceDigest source_digest;
         std::string compiler_abi;
         std::string semantic_hash;
+        std::string state_schema_hash;
         SchemaCatalog schemas;
         std::vector<FactValue> constants;
         std::vector<BytecodeFunction> functions;

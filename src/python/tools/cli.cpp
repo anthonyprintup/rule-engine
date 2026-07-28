@@ -88,7 +88,7 @@ Options:
   --operation-id ID    Existing durable operation (defaults to request ID)
   --idempotency-key ID Durable idempotency identity (defaults to request ID)
   --expected-version N Optimistic pack resource version
-  --state-schema HASH  Durable state schema identity for a stage
+  --state-schema HASH  Optional expected compiler-derived state schema
   --state-namespace ID Durable state namespace for a stage
   --phase PHASE        preview, drain, fence, or flip
   --boundary CURSOR    Durable drain boundary for the drain phase

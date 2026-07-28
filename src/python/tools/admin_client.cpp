@@ -238,7 +238,7 @@ namespace rule_engine::python::tools {
                     (command.preview && command.wait)) {
                     return std::unexpected(
                         failure(ToolFailureKind::operation, "ADMIN-ARGUMENT",
-                                "stage requires PACK_ID, SOURCE_DIGEST, GENERATION, --request-id, state metadata, "
+                                "stage requires PACK_ID, SOURCE_DIGEST, GENERATION, --request-id, a state namespace, "
                                 "and a preview reason"));
                 }
                 std::uint64_t generation {};
@@ -247,7 +247,7 @@ namespace rule_engine::python::tools {
                 const auto state_schema = option(command, "state-schema");
                 const auto state_namespace = option(command, "state-namespace");
                 if (parsed.ec != std::errc {} || parsed.ptr != text.data() + text.size() || generation == 0U ||
-                    state_schema.empty() || state_namespace.empty()) {
+                    state_namespace.empty()) {
                     return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-ARGUMENT",
                                                    "stage generation and state metadata are invalid"));
                 }

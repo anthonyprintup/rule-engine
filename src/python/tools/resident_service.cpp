@@ -257,13 +257,13 @@ namespace rule_engine::python::tools {
                     return mutation_identity() && printable_ascii(request.reason, false) &&
                            request.target_generation != 0U && request.drain_boundary == 0U &&
                            request.work_ids.empty() && no_upload && canonical_source_digest(request.source_digest) &&
-                           printable_ascii(request.state_schema_hash, false) &&
+                           printable_ascii(request.state_schema_hash) &&
                            printable_ascii(request.state_namespace, false) && no_rollback;
                 case ResidentAdminRequestKind::stage_apply:
                     return mutation_identity() && request.reason.empty() && request.target_generation != 0U &&
                            request.drain_boundary == 0U && request.work_ids.empty() && no_upload &&
                            canonical_source_digest(request.source_digest) &&
-                           printable_ascii(request.state_schema_hash, false) &&
+                           printable_ascii(request.state_schema_hash) &&
                            printable_ascii(request.state_namespace, false) && no_rollback;
                 case ResidentAdminRequestKind::rollback_preview:
                     return mutation_identity() && printable_ascii(request.reason, false) &&

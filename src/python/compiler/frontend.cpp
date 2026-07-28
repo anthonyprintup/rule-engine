@@ -1,4 +1,5 @@
 #include "rule_engine/python/compiler/frontend.hpp"
+#include "rule_engine/python/packaging/source_pack.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1196,6 +1197,21 @@ namespace rule_engine::python::compiler {
 
         void canonical_token(std::ostringstream &output, const std::string_view value) {
             output << value.size() << ':' << value << ';';
+        }
+
+        [[nodiscard]] std::string canonical_state_schema_hash(std::vector<StateKeyModel> state_keys) {
+            std::ranges::sort(state_keys, {}, &StateKeyModel::stable_id);
+            std::ostringstream canonical;
+            canonical.imbue(std::locale::classic());
+            canonical << "rule-engine.state-schema.v1\n";
+            for (const auto &key : state_keys) {
+                canonical_token(canonical, key.stable_id);
+                canonical_token(canonical, key.state_namespace);
+                canonical_token(canonical, key.schema.value);
+                canonical << '\n';
+            }
+            const auto material = std::move(canonical).str();
+            return "sha256:" + packaging::sha256_hex(std::as_bytes(std::span {material.data(), material.size()}));
         }
 
         void canonical_fact(std::ostringstream &output, const FactValue &fact) {
@@ -3456,6 +3472,7 @@ namespace rule_engine::python::compiler {
             canonical_token(output, pack.version.value);
             canonical_token(output, pack.source_digest.value);
             canonical_token(output, pack.compiler_abi);
+            canonical_token(output, pack.state_schema_hash);
             canonical_token(output, pack.schemas.canonical_hash);
             output << '\n';
             for (const auto &descriptor : pack.schemas.descriptors) {
@@ -3614,6 +3631,7 @@ namespace rule_engine::python::compiler {
             .source_digest = pack.closure_digest,
             .compiler_abi = std::string {python_static_compiler_abi_v1},
             .semantic_hash = {},
+            .state_schema_hash = canonical_state_schema_hash(state_keys),
             .schemas = std::move(merged_schemas),
             .constants = {},
             .functions = {},

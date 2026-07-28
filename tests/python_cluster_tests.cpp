@@ -258,12 +258,14 @@ namespace {
         };
     }
 
-    CompilationReport compilation(const ClusterNode &target, const std::string &semantic, const std::string &binding) {
+    CompilationReport compilation(const ClusterNode &target, const std::string &semantic, const std::string &binding,
+                                  const std::string &state_schema = "state-schema-v1") {
         return CompilationReport {
             .node_id = target.node_id,
             .node_lease_fence = target.lease_fence,
             .success = true,
             .semantic_hash = semantic,
+            .state_schema_hash = state_schema,
             .binding_hash = binding,
             .executable_hash = "sha256:executable:" + target.platform_abi + ":" + semantic,
             .capability_hashes = {},
@@ -282,7 +284,7 @@ namespace {
             .request = generation(number, source, schema, state_namespace),
             .phase = GenerationPhase::ready,
             .target_nodes = {first.node_id, second.node_id},
-            .reports = {compilation(first, semantic, binding), compilation(second, semantic, binding)},
+            .reports = {compilation(first, semantic, binding, schema), compilation(second, semantic, binding, schema)},
             .semantic_hash = semantic,
             .binding_hash = binding,
             .requeued_work = {},
@@ -618,6 +620,7 @@ namespace {
             .source_digest = SourceDigest {"sha256:signed-source"},
             .compiler_abi = std::string {python_static_compiler_abi_v1},
             .semantic_hash = "fnv1a64:0000000000000001",
+            .state_schema_hash = "state-schema-v1",
             .schemas = {.descriptors = {}, .canonical_hash = "fnv1a64:0000000000000002"},
             .constants = {},
             .functions = {},
@@ -637,6 +640,7 @@ namespace {
                          .node_lease_fence = 17,
                          .success = true,
                          .semantic_hash = compiled.semantic_hash,
+                         .state_schema_hash = compiled.state_schema_hash,
                          .binding_hash = binding_hash,
                          .executable_hash = executable_hash,
                          .capability_hashes = {},
@@ -653,6 +657,12 @@ namespace {
         const auto semantic_mismatch = qualify_resident_compilation(active, "node-a", "windows-x64-v1", changed);
         REQUIRE_FALSE(semantic_mismatch.has_value());
         REQUIRE(semantic_mismatch.error().code == StoreErrorCode::incompatible_schema);
+
+        auto state_mismatch = compiled;
+        state_mismatch.state_schema_hash = "state-schema-v2";
+        const auto rejected_state = qualify_resident_compilation(active, "node-a", "windows-x64-v1", state_mismatch);
+        REQUIRE_FALSE(rejected_state.has_value());
+        REQUIRE(rejected_state.error().code == StoreErrorCode::incompatible_schema);
 
         auto restarted = active;
         restarted.reports.front().node_lease_fence = 9U;
@@ -1006,6 +1016,12 @@ namespace {
             REQUIRE_FALSE(stale.has_value());
             REQUIRE(stale.error().code == StoreErrorCode::stale_fence);
 
+            auto schema_mismatch =
+                compilation(node("node-a", 11), "sha256:semantic", "sha256:binding", "state-schema-v2");
+            const auto rejected_schema = admin.report_server_compilation(preview.operation_id, schema_mismatch, 1'100);
+            REQUIRE_FALSE(rejected_schema.has_value());
+            REQUIRE(rejected_schema.error().code == StoreErrorCode::constraint_violation);
+
             const auto first = admin.report_server_compilation(
                 preview.operation_id, compilation(node("node-a", 11), "sha256:semantic", "sha256:binding"), 1'101);
             REQUIRE(first.has_value());
@@ -1024,6 +1040,7 @@ namespace {
             REQUIRE(state.has_value());
             REQUIRE(state->packs.front().resource_version == 3);
             REQUIRE(state->generations.front().request.policy == requested.policy);
+            REQUIRE(state->generations.front().reports.front().state_schema_hash == "state-schema-v1");
             REQUIRE_FALSE(state->packs.front().active_generation.has_value());
             REQUIRE_FALSE(state->packs.front().accepting_assignments);
         }

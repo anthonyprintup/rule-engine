@@ -77,6 +77,7 @@ namespace rule_engine::python::cluster {
             for (const auto &report : generation.reports) {
                 if (report.node_id.empty() || report.node_lease_fence == 0 || !report.success ||
                     report.semantic_hash != generation.semantic_hash ||
+                    report.state_schema_hash != request.state_schema_hash ||
                     report.binding_hash != generation.binding_hash || report.executable_hash.empty() ||
                     !targets.contains(report.node_id) || !reports.insert(report.node_id).second) {
                     return std::unexpected(invalid("staged compilation evidence is incomplete or inconsistent"));
@@ -708,6 +709,7 @@ namespace rule_engine::python::cluster {
             if (existing->node_lease_fence != canonical_report.node_lease_fence ||
                 existing->success != canonical_report.success ||
                 existing->semantic_hash != canonical_report.semantic_hash ||
+                existing->state_schema_hash != canonical_report.state_schema_hash ||
                 existing->binding_hash != canonical_report.binding_hash ||
                 existing->executable_hash != canonical_report.executable_hash ||
                 existing->capability_hashes != canonical_report.capability_hashes) {
@@ -730,6 +732,7 @@ namespace rule_engine::python::cluster {
         }
         if (canonical_report.success &&
             (canonical_report.semantic_hash.empty() || canonical_report.binding_hash.empty() ||
+             canonical_report.state_schema_hash != generation->request.state_schema_hash ||
              canonical_report.executable_hash.empty() ||
              !std::ranges::all_of(generation->request.required_capability_hashes, [&](const auto &required) {
                  return std::ranges::binary_search(canonical_report.capability_hashes, required);
@@ -749,6 +752,7 @@ namespace rule_engine::python::cluster {
         }
         if (canonical_report.success && !generation->reports.empty() &&
             (generation->semantic_hash != canonical_report.semantic_hash ||
+             generation->reports.front().state_schema_hash != canonical_report.state_schema_hash ||
              generation->binding_hash != canonical_report.binding_hash)) {
             canonical_report.success = false;
         }

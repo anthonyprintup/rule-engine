@@ -63,6 +63,7 @@ namespace rule_engine::python::cluster {
         std::uint64_t node_lease_fence {};
         bool success {};
         std::string semantic_hash;
+        std::string state_schema_hash;
         std::string binding_hash;
         std::string executable_hash;
         std::vector<std::string> capability_hashes;

@@ -24,6 +24,7 @@ namespace rule_engine::python::cluster::control_serialization {
             generation_v2 = 7,
             stage_fingerprint = 8,
             generation_v3 = 9,
+            generation_v4 = 10,
         };
 
         struct Writer {
@@ -322,11 +323,30 @@ namespace rule_engine::python::cluster::control_serialization {
             return request;
         }
 
-        void write_report(Writer &writer, const CompilationReport &report) {
+        CompilationReport read_report_v1(Reader &reader) {
+            CompilationReport result {.node_id = reader.string(),
+                                      .node_lease_fence = reader.number<std::uint64_t>(),
+                                      .success = reader.boolean(),
+                                      .semantic_hash = reader.string(),
+                                      .state_schema_hash = {},
+                                      .binding_hash = reader.string(),
+                                      .executable_hash = reader.string(),
+                                      .capability_hashes = read_strings(reader),
+                                      .diagnostics = {}};
+            const auto count = reader.count();
+            result.diagnostics.reserve(count);
+            for (std::uint32_t index = 0; index < count; ++index) {
+                result.diagnostics.push_back(read_diagnostic(reader));
+            }
+            return result;
+        }
+
+        void write_report_v2(Writer &writer, const CompilationReport &report) {
             writer.string(report.node_id);
             writer.number(report.node_lease_fence);
             writer.boolean(report.success);
             writer.string(report.semantic_hash);
+            writer.string(report.state_schema_hash);
             writer.string(report.binding_hash);
             writer.string(report.executable_hash);
             write_strings(writer, report.capability_hashes);
@@ -334,11 +354,12 @@ namespace rule_engine::python::cluster::control_serialization {
             for (const auto &diagnostic : report.diagnostics) { write_diagnostic(writer, diagnostic); }
         }
 
-        CompilationReport read_report(Reader &reader) {
+        CompilationReport read_report_v2(Reader &reader) {
             CompilationReport result {.node_id = reader.string(),
                                       .node_lease_fence = reader.number<std::uint64_t>(),
                                       .success = reader.boolean(),
                                       .semantic_hash = reader.string(),
+                                      .state_schema_hash = reader.string(),
                                       .binding_hash = reader.string(),
                                       .executable_hash = reader.string(),
                                       .capability_hashes = read_strings(reader),
@@ -385,7 +406,7 @@ namespace rule_engine::python::cluster::control_serialization {
             result.target_nodes = read_strings(reader);
             const auto count = reader.count();
             result.reports.reserve(count);
-            for (std::uint32_t index = 0; index < count; ++index) { result.reports.push_back(read_report(reader)); }
+            for (std::uint32_t index = 0; index < count; ++index) { result.reports.push_back(read_report_v1(reader)); }
             result.semantic_hash = reader.string();
             result.binding_hash = reader.string();
             result.requeued_work = read_strings(reader);
@@ -417,27 +438,13 @@ namespace rule_engine::python::cluster::control_serialization {
             const auto report_count = reader.count();
             result.reports.reserve(report_count);
             for (std::uint32_t index = 0; index < report_count; ++index) {
-                result.reports.push_back(read_report(reader));
+                result.reports.push_back(read_report_v1(reader));
             }
             result.semantic_hash = reader.string();
             result.binding_hash = reader.string();
             result.requeued_work = read_strings(reader);
             result.failure = reader.string();
             return result;
-        }
-
-        void write_generation_v3(Writer &writer, const GenerationSnapshot &generation) {
-            write_request_v3(writer, generation.request);
-            writer.u8(static_cast<std::uint8_t>(generation.phase));
-            write_strings(writer, generation.target_nodes);
-            writer.number(writer.count(generation.targets.size()));
-            for (const auto &target : generation.targets) { write_target(writer, target); }
-            writer.number(writer.count(generation.reports.size()));
-            for (const auto &report : generation.reports) { write_report(writer, report); }
-            writer.string(generation.semantic_hash);
-            writer.string(generation.binding_hash);
-            write_strings(writer, generation.requeued_work);
-            writer.string(generation.failure);
         }
 
         GenerationSnapshot read_generation_v3(Reader &reader) {
@@ -464,7 +471,54 @@ namespace rule_engine::python::cluster::control_serialization {
             const auto report_count = reader.count();
             result.reports.reserve(report_count);
             for (std::uint32_t index = 0; index < report_count; ++index) {
-                result.reports.push_back(read_report(reader));
+                result.reports.push_back(read_report_v1(reader));
+            }
+            result.semantic_hash = reader.string();
+            result.binding_hash = reader.string();
+            result.requeued_work = read_strings(reader);
+            result.failure = reader.string();
+            return result;
+        }
+
+        void write_generation_v4(Writer &writer, const GenerationSnapshot &generation) {
+            write_request_v3(writer, generation.request);
+            writer.u8(static_cast<std::uint8_t>(generation.phase));
+            write_strings(writer, generation.target_nodes);
+            writer.number(writer.count(generation.targets.size()));
+            for (const auto &target : generation.targets) { write_target(writer, target); }
+            writer.number(writer.count(generation.reports.size()));
+            for (const auto &report : generation.reports) { write_report_v2(writer, report); }
+            writer.string(generation.semantic_hash);
+            writer.string(generation.binding_hash);
+            write_strings(writer, generation.requeued_work);
+            writer.string(generation.failure);
+        }
+
+        GenerationSnapshot read_generation_v4(Reader &reader) {
+            GenerationSnapshot result {.request = read_request_v3(reader),
+                                       .phase = GenerationPhase::compiling,
+                                       .target_nodes = {},
+                                       .targets = {},
+                                       .reports = {},
+                                       .semantic_hash = {},
+                                       .binding_hash = {},
+                                       .requeued_work = {},
+                                       .failure = {}};
+            const auto phase = reader.u8();
+            if (phase > static_cast<std::uint8_t>(GenerationPhase::failed) && reader.error.empty()) {
+                reader.error = "control-plane generation phase is invalid";
+            }
+            result.phase = static_cast<GenerationPhase>(phase);
+            result.target_nodes = read_strings(reader);
+            const auto target_count = reader.count();
+            result.targets.reserve(target_count);
+            for (std::uint32_t index = 0; index < target_count; ++index) {
+                result.targets.push_back(read_target(reader));
+            }
+            const auto report_count = reader.count();
+            result.reports.reserve(report_count);
+            for (std::uint32_t index = 0; index < report_count; ++index) {
+                result.reports.push_back(read_report_v2(reader));
             }
             result.semantic_hash = reader.string();
             result.binding_hash = reader.string();
@@ -634,7 +688,7 @@ namespace rule_engine::python::cluster::control_serialization {
     } // namespace
 
     std::expected<std::vector<std::byte>, CodecError> encode(const GenerationSnapshot &value) {
-        return encode_value(PayloadKind::generation_v3, value, write_generation_v3);
+        return encode_value(PayloadKind::generation_v4, value, write_generation_v4);
     }
 
     std::expected<GenerationSnapshot, CodecError> decode_generation(const std::span<const std::byte> bytes) {
@@ -648,7 +702,10 @@ namespace rule_engine::python::cluster::control_serialization {
         if (kind == PayloadKind::generation_v2) {
             return decode_value<GenerationSnapshot>(bytes, PayloadKind::generation_v2, read_generation_v2);
         }
-        return decode_value<GenerationSnapshot>(bytes, PayloadKind::generation_v3, read_generation_v3);
+        if (kind == PayloadKind::generation_v3) {
+            return decode_value<GenerationSnapshot>(bytes, PayloadKind::generation_v3, read_generation_v3);
+        }
+        return decode_value<GenerationSnapshot>(bytes, PayloadKind::generation_v4, read_generation_v4);
     }
 
     std::expected<std::vector<std::byte>, CodecError> encode(const DurablePackControlSnapshot &value) {

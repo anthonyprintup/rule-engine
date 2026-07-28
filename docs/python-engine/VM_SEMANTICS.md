@@ -97,7 +97,10 @@ State is an injected static capability, not a Python object passed to the VM.
 The compiler therefore erases an entrypoint's `State` parameter from the
 runtime argument list. A supported module-level declaration such as
 `FLAG = StateKey("com.acme.flag", bool, scope=StateScope.PEER)` becomes a
-verifier-visible logical state operand.
+verifier-visible logical state operand. Every declaration, including an unused
+key, also contributes to a canonical SHA-256 state-schema identity. That
+identity is compiler-derived during stage, attested by every resident, and
+checked again when an active pack is loaded.
 
 `state.get(FLAG)` emits `read_state`; `set` and `delete` append mutations to the
 session journal. The resident, not the rule or agent, turns the logical operand

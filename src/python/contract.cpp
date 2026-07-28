@@ -403,6 +403,7 @@ namespace rule_engine::python {
         append_token(canonical, pack.version.value);
         append_token(canonical, pack.source_digest.value);
         append_token(canonical, pack.semantic_hash);
+        append_token(canonical, pack.state_schema_hash);
         append_token(canonical, canonical_operator_bindings_hash(pack.bindings));
         append_token(canonical, pack.schemas.canonical_hash);
         return stable_compiler_digest(canonical);

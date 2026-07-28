@@ -16,7 +16,8 @@ namespace rule_engine::python::cluster {
         bool compilation_matches(const CompilationReport &left, const CompilationReport &right) {
             return left.node_id == right.node_id && left.node_lease_fence == right.node_lease_fence &&
                    left.success == right.success && left.semantic_hash == right.semantic_hash &&
-                   left.binding_hash == right.binding_hash && left.executable_hash == right.executable_hash &&
+                   left.state_schema_hash == right.state_schema_hash && left.binding_hash == right.binding_hash &&
+                   left.executable_hash == right.executable_hash &&
                    normalized(left.capability_hashes) == normalized(right.capability_hashes);
         }
 
@@ -53,10 +54,13 @@ namespace rule_engine::python::cluster {
         const auto binding_hash = canonical_operator_bindings_hash(compiled.bindings);
         const auto executable_hash = compiled_pack_executable_hash(compiled, platform_abi);
         if (compiled.semantic_hash.empty() || generation.semantic_hash != compiled.semantic_hash ||
+            compiled.state_schema_hash.empty() || generation.request.state_schema_hash != compiled.state_schema_hash ||
             generation.binding_hash != binding_hash || report->semantic_hash != compiled.semantic_hash ||
-            report->binding_hash != binding_hash || report->executable_hash != executable_hash) {
+            report->state_schema_hash != compiled.state_schema_hash || report->binding_hash != binding_hash ||
+            report->executable_hash != executable_hash) {
             return reject(StoreErrorCode::incompatible_schema,
-                          "resident compiler, binding, or executable identity differs from activation evidence");
+                          "resident compiler, state schema, binding, or executable identity differs from activation "
+                          "evidence");
         }
         return {};
     }
@@ -288,7 +292,8 @@ namespace rule_engine::python::cluster {
                 failure = "frozen target lost its healthy serving lease";
                 break;
             }
-            if (!report->success || report->semantic_hash.empty() || report->binding_hash.empty() ||
+            if (!report->success || report->semantic_hash.empty() ||
+                report->state_schema_hash != staged->second.request.state_schema_hash || report->binding_hash.empty() ||
                 report->executable_hash.empty()) {
                 failure = "a target did not produce a valid executable";
                 break;
