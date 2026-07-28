@@ -160,7 +160,12 @@ namespace rule_engine::python::cluster {
                                                                                     const std::uint64_t now_unix_ms,
                                                                                     const std::string_view actor) {
         if (request.pack.empty() || request.version.empty() || request.source_digest.empty() ||
-            request.generation == 0 || !request.signature_verified) {
+            request.generation == 0 || !request.signature_verified ||
+            request.policy.version != "activation-policy.v1" || request.policy.bundle_hash.size() != 71U ||
+            !request.policy.bundle_hash.starts_with("sha256:") ||
+            !std::ranges::all_of(std::string_view {request.policy.bundle_hash}.substr(7U), [](const char character) {
+                return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
+            })) {
             return std::unexpected(error(StoreErrorCode::constraint_violation,
                                          "generation requires verified source and complete identity"));
         }
@@ -535,6 +540,7 @@ namespace rule_engine::python::cluster {
                 .state_transition = std::move(state_transition),
                 .rollback_from = source_generation,
                 .signature_verified = true,
+                .policy = source->second.request.policy,
             };
         }
         return begin_stage(request, now_unix_ms, actor);

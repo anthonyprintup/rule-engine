@@ -338,6 +338,10 @@ TEST_CASE("resident backend seam remains injectable and stop-aware") {
         .allow_unsigned_generators = false,
         .signers = {},
     };
+    const cluster::ActivationPolicySnapshot activation_policy {
+        .version = "activation-policy.v1",
+        .bundle_hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    };
     const protocol_v2::OperatorTrustPolicy peer_trust;
     const ResidentServerContext context {
         .config = config,
@@ -346,6 +350,7 @@ TEST_CASE("resident backend seam remains injectable and stop-aware") {
         .store_capabilities = capabilities,
         .runtime = runtime,
         .pack_trust_policy = pack_trust,
+        .activation_policy = activation_policy,
         .peer_trust_policy = peer_trust,
         .agent_tls = nullptr,
         .admin_tls = nullptr,
@@ -462,6 +467,45 @@ TEST_CASE("server validates explicit configuration and fails closed before resid
         run_process(server, "--config " + shell_quote(exposed_path) + " --validate-config", temporary, "exposed");
     CHECK(exposed.exit_code == 2);
     CHECK(exposed.standard_error.find("SRV-CONFIG-PLAINTEXT") != std::string::npos);
+}
+
+TEST_CASE("activation policy snapshots bind every execution and authorization input") {
+    TemporaryDirectory temporary;
+    rule_engine::python::tools::ServerConfig config;
+    config.trusted_signers_path = temporary.path / "trusted-signers.policy";
+    config.revocations_path = temporary.path / "revocations.policy";
+    config.peer_enrollment_path = temporary.path / "peer-enrollment.policy";
+    config.operator_bindings_path = temporary.path / "operator-bindings.policy";
+    config.schema_catalog_path = temporary.path / "schema-catalog.policy";
+    config.budget_profiles_path = temporary.path / "budget-profiles.policy";
+    config.retention_profiles_path = temporary.path / "retention-profiles.policy";
+    config.trace_profiles_path = temporary.path / "trace-profiles.policy";
+    config.capture_profiles_path = temporary.path / "capture-profiles.policy";
+    config.service_profiles_path = temporary.path / "service-profiles.policy";
+    config.sink_profiles_path = temporary.path / "sink-profiles.policy";
+    const std::filesystem::path *paths[] {
+        &config.trusted_signers_path,    &config.revocations_path,    &config.peer_enrollment_path,
+        &config.operator_bindings_path,  &config.schema_catalog_path, &config.budget_profiles_path,
+        &config.retention_profiles_path, &config.trace_profiles_path, &config.capture_profiles_path,
+        &config.service_profiles_path,   &config.sink_profiles_path,
+    };
+    for (std::size_t index = 0U; index < std::size(paths); ++index) {
+        write_file(*paths[index], "policy-input-" + std::to_string(index) + "\n");
+    }
+
+    const auto first = rule_engine::python::tools::snapshot_activation_policy(config);
+    const auto retry = rule_engine::python::tools::snapshot_activation_policy(config);
+    REQUIRE(first);
+    REQUIRE(retry);
+    CHECK(*first == *retry);
+    CHECK(first->version == "activation-policy.v1");
+    CHECK(first->bundle_hash.size() == 71U);
+
+    write_file(config.retention_profiles_path, "changed-retention-policy\n");
+    const auto changed = rule_engine::python::tools::snapshot_activation_policy(config);
+    REQUIRE(changed);
+    CHECK(changed->version == first->version);
+    CHECK(changed->bundle_hash != first->bundle_hash);
 }
 
 TEST_CASE("production startup qualifies PostgreSQL capability and rejects inline secrets") {
@@ -951,6 +995,8 @@ namespace {
                                      .accept_state_gap = false},
                 .rollback_from = std::nullopt,
                 .signature_verified = true,
+                .policy = {.version = "activation-policy.v1",
+                           .bundle_hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
             };
         }
     };
@@ -1164,7 +1210,10 @@ namespace {
                                                  .reset_authorized = false,
                                                  .accept_state_gap = false},
                             .rollback_from = std::nullopt,
-                            .signature_verified = true},
+                            .signature_verified = true,
+                            .policy = {.version = "activation-policy.v1",
+                                       .bundle_hash =
+                                           "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}},
                 .phase = py::cluster::GenerationPhase::ready,
                 .target_nodes = {"node:test"},
                 .reports = {{.node_id = "node:test",
@@ -2026,8 +2075,9 @@ TEST_CASE("resident scheduler rejects overload and joins owned workers on shutdo
               ->submit({.role = tools::ResidentSessionRole::agent,
                         .peer = {},
                         .channel = std::make_unique<FakeByteChannel>(first)}) == tools::ResidentAdmission::accepted);
-    for (std::size_t attempt = 0U; attempt < 10'000U && handler.entered.load() == 0U; ++attempt) {
-        std::this_thread::yield();
+    const auto entered_deadline = std::chrono::steady_clock::now() + std::chrono::seconds {2};
+    while (handler.entered.load() == 0U && std::chrono::steady_clock::now() < entered_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds {1});
     }
     REQUIRE(handler.entered.load() == 1U);
     CHECK((*scheduler)

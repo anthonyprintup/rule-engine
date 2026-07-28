@@ -23,6 +23,7 @@ namespace rule_engine::python::cluster::control_serialization {
             node = 6,
             generation_v2 = 7,
             stage_fingerprint = 8,
+            generation_v3 = 9,
         };
 
         struct Writer {
@@ -281,7 +282,7 @@ namespace rule_engine::python::cluster::control_serialization {
             return result;
         }
 
-        void write_request(Writer &writer, const GenerationRequest &request) {
+        void write_request_v2(Writer &writer, const GenerationRequest &request) {
             write_id(writer, request.pack);
             write_id(writer, request.version);
             write_id(writer, request.source_digest);
@@ -294,7 +295,7 @@ namespace rule_engine::python::cluster::control_serialization {
             writer.boolean(request.signature_verified);
         }
 
-        GenerationRequest read_request(Reader &reader) {
+        GenerationRequest read_request_v2(Reader &reader) {
             return GenerationRequest {.pack = read_id<PackId>(reader),
                                       .version = read_id<PackVersion>(reader),
                                       .source_digest = read_id<SourceDigest>(reader),
@@ -304,7 +305,21 @@ namespace rule_engine::python::cluster::control_serialization {
                                       .required_capability_hashes = read_strings(reader),
                                       .state_transition = read_transition(reader),
                                       .rollback_from = read_optional_u64(reader),
-                                      .signature_verified = reader.boolean()};
+                                      .signature_verified = reader.boolean(),
+                                      .policy = {}};
+        }
+
+        void write_request_v3(Writer &writer, const GenerationRequest &request) {
+            write_request_v2(writer, request);
+            writer.string(request.policy.version);
+            writer.string(request.policy.bundle_hash);
+        }
+
+        GenerationRequest read_request_v3(Reader &reader) {
+            auto request = read_request_v2(reader);
+            request.policy.version = reader.string();
+            request.policy.bundle_hash = reader.string();
+            return request;
         }
 
         void write_report(Writer &writer, const CompilationReport &report) {
@@ -352,22 +367,8 @@ namespace rule_engine::python::cluster::control_serialization {
                                     .capability_hashes = read_strings(reader)};
         }
 
-        void write_generation_v2(Writer &writer, const GenerationSnapshot &generation) {
-            write_request(writer, generation.request);
-            writer.u8(static_cast<std::uint8_t>(generation.phase));
-            write_strings(writer, generation.target_nodes);
-            writer.number(writer.count(generation.targets.size()));
-            for (const auto &target : generation.targets) { write_target(writer, target); }
-            writer.number(writer.count(generation.reports.size()));
-            for (const auto &report : generation.reports) { write_report(writer, report); }
-            writer.string(generation.semantic_hash);
-            writer.string(generation.binding_hash);
-            write_strings(writer, generation.requeued_work);
-            writer.string(generation.failure);
-        }
-
         GenerationSnapshot read_generation_v1(Reader &reader) {
-            GenerationSnapshot result {.request = read_request(reader),
+            GenerationSnapshot result {.request = read_request_v2(reader),
                                        .phase = GenerationPhase::compiling,
                                        .target_nodes = {},
                                        .targets = {},
@@ -393,7 +394,54 @@ namespace rule_engine::python::cluster::control_serialization {
         }
 
         GenerationSnapshot read_generation_v2(Reader &reader) {
-            GenerationSnapshot result {.request = read_request(reader),
+            GenerationSnapshot result {.request = read_request_v2(reader),
+                                       .phase = GenerationPhase::compiling,
+                                       .target_nodes = {},
+                                       .targets = {},
+                                       .reports = {},
+                                       .semantic_hash = {},
+                                       .binding_hash = {},
+                                       .requeued_work = {},
+                                       .failure = {}};
+            const auto phase = reader.u8();
+            if (phase > static_cast<std::uint8_t>(GenerationPhase::failed) && reader.error.empty()) {
+                reader.error = "control-plane generation phase is invalid";
+            }
+            result.phase = static_cast<GenerationPhase>(phase);
+            result.target_nodes = read_strings(reader);
+            const auto target_count = reader.count();
+            result.targets.reserve(target_count);
+            for (std::uint32_t index = 0; index < target_count; ++index) {
+                result.targets.push_back(read_target(reader));
+            }
+            const auto report_count = reader.count();
+            result.reports.reserve(report_count);
+            for (std::uint32_t index = 0; index < report_count; ++index) {
+                result.reports.push_back(read_report(reader));
+            }
+            result.semantic_hash = reader.string();
+            result.binding_hash = reader.string();
+            result.requeued_work = read_strings(reader);
+            result.failure = reader.string();
+            return result;
+        }
+
+        void write_generation_v3(Writer &writer, const GenerationSnapshot &generation) {
+            write_request_v3(writer, generation.request);
+            writer.u8(static_cast<std::uint8_t>(generation.phase));
+            write_strings(writer, generation.target_nodes);
+            writer.number(writer.count(generation.targets.size()));
+            for (const auto &target : generation.targets) { write_target(writer, target); }
+            writer.number(writer.count(generation.reports.size()));
+            for (const auto &report : generation.reports) { write_report(writer, report); }
+            writer.string(generation.semantic_hash);
+            writer.string(generation.binding_hash);
+            write_strings(writer, generation.requeued_work);
+            writer.string(generation.failure);
+        }
+
+        GenerationSnapshot read_generation_v3(Reader &reader) {
+            GenerationSnapshot result {.request = read_request_v3(reader),
                                        .phase = GenerationPhase::compiling,
                                        .target_nodes = {},
                                        .targets = {},
@@ -586,7 +634,7 @@ namespace rule_engine::python::cluster::control_serialization {
     } // namespace
 
     std::expected<std::vector<std::byte>, CodecError> encode(const GenerationSnapshot &value) {
-        return encode_value(PayloadKind::generation_v2, value, write_generation_v2);
+        return encode_value(PayloadKind::generation_v3, value, write_generation_v3);
     }
 
     std::expected<GenerationSnapshot, CodecError> decode_generation(const std::span<const std::byte> bytes) {
@@ -597,7 +645,10 @@ namespace rule_engine::python::cluster::control_serialization {
         if (kind == PayloadKind::generation) {
             return decode_value<GenerationSnapshot>(bytes, PayloadKind::generation, read_generation_v1);
         }
-        return decode_value<GenerationSnapshot>(bytes, PayloadKind::generation_v2, read_generation_v2);
+        if (kind == PayloadKind::generation_v2) {
+            return decode_value<GenerationSnapshot>(bytes, PayloadKind::generation_v2, read_generation_v2);
+        }
+        return decode_value<GenerationSnapshot>(bytes, PayloadKind::generation_v3, read_generation_v3);
     }
 
     std::expected<std::vector<std::byte>, CodecError> encode(const DurablePackControlSnapshot &value) {
@@ -635,7 +686,7 @@ namespace rule_engine::python::cluster::control_serialization {
 
     std::expected<std::vector<std::byte>, CodecError> stage_fingerprint(const GenerationRequest &request) {
         return encode_value(PayloadKind::stage_fingerprint, request,
-                            [](Writer &writer, const GenerationRequest &value) { write_request(writer, value); });
+                            [](Writer &writer, const GenerationRequest &value) { write_request_v3(writer, value); });
     }
 
     std::expected<std::vector<std::byte>, CodecError>

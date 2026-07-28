@@ -27,6 +27,14 @@ namespace rule_engine::python::cluster {
             return values;
         }
 
+        [[nodiscard]] bool valid_policy_snapshot(const ActivationPolicySnapshot &policy) noexcept {
+            return policy.version == "activation-policy.v1" && policy.bundle_hash.size() == 71U &&
+                   policy.bundle_hash.starts_with("sha256:") &&
+                   std::ranges::all_of(std::string_view {policy.bundle_hash}.substr(7U), [](const char character) {
+                       return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
+                   });
+        }
+
         GenerationSnapshot canonical_generation(GenerationSnapshot generation) {
             generation.request.required_capability_hashes =
                 normalized(std::move(generation.request.required_capability_hashes));
@@ -50,10 +58,10 @@ namespace rule_engine::python::cluster {
             const auto &request = generation.request;
             if (request.pack.empty() || request.version.empty() || request.source_digest.empty() ||
                 request.generation == 0 || request.state_schema_hash.empty() || request.state_namespace.empty() ||
-                !request.signature_verified || generation.phase != GenerationPhase::ready ||
-                generation.semantic_hash.empty() || generation.binding_hash.empty() || !generation.failure.empty() ||
-                !generation.requeued_work.empty() || generation.target_nodes.empty() ||
-                generation.target_nodes.size() != generation.reports.size()) {
+                !request.signature_verified || !valid_policy_snapshot(request.policy) ||
+                generation.phase != GenerationPhase::ready || generation.semantic_hash.empty() ||
+                generation.binding_hash.empty() || !generation.failure.empty() || !generation.requeued_work.empty() ||
+                generation.target_nodes.empty() || generation.target_nodes.size() != generation.reports.size()) {
                 return std::unexpected(invalid("staged generation metadata is incomplete or not ready"));
             }
             if (request.state_transition.target_namespace != request.state_namespace) {
@@ -112,7 +120,7 @@ namespace rule_engine::python::cluster {
         std::expected<void, StoreError> validate_server_stage_request(const GenerationRequest &request) {
             if (request.pack.empty() || request.version.empty() || request.source_digest.empty() ||
                 request.generation == 0 || request.state_schema_hash.empty() || request.state_namespace.empty() ||
-                !request.signature_verified || request.rollback_from ||
+                !request.signature_verified || request.rollback_from || !valid_policy_snapshot(request.policy) ||
                 request.state_transition.target_namespace != request.state_namespace ||
                 std::ranges::any_of(request.required_capability_hashes,
                                     [](const auto &capability) { return capability.empty(); })) {
@@ -1204,6 +1212,7 @@ namespace rule_engine::python::cluster {
         if (rollback_request.pack.empty() || rollback_request.version.empty() ||
             rollback_request.source_digest.empty() || rollback_request.generation == 0U ||
             rollback_request.state_schema_hash.empty() || rollback_request.state_namespace.empty() ||
+            !valid_policy_snapshot(rollback_request.policy) ||
             rollback_request.state_transition.target_namespace != rollback_request.state_namespace) {
             return std::unexpected(invalid("server-owned rollback source metadata is incomplete"));
         }

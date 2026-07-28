@@ -118,6 +118,19 @@ This evidence does not qualify live
 PostgreSQL, multiple server processes, network partitions, Linux, or mixed-OS
 operation.
 
+The immutable activation-policy slice then passed the complete 38-test Debug
+graph in 171.19 seconds. Focused control-plane coverage proves that the policy
+snapshot is durable across restart and changes the stage idempotency
+fingerprint. Executable-surface coverage proves deterministic
+`activation-policy.v1` hashing across every configured trust, authorization,
+schema, budget, retention, trace, capture, service, and sink input, and proves
+that changing one input changes the bundle identity. Resident compilation,
+report submission, restart readiness, rollback, and live-active identity all
+require the exact snapshot. This is raw-byte immutable deployment-policy
+evidence; it does not qualify an authenticated policy mutation API, semantic
+policy canonicalization, registry lifecycle, or any open distributed platform
+cell.
+
 ## Artifact identity
 
 | Artifact | SHA-256 |

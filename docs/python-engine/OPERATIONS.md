@@ -329,6 +329,21 @@ forward restage and currently accepts carry state only: the retained and active
 state schema must match, and no reset/migration flag can be supplied. Policy
 mutation still fails closed with `ADMIN-NOT-IMPLEMENTED`.
 
+At startup, the resident reads every configured trust and execution-policy
+file and computes one `activation-policy.v1` bundle identity. Stage records that
+identity in both the durable generation and its idempotency fingerprint. Every
+target must be running the same bundle before it can report, and active-pack
+readiness requires an exact match.
+
+Policy files are therefore deployment inputs, not live-editable configuration.
+Replace them atomically and restart the residents as one controlled rollout,
+then stage source as a new generation under the new bundle before activation.
+Changing comments or whitespace changes the byte identity. A generation written
+by control-payload version 1 or 2 has no policy snapshot and must be restaged
+before this server version will serve it. A rollback also retains the original
+generation's policy identity; if policy has changed, stage the retained source
+as an ordinary new generation under the current policy instead.
+
 Use the configured JSON log, security audit, readiness, and Prometheus outputs
 for operations. Logs and diagnostics record identities, hashes, limits, and
 failure classes, not rule payloads, private keys, connection secrets, or

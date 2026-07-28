@@ -105,6 +105,8 @@ namespace rule_engine::python::tools {
     [[nodiscard]] std::expected<ServerConfig, ServerConfigError> parse_server_config(std::string_view text);
     [[nodiscard]] std::expected<ServerConfig, ServerConfigError> load_server_config(const std::filesystem::path &path);
     [[nodiscard]] std::expected<void, ServerConfigError> validate_server_config(const ServerConfig &config);
+    [[nodiscard]] std::expected<cluster::ActivationPolicySnapshot, ToolFailure>
+    snapshot_activation_policy(const ServerConfig &config);
 
     struct ResidentServerContext {
         const ServerConfig &config;
@@ -113,6 +115,7 @@ namespace rule_engine::python::tools {
         const cluster::StoreBackendCapabilities &store_capabilities;
         const packaging::PrivatePythonRuntime &runtime;
         const packaging::TrustPolicy &pack_trust_policy;
+        const cluster::ActivationPolicySnapshot &activation_policy;
         const protocol_v2::ITrustPolicy &peer_trust_policy;
         protocol_v2::OpenSslTlsContext *agent_tls;
         protocol_v2::OpenSslTlsContext *admin_tls;

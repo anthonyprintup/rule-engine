@@ -253,6 +253,8 @@ namespace {
                 },
             .rollback_from = std::nullopt,
             .signature_verified = true,
+            .policy = {.version = "activation-policy.v1",
+                       .bundle_hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
         };
     }
 
@@ -979,12 +981,19 @@ namespace {
             const auto created = admin.preview_server_stage(preview_request, requested);
             REQUIRE(created.has_value());
             preview = *created;
+            auto changed_policy = requested;
+            changed_policy.policy.bundle_hash =
+                "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+            const auto rejected_policy_retry = admin.preview_server_stage(preview_request, changed_policy);
+            REQUIRE_FALSE(rejected_policy_retry.has_value());
+            REQUIRE(rejected_policy_retry.error().code == StoreErrorCode::constraint_violation);
             const auto compiling = admin.begin_server_stage(apply_request(preview, 0, 1'001), requested);
             REQUIRE(compiling.has_value());
             REQUIRE(compiling->phase == GenerationPhase::compiling);
             REQUIRE(compiling->target_nodes == std::vector<std::string> {"node-a", "node-b"});
             REQUIRE(compiling->targets.size() == 2);
             REQUIRE(compiling->targets.front().lease_fence == 11);
+            REQUIRE(compiling->request.policy == requested.policy);
         }
 
         {
@@ -1014,6 +1023,7 @@ namespace {
             const auto state = admin.state_snapshot();
             REQUIRE(state.has_value());
             REQUIRE(state->packs.front().resource_version == 3);
+            REQUIRE(state->generations.front().request.policy == requested.policy);
             REQUIRE_FALSE(state->packs.front().active_generation.has_value());
             REQUIRE_FALSE(state->packs.front().accepting_assignments);
         }

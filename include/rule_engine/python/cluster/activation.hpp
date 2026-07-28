@@ -28,6 +28,14 @@ namespace rule_engine::python::cluster {
         bool accept_state_gap {};
     };
 
+    struct ActivationPolicySnapshot {
+        std::string version;
+        std::string bundle_hash;
+
+        [[nodiscard]] friend bool operator==(const ActivationPolicySnapshot &,
+                                             const ActivationPolicySnapshot &) = default;
+    };
+
     struct ClusterNode {
         std::string node_id;
         std::string platform_abi;
@@ -47,6 +55,7 @@ namespace rule_engine::python::cluster {
         StateTransitionPlan state_transition;
         std::optional<std::uint64_t> rollback_from;
         bool signature_verified {};
+        ActivationPolicySnapshot policy;
     };
 
     struct CompilationReport {

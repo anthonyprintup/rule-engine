@@ -715,6 +715,61 @@ versioned policy/registry administration remain fail-closed.
             return fields;
         }
 
+        [[nodiscard]] std::expected<std::string, ToolFailure> policy_file_identity(const std::filesystem::path &path,
+                                                                                   const std::string_view name) {
+            if (path.empty()) {
+                return std::string {"absent"};
+            }
+            std::error_code filesystem_error;
+            const auto status = std::filesystem::symlink_status(path, filesystem_error);
+            const auto size = std::filesystem::file_size(path, filesystem_error);
+            if (filesystem_error || !std::filesystem::is_regular_file(status) || std::filesystem::is_symlink(status) ||
+                size == 0U || size > maximum_policy_bytes) {
+                return std::unexpected(
+                    unavailable("SRV-POLICY-SNAPSHOT", std::string {name} + " policy input is not a bounded file"));
+            }
+            std::ifstream input {path, std::ios::binary};
+            std::vector<std::byte> bytes(static_cast<std::size_t>(size));
+            input.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            if (!input || input.gcount() != static_cast<std::streamsize>(bytes.size())) {
+                return std::unexpected(
+                    unavailable("SRV-POLICY-SNAPSHOT", std::string {name} + " policy input could not be read"));
+            }
+            return "sha256:" + packaging::sha256_hex(bytes);
+        }
+
+        [[nodiscard]] std::expected<cluster::ActivationPolicySnapshot, ToolFailure>
+        compute_activation_policy_snapshot(const ServerConfig &config) {
+            const std::pair<std::string_view, const std::filesystem::path *> inputs[] {
+                {"trusted-signers", &config.trusted_signers_path},
+                {"revocations", &config.revocations_path},
+                {"peer-enrollment", &config.peer_enrollment_path},
+                {"operator-bindings", &config.operator_bindings_path},
+                {"schema-catalog", &config.schema_catalog_path},
+                {"budget-profiles", &config.budget_profiles_path},
+                {"retention-profiles", &config.retention_profiles_path},
+                {"trace-profiles", &config.trace_profiles_path},
+                {"capture-profiles", &config.capture_profiles_path},
+                {"service-profiles", &config.service_profiles_path},
+                {"sink-profiles", &config.sink_profiles_path},
+            };
+            std::string material {"activation-policy.v1\n"};
+            for (const auto &[name, path] : inputs) {
+                auto identity = policy_file_identity(*path, name);
+                if (!identity) {
+                    return std::unexpected(std::move(identity.error()));
+                }
+                material += name;
+                material.push_back('\0');
+                material += *identity;
+                material.push_back('\n');
+            }
+            return cluster::ActivationPolicySnapshot {
+                .version = "activation-policy.v1",
+                .bundle_hash = "sha256:" + packaging::sha256_hex(std::as_bytes(std::span {material})),
+            };
+        }
+
         [[nodiscard]] bool safe_policy_atom(const std::string_view value, const std::size_t maximum = 512U) noexcept {
             return !value.empty() && value.size() <= maximum && std::ranges::all_of(value, [](const char character) {
                 const auto byte = static_cast<unsigned char>(character);
@@ -1656,6 +1711,11 @@ versioned policy/registry administration remain fail-closed.
                     return std::unexpected(unavailable("SRV-ACTIVATION-GENERATION",
                                                        "active pack generation evidence is absent or incomplete"));
                 }
+                if (generation->request.policy != context.activation_policy) {
+                    return std::unexpected(
+                        unavailable("SRV-ACTIVATION-POLICY",
+                                    "active generation was staged under a different immutable policy bundle"));
+                }
                 if (!generation->target_nodes.empty() &&
                     std::ranges::find(generation->target_nodes, context.config.node_id) ==
                         generation->target_nodes.end()) {
@@ -1730,7 +1790,9 @@ versioned policy/registry administration remain fail-closed.
                     return std::nullopt;
                 }
                 identities.push_back(pack.pack.value + '\0' + std::to_string(*pack.active_generation) + '\0' +
-                                     generation->semantic_hash + '\0' + generation->binding_hash);
+                                     generation->request.policy.version + '\0' +
+                                     generation->request.policy.bundle_hash + '\0' + generation->semantic_hash + '\0' +
+                                     generation->binding_hash);
             }
             std::ranges::sort(identities);
             std::string result;
@@ -1788,7 +1850,8 @@ versioned policy/registry administration remain fail-closed.
                     archive ? packaging::verify_and_load_source_pack(*archive, context.pack_trust_policy, verifier) :
                               std::expected<packaging::LoadedSourcePack, packaging::PackagingError> {
                                   std::unexpected(packaging::PackagingError {})};
-                if (loaded && loaded->manifest.pack == generation->request.pack &&
+                if (generation->request.policy == context.activation_policy && loaded &&
+                    loaded->manifest.pack == generation->request.pack &&
                     loaded->manifest.version == generation->request.version &&
                     loaded->closure_digest == generation->request.source_digest) {
                     std::error_code filesystem_error;
@@ -1826,14 +1889,17 @@ versioned policy/registry administration remain fail-closed.
         struct FilesystemResidentStageSourceBackend final: IResidentStageSourceBackend {
             FilesystemResidentStageSourceBackend(std::filesystem::path selected_registry,
                                                  const packaging::TrustPolicy &selected_trust,
-                                                 std::filesystem::path selected_crypto_library):
+                                                 std::filesystem::path selected_crypto_library,
+                                                 cluster::ActivationPolicySnapshot selected_policy):
                 registry {std::move(selected_registry)},
                 trust {selected_trust},
-                crypto_library {std::move(selected_crypto_library)} {}
+                crypto_library {std::move(selected_crypto_library)},
+                policy {std::move(selected_policy)} {}
 
             std::filesystem::path registry;
             const packaging::TrustPolicy &trust;
             std::filesystem::path crypto_library;
+            cluster::ActivationPolicySnapshot policy;
 
             [[nodiscard]] std::expected<cluster::GenerationRequest, protocol_v2::ProtocolError>
             resolve(const PackId &pack, const SourceDigest &source_digest, const std::uint64_t generation,
@@ -1886,6 +1952,7 @@ versioned policy/registry administration remain fail-closed.
                                                                       .accept_state_gap = false},
                     .rollback_from = std::nullopt,
                     .signature_verified = true,
+                    .policy = policy,
                 };
             }
         };
@@ -1900,6 +1967,11 @@ versioned policy/registry administration remain fail-closed.
         }
 
     } // namespace
+
+    std::expected<cluster::ActivationPolicySnapshot, ToolFailure>
+    snapshot_activation_policy(const ServerConfig &config) {
+        return compute_activation_policy_snapshot(config);
+    }
 
     std::expected<ServerConfig, ServerConfigError> parse_server_config(const std::string_view text) {
         auto entries = parse_entries(text);
@@ -2779,6 +2851,10 @@ versioned policy/registry administration remain fail-closed.
         if (!operator_bindings) {
             return failure_output(operator_bindings.error());
         }
+        auto activation_policy = snapshot_activation_policy(*config);
+        if (!activation_policy) {
+            return failure_output(activation_policy.error());
+        }
         auto agent_tls = create_tls(*config);
         if (!agent_tls) {
             return failure_output(agent_tls.error());
@@ -2819,7 +2895,7 @@ versioned policy/registry administration remain fail-closed.
                                                       config->service.maximum_frame_bytes};
         FileAdminSecurityAudit admin_security_audit {config->audit_path};
         FilesystemResidentStageSourceBackend stages {config->pack_registry_path, *pack_trust_policy,
-                                                     runtime->crypto_library};
+                                                     runtime->crypto_library, *activation_policy};
         AuthorizedResidentAdminBackend staged_admin_backend {**activation_store,     **operator_bindings,
                                                              &admin_security_audit,  uploads->get(),
                                                              std::addressof(stages), std::addressof(agent_backend)};
@@ -2830,6 +2906,7 @@ versioned policy/registry administration remain fail-closed.
             .store_capabilities = *capabilities,
             .runtime = *runtime,
             .pack_trust_policy = *pack_trust_policy,
+            .activation_policy = *activation_policy,
             .peer_trust_policy = **peer_trust_policy,
             .agent_tls = agent_tls->has_value() ? std::addressof(**agent_tls) : nullptr,
             .admin_tls = admin_tls->has_value() ? std::addressof(**admin_tls) : nullptr,
