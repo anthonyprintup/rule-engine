@@ -54,13 +54,18 @@ The `codex/python-production-readiness` Debug graph built successfully with
 clang-cl and Ninja after adding exact active-pack compilation, the resident
 evaluator, and schema-typed custom-event author lowering.
 `ctest --test-dir build/Debug --output-on-failure` passed 38/38 tests in
-172.13 seconds. The suite covers snapshot-to-fact-to-match commit, restart
+161.07 seconds after connecting the authenticated resident admin v2 lifecycle
+and standalone mTLS client. The suite covers snapshot-to-fact-to-match commit, restart
 reconstruction from durable snapshot ingress, reconnect work reclamation with
 stale-session isolation, durable cross-epoch replay ordering, and the exact
 private-worker-to-compiler-to-VM-to-transaction path for a typed custom event.
 It also proves deterministic rejection of duplicate event wire IDs, incomplete
 event construction, receipt use, and emission of non-event values. This is
-Windows-local component and process-restart evidence. It does not qualify live
+Windows-local component, process-restart, admin-codec, and CLI-mapping evidence.
+The admin tests prove canonical request/response bounds, every activation phase,
+idempotent replay after lost preview/flip responses, and authorization denial
+before store access; they do not constitute a live certificate deployment test.
+This evidence does not qualify live
 PostgreSQL, multiple server processes, network partitions, Linux, or mixed-OS
 operation.
 

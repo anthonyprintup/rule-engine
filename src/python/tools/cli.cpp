@@ -66,19 +66,35 @@ Options:
 Operate the authenticated, audited Python rule-engine control plane.
 
 Commands:
-  upload stage activate rollback operation packs nodes policy quarantine trace
-  capture backfill outbox deadletters purge audit
+  packs PACK_ID        Read one authorized durable pack snapshot
+  operation PACK_ID OPERATION_ID
+                       Read one authorized durable operation snapshot
+  activate PACK_ID GENERATION
+                       Preview activation (requires --request-id and --reason)
+  activate PACK_ID --phase drain|fence|flip --apply
+                       Advance an existing activation operation
 
 Options:
   --config PATH        Authenticated endpoint, client certificate/key, and trust bundle
+  --tenant ID          Explicit authorization tenant
   --request-id ID      Idempotent request identity for mutations
   --reason TEXT        Audited operator reason (never echoed)
+  --operation-id ID    Existing durable operation (defaults to request ID)
+  --idempotency-key ID Durable idempotency identity (defaults to request ID)
+  --expected-version N Optimistic pack resource version
+  --phase PHASE        preview, drain, fence, or flip
+  --boundary CURSOR    Durable drain boundary for the drain phase
+  --work-ids A,B       Explicit straggler IDs for the fence phase
   --wait               Wait by polling the durable operation record
   --preview            Force preview/dry-run
   --apply              Explicitly apply a command that defaults to preview
   --format FORMAT      text, json, or sarif (default: text)
   --help               Show this help
   --version            Show the tool API version
+
+The upload, stage, rollback-restage, and policy commands are reserved until
+their server-owned compilation/registry workflows are connected; they fail
+closed with ADMIN-NOT-IMPLEMENTED.
 )";
 
         struct ParseError {

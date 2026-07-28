@@ -911,15 +911,15 @@ final activation flip; other control-plane operations remain CLI/backend work.
             switch (operation) {
                 case pack_read: return "pack.read";
                 case operation_read: return "operation.read";
-                case activation_flip: return "pack.activate";
-                case stage_preview:
-                case stage_apply:
+                case pack_inspect: return "pack.read";
                 case activation_preview:
                 case activation_drain:
                 case activation_fence:
+                case activation_flip: return "pack.activate";
+                case stage_preview:
+                case stage_apply:
                 case rollback_preview:
-                case rollback_stage_apply:
-                case pack_inspect: return {};
+                case rollback_stage_apply: return {};
                 default: return {};
             }
         }

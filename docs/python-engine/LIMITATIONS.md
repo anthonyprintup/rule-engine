@@ -242,13 +242,13 @@ Every entry records impact, rationale, mitigation, observability, and revisit co
 - **Observability:** Signing diagnostics expose only the failure class and public key ID; they never log the seed, its contents, or a secret-bearing path.
 - **Revisit:** Add a provider only with explicit key identity, authorization, audit, cancellation, zeroization, rotation, and deterministic-signature contracts plus integration tests for the real device/service.
 
-## L-033 — Filesystem tooling adapters are intentionally narrow
+## L-033 — Filesystem and administration adapters are intentionally narrow
 
-- **Impact:** Atomic no-clobber archive publication depends on a same-directory hard link and fails on filesystems without hard-link support. `--watch` owns cancellation/publication generations but has no platform filesystem-event source, and cancellation is observed between compiler phases rather than forcibly terminating an in-flight parser worker. The standalone admin CLI also lacks the resident admin network adapter.
-- **Rationale:** Portable polling, cross-volume replacement, forced worker interruption, and an authenticated admin client each need separately bounded lifecycle and durability semantics; pretending they are atomic or cancelable would be unsafe.
-- **Mitigation:** Use a local hard-link-capable staging filesystem, invoke checks explicitly from an external watcher, rely on the worker's hard process deadline, and use the tested injected/admin-server interfaces until the client transport is implemented.
+- **Impact:** Atomic no-clobber archive publication depends on a same-directory hard link and fails on filesystems without hard-link support. `--watch` owns cancellation/publication generations but has no platform filesystem-event source, and cancellation is observed between compiler phases rather than forcibly terminating an in-flight parser worker. The standalone admin CLI now connects with mTLS and supports reads plus activation preview/drain/fence/flip, but upload, distributed stage compilation, rollback restaging, policy mutation, and bounded operation polling are not connected.
+- **Rationale:** Portable polling, cross-volume replacement, forced worker interruption, and every privileged lifecycle need separately bounded, server-owned durability semantics; pretending they are atomic or accepting client-supplied semantic evidence would be unsafe.
+- **Mitigation:** Use a local hard-link-capable staging filesystem, invoke checks explicitly from an external watcher, rely on the worker's hard process deadline, and use the authenticated v2 activation sequence only for generations already staged by the durable backend. Unconnected admin commands fail closed with `ADMIN-NOT-IMPLEMENTED`.
 - **Observability:** Tool results distinguish unsupported publication, cancellation generation, worker timeout, and unavailable transport without partially publishing output.
-- **Revisit:** Add platform event adapters, phase-aware worker cancellation, alternative atomic publication protocols, and the authenticated admin transport with failure-injection tests.
+- **Revisit:** Add platform event adapters, phase-aware worker cancellation, alternative atomic publication protocols, server-owned upload/stage/rollback orchestration, policy versioning, and bounded reconnect polling with failure-injection tests.
 
 ## L-034 — Portable and PostgreSQL release qualification is incomplete
 

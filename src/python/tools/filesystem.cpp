@@ -764,15 +764,15 @@ namespace rule_engine::python::tools {
                                            "admin endpoint configuration cannot be read"));
         }
         auto lines = split_configuration(text(*content));
-        if (!lines.has_value() || lines->size() != 6U || (*lines)[0] != "format=1") {
+        if (!lines.has_value() || lines->size() != 6U || (*lines)[0] != "format=2") {
             return std::unexpected(failure(ToolFailureKind::authentication, "ADMIN-CONFIG",
-                                           "admin endpoint configuration is not canonical format 1"));
+                                           "admin endpoint configuration is not canonical format 2"));
         }
         const auto endpoint = value_after((*lines)[1], "endpoint");
-        const auto certificate = value_after((*lines)[2], "client_certificate");
-        const auto key = value_after((*lines)[3], "client_key");
-        const auto trust = value_after((*lines)[4], "trust_bundle");
-        const auto actor = value_after((*lines)[5], "actor");
+        const auto server_uri = value_after((*lines)[2], "server_uri");
+        const auto certificate = value_after((*lines)[3], "client_certificate");
+        const auto key = value_after((*lines)[4], "client_key");
+        const auto trust = value_after((*lines)[5], "trust_bundle");
         const auto endpoint_authority = endpoint.has_value() && endpoint->starts_with("https://") ?
                                             endpoint->substr(std::string_view {"https://"}.size()) :
                                             std::string_view {};
@@ -780,9 +780,9 @@ namespace rule_engine::python::tools {
         const auto endpoint_has_unsafe_character =
             endpoint_authority.find_first_of("@?#\\\r\n\t ") != std::string_view::npos;
         if (!endpoint.has_value() || endpoint_host.empty() || endpoint_has_unsafe_character ||
-            !certificate.has_value() || certificate->empty() || !key.has_value() || key->empty() ||
-            !trust.has_value() || trust->empty() || !actor.has_value() || actor->empty() ||
-            actor->find_first_of("\r\n\t") != std::string_view::npos) {
+            !server_uri.has_value() || server_uri->empty() || server_uri->size() > 1'024U ||
+            server_uri->find_first_of("\r\n\t ") != std::string_view::npos || !certificate.has_value() ||
+            certificate->empty() || !key.has_value() || key->empty() || !trust.has_value() || trust->empty()) {
             return std::unexpected(failure(ToolFailureKind::authentication, "ADMIN-CONFIG",
                                            "admin endpoint or mTLS identity fields are invalid"));
         }
@@ -804,10 +804,10 @@ namespace rule_engine::python::tools {
         }
         return AdminEndpointConfiguration {
             .endpoint = std::string {*endpoint},
+            .server_uri = std::string {*server_uri},
             .client_certificate = std::move(material[0]),
             .client_key = std::move(material[1]),
             .trust_bundle = std::move(material[2]),
-            .actor = std::string {*actor},
         };
     }
 

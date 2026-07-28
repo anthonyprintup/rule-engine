@@ -105,7 +105,10 @@ namespace rule_engine::python::tools {
     enum struct ResidentAdminRequestKind : std::uint8_t {
         pack_snapshot = 1,
         operation_snapshot = 2,
-        activation_flip = 3
+        activation_flip = 3,
+        activation_preview = 4,
+        activation_drain = 5,
+        activation_fence = 6,
     };
 
     struct ResidentAdminRequest {
@@ -117,6 +120,10 @@ namespace rule_engine::python::tools {
         std::string idempotency_key;
         std::uint64_t expected_pack_version {};
         std::uint64_t at_unix_ms {};
+        std::string reason;
+        std::uint64_t target_generation {};
+        std::uint64_t drain_boundary {};
+        std::vector<std::string> work_ids;
     };
 
     enum struct ResidentAdminResponseStatus : std::uint8_t { ok = 0, rejected = 1, unavailable = 2 };
@@ -130,6 +137,11 @@ namespace rule_engine::python::tools {
         std::uint64_t resource_version {};
         std::optional<std::uint64_t> active_generation;
         std::optional<std::uint64_t> previous_active_generation;
+        std::string operation_phase;
+        std::uint64_t target_generation {};
+        std::uint64_t drain_boundary {};
+        std::uint64_t assignment_fence {};
+        std::vector<std::string> work_ids;
     };
 
     [[nodiscard]] std::expected<std::vector<std::byte>, protocol_v2::ProtocolError>

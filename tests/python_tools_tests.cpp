@@ -679,6 +679,7 @@ namespace {
 
         CHECK(admin_action_mutates(AdminAction::activate));
         CHECK_FALSE(admin_action_mutates(AdminAction::packs));
+        CHECK(admin_action_defaults_to_preview(AdminAction::activate));
         CHECK(admin_action_defaults_to_preview(AdminAction::backfill));
         CHECK_FALSE(admin_action_defaults_to_preview(AdminAction::stage));
     }
@@ -690,12 +691,12 @@ namespace {
         REQUIRE(write_text_file(temporary.path / "client.key", "private key\n"));
         REQUIRE(write_text_file(temporary.path / "trust.pem", "trust bundle\n"));
         const auto configuration = temporary.path / "admin.conf";
-        REQUIRE(write_text_file(configuration, "format=1\n"
+        REQUIRE(write_text_file(configuration, "format=2\n"
                                                "endpoint=https://control.example.test/v1\n"
+                                               "server_uri=urn:rule-engine:control:test\n"
                                                "client_certificate=client.pem\n"
                                                "client_key=client.key\n"
-                                               "trust_bundle=trust.pem\n"
-                                               "actor=tooling-test\n"));
+                                               "trust_bundle=trust.pem\n"));
 
         RecordingControlPlaneAdapter adapter;
         FilesystemAdminBackend backend {&adapter};
@@ -710,6 +711,7 @@ namespace {
         CHECK(accepted.standard_output.find("rule-engine.admin.v1") != std::string::npos);
         REQUIRE(adapter.endpoint.has_value());
         CHECK(adapter.endpoint->endpoint == "https://control.example.test/v1");
+        CHECK(adapter.endpoint->server_uri == "urn:rule-engine:control:test");
         CHECK(adapter.endpoint->client_certificate == temporary.path / "client.pem");
         REQUIRE(adapter.command.has_value());
         CHECK(adapter.command->config_path == configuration_text);
@@ -723,12 +725,12 @@ namespace {
         CHECK(no_configuration.exit_code == ExitCode::unavailable);
 
         const auto invalid_configuration = temporary.path / "invalid.conf";
-        REQUIRE(write_text_file(invalid_configuration, "format=1\n"
+        REQUIRE(write_text_file(invalid_configuration, "format=2\n"
                                                        "endpoint=http://control.example.test\n"
+                                                       "server_uri=urn:rule-engine:control:test\n"
                                                        "client_certificate=client.pem\n"
                                                        "client_key=client.key\n"
-                                                       "trust_bundle=trust.pem\n"
-                                                       "actor=tooling-test\n"));
+                                                       "trust_bundle=trust.pem\n"));
         const std::string invalid_text = invalid_configuration.string();
         const std::array invalid_arguments {
             std::string_view {"packs"},

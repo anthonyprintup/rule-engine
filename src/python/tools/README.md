@@ -54,24 +54,26 @@ The executable intentionally contains no implicit local administrator and no
 unauthenticated fallback. It requires `--config` in this canonical format:
 
 ```text
-format=1
-endpoint=https://control.example/v1
+format=2
+endpoint=https://control.example:9443/v1
+server_uri=urn:rule-engine:control:production
 client_certificate=client.pem
 client_key=client.key
 trust_bundle=trust.pem
-actor=operator-identity
 ```
 
 Relative mTLS paths resolve beside the configuration file. Symlinked or missing
-material is rejected. A deployment must inject a real control-plane adapter;
-the standalone executable fails with the stable unavailable-transport exit when
-none is linked.
+material is rejected. No actor field exists: the server derives the actor only
+from the authenticated certificate binding.
 
-The resident server has a separate TLS-only admin listener. Its version-1
-canonical length-prefixed application codec is deliberately narrow: pack
-snapshot, operation snapshot, and final activation flip. It resolves the mTLS
-peer through `rule-engine.operator-bindings.v1` and then calls
+The resident server has a separate TLS-only admin listener. Its version-2
+canonical length-prefixed application codec supports pack and operation
+snapshots plus the explicit activation preview, drain, straggler-fence, and
+atomic-flip sequence. It resolves the mTLS peer through
+`rule-engine.operator-bindings.v1` and then calls
 `AuthorizedActivationAdmin`; it never trusts an actor string from the request.
+The standalone CLI now dials this listener with mTLS, pins the configured server
+URI SAN, correlates one bounded request/response, and closes the connection.
 The bounded tab-separated binding snapshot is:
 
 ```text
@@ -98,10 +100,12 @@ OpenSSL allocator overhead, or backend-internal caches.
 
 - The worker's process and resource limits contain ordinary failure and abuse;
   they are not a hostile-code sandbox for a trusted generator.
-- The standalone admin CLI transport adapter is not linked by this component;
-  the resident server's narrow authenticated admin listener is linked as
-  described above. The offline file signer is currently implemented only on
-  Windows; HSM/KMS/PKCS#11 providers remain deployment integrations.
+- The authenticated activation lifecycle and reads are connected end to end.
+  Upload, server-owned distributed stage compilation, rollback restaging,
+  policy mutation, and bounded `--wait` polling still fail closed with
+  `ADMIN-NOT-IMPLEMENTED`; they are not simulated by trusting client-supplied
+  compilation evidence. The offline file signer is currently implemented only
+  on Windows; HSM/KMS/PKCS#11 providers remain deployment integrations.
 - The resident listener currently requires mTLS even when development
   configuration permits loopback plaintext; startup fails closed instead of
   dereferencing a missing TLS context. Accept and TLS handshake are serialized

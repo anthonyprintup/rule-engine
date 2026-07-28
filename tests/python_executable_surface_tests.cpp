@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "rule_engine/python/protocol/codec.hpp"
+#include "rule_engine/python/tools/admin_client.hpp"
 #include "rule_engine/python/tools/benchmark.hpp"
 #include "rule_engine/python/tools/server.hpp"
 
@@ -21,8 +22,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -839,6 +842,115 @@ namespace {
         }
     };
 
+    struct AllowAdminPolicy final: tools::IResidentAdminAccessPolicy {
+        mutable std::vector<py::cluster::AdminControlOperation> operations;
+
+        [[nodiscard]] std::expected<py::cluster::AuthenticatedAdminPrincipal, py::cluster::AuthorizedAdminError>
+        principal_for(const proto::AuthenticatedPeer &) const noexcept override {
+            return py::cluster::AuthenticatedAdminPrincipal {.principal_id = "principal:test",
+                                                             .home_tenant = py::TenantId {"tenant:test"},
+                                                             .kind = py::cluster::AdminPrincipalKind::administrator,
+                                                             .authentication_id = "cert:test"};
+        }
+
+        [[nodiscard]] std::expected<py::cluster::AdminAuthorizationDecision, py::cluster::AdminAuthorizerFailure>
+        authorize(const py::cluster::AuthenticatedAdminPrincipal &,
+                  const py::cluster::AdminAuthorizationRequest &request) const override {
+            operations.push_back(request.operation);
+            return py::cluster::AdminAuthorizationDecision {
+                .outcome = py::cluster::AdminAuthorizationOutcome::allowed,
+                .decision_id = "test-allow-" + std::to_string(operations.size()),
+                .detail = "allowed",
+            };
+        }
+    };
+
+    struct StatefulControlStore final: py::cluster::IActivationControlStore {
+        py::cluster::DurableControlState state;
+        std::map<std::string, py::cluster::AdminOperationRecord, std::less<>> operations;
+        std::vector<py::cluster::AuditRecord> audit;
+
+        [[nodiscard]] std::expected<py::cluster::DurableControlState, py::StoreError> load_state() const override {
+            return state;
+        }
+
+        [[nodiscard]] std::expected<std::optional<py::cluster::AdminOperationRecord>, py::StoreError>
+        find_operation(const std::string_view operation_id) const override {
+            const auto found = operations.find(operation_id);
+            return found == operations.end() ? std::optional<py::cluster::AdminOperationRecord> {} :
+                                               std::optional<py::cluster::AdminOperationRecord> {found->second};
+        }
+
+        [[nodiscard]] std::expected<std::optional<py::cluster::AdminOperationRecord>, py::StoreError>
+        find_operation_by_idempotency(const std::string_view idempotency_key) const override {
+            const auto found = std::ranges::find_if(
+                operations, [&](const auto &entry) { return entry.second.idempotency_key == idempotency_key; });
+            return found == operations.end() ? std::optional<py::cluster::AdminOperationRecord> {} :
+                                               std::optional<py::cluster::AdminOperationRecord> {found->second};
+        }
+
+        [[nodiscard]] std::expected<void, py::StoreError>
+        commit(const py::cluster::ControlPlaneCommit &commit) override {
+            if (commit.expected_storage_revision != state.storage_revision ||
+                commit.state.storage_revision != state.storage_revision + 1U) {
+                return std::unexpected(py::StoreError {.code = py::StoreErrorCode::conflict,
+                                                       .message = "test storage revision conflict",
+                                                       .retryable = true});
+            }
+            state = commit.state;
+            operations.insert_or_assign(commit.operation.operation_id, commit.operation);
+            audit.push_back(commit.audit);
+            return {};
+        }
+
+        [[nodiscard]] std::expected<py::cluster::ControlPlaneInspection, py::StoreError> inspect() const override {
+            std::vector<py::cluster::AdminOperationRecord> operation_values;
+            operation_values.reserve(operations.size());
+            for (const auto &[identity, operation] : operations) {
+                static_cast<void>(identity);
+                operation_values.push_back(operation);
+            }
+            return py::cluster::ControlPlaneInspection {
+                .state = state, .operations = std::move(operation_values), .audit = audit};
+        }
+
+        [[nodiscard]] py::cluster::RuntimeStoreHealth health() const override { return {}; }
+    };
+
+    [[nodiscard]] py::cluster::GenerationSnapshot resident_ready_generation() {
+        const std::string semantic {"sha256:semantic:test"};
+        const std::string binding {"sha256:binding:test"};
+        return {.request = {.pack = py::PackId {"pack:test"},
+                            .version = py::PackVersion {"1.0.0"},
+                            .source_digest = py::SourceDigest {"sha256:source:test"},
+                            .generation = 7U,
+                            .state_schema_hash = "sha256:state:test",
+                            .state_namespace = "state:test",
+                            .required_capability_hashes = {},
+                            .state_transition = {.mode = py::cluster::StateTransitionMode::carry,
+                                                 .source_namespace = {},
+                                                 .target_namespace = "state:test",
+                                                 .migration_id = {},
+                                                 .reset_authorized = false,
+                                                 .accept_state_gap = false},
+                            .rollback_from = std::nullopt,
+                            .signature_verified = true},
+                .phase = py::cluster::GenerationPhase::ready,
+                .target_nodes = {"node:test"},
+                .reports = {{.node_id = "node:test",
+                             .node_lease_fence = 1U,
+                             .success = true,
+                             .semantic_hash = semantic,
+                             .binding_hash = binding,
+                             .executable_hash = "sha256:executable:test",
+                             .capability_hashes = {},
+                             .diagnostics = {}}},
+                .semantic_hash = semantic,
+                .binding_hash = binding,
+                .requeued_work = {},
+                .failure = {}};
+    }
+
     struct BlockingHandler final: tools::IResidentSessionHandler {
         std::atomic<std::size_t> entered {};
         void run(tools::ResidentSessionJob job, const std::stop_token cancellation) noexcept override {
@@ -962,25 +1074,105 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
     CountingControlStore store;
     DenyAdminPolicy policy;
     tools::AuthorizedResidentAdminBackend backend {store, policy};
-    const tools::ResidentAdminRequest request {.kind = tools::ResidentAdminRequestKind::activation_flip,
-                                               .request_id = "request:test",
-                                               .tenant = py::TenantId {"tenant:test"},
-                                               .pack = py::PackId {"pack:test"},
-                                               .operation_id = "operation:test",
-                                               .idempotency_key = "idempotency:test",
-                                               .expected_pack_version = 1U,
-                                               .at_unix_ms = 10U};
-    auto bytes = tools::encode_resident_admin_request(request, 4U * py::kibibyte);
+    const std::array requests {
+        tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::pack_snapshot,
+                                     .request_id = "request:pack",
+                                     .tenant = py::TenantId {"tenant:test"},
+                                     .pack = py::PackId {"pack:test"},
+                                     .at_unix_ms = 10U},
+        tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::operation_snapshot,
+                                     .request_id = "request:operation",
+                                     .tenant = py::TenantId {"tenant:test"},
+                                     .pack = py::PackId {"pack:test"},
+                                     .operation_id = "operation:test",
+                                     .at_unix_ms = 10U},
+        tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::activation_preview,
+                                     .request_id = "request:preview",
+                                     .tenant = py::TenantId {"tenant:test"},
+                                     .pack = py::PackId {"pack:test"},
+                                     .operation_id = "operation:test",
+                                     .idempotency_key = "idempotency:test",
+                                     .expected_pack_version = 1U,
+                                     .at_unix_ms = 10U,
+                                     .reason = "test activation",
+                                     .target_generation = 2U},
+        tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::activation_drain,
+                                     .request_id = "request:drain",
+                                     .tenant = py::TenantId {"tenant:test"},
+                                     .pack = py::PackId {"pack:test"},
+                                     .operation_id = "operation:test",
+                                     .idempotency_key = "idempotency:test",
+                                     .expected_pack_version = 1U,
+                                     .at_unix_ms = 10U,
+                                     .drain_boundary = 42U},
+        tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::activation_fence,
+                                     .request_id = "request:fence",
+                                     .tenant = py::TenantId {"tenant:test"},
+                                     .pack = py::PackId {"pack:test"},
+                                     .operation_id = "operation:test",
+                                     .idempotency_key = "idempotency:test",
+                                     .expected_pack_version = 2U,
+                                     .at_unix_ms = 10U,
+                                     .work_ids = {"work:b", "work:a"}},
+        tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::activation_flip,
+                                     .request_id = "request:flip",
+                                     .tenant = py::TenantId {"tenant:test"},
+                                     .pack = py::PackId {"pack:test"},
+                                     .operation_id = "operation:test",
+                                     .idempotency_key = "idempotency:test",
+                                     .expected_pack_version = 3U,
+                                     .at_unix_ms = 10U},
+    };
+    for (const auto &request : requests) {
+        auto encoded = tools::encode_resident_admin_request(request, 4U * py::kibibyte);
+        REQUIRE(encoded);
+        auto decoded = tools::decode_resident_admin_request(*encoded, 4U * py::kibibyte);
+        REQUIRE(decoded);
+        CHECK(decoded->kind == request.kind);
+        CHECK(decoded->request_id == request.request_id);
+        CHECK(decoded->reason == request.reason);
+        CHECK(decoded->target_generation == request.target_generation);
+        CHECK(decoded->drain_boundary == request.drain_boundary);
+        CHECK(decoded->work_ids == request.work_ids);
+    }
+    auto bytes = tools::encode_resident_admin_request(requests.back(), 4U * py::kibibyte);
     REQUIRE(bytes);
     auto decoded = tools::decode_resident_admin_request(*bytes, 4U * py::kibibyte);
     REQUIRE(decoded);
     const auto admin_peer =
         proto::AuthenticatedPeer {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:admin"}};
-    const auto response = backend.execute(admin_peer, *decoded);
-    CHECK(response.status == tools::ResidentAdminResponseStatus::rejected);
-    CHECK(response.code == "ADMIN-UNAUTHORIZED");
+    for (const auto &request : requests) {
+        const auto response = backend.execute(admin_peer, request);
+        CHECK(response.status == tools::ResidentAdminResponseStatus::rejected);
+        CHECK(response.code == "ADMIN-UNAUTHORIZED");
+    }
     CHECK(store.reads == 0U);
     CHECK(store.commits == 0U);
+
+    const tools::ResidentAdminResponse rich_response {
+        .status = tools::ResidentAdminResponseStatus::ok,
+        .request_id = "request:rich",
+        .code = "OK",
+        .diagnostic = {},
+        .storage_revision = 7U,
+        .resource_version = 8U,
+        .active_generation = 3U,
+        .previous_active_generation = 2U,
+        .operation_phase = "fenced",
+        .target_generation = 3U,
+        .drain_boundary = 99U,
+        .assignment_fence = 12U,
+        .work_ids = {"work:a", "work:b"},
+    };
+    const auto rich_bytes = tools::encode_resident_admin_response(rich_response, 4U * py::kibibyte);
+    REQUIRE(rich_bytes);
+    const auto rich_decoded = tools::decode_resident_admin_response(*rich_bytes, 4U * py::kibibyte);
+    REQUIRE(rich_decoded);
+    CHECK(rich_decoded->operation_phase == "fenced");
+    CHECK(rich_decoded->target_generation == 3U);
+    CHECK(rich_decoded->drain_boundary == 99U);
+    CHECK(rich_decoded->assignment_fence == 12U);
+    CHECK(rich_decoded->work_ids == std::vector<std::string> {"work:a", "work:b"});
 
     AllowTrust trust;
     DurableFakeAgentBackend agents;
@@ -998,6 +1190,137 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
     CHECK(wire_response->status == tools::ResidentAdminResponseStatus::rejected);
     CHECK(store.reads == 0U);
     CHECK(store.commits == 0U);
+}
+
+TEST_CASE("standalone admin client maps explicit lifecycle commands without trusting an actor field") {
+    tools::AdminCommand preview {.action = tools::AdminAction::activate,
+                                 .operands = {"pack:test", "7"},
+                                 .options = {{"tenant", "tenant:test"}, {"expected-version", "3"}},
+                                 .request_id = "request:activate",
+                                 .reason = "deploy approved generation",
+                                 .preview = true};
+    const auto preview_request = tools::build_resident_admin_request(preview, 100U);
+    REQUIRE(preview_request);
+    CHECK(preview_request->kind == tools::ResidentAdminRequestKind::activation_preview);
+    CHECK(preview_request->operation_id == "request:activate");
+    CHECK(preview_request->idempotency_key == "request:activate");
+    CHECK(preview_request->target_generation == 7U);
+    CHECK(preview_request->expected_pack_version == 3U);
+    CHECK(preview_request->at_unix_ms == 100U);
+
+    tools::AdminCommand drain {.action = tools::AdminAction::activate,
+                               .operands = {"pack:test"},
+                               .options = {{"tenant", "tenant:test"},
+                                           {"phase", "drain"},
+                                           {"operation-id", "operation:activate"},
+                                           {"idempotency-key", "idempotency:activate"},
+                                           {"expected-version", "4"},
+                                           {"boundary", "99"}},
+                               .request_id = "request:drain",
+                               .preview = false};
+    const auto drain_request = tools::build_resident_admin_request(drain, 101U);
+    REQUIRE(drain_request);
+    CHECK(drain_request->kind == tools::ResidentAdminRequestKind::activation_drain);
+    CHECK(drain_request->operation_id == "operation:activate");
+    CHECK(drain_request->idempotency_key == "idempotency:activate");
+    CHECK(drain_request->drain_boundary == 99U);
+
+    preview.options.erase("tenant");
+    const auto missing_tenant = tools::build_resident_admin_request(preview, 102U);
+    REQUIRE_FALSE(missing_tenant);
+    CHECK(missing_tenant.error().code == "ADMIN-TENANT");
+}
+
+TEST_CASE("resident admin v2 activation sequence is durable and idempotent across lost responses") {
+    StatefulControlStore store;
+    store.state.storage_revision = 0U;
+    store.state.generations = {resident_ready_generation()};
+    store.state.packs = {{.pack = py::PackId {"pack:test"},
+                          .resource_version = 1U,
+                          .active_generation = std::nullopt,
+                          .assignment_fence = 0U,
+                          .accepting_assignments = false,
+                          .drain_boundary = std::nullopt,
+                          .drain_target = std::nullopt,
+                          .pending_requeues = {}}};
+    AllowAdminPolicy policy;
+    tools::AuthorizedResidentAdminBackend backend {store, policy};
+    const proto::AuthenticatedPeer peer {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:admin"}};
+
+    const tools::ResidentAdminRequest preview {.kind = tools::ResidentAdminRequestKind::activation_preview,
+                                               .request_id = "request:preview",
+                                               .tenant = py::TenantId {"tenant:test"},
+                                               .pack = py::PackId {"pack:test"},
+                                               .operation_id = "operation:activate",
+                                               .idempotency_key = "idempotency:activate",
+                                               .expected_pack_version = 1U,
+                                               .at_unix_ms = 10U,
+                                               .reason = "approved rollout",
+                                               .target_generation = 7U};
+    const auto previewed = backend.execute(peer, preview);
+    REQUIRE(previewed.status == tools::ResidentAdminResponseStatus::ok);
+    CHECK(previewed.operation_phase == "previewed");
+    CHECK(previewed.resource_version == 1U);
+
+    auto drain = preview;
+    drain.kind = tools::ResidentAdminRequestKind::activation_drain;
+    drain.request_id = "request:drain";
+    drain.at_unix_ms = 11U;
+    drain.reason.clear();
+    drain.target_generation = 0U;
+    drain.drain_boundary = 500U;
+    const auto drained = backend.execute(peer, drain);
+    REQUIRE(drained.status == tools::ResidentAdminResponseStatus::ok);
+    CHECK(drained.operation_phase == "draining");
+    CHECK(drained.resource_version == 2U);
+    CHECK(drained.assignment_fence == 1U);
+
+    auto fence = drain;
+    fence.kind = tools::ResidentAdminRequestKind::activation_fence;
+    fence.request_id = "request:fence";
+    fence.expected_pack_version = 2U;
+    fence.at_unix_ms = 12U;
+    fence.drain_boundary = 0U;
+    fence.work_ids = {"work:b", "work:a", "work:a"};
+    const auto fenced = backend.execute(peer, fence);
+    REQUIRE(fenced.status == tools::ResidentAdminResponseStatus::ok);
+    CHECK(fenced.operation_phase == "fenced");
+    CHECK(fenced.resource_version == 3U);
+    CHECK(fenced.work_ids == std::vector<std::string> {"work:a", "work:b"});
+
+    auto flip = fence;
+    flip.kind = tools::ResidentAdminRequestKind::activation_flip;
+    flip.request_id = "request:flip";
+    flip.expected_pack_version = 3U;
+    flip.at_unix_ms = 13U;
+    flip.work_ids.clear();
+    const auto flipped = backend.execute(peer, flip);
+    REQUIRE(flipped.status == tools::ResidentAdminResponseStatus::ok);
+    CHECK(flipped.operation_phase == "applied");
+    CHECK(flipped.resource_version == 4U);
+    CHECK(flipped.active_generation == 7U);
+    CHECK(flipped.assignment_fence == 2U);
+    CHECK(flipped.work_ids == std::vector<std::string> {"work:a", "work:b"});
+
+    const auto flip_after_lost_response = backend.execute(peer, flip);
+    REQUIRE(flip_after_lost_response.status == tools::ResidentAdminResponseStatus::ok);
+    CHECK(flip_after_lost_response.resource_version == 4U);
+    CHECK(flip_after_lost_response.active_generation == 7U);
+
+    const auto preview_after_lost_response = backend.execute(peer, preview);
+    REQUIRE(preview_after_lost_response.status == tools::ResidentAdminResponseStatus::ok);
+    CHECK(preview_after_lost_response.operation_phase == "applied");
+    CHECK(preview_after_lost_response.resource_version == 4U);
+    CHECK(store.state.storage_revision == 4U);
+    CHECK(store.audit.size() == 4U);
+    CHECK(policy.operations == std::vector<py::cluster::AdminControlOperation> {
+                                   py::cluster::AdminControlOperation::activation_preview,
+                                   py::cluster::AdminControlOperation::activation_drain,
+                                   py::cluster::AdminControlOperation::activation_fence,
+                                   py::cluster::AdminControlOperation::activation_flip,
+                                   py::cluster::AdminControlOperation::activation_flip,
+                                   py::cluster::AdminControlOperation::activation_preview,
+                               });
 }
 
 TEST_CASE("resident scheduler rejects overload and joins owned workers on shutdown") {

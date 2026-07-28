@@ -252,12 +252,12 @@ transport backend. There is no implicit local administrator or unauthenticated
 fallback:
 
 ```text
-format=1
-endpoint=https://control.example/v1
+format=2
+endpoint=https://control.example:9443/v1
+server_uri=urn:rule-engine:control:production
 client_certificate=client.pem
 client_key=client.key
 trust_bundle=trust.pem
-actor=operator-identity
 ```
 
 Mutating commands require an idempotent request identity and audited reason;
@@ -270,10 +270,29 @@ bounded snapshot whose first line is `rule-engine.operator-bindings.v1` and
 whose remaining tab-separated rows contain tenant, peer, principal, principal
 kind, home tenant, pack prefix, and an explicit comma-separated capability
 set. Peers and principals are unique; tenant, pack prefix, principal kind, and
-capability must all authorize the exact resource. The current version-1
-canonical binary wire exposes only pack snapshot, operation snapshot, and
-final activation flip. The standalone admin CLI does not yet provide the
-corresponding network adapter.
+capability must all authorize the exact resource. The version-2 canonical
+binary wire and standalone client expose pack/operation reads and activation
+preview, drain, explicit straggler fencing, and atomic flip. The client pins
+the configured server URI SAN and correlates one bounded request/response per
+mTLS connection.
+
+For example:
+
+```powershell
+rule_engine_admin activate com.example.cheat 7 --tenant tenant-a `
+  --expected-version 3 --request-id change-1042 `
+  --reason "approved detection rollout" --config admin.conf
+
+rule_engine_admin activate com.example.cheat --tenant tenant-a `
+  --phase drain --boundary 92014 --expected-version 3 `
+  --operation-id change-1042 --idempotency-key change-1042 `
+  --request-id change-1042-drain --apply --config admin.conf
+```
+
+The fence and flip phases use the updated resource version returned by the
+previous phase. Upload, server-owned distributed stage/rollback compilation,
+policy mutation, and bounded `--wait` polling still fail closed with
+`ADMIN-NOT-IMPLEMENTED`.
 
 Use the configured JSON log, security audit, readiness, and Prometheus outputs
 for operations. Logs and diagnostics record identities, hashes, limits, and

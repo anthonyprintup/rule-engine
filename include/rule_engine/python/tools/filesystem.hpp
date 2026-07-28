@@ -38,10 +38,10 @@ namespace rule_engine::python::tools {
 
     struct AdminEndpointConfiguration {
         std::string endpoint;
+        std::string server_uri;
         std::filesystem::path client_certificate;
         std::filesystem::path client_key;
         std::filesystem::path trust_bundle;
-        std::string actor;
     };
 
     [[nodiscard]] std::expected<AdminEndpointConfiguration, ToolFailure>

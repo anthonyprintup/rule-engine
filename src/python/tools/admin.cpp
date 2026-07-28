@@ -26,6 +26,7 @@ namespace rule_engine::python::tools {
 
     bool admin_action_defaults_to_preview(const AdminAction action) noexcept {
         switch (action) {
+            case AdminAction::activate:
             case AdminAction::rollback:
             case AdminAction::nodes:
             case AdminAction::policy:
@@ -38,7 +39,6 @@ namespace rule_engine::python::tools {
             case AdminAction::purge: return true;
             case AdminAction::upload:
             case AdminAction::stage:
-            case AdminAction::activate:
             case AdminAction::operation:
             case AdminAction::packs:
             case AdminAction::audit: return false;

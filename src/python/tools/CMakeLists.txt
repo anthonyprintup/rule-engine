@@ -24,6 +24,7 @@ target_link_libraries(
 
 add_library(
     rule_engine_python_executable_support
+    admin_client.cpp
     benchmark.cpp
     resident_evaluator.cpp
     resident_service.cpp
@@ -69,7 +70,7 @@ add_executable(rule_engine_python_admin_cli bin/rule_engine_admin_main.cpp)
 set_target_properties(rule_engine_python_admin_cli PROPERTIES OUTPUT_NAME rule_engine_admin)
 target_link_libraries(
     rule_engine_python_admin_cli
-    PRIVATE rule_engine::python_tools rule_engine::project_options
+    PRIVATE rule_engine::python_executable_support rule_engine::project_options
 )
 
 add_executable(rule_engine_python_server server_main.cpp)
