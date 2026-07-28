@@ -629,6 +629,135 @@ namespace {
         REQUIRE(completed.result->verdict == true);
     }
 
+    TEST_CASE("exact worker lowers schema-typed EventRecord construction and telemetry emission") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+        const auto compiled =
+            compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                 "from rule_engine import EventRecord, rule, schema, telemetry, wire_field\n"
+                                 "\n"
+                                 "@schema(\"com.example.alert.v1\")\n"
+                                 "class Alert(EventRecord):\n"
+                                 "    process_id: int = wire_field(id=1)\n"
+                                 "    reason: str = wire_field(id=2)\n"
+                                 "\n"
+                                 "@rule(\"com.example.emit-alert\")\n"
+                                 "def emit_alert() -> bool:\n"
+                                 "    telemetry.emit(Alert(reason=\"unsigned\", process_id=42))\n"
+                                 "    return True\n",
+                                 "com.example.emit-alert");
+        INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
+        REQUIRE(compiled.has_value());
+        REQUIRE(verify_bytecode(*compiled).has_value());
+        const auto descriptor =
+            std::ranges::find(compiled->schemas.descriptors, SchemaId {"com.example.alert.v1"}, &SchemaDescriptor::id);
+        REQUIRE(descriptor != compiled->schemas.descriptors.end());
+        REQUIRE(descriptor->kind == SchemaKind::event);
+        REQUIRE(descriptor->qualified_name == "rules.main.Alert");
+        REQUIRE(descriptor->fields.size() == 2U);
+        REQUIRE(descriptor->fields[0].field_id == 1U);
+        REQUIRE(descriptor->fields[0].name == "process_id");
+        REQUIRE(descriptor->fields[1].field_id == 2U);
+        REQUIRE(descriptor->fields[1].name == "reason");
+
+        const auto function =
+            std::ranges::find(compiled->functions, ExecutableId {"com.example.emit-alert"}, &BytecodeFunction::id);
+        REQUIRE(function != compiled->functions.end());
+        CHECK(std::ranges::count(function->instructions, Opcode::build_record, &Instruction::opcode) == 1);
+        CHECK(std::ranges::count(function->instructions, Opcode::emit_event, &Instruction::opcode) == 1);
+        const auto certificate =
+            std::ranges::find(compiled->optimization_certificates, ExecutableId {"com.example.emit-alert"},
+                              &OptimizationCertificate::executable);
+        REQUIRE(certificate != compiled->optimization_certificates.end());
+        CHECK(certificate->emits_events);
+
+        auto event_invocation = invocation();
+        event_invocation.root_event = EventId {"root-event"};
+        auto session = vm::RegisterVmSession::create(*compiled, event_invocation);
+        REQUIRE(session.has_value());
+        const auto completed = (*session)->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        REQUIRE(completed.result->verdict == true);
+        REQUIRE(completed.result->committed_events.size() == 1U);
+        const auto &intent = completed.result->committed_events.front();
+        CHECK(intent.schema == SchemaId {"com.example.alert.v1"});
+        const auto *record = std::get_if<FactRecord>(&intent.payload.value.node->data);
+        REQUIRE(record != nullptr);
+        REQUIRE(record->fields.size() == 2U);
+        CHECK(std::get<IntegerValue>(record->fields[0].value.node->data).decimal == "42");
+        CHECK(std::get<UnicodeValue>(record->fields[1].value.node->data).utf8 == "unsigned");
+    }
+
+    TEST_CASE("event authoring boundary rejects ambiguous schemas constructors payloads and receipt use") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+        const auto reject = [&](std::string source, const std::string_view code) {
+            const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent, std::move(source),
+                                                       "com.example.invalid-event");
+            REQUIRE_FALSE(compiled.has_value());
+            INFO(diagnostic_text(compiled.error()));
+            CHECK(std::ranges::any_of(compiled.error(),
+                                      [code](const Diagnostic &diagnostic) { return diagnostic.code == code; }));
+        };
+
+        reject("from rule_engine import EventRecord, rule, schema, telemetry, wire_field\n"
+               "\n"
+               "@schema(\"com.example.alert.v1\")\n"
+               "class Alert(EventRecord):\n"
+               "    process_id: int = wire_field(id=1)\n"
+               "    reason: str = wire_field(id=1)\n"
+               "\n"
+               "@rule(\"com.example.invalid-event\")\n"
+               "def invalid_event() -> bool:\n"
+               "    return True\n",
+               "PY-EVENT-FIELD");
+        reject("from rule_engine import EventRecord, rule, schema, telemetry, wire_field\n"
+               "\n"
+               "@schema(\"com.example.alert.v1\")\n"
+               "class Alert(EventRecord):\n"
+               "    process_id: int = wire_field(id=1)\n"
+               "    reason: str = wire_field(id=2)\n"
+               "\n"
+               "@rule(\"com.example.invalid-event\")\n"
+               "def invalid_event() -> bool:\n"
+               "    telemetry.emit(Alert(process_id=42))\n"
+               "    return True\n",
+               "PY-EVENT-CONSTRUCTOR");
+        reject("from rule_engine import EventRecord, rule, schema, telemetry, wire_field\n"
+               "\n"
+               "@schema(\"com.example.alert.v1\")\n"
+               "class Alert(EventRecord):\n"
+               "    process_id: int = wire_field(id=1)\n"
+               "\n"
+               "@rule(\"com.example.invalid-event\")\n"
+               "def invalid_event() -> bool:\n"
+               "    receipt = telemetry.emit(Alert(process_id=42))\n"
+               "    return True\n",
+               "PY-EVENT-RECEIPT");
+        reject("from rule_engine import rule, telemetry\n"
+               "\n"
+               "@rule(\"com.example.invalid-event\")\n"
+               "def invalid_event() -> bool:\n"
+               "    telemetry.emit(42)\n"
+               "    return True\n",
+               "PY-EVENT-EMIT");
+    }
+
     TEST_CASE("exact worker lowers fresh container displays and subscription mutation into verified bytecode",
               "[compiler-vm-progress]") {
         auto &runtime = shared_runtime();

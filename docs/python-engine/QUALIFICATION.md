@@ -51,14 +51,18 @@ mixed-OS, and real distributed failure/scale claims are not qualified.
 ### 2026-07-28 production-readiness continuation
 
 The `codex/python-production-readiness` Debug graph built successfully with
-clang-cl and Ninja after adding exact active-pack compilation and the resident
-evaluator. `ctest --test-dir build/Debug --output-on-failure` passed 38/38
-tests in 177.64 seconds after the final reconnect hardening. The added resident
-evaluator target covers snapshot-to-fact-to-match commit, restart reconstruction
-from durable snapshot ingress, reconnect work reclamation with stale-session
-isolation, and durable cross-epoch replay ordering. This is Windows-local
-component and process-restart evidence. It does not qualify live PostgreSQL,
-multiple server processes, network partitions, Linux, or mixed-OS operation.
+clang-cl and Ninja after adding exact active-pack compilation, the resident
+evaluator, and schema-typed custom-event author lowering.
+`ctest --test-dir build/Debug --output-on-failure` passed 38/38 tests in
+172.13 seconds. The suite covers snapshot-to-fact-to-match commit, restart
+reconstruction from durable snapshot ingress, reconnect work reclamation with
+stale-session isolation, durable cross-epoch replay ordering, and the exact
+private-worker-to-compiler-to-VM-to-transaction path for a typed custom event.
+It also proves deterministic rejection of duplicate event wire IDs, incomplete
+event construction, receipt use, and emission of non-event values. This is
+Windows-local component and process-restart evidence. It does not qualify live
+PostgreSQL, multiple server processes, network partitions, Linux, or mixed-OS
+operation.
 
 ## Artifact identity
 

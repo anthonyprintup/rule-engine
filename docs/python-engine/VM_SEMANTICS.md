@@ -96,7 +96,7 @@ The current exact bytecode ABI is deliberately small:
 |---|---|
 | Values and arithmetic | `load_const`, `move`, `unary_op`, `binary_op`, `compare` |
 | Control flow | `jump`, `jump_if_false`, `call`, `return_value` |
-| Lists, tuples, maps | `build_list`, `build_tuple`, `build_dict`, `load_subscript`, `store_subscript` |
+| Lists, tuples, maps, records | `build_list`, `build_tuple`, `build_dict`, `build_record`, `load_subscript`, `store_subscript` |
 | Bounded iteration | `get_iter`, `iter_next`, `yield_value` |
 | Host suspension | `await_fact`, `await_capability` |
 | State | `read_state`, `write_state`, `delete_state` |
@@ -109,6 +109,11 @@ The current exact bytecode ABI is deliberately small:
 There is no generic "call arbitrary C++" or "execute Python" instruction.
 Every reachable operation has verifier-visible operand types, control edges,
 effects, suspension behavior, and cost.
+
+`build_record` is not a dynamic object constructor. Its constant operand pins
+one active event schema ID and hash; its register window must contain exactly
+that descriptor's fields in field-ID order. `emit_event` accepts the resulting
+record only when the same active schema identity still matches.
 
 ## Value and evaluation rules
 

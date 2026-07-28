@@ -2264,6 +2264,55 @@ namespace rule_engine::python::vm {
                         ++frame.pc;
                         break;
                     }
+                    case Opcode::build_record: {
+                        if (instruction.immediate >= pack.constants.size() ||
+                            !valid_event_operand(pack.constants[instruction.immediate]) ||
+                            instruction.operand_a > frame.registers.size() ||
+                            instruction.operand_b > frame.registers.size() - instruction.operand_a) {
+                            return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                                 .message = "record build operand or register range is invalid",
+                                                 .span = instruction.span});
+                        }
+                        const auto schema_text = record_text_field(pack.constants[instruction.immediate],
+                                                                   python_event_operand_schema_v1, 1U);
+                        const auto schema_hash = record_text_field(pack.constants[instruction.immediate],
+                                                                   python_event_operand_schema_v1, 2U);
+                        const auto schema = SchemaId {*schema_text};
+                        const auto descriptor =
+                            std::ranges::find(pack.schemas.descriptors, schema, &SchemaDescriptor::id);
+                        if (descriptor == pack.schemas.descriptors.end() || descriptor->kind != SchemaKind::event ||
+                            descriptor->canonical_hash != *schema_hash ||
+                            descriptor->fields.size() != instruction.operand_b) {
+                            return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                                 .message = "record build schema operand does not match active fields",
+                                                 .span = instruction.span});
+                        }
+                        std::vector<RecordFieldValue> fields;
+                        fields.reserve(descriptor->fields.size());
+                        for (std::uint32_t position = 0U; position < instruction.operand_b; ++position) {
+                            const auto reg = instruction.operand_a + position;
+                            if (!register_valid(frame, reg)) {
+                                return fail(VmError {.code = VmErrorCode::invalid_bytecode,
+                                                     .message = "record build reads an uninitialized register",
+                                                     .span = instruction.span});
+                            }
+                            fields.push_back(RecordFieldValue {
+                                .field_id = descriptor->fields[position].field_id,
+                                .value = frame.registers[reg],
+                            });
+                        }
+                        if (const auto work_fault = charge_instructions(instruction.operand_b, instruction.span);
+                            work_fault.has_value()) {
+                            return fail(*work_fault);
+                        }
+                        auto result = heap.allocate_record(std::move(schema), fields);
+                        if (!result) {
+                            return fail(result.error());
+                        }
+                        frame.registers[instruction.destination] = *result;
+                        ++frame.pc;
+                        break;
+                    }
                     case Opcode::get_iter: {
                         if (!register_valid(frame, instruction.operand_a)) {
                             return fail(VmError {.code = VmErrorCode::invalid_bytecode,

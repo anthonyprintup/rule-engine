@@ -74,6 +74,14 @@ namespace rule_engine::python::compiler {
                               });
     }
 
+    FactValue make_vm_event_operand(SchemaId schema, std::string schema_hash) {
+        return operand_record(python_event_operand_schema_v1,
+                              {
+                                  FactRecordField {.field_id = 1U, .value = text_fact(std::move(schema.value))},
+                                  FactRecordField {.field_id = 2U, .value = text_fact(std::move(schema_hash))},
+                              });
+    }
+
     std::expected<FactOperand, DiagnosticSet> decode_vm_fact_operand(const FactValue &value) {
         const auto decoded = record(value, vm_fact_operand_schema, 3U);
         if (!decoded) {

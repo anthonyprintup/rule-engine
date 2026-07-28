@@ -88,8 +88,16 @@ Correlation subscriptions and correlation-to-correlation emissions form a static
 
 ### 4.4 Implemented transactional emission path
 
-The current runtime represents `telemetry.emit` at the verified-bytecode seam
-as an ordered `EventIntent`, not as an `EventEnvelope` supplied by a caller.
+The static frontend recognizes only an `EventRecord` subclass with one literal
+stable `@schema` decorator and explicit unique `wire_field` IDs. Construction is
+complete and keyword-only. The compiler evaluates keyword values in Python
+order, stages them in canonical field-ID order, and emits a schema/hash-pinned
+`build_record`. A standalone `telemetry.emit(record)` becomes `emit_event`;
+ambiguous schemas, missing/extra fields, wrong types, and receipt use fail at
+compile time.
+
+The runtime represents that emission as an ordered `EventIntent`, not as an
+`EventEnvelope` supplied by a caller.
 Each intent pins an active event schema ID/hash and contains a frozen labeled
 record, source span, root event, invocation, owner, binding, sequence, and final
 disposition. The VM owns creation, identity, ordering, charging, and rollback.
@@ -115,9 +123,9 @@ effect dispatch.
 
 The implemented envelope currently records one root `causation` field and
 inherits the root ingest timestamp for both emitted timestamps because the
-store API has no commit-clock assignment. Immediate-parent/depth metadata and
-source-level `EventRecord` construction/lowering remain the explicit residual
-described in `LIMITATIONS.md`.
+store API has no commit-clock assignment. Immediate-parent/depth metadata,
+constructor defaults, and materialized in-rule receipts remain the explicit
+residual described in `LIMITATIONS.md`.
 
 ## 5. Correlation declarations and scheduling
 

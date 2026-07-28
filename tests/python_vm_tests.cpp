@@ -801,6 +801,37 @@ TEST_CASE("typed event intents are deterministic frozen labeled and VM-journaled
           DataLabel {.classification = Classification::sensitive, .categories = {"identity"}});
 }
 
+TEST_CASE("verified build_record constructs an active event payload from runtime registers") {
+    auto pack = pack_with({text("detected"), make_fact(true),
+                           make_event_operand(SchemaId {"alert.v1"}, "sha256:alert-v1"), make_fact(true)},
+                          {function("rule.main", 4U,
+                                    {
+                                        instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                                        instruction(Opcode::load_const, 1U, 0U, 0U, 1U),
+                                        instruction(Opcode::build_record, 2U, 0U, 2U, 2U),
+                                        instruction(Opcode::emit_event, 0U, 2U, 0U, 2U),
+                                        instruction(Opcode::load_const, 3U, 0U, 0U, 3U),
+                                        instruction(Opcode::return_value, 0U, 3U),
+                                    })});
+    pack.schemas = SchemaCatalog {.descriptors = {alert_schema()}, .canonical_hash = "sha256:event-schemas"};
+    REQUIRE(verify_bytecode(pack).has_value());
+    auto session = start(pack);
+    const auto completed = session->step({});
+    REQUIRE(completed.state == VmStepState::complete);
+    REQUIRE(completed.result.has_value());
+    REQUIRE(completed.result->committed_events.size() == 1U);
+    const auto *record = std::get_if<FactRecord>(&completed.result->committed_events.front().payload.value.node->data);
+    REQUIRE(record != nullptr);
+    CHECK(std::get<UnicodeValue>(record->fields[0].value.node->data).utf8 == "detected");
+    CHECK(std::get<bool>(record->fields[1].value.node->data));
+
+    pack.functions.front().instructions[2].operand_b = 1U;
+    const auto malformed = verify_bytecode(pack);
+    REQUIRE_FALSE(malformed.has_value());
+    CHECK(std::ranges::any_of(malformed.error(),
+                              [](const Diagnostic &diagnostic) { return diagnostic.code == "PYC0116"; }));
+}
+
 TEST_CASE("event journal rolls back nested transactions and uncaught exceptions") {
     SECTION("inner rollback preserves only the outer event") {
         const auto pack = event_pack({alert_record(), make_event_operand(SchemaId {"alert.v1"}, "sha256:alert-v1"),

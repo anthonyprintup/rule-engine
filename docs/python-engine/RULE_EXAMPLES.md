@@ -249,6 +249,12 @@ State writes and emitted events are journaled. They become visible only with
 the rule result and cursor in one durable commit. A fault, cancellation, or
 uncommitted transaction discards them.
 
+The custom-event portion of this example is intentionally strict:
+`EventRecord` requires one stable `@schema`, every field needs a unique positive
+`wire_field` ID, construction supplies every field by keyword, and
+`telemetry.emit(...)` is a standalone statement. Positional/default construction
+and using an in-rule `EventReceipt` are not yet supported.
+
 ## What is usable today
 
 | Authoring area | Current branch |

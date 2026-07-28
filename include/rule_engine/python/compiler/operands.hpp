@@ -28,6 +28,7 @@ namespace rule_engine::python::compiler {
 
     [[nodiscard]] FactValue make_vm_fact_operand(FactRoute route, SchemaId expected_schema);
     [[nodiscard]] FactValue make_vm_capability_operand(CapabilityId capability, SchemaId request_schema);
+    [[nodiscard]] FactValue make_vm_event_operand(SchemaId schema, std::string schema_hash);
     [[nodiscard]] std::expected<FactOperand, DiagnosticSet> decode_vm_fact_operand(const FactValue &value);
     [[nodiscard]] std::expected<CapabilityOperand, DiagnosticSet> decode_vm_capability_operand(const FactValue &value);
 

@@ -127,6 +127,7 @@ namespace rule_engine::python {
         reraise,
         unwind_jump,
         leave_except,
+        build_record,
         emit_event,
     };
 

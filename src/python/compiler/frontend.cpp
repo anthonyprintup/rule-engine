@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <charconv>
 #include <deque>
+#include <limits>
 #include <locale>
 #include <map>
 #include <optional>
@@ -501,6 +503,52 @@ namespace rule_engine::python::compiler {
             return !segment_start;
         }
 
+        [[nodiscard]] std::optional<std::uint32_t> positive_field_id(const AstNode *value) {
+            if (value == nullptr || value->kind != "Constant") {
+                return std::nullopt;
+            }
+            const auto *constant = AstIndex::field(*value, "value");
+            const auto *integer = constant == nullptr ? nullptr : std::get_if<IntegerValue>(&constant->value.data);
+            if (integer == nullptr) {
+                return std::nullopt;
+            }
+            std::uint64_t parsed {};
+            const auto converted =
+                std::from_chars(integer->decimal.data(), integer->decimal.data() + integer->decimal.size(), parsed);
+            if (converted.ec != std::errc {} || converted.ptr != integer->decimal.data() + integer->decimal.size() ||
+                parsed == 0U || parsed > (std::numeric_limits<std::uint32_t>::max)()) {
+                return std::nullopt;
+            }
+            return static_cast<std::uint32_t>(parsed);
+        }
+
+        [[nodiscard]] std::optional<std::string> event_schema_id(const AstIndex &index, const AstNode &node,
+                                                                 DiagnosticSet &diagnostics) {
+            const auto decorators = index.sequence(node, "decorator_list");
+            if (decorators.size() != 1U || decorators.front()->kind != "Call") {
+                diagnostics.push_back(make_diagnostic(
+                    "PY-EVENT-SCHEMA", "EventRecord requires exactly one @schema(\"stable.id\") decorator", node.span));
+                return std::nullopt;
+            }
+            const auto *target = index.reference(*decorators.front(), "func");
+            const auto arguments = index.sequence(*decorators.front(), "args");
+            if (target == nullptr || root_name(index, *target) != "schema" || arguments.size() != 1U ||
+                arguments.front()->kind != "Constant" || !index.sequence(*decorators.front(), "keywords").empty()) {
+                diagnostics.push_back(make_diagnostic("PY-EVENT-SCHEMA",
+                                                      "EventRecord schema decorator requires one literal stable ID",
+                                                      decorators.front()->span));
+                return std::nullopt;
+            }
+            const auto id = index.string(*arguments.front(), "value").value_or(std::string {});
+            if (!valid_stable_id(id)) {
+                diagnostics.push_back(make_diagnostic("PY-EVENT-SCHEMA",
+                                                      "EventRecord schema decorator has an invalid stable ID",
+                                                      decorators.front()->span));
+                return std::nullopt;
+            }
+            return id;
+        }
+
         void bind_model(const AstIndex &index, const AstNode &node, const std::string &module,
                         std::vector<BoundSymbol> &symbols, SchemaCatalog &generated_schemas,
                         DiagnosticSet &diagnostics) {
@@ -513,27 +561,36 @@ namespace rule_engine::python::compiler {
                     node.span));
                 return;
             }
-            if (bases.empty() || root_name(index, *bases.front()) != "Model") {
-                const auto base = bases.empty() ? std::string {"object"} : root_name(index, *bases.front());
+            const auto base = bases.empty() ? std::string {"object"} : root_name(index, *bases.front());
+            const auto event_record = base == "EventRecord";
+            if (base != "Model" && !event_record) {
                 diagnostics.push_back(make_diagnostic(
-                    "PY-NYI-CLASS", "class base '" + base + "' is not implemented; explicit Model is supported",
+                    "PY-NYI-CLASS",
+                    "class base '" + base + "' is not implemented; explicit Model and EventRecord are supported",
                     bases.empty() ? node.span : bases.front()->span));
                 return;
             }
-            if (!index.sequence(node, "decorator_list").empty()) {
+            std::optional<std::string> declared_schema;
+            if (event_record) {
+                declared_schema = event_schema_id(index, node, diagnostics);
+                if (!declared_schema) {
+                    return;
+                }
+            } else if (!index.sequence(node, "decorator_list").empty()) {
                 diagnostics.push_back(make_diagnostic(
                     "PY-NYI-CLASS-DECORATOR", "model class decorators are represented but not lowered yet", node.span));
                 return;
             }
 
             SchemaDescriptor descriptor {
-                .id = SchemaId {qualified_name},
-                .kind = SchemaKind::model,
+                .id = SchemaId {declared_schema.value_or(qualified_name)},
+                .kind = event_record ? SchemaKind::event : SchemaKind::model,
                 .qualified_name = qualified_name,
                 .canonical_hash = {},
                 .fields = {},
             };
             std::set<std::string, std::less<>> field_names;
+            std::set<std::uint32_t> field_ids;
             std::vector<std::string> field_storage;
             for (const auto *statement : index.sequence(node, "body")) {
                 if (statement->kind == "Expr") {
@@ -579,7 +636,31 @@ namespace rule_engine::python::compiler {
                     continue;
                 }
                 auto storage = std::string {"eager"};
-                if (const auto *value = index.reference(*statement, "value")) {
+                auto field_id = static_cast<std::uint32_t>(descriptor.fields.size() + 1U);
+                if (event_record) {
+                    const auto *value = index.reference(*statement, "value");
+                    const auto *field_target = value == nullptr ? nullptr : index.reference(*value, "func");
+                    const auto keywords =
+                        value == nullptr ? std::vector<const AstNode *> {} : index.sequence(*value, "keywords");
+                    if (value == nullptr || value->kind != "Call" || field_target == nullptr ||
+                        root_name(index, *field_target) != "wire_field" || !index.sequence(*value, "args").empty() ||
+                        keywords.size() != 1U || index.string(*keywords.front(), "arg") != "id") {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-EVENT-FIELD",
+                            "EventRecord fields require wire_field(id=POSITIVE_INTEGER) without a default",
+                            statement->span));
+                        continue;
+                    }
+                    const auto parsed_id = positive_field_id(index.reference(*keywords.front(), "value"));
+                    if (!parsed_id || !field_ids.insert(*parsed_id).second) {
+                        diagnostics.push_back(make_diagnostic("PY-EVENT-FIELD",
+                                                              "EventRecord wire field IDs must be positive and unique",
+                                                              statement->span));
+                        continue;
+                    }
+                    field_id = *parsed_id;
+                    storage = "wire";
+                } else if (const auto *value = index.reference(*statement, "value")) {
                     if (value->kind != "Call") {
                         diagnostics.push_back(make_diagnostic(
                             "PY-NYI-MODEL-DEFAULT",
@@ -611,7 +692,7 @@ namespace rule_engine::python::compiler {
                     storage = "lazy:" + *route;
                 }
                 descriptor.fields.push_back(SchemaField {
-                    .field_id = static_cast<std::uint32_t>(descriptor.fields.size() + 1U),
+                    .field_id = field_id,
                     .name = field_name,
                     .type = schema_for_type(type),
                     .optional = false,
@@ -621,7 +702,8 @@ namespace rule_engine::python::compiler {
             }
             std::ostringstream canonical;
             canonical.imbue(std::locale::classic());
-            canonical << qualified_name << '|';
+            canonical << static_cast<unsigned int>(descriptor.kind) << '|' << descriptor.id.value << '|'
+                      << qualified_name << '|';
             for (std::size_t position = 0; position < descriptor.fields.size(); ++position) {
                 const auto &field = descriptor.fields[position];
                 canonical << field.field_id << ':' << field.name << ':' << field.type.value << ':'
@@ -1187,6 +1269,7 @@ namespace rule_engine::python::compiler {
             std::vector<LoopFrame> loops;
             std::vector<HandlerFrame> handlers;
             std::set<std::string, std::less<>> statically_bound_names;
+            std::map<std::string, std::uint32_t, std::less<>> event_operands;
             std::uint32_t conditional_depth {};
             std::uint32_t direct_await_depth {};
             std::uint32_t finalizer_depth {};
@@ -1629,6 +1712,160 @@ namespace rule_engine::python::compiler {
                 return ExpressionResult {.reg = destination, .type = subscription_result_type(container->type)};
             }
 
+            [[nodiscard]] const SchemaDescriptor *event_descriptor(const AstNode &target) const {
+                const auto path = attribute_path(index, target);
+                if (!path) {
+                    return nullptr;
+                }
+                const auto local = function.module + "." + *path;
+                const auto found = std::ranges::find_if(pack.schemas.descriptors, [&](const auto &descriptor) {
+                    return descriptor.kind == SchemaKind::event &&
+                           (descriptor.qualified_name == local || descriptor.qualified_name == *path);
+                });
+                return found == pack.schemas.descriptors.end() ? nullptr : std::addressof(*found);
+            }
+
+            [[nodiscard]] const SchemaDescriptor *event_descriptor(const StaticType &type) const {
+                if (type.kind != StaticTypeKind::model) {
+                    return nullptr;
+                }
+                const auto found = std::ranges::find_if(pack.schemas.descriptors, [&](const auto &descriptor) {
+                    return descriptor.kind == SchemaKind::event && descriptor.qualified_name == type.qualified_name;
+                });
+                return found == pack.schemas.descriptors.end() ? nullptr : std::addressof(*found);
+            }
+
+            [[nodiscard]] StaticType type_for_schema(const SchemaId &schema) const {
+                if (schema.value == "bool") {
+                    return {.kind = StaticTypeKind::boolean, .qualified_name = "bool"};
+                }
+                if (schema.value == "int") {
+                    return {.kind = StaticTypeKind::integer, .qualified_name = "int"};
+                }
+                if (schema.value == "float") {
+                    return {.kind = StaticTypeKind::floating, .qualified_name = "float"};
+                }
+                if (schema.value == "str") {
+                    return {.kind = StaticTypeKind::string, .qualified_name = "str"};
+                }
+                if (schema.value == "bytes") {
+                    return {.kind = StaticTypeKind::bytes, .qualified_name = "bytes"};
+                }
+                const auto descriptor = std::ranges::find(pack.schemas.descriptors, schema, &SchemaDescriptor::id);
+                return descriptor == pack.schemas.descriptors.end() ?
+                           any_type() :
+                           StaticType {.kind = StaticTypeKind::model, .qualified_name = descriptor->qualified_name};
+            }
+
+            [[nodiscard]] std::uint32_t event_operand(const SchemaDescriptor &descriptor) {
+                const auto existing = event_operands.find(descriptor.id.value);
+                if (existing != event_operands.end()) {
+                    return existing->second;
+                }
+                const auto constant_index = static_cast<std::uint32_t>(pack.constants.size());
+                pack.constants.push_back(make_vm_event_operand(descriptor.id, descriptor.canonical_hash));
+                event_operands.emplace(descriptor.id.value, constant_index);
+                return constant_index;
+            }
+
+            std::optional<ExpressionResult> event_record_constructor(const AstNode &node,
+                                                                     const SchemaDescriptor &descriptor) {
+                if (!index.sequence(node, "args").empty()) {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-EVENT-CONSTRUCTOR",
+                        "EventRecord construction is keyword-only so field-ID order cannot change source semantics",
+                        node.span));
+                    return std::nullopt;
+                }
+                const auto keywords = index.sequence(node, "keywords");
+                std::map<std::string, ExpressionResult, std::less<>> values;
+                for (const auto *keyword : keywords) {
+                    const auto name = index.string(*keyword, "arg");
+                    const auto *value = index.reference(*keyword, "value");
+                    const auto field = name ? std::ranges::find(descriptor.fields, *name, &SchemaField::name) :
+                                              descriptor.fields.end();
+                    if (!name || value == nullptr || field == descriptor.fields.end() || values.contains(*name)) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-EVENT-CONSTRUCTOR",
+                            "EventRecord constructor fields must be known, explicit, and supplied exactly once",
+                            keyword->span));
+                        return std::nullopt;
+                    }
+                    auto lowered = expression(*value);
+                    if (!lowered) {
+                        return std::nullopt;
+                    }
+                    const auto expected = type_for_schema(field->type);
+                    const auto exact_model = expected.kind != StaticTypeKind::model ||
+                                             lowered->type.kind == StaticTypeKind::unknown ||
+                                             lowered->type.qualified_name == expected.qualified_name;
+                    if (!assignable(lowered->type, expected) || !exact_model) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-EVENT-CONSTRUCTOR", "EventRecord constructor field has an incompatible value type",
+                            value->span));
+                        return std::nullopt;
+                    }
+                    values.emplace(*name, *lowered);
+                }
+                if (values.size() != descriptor.fields.size()) {
+                    diagnostics.push_back(
+                        make_diagnostic("PY-EVENT-CONSTRUCTOR",
+                                        "EventRecord constructor must supply every declared wire field", node.span));
+                    return std::nullopt;
+                }
+                const auto first_field = bytecode.register_count;
+                for (const auto &field : descriptor.fields) {
+                    const auto value = values.find(field.name);
+                    if (value == values.end()) {
+                        diagnostics.push_back(make_diagnostic("PY-EVENT-CONSTRUCTOR",
+                                                              "EventRecord constructor omitted a declared wire field",
+                                                              node.span));
+                        return std::nullopt;
+                    }
+                    const auto staging = allocate();
+                    emit(Opcode::move, staging, value->second.reg, 0U, 0U, node.span);
+                }
+                const auto destination = allocate();
+                emit(Opcode::build_record, destination, first_field,
+                     static_cast<std::uint32_t>(descriptor.fields.size()), event_operand(descriptor), node.span);
+                may_fault = true;
+                return ExpressionResult {
+                    .reg = destination,
+                    .type = {.kind = StaticTypeKind::model, .qualified_name = descriptor.qualified_name},
+                };
+            }
+
+            [[nodiscard]] bool telemetry_emit_call(const AstNode &node) const {
+                if (node.kind != "Call") {
+                    return false;
+                }
+                const auto *target = index.reference(node, "func");
+                return target != nullptr &&
+                       attribute_path(index, *target) == std::optional<std::string> {"telemetry.emit"};
+            }
+
+            void emit_event_statement(const AstNode &node) {
+                const auto arguments = index.sequence(node, "args");
+                if (arguments.size() != 1U || !index.sequence(node, "keywords").empty()) {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-EVENT-EMIT", "telemetry.emit requires exactly one positional EventRecord", node.span));
+                    return;
+                }
+                const auto payload = expression(*arguments.front());
+                if (!payload) {
+                    return;
+                }
+                const auto *descriptor = event_descriptor(payload->type);
+                if (descriptor == nullptr) {
+                    diagnostics.push_back(make_diagnostic("PY-EVENT-EMIT",
+                                                          "telemetry.emit payload must be a schema-typed EventRecord",
+                                                          arguments.front()->span));
+                    return;
+                }
+                emit(Opcode::emit_event, 0U, payload->reg, 0U, event_operand(*descriptor), node.span);
+                may_fault = true;
+            }
+
             std::optional<ExpressionResult> expression(const AstNode &node) {
                 if (node.kind == "Constant") {
                     return constant(node);
@@ -1997,6 +2234,19 @@ namespace rule_engine::python::compiler {
                     const auto name = target ? root_name(index, *target) : std::string {};
                     if (contains_name(forbidden_calls, name)) {
                         return std::nullopt;
+                    }
+                    if (telemetry_emit_call(node)) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-EVENT-RECEIPT",
+                            "telemetry.emit is currently a standalone journal statement; its receipt is not "
+                            "materialized inside rule bytecode",
+                            node.span));
+                        return std::nullopt;
+                    }
+                    if (target != nullptr) {
+                        if (const auto *descriptor = event_descriptor(*target)) {
+                            return event_record_constructor(node, *descriptor);
+                        }
                     }
                     if (target != nullptr && target->kind == "Attribute" &&
                         index.string(*target, "attr").value_or(std::string {}) == "delete") {
@@ -2527,6 +2777,10 @@ namespace rule_engine::python::compiler {
                             if (result) {
                                 emit(Opcode::yield_value, result->reg, result->reg, 0U, 0U, value->span);
                             }
+                            continue;
+                        }
+                        if (value && telemetry_emit_call(*value)) {
+                            emit_event_statement(*value);
                             continue;
                         }
                         if (value) {
@@ -3117,6 +3371,9 @@ namespace rule_engine::python::compiler {
                 std::ranges::all_of(bytecode.instructions, [](const Instruction &instruction) {
                     return instruction.opcode == Opcode::load_const || instruction.opcode == Opcode::return_value;
                 });
+            const auto emits_events = std::ranges::any_of(bytecode.instructions, [](const Instruction &instruction) {
+                return instruction.opcode == Opcode::emit_event;
+            });
             compiled.functions.push_back(std::move(bytecode));
             compiled.optimization_certificates.push_back(OptimizationCertificate {
                 .executable = function.executable,
@@ -3127,7 +3384,7 @@ namespace rule_engine::python::compiler {
                 .reads_history = false,
                 .calls_services = false,
                 .emits_effects = false,
-                .emits_events = false,
+                .emits_events = emits_events,
                 .logical_facts = std::move(logical_facts),
                 .pure_false_prefix_exits = {},
                 .semantic_hash = {},
@@ -3383,6 +3640,7 @@ namespace rule_engine::python::compiler {
                     case Opcode::build_list:
                     case Opcode::build_tuple:
                     case Opcode::build_dict:
+                    case Opcode::build_record:
                     case Opcode::get_iter:
                     case Opcode::iter_next:
                     case Opcode::load_subscript:
@@ -3476,6 +3734,7 @@ namespace rule_engine::python::compiler {
                     case Opcode::iter_next: require_initialized(instruction.operand_a); break;
                     case Opcode::build_list:
                     case Opcode::build_tuple:
+                    case Opcode::build_record:
                         for (std::uint32_t item = 0U; item < instruction.operand_b; ++item) {
                             require_initialized(instruction.operand_a + item);
                         }

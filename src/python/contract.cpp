@@ -662,6 +662,32 @@ namespace rule_engine::python {
                             malformed_reserved();
                         }
                         break;
+                    case Opcode::build_record: {
+                        if (!register_window_valid(instruction.operand_a, instruction.operand_b)) {
+                            malformed_register();
+                        }
+                        if (instruction.immediate >= pack.constants.size()) {
+                            diagnostics.push_back(bytecode_error(
+                                "PYC0116", "build_record constant index is out of range", instruction.span));
+                            break;
+                        }
+                        const auto operand = decode_event_operand(pack.constants[instruction.immediate]);
+                        if (!operand) {
+                            diagnostics.push_back(bytecode_error(
+                                "PYC0116", "build_record requires a canonical event schema operand", instruction.span));
+                            break;
+                        }
+                        const auto descriptor =
+                            std::ranges::find(pack.schemas.descriptors, operand->schema, &SchemaDescriptor::id);
+                        if (descriptor == pack.schemas.descriptors.end() || descriptor->kind != SchemaKind::event ||
+                            descriptor->canonical_hash.empty() || descriptor->canonical_hash != operand->schema_hash ||
+                            descriptor->fields.size() != instruction.operand_b) {
+                            diagnostics.push_back(bytecode_error(
+                                "PYC0116", "build_record operand does not pin the exact active event schema fields",
+                                instruction.span));
+                        }
+                        break;
+                    }
                     case Opcode::emit_event: {
                         if (!register_valid(instruction.operand_a)) {
                             malformed_register();
@@ -914,6 +940,7 @@ namespace rule_engine::python {
                     case Opcode::store_subscript:
                     case Opcode::delete_state:
                     case Opcode::load_current_exception:
+                    case Opcode::build_record:
                     case Opcode::emit_event: add(pc + 1U); break;
                     case Opcode::leave_except: add(pc + 1U); break;
                     default: break;
