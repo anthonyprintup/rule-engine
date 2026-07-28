@@ -71,6 +71,8 @@ Commands:
   packs PACK_ID        Read one authorized durable pack snapshot
   operation PACK_ID OPERATION_ID
                        Read one authorized durable operation snapshot
+  stage PACK_ID SOURCE_DIGEST GENERATION
+                       Preview or begin server-owned distributed compilation
   activate PACK_ID GENERATION
                        Preview activation (requires --request-id and --reason)
   activate PACK_ID --phase drain|fence|flip --apply
@@ -84,6 +86,8 @@ Options:
   --operation-id ID    Existing durable operation (defaults to request ID)
   --idempotency-key ID Durable idempotency identity (defaults to request ID)
   --expected-version N Optimistic pack resource version
+  --state-schema HASH  Durable state schema identity for a stage
+  --state-namespace ID Durable state namespace for a stage
   --phase PHASE        preview, drain, fence, or flip
   --boundary CURSOR    Durable drain boundary for the drain phase
   --work-ids A,B       Explicit straggler IDs for the fence phase
@@ -96,9 +100,10 @@ Options:
   --help               Show this help
   --version            Show the tool API version
 
-Upload is resumable when retried with the same request ID. Stage,
-rollback-restage, and policy mutation remain reserved and fail closed with
-ADMIN-NOT-IMPLEMENTED.
+Upload is resumable when retried with the same request ID. Stage defaults to
+preview; repeat it with --apply and the preview's expected version to freeze
+eligible resident targets. Rollback-restage and policy mutation remain reserved
+and fail closed with ADMIN-NOT-IMPLEMENTED.
 )";
 
         struct ParseError {

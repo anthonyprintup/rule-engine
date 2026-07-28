@@ -346,6 +346,20 @@ namespace rule_engine::python::cluster {
         return {};
     }
 
+    std::expected<void, AuthorizedAdminError>
+    AuthorizedActivationAdmin::authorize_stage_source(const AdminCallContext &context, const TenantId &tenant,
+                                                      const PackId &pack, const std::string_view operation_id,
+                                                      const bool apply) const {
+        const AdminAuthorizationRequest authorization {
+            .operation = apply ? AdminControlOperation::stage_apply : AdminControlOperation::stage_preview,
+            .resource = operation_resource(tenant, pack, operation_id),
+        };
+        if (auto authorized = authorize(context, authorization); !authorized) {
+            return std::unexpected(authorized.error());
+        }
+        return {};
+    }
+
     std::expected<std::optional<AdminOperationRecord>, AuthorizedAdminError>
     AuthorizedActivationAdmin::operation_snapshot(const AdminCallContext &context, const TenantId &tenant,
                                                   const PackId &pack, std::string operation_id) const {

@@ -100,6 +100,7 @@ namespace rule_engine::python::tools {
         persist(const ResidentAgentSession &session, std::uint64_t sequence, const protocol_v2::DurableAgentBody &body,
                 std::stop_token cancellation) noexcept = 0;
         virtual void close(const ResidentAgentSession &session) noexcept = 0;
+        virtual void fence_activation() noexcept {}
     };
 
     enum struct ResidentAdminRequestKind : std::uint8_t {
@@ -112,6 +113,8 @@ namespace rule_engine::python::tools {
         upload_begin = 7,
         upload_chunk = 8,
         upload_finalize = 9,
+        stage_preview = 10,
+        stage_apply = 11,
     };
 
     struct ResidentAdminRequest {
@@ -130,6 +133,9 @@ namespace rule_engine::python::tools {
         std::uint64_t upload_offset {};
         std::uint64_t upload_total_bytes {};
         std::vector<std::byte> payload;
+        SourceDigest source_digest;
+        std::string state_schema_hash;
+        std::string state_namespace;
     };
 
     enum struct ResidentAdminResponseStatus : std::uint8_t { ok = 0, rejected = 1, unavailable = 2 };
@@ -190,11 +196,20 @@ namespace rule_engine::python::tools {
         finalize(const PackId &pack, std::string_view upload_id) noexcept = 0;
     };
 
+    struct IResidentStageSourceBackend {
+        virtual ~IResidentStageSourceBackend() = default;
+        [[nodiscard]] virtual std::expected<cluster::GenerationRequest, protocol_v2::ProtocolError>
+        resolve(const PackId &pack, const SourceDigest &source_digest, std::uint64_t generation,
+                std::string_view state_schema_hash, std::string_view state_namespace) noexcept = 0;
+    };
+
     struct AuthorizedResidentAdminBackend final: IResidentAdminBackend {
         AuthorizedResidentAdminBackend(cluster::IActivationControlStore &store,
                                        const IResidentAdminAccessPolicy &policy,
                                        cluster::IAdminSecurityAuditSink *security_audit = nullptr,
-                                       IResidentPackUploadBackend *uploads = nullptr) noexcept;
+                                       IResidentPackUploadBackend *uploads = nullptr,
+                                       IResidentStageSourceBackend *stages = nullptr,
+                                       IResidentAgentBackend *activation_target = nullptr) noexcept;
 
         [[nodiscard]] ResidentAdminResponse execute(const protocol_v2::AuthenticatedPeer &peer,
                                                     const ResidentAdminRequest &request) noexcept override;
@@ -204,6 +219,8 @@ namespace rule_engine::python::tools {
         const IResidentAdminAccessPolicy &policy_;
         cluster::IAdminSecurityAuditSink *security_audit_ {};
         IResidentPackUploadBackend *uploads_ {};
+        IResidentStageSourceBackend *stages_ {};
+        IResidentAgentBackend *activation_target_ {};
     };
 
     struct ResidentSessionJob {

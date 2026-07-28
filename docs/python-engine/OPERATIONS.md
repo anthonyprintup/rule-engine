@@ -206,9 +206,11 @@ VM from the authenticated result, and commits the terminal transaction through
 the same durable coordinator. Restart reconstructs pending work from committed
 snapshot messages.
 
-Current operations must account for three limits: one VM provider turn stays on
-one agent route, capability/service/state/history host turns fail closed, and a
-changed active generation is loaded only after server restart. See
+Current operations must account for two evaluator limits: one VM provider turn
+stays on one agent route, and capability/service/state/history host turns fail
+closed. Activation does not require a process restart: an atomic flip fences
+old sessions, residents verify and compile the new durable active identity, and
+new sessions are admitted only after the local scheduler has swapped. See
 [L-031](LIMITATIONS.md#l-031--resident-evaluation-supports-agent-fact-and-scan-turns-only).
 
 ## 5. Configure the Windows agent
@@ -270,15 +272,34 @@ bounded snapshot whose first line is `rule-engine.operator-bindings.v1` and
 whose remaining tab-separated rows contain tenant, peer, principal, principal
 kind, home tenant, pack prefix, and an explicit comma-separated capability
 set. Peers and principals are unique; tenant, pack prefix, principal kind, and
-capability must all authorize the exact resource. The version-2 canonical
-binary wire and standalone client expose pack/operation reads and activation
-preview, drain, explicit straggler fencing, and atomic flip. The client pins
-the configured server URI SAN and correlates one bounded request/response per
-mTLS connection.
+capability must all authorize the exact resource. The version-4 canonical
+request wire and standalone client expose pack/operation reads, verified
+resumable upload, server-owned distributed stage, bounded operation polling,
+and activation preview, drain, explicit straggler fencing, and atomic flip.
+The client pins the configured server URI SAN and correlates one bounded
+request/response per mTLS connection.
 
 For example:
 
 ```powershell
+rule_engine_admin upload C:/approved/com.example.cheat.rpack `
+  --tenant tenant-a --request-id upload-1042 --config admin.conf
+
+rule_engine_admin stage com.example.cheat `
+  sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 7 `
+  --tenant tenant-a --state-schema sha256:state-v1 `
+  --state-namespace state:com.example.cheat `
+  --expected-version 0 --request-id stage-1042 `
+  --reason "compile approved source on every resident" --config admin.conf
+
+rule_engine_admin stage com.example.cheat `
+  sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 7 `
+  --tenant tenant-a --state-schema sha256:state-v1 `
+  --state-namespace state:com.example.cheat `
+  --expected-version 0 --request-id stage-1042-apply `
+  --operation-id stage-1042 --idempotency-key stage-1042 `
+  --apply --wait --config admin.conf
+
 rule_engine_admin activate com.example.cheat 7 --tenant tenant-a `
   --expected-version 3 --request-id change-1042 `
   --reason "approved detection rollout" --config admin.conf
@@ -289,10 +310,11 @@ rule_engine_admin activate com.example.cheat --tenant tenant-a `
   --request-id change-1042-drain --apply --config admin.conf
 ```
 
-The fence and flip phases use the updated resource version returned by the
-previous phase. Upload, server-owned distributed stage/rollback compilation,
-policy mutation, and bounded `--wait` polling still fail closed with
-`ADMIN-NOT-IMPLEMENTED`.
+Preview does not mutate the pack version. Stage apply freezes the eligible
+serving targets and returns the new resource version; `--wait` follows the
+durable operation through `staged` or `failed`. Each activation phase then uses
+the updated resource version returned by the previous phase. Rollback
+restaging and policy mutation still fail closed with `ADMIN-NOT-IMPLEMENTED`.
 
 Use the configured JSON log, security audit, readiness, and Prometheus outputs
 for operations. Logs and diagnostics record identities, hashes, limits, and

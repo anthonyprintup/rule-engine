@@ -87,9 +87,10 @@ Authenticated application sessions run on a fixed owned worker pool with a
 bounded queue and memory reservation. Agent ACKs require a backend-declared
 durable receipt. Agent message bodies and their cumulative receipts commit in
 one fenced store transaction before an ACK is emitted. The current production
-composition does not yet assign event-to-pack work. The
-bounded admin wire surface currently supports pack/operation reads and the
-final activation flip; other control-plane operations remain CLI/backend work.
+composition does not yet assign event-to-pack work. The bounded admin wire
+surface supports pack/operation reads, verified resumable upload, server-owned
+distributed stage, and explicit activation phases. Rollback restaging and
+versioned policy/registry administration remain fail-closed.
 )";
 
         enum struct ValueKind : std::uint8_t { text, integer, boolean };
@@ -1073,13 +1074,21 @@ final activation flip; other control-plane operations remain CLI/backend work.
 
             [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
             activate(const std::span<const ResidentActivePack> packs) noexcept override {
-                if (scheduler_) {
-                    return std::unexpected(protocol_v2::ProtocolError {
-                        .code = protocol_v2::ProtocolErrorCode::stale_generation,
-                        .message = "resident active packs were already installed",
-                    });
-                }
                 if (packs.empty()) {
+                    const std::scoped_lock lock {mutex_};
+                    if (!sessions_.empty()) {
+                        begin_refresh_locked();
+                        return std::unexpected(protocol_v2::ProtocolError {
+                            .code = protocol_v2::ProtocolErrorCode::backpressured,
+                            .message = "active generation refresh waits for resident sessions to reconnect",
+                        });
+                    }
+                    bump_activation_epoch_locked();
+                    scheduler_.reset();
+                    schema_advertisements_.clear();
+                    required_schemas_.clear();
+                    required_capabilities_.clear();
+                    refresh_pending_ = false;
                     return {};
                 }
                 std::map<std::string, protocol_v2::SchemaAdvertisement, std::less<>> schemas;
@@ -1129,12 +1138,22 @@ final activation flip; other control-plane operations remain CLI/backend work.
                 if (!scheduler) {
                     return std::unexpected(std::move(scheduler.error()));
                 }
+                const std::scoped_lock lock {mutex_};
+                if (!sessions_.empty()) {
+                    begin_refresh_locked();
+                    return std::unexpected(protocol_v2::ProtocolError {
+                        .code = protocol_v2::ProtocolErrorCode::backpressured,
+                        .message = "active generation refresh waits for resident sessions to reconnect",
+                    });
+                }
+                bump_activation_epoch_locked();
                 schema_advertisements_.clear();
                 schema_advertisements_.reserve(schemas.size());
                 for (auto &[_, advertisement] : schemas) { schema_advertisements_.push_back(std::move(advertisement)); }
                 required_schemas_ = std::move(required_schemas);
                 required_capabilities_ = std::move(required_capabilities);
-                scheduler_ = std::move(*scheduler);
+                scheduler_ = std::shared_ptr<ResidentEvaluationScheduler> {std::move(*scheduler)};
+                refresh_pending_ = false;
                 return {};
             }
 
@@ -1145,6 +1164,15 @@ final activation flip; other control-plane operations remain CLI/backend work.
                     return std::unexpected(
                         protocol_v2::ProtocolError {.code = protocol_v2::ProtocolErrorCode::canceled,
                                                     .message = "agent session establishment canceled"});
+                }
+                {
+                    const std::scoped_lock lock {mutex_};
+                    if (refresh_pending_) {
+                        return std::unexpected(protocol_v2::ProtocolError {
+                            .code = protocol_v2::ProtocolErrorCode::backpressured,
+                            .message = "resident activation refresh requires a new session",
+                        });
+                    }
                 }
                 const auto serial = next_session_.fetch_add(1U, std::memory_order_relaxed) + 1U;
                 const auto session_id = "session:" + node_id_ + ':' + std::to_string(serial);
@@ -1173,13 +1201,24 @@ final activation flip; other control-plane operations remain CLI/backend work.
                         .message = "durable agent receipt could not be loaded",
                     });
                 }
+                std::vector<protocol_v2::SchemaAdvertisement> schema_advertisements;
+                std::set<std::string, std::less<>> required_schemas;
+                std::set<std::string, std::less<>> required_capabilities;
+                std::shared_ptr<ResidentEvaluationScheduler> scheduler;
+                {
+                    const std::scoped_lock lock {mutex_};
+                    schema_advertisements = schema_advertisements_;
+                    required_schemas = required_schemas_;
+                    required_capabilities = required_capabilities_;
+                    scheduler = scheduler_;
+                }
                 std::vector<protocol_v2::SchemaAdvertisement> selected_schemas;
-                for (const auto &required : required_schemas_) {
-                    const auto server = std::ranges::find(schema_advertisements_, SchemaId {required},
+                for (const auto &required : required_schemas) {
+                    const auto server = std::ranges::find(schema_advertisements, SchemaId {required},
                                                           &protocol_v2::SchemaAdvertisement::schema);
                     const auto agent = std::ranges::find(hello.schemas, SchemaId {required},
                                                          &protocol_v2::SchemaAdvertisement::schema);
-                    if (server == schema_advertisements_.end() || agent == hello.schemas.end() ||
+                    if (server == schema_advertisements.end() || agent == hello.schemas.end() ||
                         server->major != agent->major || server->canonical_hash != agent->canonical_hash) {
                         static_cast<void>(store_.release_lease(*lease, now_unix_ms()));
                         return std::unexpected(protocol_v2::ProtocolError {
@@ -1190,7 +1229,7 @@ final activation flip; other control-plane operations remain CLI/backend work.
                     selected_schemas.push_back(*server);
                 }
                 std::vector<protocol_v2::CapabilityAdvertisement> selected_capabilities;
-                for (const auto &required : required_capabilities_) {
+                for (const auto &required : required_capabilities) {
                     const auto capability = std::ranges::find(hello.capabilities, CapabilityId {required},
                                                               &protocol_v2::CapabilityAdvertisement::capability);
                     if (capability == hello.capabilities.end()) {
@@ -1202,9 +1241,20 @@ final activation flip; other control-plane operations remain CLI/backend work.
                     }
                     selected_capabilities.push_back(*capability);
                 }
+                bool registered {};
                 {
-                    std::scoped_lock lock {mutex_};
-                    sessions_.emplace(session_id, *lease);
+                    const std::scoped_lock lock {mutex_};
+                    if (!refresh_pending_) {
+                        sessions_.emplace(session_id, *lease);
+                        registered = true;
+                    }
+                }
+                if (!registered) {
+                    static_cast<void>(store_.release_lease(*lease, now_unix_ms()));
+                    return std::unexpected(protocol_v2::ProtocolError {
+                        .code = protocol_v2::ProtocolErrorCode::backpressured,
+                        .message = "resident activation changed during session establishment",
+                    });
                 }
                 ResidentAgentSession session {
                     .authenticated_peer = peer,
@@ -1216,10 +1266,14 @@ final activation flip; other control-plane operations remain CLI/backend work.
                     .schemas = std::move(selected_schemas),
                     .capabilities = std::move(selected_capabilities),
                 };
-                if (scheduler_) {
-                    auto bound = scheduler_->bind_session(session);
+                if (scheduler) {
+                    auto bound = scheduler->bind_session(session);
                     if (!bound) {
-                        close(session);
+                        {
+                            const std::scoped_lock lock {mutex_};
+                            sessions_.erase(session_id);
+                        }
+                        static_cast<void>(store_.release_lease(*lease, now_unix_ms()));
                         return std::unexpected(std::move(bound.error()));
                     }
                 }
@@ -1233,8 +1287,19 @@ final activation flip; other control-plane operations remain CLI/backend work.
                     return std::unexpected(protocol_v2::ProtocolError {.code = protocol_v2::ProtocolErrorCode::canceled,
                                                                        .message = "agent work poll canceled"});
                 }
-                if (scheduler_) {
-                    return scheduler_->take_work(session, limit, cancellation);
+                std::shared_ptr<ResidentEvaluationScheduler> scheduler;
+                {
+                    const std::scoped_lock lock {mutex_};
+                    if (refresh_pending_) {
+                        return std::unexpected(protocol_v2::ProtocolError {
+                            .code = protocol_v2::ProtocolErrorCode::stale_generation,
+                            .message = "resident activation changed; reconnect before taking work",
+                        });
+                    }
+                    scheduler = scheduler_;
+                }
+                if (scheduler) {
+                    return scheduler->take_work(session, limit, cancellation);
                 }
                 return std::vector<protocol_v2::WorkLeaseMessage> {};
             }
@@ -1246,6 +1311,19 @@ final activation flip; other control-plane operations remain CLI/backend work.
                     return std::unexpected(
                         protocol_v2::ProtocolError {.code = protocol_v2::ProtocolErrorCode::canceled,
                                                     .message = "agent message persistence canceled"});
+                }
+                std::shared_ptr<ResidentEvaluationScheduler> scheduler;
+                std::uint64_t activation_epoch {};
+                {
+                    const std::scoped_lock lock {mutex_};
+                    if (refresh_pending_) {
+                        return std::unexpected(protocol_v2::ProtocolError {
+                            .code = protocol_v2::ProtocolErrorCode::stale_generation,
+                            .message = "resident activation changed; reconnect before persisting work",
+                        });
+                    }
+                    scheduler = scheduler_;
+                    activation_epoch = activation_epoch_;
                 }
                 auto encoded = protocol_v2::encode_durable_body(body, protocol_limits_);
                 if (!encoded) {
@@ -1266,34 +1344,64 @@ final activation flip; other control-plane operations remain CLI/backend work.
                 if (!receipt) {
                     return std::unexpected(store_protocol_error(receipt.error()));
                 }
-                if (scheduler_) {
-                    auto ingested = scheduler_->ingest(session, sequence, body, cancellation);
-                    if (!ingested) {
-                        return std::unexpected(std::move(ingested.error()));
+                {
+                    const std::scoped_lock lock {mutex_};
+                    if (refresh_pending_ || activation_epoch_ != activation_epoch) {
+                        return std::unexpected(protocol_v2::ProtocolError {
+                            .code = protocol_v2::ProtocolErrorCode::stale_generation,
+                            .message = "resident activation changed after durable message persistence; reconnect to "
+                                       "replay the acknowledged message",
+                        });
+                    }
+                    if (scheduler) {
+                        auto ingested = scheduler->ingest(session, sequence, body, cancellation);
+                        if (!ingested) {
+                            return std::unexpected(std::move(ingested.error()));
+                        }
                     }
                 }
                 return DurableAgentReceipt {.acknowledged_through = receipt->acknowledged_through, .credit = credit_};
             }
 
             void close(const ResidentAgentSession &session) noexcept override {
-                if (scheduler_) {
-                    scheduler_->close(session);
-                }
                 std::optional<cluster::FencedLease> lease;
+                std::shared_ptr<ResidentEvaluationScheduler> scheduler;
                 {
                     std::scoped_lock lock {mutex_};
+                    scheduler = scheduler_;
                     const auto found = sessions_.find(session.session.value);
                     if (found != sessions_.end()) {
                         lease = found->second;
                         sessions_.erase(found);
                     }
                 }
+                if (scheduler) {
+                    scheduler->close(session);
+                }
                 if (lease) {
                     static_cast<void>(store_.release_lease(*lease, now_unix_ms()));
                 }
             }
 
+            void fence_activation() noexcept override {
+                const std::scoped_lock lock {mutex_};
+                begin_refresh_locked();
+            }
+
         private:
+            void bump_activation_epoch_locked() noexcept {
+                if (activation_epoch_ != std::numeric_limits<std::uint64_t>::max()) {
+                    ++activation_epoch_;
+                }
+            }
+
+            void begin_refresh_locked() noexcept {
+                if (!refresh_pending_) {
+                    bump_activation_epoch_locked();
+                }
+                refresh_pending_ = true;
+            }
+
             [[nodiscard]] static std::uint8_t durable_body_kind(const protocol_v2::DurableAgentBody &body) noexcept {
                 if (std::holds_alternative<protocol_v2::WorkResultMessage>(body)) {
                     return static_cast<std::uint8_t>(protocol_v2::MessageKind::work_result);
@@ -1328,10 +1436,12 @@ final activation flip; other control-plane operations remain CLI/backend work.
             std::atomic<std::uint64_t> next_session_ {};
             std::mutex mutex_;
             std::map<std::string, cluster::FencedLease, std::less<>> sessions_;
-            std::unique_ptr<ResidentEvaluationScheduler> scheduler_;
+            std::shared_ptr<ResidentEvaluationScheduler> scheduler_;
             std::vector<protocol_v2::SchemaAdvertisement> schema_advertisements_;
             std::set<std::string, std::less<>> required_schemas_;
             std::set<std::string, std::less<>> required_capabilities_;
+            std::uint64_t activation_epoch_ {};
+            bool refresh_pending_ {};
         };
 
         [[nodiscard]] std::expected<cluster::StoreBackendCapabilities, ToolFailure>
@@ -1601,12 +1711,182 @@ final activation flip; other control-plane operations remain CLI/backend work.
             return result;
         }
 
+        [[nodiscard]] std::optional<std::string> stable_active_identity(const cluster::DurableControlState &state) {
+            std::vector<std::string> identities;
+            for (const auto &pack : state.packs) {
+                if (!pack.active_generation) {
+                    continue;
+                }
+                if (!pack.accepting_assignments || pack.drain_target) {
+                    return std::nullopt;
+                }
+                const auto generation = std::ranges::find_if(state.generations, [&pack](const auto &candidate) {
+                    return candidate.request.pack == pack.pack &&
+                           candidate.request.generation == *pack.active_generation &&
+                           candidate.phase == cluster::GenerationPhase::active;
+                });
+                if (generation == state.generations.end()) {
+                    return std::nullopt;
+                }
+                identities.push_back(pack.pack.value + '\0' + std::to_string(*pack.active_generation) + '\0' +
+                                     generation->semantic_hash + '\0' + generation->binding_hash);
+            }
+            std::ranges::sort(identities);
+            std::string result;
+            for (const auto &identity : identities) {
+                result += std::to_string(identity.size());
+                result.push_back(':');
+                result += identity;
+            }
+            return result;
+        }
+
+        [[nodiscard]] bool process_resident_stage_once(const ResidentServerContext &context) {
+            auto inspection = context.activation_store.inspect();
+            if (!inspection) {
+                return false;
+            }
+            for (const auto &operation : inspection->operations) {
+                if (operation.kind != cluster::AdminOperationKind::stage ||
+                    operation.phase != cluster::AdminOperationPhase::previewed) {
+                    continue;
+                }
+                const auto generation = std::ranges::find_if(inspection->state.generations, [&](const auto &candidate) {
+                    return candidate.request.pack == operation.pack &&
+                           candidate.request.generation == operation.target_generation &&
+                           candidate.phase == cluster::GenerationPhase::compiling;
+                });
+                if (generation == inspection->state.generations.end()) {
+                    continue;
+                }
+                const auto target =
+                    std::ranges::find(generation->targets, context.config.node_id, &cluster::StageTargetNode::node_id);
+                const auto reported = std::ranges::find(generation->reports, context.config.node_id,
+                                                        &cluster::CompilationReport::node_id);
+                if (target == generation->targets.end() || reported != generation->reports.end()) {
+                    continue;
+                }
+
+                cluster::CompilationReport report {.node_id = context.config.node_id,
+                                                   .node_lease_fence = target->lease_fence,
+                                                   .success = false,
+                                                   .semantic_hash = {},
+                                                   .binding_hash = {},
+                                                   .executable_hash = {},
+                                                   .capability_hashes = target->capability_hashes,
+                                                   .diagnostics = {}};
+                auto path = packaging::content_addressed_source_pack_path(context.config.pack_registry_path,
+                                                                          generation->request.source_digest);
+                auto archive = path ? packaging::read_canonical_source_pack(*path) :
+                                      std::expected<packaging::SourcePackArchive, packaging::PackagingError> {
+                                          std::unexpected(packaging::PackagingError {})};
+                packaging::OpenSsl3Ed25519Verifier verifier;
+                verifier.crypto_library = context.runtime.crypto_library;
+                auto loaded =
+                    archive ? packaging::verify_and_load_source_pack(*archive, context.pack_trust_policy, verifier) :
+                              std::expected<packaging::LoadedSourcePack, packaging::PackagingError> {
+                                  std::unexpected(packaging::PackagingError {})};
+                if (loaded && loaded->manifest.pack == generation->request.pack &&
+                    loaded->manifest.version == generation->request.version &&
+                    loaded->closure_digest == generation->request.source_digest) {
+                    std::error_code filesystem_error;
+                    const auto temporary_root = std::filesystem::temp_directory_path(filesystem_error);
+                    if (!filesystem_error) {
+                        packaging::WindowsJobWorkerLauncher launcher;
+                        launcher.temporary_root = temporary_root;
+                        packaging::WorkerClient worker {.runtime = context.runtime, .launcher = launcher, .limits = {}};
+                        auto compiled = compiler::compile_source_pack(*loaded, *archive, worker);
+                        if (compiled) {
+                            report.success = true;
+                            report.semantic_hash = compiled->artifact.pack.semantic_hash;
+                            report.binding_hash = canonical_operator_bindings_hash(compiled->artifact.pack.bindings);
+                            report.executable_hash =
+                                compiled_pack_executable_hash(compiled->artifact.pack, target->platform_abi);
+                        } else {
+                            report.diagnostics = std::move(compiled.error().diagnostics);
+                        }
+                    }
+                }
+                cluster::DurableActivationAdmin admin {context.activation_store};
+                static_cast<void>(admin.report_server_compilation(operation.operation_id, report, now_unix_ms()));
+                return true;
+            }
+            return false;
+        }
+
         [[nodiscard]] bool pack_trust_ready(const packaging::TrustPolicy &policy) noexcept {
             return policy.allow_unsigned_packs ||
                    std::ranges::any_of(policy.signers, [](const packaging::TrustedSigner &signer) {
                        return !signer.revoked && signer.public_key.size() == 32U && !signer.key_id.empty();
                    });
         }
+
+        struct FilesystemResidentStageSourceBackend final: IResidentStageSourceBackend {
+            FilesystemResidentStageSourceBackend(std::filesystem::path selected_registry,
+                                                 const packaging::TrustPolicy &selected_trust,
+                                                 std::filesystem::path selected_crypto_library):
+                registry {std::move(selected_registry)},
+                trust {selected_trust},
+                crypto_library {std::move(selected_crypto_library)} {}
+
+            std::filesystem::path registry;
+            const packaging::TrustPolicy &trust;
+            std::filesystem::path crypto_library;
+
+            [[nodiscard]] std::expected<cluster::GenerationRequest, protocol_v2::ProtocolError>
+            resolve(const PackId &pack, const SourceDigest &source_digest, const std::uint64_t generation,
+                    const std::string_view state_schema_hash,
+                    const std::string_view state_namespace) noexcept override {
+                auto path = packaging::content_addressed_source_pack_path(registry, source_digest);
+                if (!path) {
+                    return std::unexpected(protocol_v2::ProtocolError {
+                        .code = protocol_v2::ProtocolErrorCode::malformed,
+                        .message = "stage source digest is not canonical",
+                    });
+                }
+                auto archive = packaging::read_canonical_source_pack(*path);
+                if (!archive) {
+                    return std::unexpected(protocol_v2::ProtocolError {
+                        .code = protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                        .message = "stage source pack is unavailable",
+                    });
+                }
+                packaging::OpenSsl3Ed25519Verifier verifier;
+                verifier.crypto_library = crypto_library;
+                auto loaded = packaging::verify_and_load_source_pack(*archive, trust, verifier);
+                if (!loaded || loaded->manifest.pack != pack || loaded->closure_digest != source_digest) {
+                    return std::unexpected(protocol_v2::ProtocolError {
+                        .code = protocol_v2::ProtocolErrorCode::invalid_identity,
+                        .message = "stage source pack failed trust or identity verification",
+                    });
+                }
+                std::vector<std::string> required_capabilities;
+                required_capabilities.reserve(loaded->manifest.required_capabilities.size());
+                for (const auto &capability : loaded->manifest.required_capabilities) {
+                    required_capabilities.push_back(capability.value);
+                }
+                std::ranges::sort(required_capabilities);
+                required_capabilities.erase(std::ranges::unique(required_capabilities).begin(),
+                                            required_capabilities.end());
+                return cluster::GenerationRequest {
+                    .pack = loaded->manifest.pack,
+                    .version = loaded->manifest.version,
+                    .source_digest = loaded->closure_digest,
+                    .generation = generation,
+                    .state_schema_hash = std::string {state_schema_hash},
+                    .state_namespace = std::string {state_namespace},
+                    .required_capability_hashes = std::move(required_capabilities),
+                    .state_transition = cluster::StateTransitionPlan {.mode = cluster::StateTransitionMode::carry,
+                                                                      .source_namespace = std::string {state_namespace},
+                                                                      .target_namespace = std::string {state_namespace},
+                                                                      .migration_id = {},
+                                                                      .reset_authorized = false,
+                                                                      .accept_state_gap = false},
+                    .rollback_from = std::nullopt,
+                    .signature_verified = true,
+                };
+            }
+        };
 
         [[nodiscard]] std::string readiness_failure(const cluster::ReadinessSnapshot &readiness) {
             std::string message {"resident startup readiness is blocked"};
@@ -2028,6 +2308,7 @@ final activation flip; other control-plane operations remain CLI/backend work.
         std::optional<cluster::FencedLease> node_lease;
         std::unique_ptr<ResidentApplicationService> application;
         std::unique_ptr<ResidentServiceScheduler> scheduler;
+        std::jthread stage_worker;
         cluster::IClusterRuntimeStore *runtime_store {};
         cluster::IActivationControlStore *activation_store {};
         const protocol_v2::ITrustPolicy *peer_trust_policy {};
@@ -2104,6 +2385,10 @@ final activation flip; other control-plane operations remain CLI/backend work.
         }
 
         void stop_services() noexcept {
+            if (stage_worker.joinable()) {
+                stage_worker.request_stop();
+                stage_worker.join();
+            }
             if (scheduler) {
                 scheduler->request_stop();
                 scheduler->join();
@@ -2281,6 +2566,26 @@ final activation flip; other control-plane operations remain CLI/backend work.
             static_cast<void>(impl_->release_node_lease());
             return std::unexpected(recorded.error());
         }
+        auto initial_active_identity = stable_active_identity(*control_state).value_or(std::string {});
+        impl_->stage_worker = std::jthread {[&context, active_identity = std::move(initial_active_identity)](
+                                                const std::stop_token cancellation) mutable {
+            while (!cancellation.stop_requested()) {
+                const auto progressed = process_resident_stage_once(context);
+                auto state = context.activation_store.load_state();
+                auto identity = state ? stable_active_identity(*state) : std::optional<std::string> {};
+                if (identity && *identity != active_identity) {
+                    auto compilations = compile_active_generations(*state, context);
+                    if (compilations) {
+                        auto activated = context.agent_backend->activate(*compilations);
+                        if (activated) {
+                            active_identity = std::move(*identity);
+                        }
+                    }
+                }
+                const auto pause = progressed ? std::chrono::milliseconds {10} : std::chrono::milliseconds {250};
+                std::this_thread::sleep_for(pause);
+            }
+        }};
         impl_->peer_trust_policy = std::addressof(context.peer_trust_policy);
         impl_->qualified = true;
         return {};
@@ -2511,8 +2816,11 @@ final activation flip; other control-plane operations remain CLI/backend work.
                                                       config->service.inbound_credit,
                                                       config->service.maximum_frame_bytes};
         FileAdminSecurityAudit admin_security_audit {config->audit_path};
-        AuthorizedResidentAdminBackend admin_backend {**activation_store, **operator_bindings, &admin_security_audit,
-                                                      uploads->get()};
+        FilesystemResidentStageSourceBackend stages {config->pack_registry_path, *pack_trust_policy,
+                                                     runtime->crypto_library};
+        AuthorizedResidentAdminBackend staged_admin_backend {**activation_store,     **operator_bindings,
+                                                             &admin_security_audit,  uploads->get(),
+                                                             std::addressof(stages), std::addressof(agent_backend)};
         const ResidentServerContext context {
             .config = *config,
             .store = **store,
@@ -2524,7 +2832,7 @@ final activation flip; other control-plane operations remain CLI/backend work.
             .agent_tls = agent_tls->has_value() ? std::addressof(**agent_tls) : nullptr,
             .admin_tls = admin_tls->has_value() ? std::addressof(**admin_tls) : nullptr,
             .agent_backend = std::addressof(agent_backend),
-            .admin_backend = std::addressof(admin_backend),
+            .admin_backend = std::addressof(staged_admin_backend),
         };
         if (auto active = backend.qualify_activation(context); !active) {
             return failure_output(active.error());

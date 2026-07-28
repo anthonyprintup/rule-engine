@@ -91,6 +91,18 @@ row-lock contract, but this remains compile evidence until the live PostgreSQL
 After this schema and staging-foundation slice, the complete Debug graph passed
 38/38 tests in 270.82 seconds, including the clean-install/private-runtime
 smoke.
+The authenticated server-owned stage and live-refresh slice then passed a clean
+incremental clang-cl/Ninja build and all 38 Debug tests in 178.84 seconds.
+Focused executable-surface coverage proves v4 stage request round trips, CLI
+preview/apply mapping, authorization before source resolution, exact durable
+target freezing, and activation fencing. The resident background path reopens
+the immutable digest, verifies signer and pack identity, compiles with the exact
+private worker, appends only fenced server-generated evidence, and detects a
+changed durable active identity. The session backend prevents a durable result
+from crossing the activation epoch into the old scheduler; an exactly
+concurrent committed message is replayed after reconnect. This remains
+Windows-local component and process-restart evidence, not the required live
+multi-node network, Linux, or PostgreSQL qualification.
 This evidence does not qualify live
 PostgreSQL, multiple server processes, network partitions, Linux, or mixed-OS
 operation.

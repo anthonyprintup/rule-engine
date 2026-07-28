@@ -681,7 +681,7 @@ namespace {
         CHECK_FALSE(admin_action_mutates(AdminAction::packs));
         CHECK(admin_action_defaults_to_preview(AdminAction::activate));
         CHECK(admin_action_defaults_to_preview(AdminAction::backfill));
-        CHECK_FALSE(admin_action_defaults_to_preview(AdminAction::stage));
+        CHECK(admin_action_defaults_to_preview(AdminAction::stage));
     }
 
     TEST_CASE("filesystem admin backend requires canonical mTLS configuration and an injected transport") {

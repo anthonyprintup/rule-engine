@@ -175,6 +175,9 @@ namespace rule_engine::python::cluster {
         pack_snapshot(const AdminCallContext &context, const TenantId &tenant, const PackId &pack) const;
         [[nodiscard]] std::expected<void, AuthorizedAdminError>
         authorize_pack_upload(const AdminCallContext &context, const TenantId &tenant, const PackId &pack) const;
+        [[nodiscard]] std::expected<void, AuthorizedAdminError>
+        authorize_stage_source(const AdminCallContext &context, const TenantId &tenant, const PackId &pack,
+                               std::string_view operation_id, bool apply) const;
         [[nodiscard]] std::expected<std::optional<AdminOperationRecord>, AuthorizedAdminError>
         operation_snapshot(const AdminCallContext &context, const TenantId &tenant, const PackId &pack,
                            std::string operation_id) const;

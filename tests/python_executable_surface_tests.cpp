@@ -685,6 +685,7 @@ namespace {
         std::size_t persists {};
         std::size_t closes {};
         std::size_t take_calls {};
+        std::size_t activation_fences {};
         bool return_invalid_session {};
 
         [[nodiscard]] std::expected<tools::ResidentAgentSession, proto::ProtocolError>
@@ -720,6 +721,7 @@ namespace {
         }
 
         void close(const tools::ResidentAgentSession &) noexcept override { ++closes; }
+        void fence_activation() noexcept override { ++activation_fences; }
     };
 
     struct RejectAdmin final: tools::IResidentAdminBackend {
@@ -926,6 +928,33 @@ namespace {
         }
     };
 
+    struct RecordingStageSourceBackend final: tools::IResidentStageSourceBackend {
+        std::size_t calls {};
+
+        [[nodiscard]] std::expected<py::cluster::GenerationRequest, proto::ProtocolError>
+        resolve(const py::PackId &pack, const py::SourceDigest &source_digest, const std::uint64_t generation,
+                const std::string_view state_schema_hash, const std::string_view state_namespace) noexcept override {
+            ++calls;
+            return py::cluster::GenerationRequest {
+                .pack = pack,
+                .version = py::PackVersion {"1.0.0"},
+                .source_digest = source_digest,
+                .generation = generation,
+                .state_schema_hash = std::string {state_schema_hash},
+                .state_namespace = std::string {state_namespace},
+                .required_capability_hashes = {},
+                .state_transition = {.mode = py::cluster::StateTransitionMode::carry,
+                                     .source_namespace = std::string {state_namespace},
+                                     .target_namespace = std::string {state_namespace},
+                                     .migration_id = {},
+                                     .reset_authorized = false,
+                                     .accept_state_gap = false},
+                .rollback_from = std::nullopt,
+                .signature_verified = true,
+            };
+        }
+    };
+
     struct ResumingUploadTransport final: tools::IResidentAdminRequestTransport {
         std::vector<tools::ResidentAdminRequest> requests;
 
@@ -1053,6 +1082,7 @@ namespace {
         py::cluster::DurableControlState state;
         std::map<std::string, py::cluster::AdminOperationRecord, std::less<>> operations;
         std::vector<py::cluster::AuditRecord> audit;
+        std::vector<py::cluster::DurableResidentNode> nodes;
 
         [[nodiscard]] std::expected<py::cluster::DurableControlState, py::StoreError> load_state() const override {
             return state;
@@ -1074,13 +1104,19 @@ namespace {
         }
 
         [[nodiscard]] std::expected<void, py::StoreError>
-        upsert_node(const py::cluster::DurableResidentNode &) override {
+        upsert_node(const py::cluster::DurableResidentNode &node) override {
+            const auto found = std::ranges::find(nodes, node.node_id, &py::cluster::DurableResidentNode::node_id);
+            if (found == nodes.end()) {
+                nodes.push_back(node);
+            } else {
+                *found = node;
+            }
             return {};
         }
 
         [[nodiscard]] std::expected<std::vector<py::cluster::DurableResidentNode>, py::StoreError>
         node_snapshot() const override {
-            return std::vector<py::cluster::DurableResidentNode> {};
+            return nodes;
         }
 
         [[nodiscard]] std::expected<void, py::StoreError>
@@ -1349,6 +1385,22 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
                                      .upload_offset = 3U,
                                      .upload_total_bytes = 3U,
                                      .payload = {}},
+        tools::ResidentAdminRequest {
+            .kind = tools::ResidentAdminRequestKind::stage_preview,
+            .request_id = "request:stage:preview",
+            .tenant = py::TenantId {"tenant:test"},
+            .pack = py::PackId {"pack:test"},
+            .operation_id = "operation:stage",
+            .idempotency_key = "idempotency:stage",
+            .expected_pack_version = 0U,
+            .at_unix_ms = 10U,
+            .reason = "approved stage",
+            .target_generation = 1U,
+            .payload = {},
+            .source_digest =
+                py::SourceDigest {"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+            .state_schema_hash = "sha256:state",
+            .state_namespace = "state:live"},
     };
     for (const auto &request : requests) {
         auto encoded = tools::encode_resident_admin_request(request, 4U * py::kibibyte);
@@ -1364,6 +1416,9 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
         CHECK(decoded->upload_offset == request.upload_offset);
         CHECK(decoded->upload_total_bytes == request.upload_total_bytes);
         CHECK(decoded->payload == request.payload);
+        CHECK(decoded->source_digest == request.source_digest);
+        CHECK(decoded->state_schema_hash == request.state_schema_hash);
+        CHECK(decoded->state_namespace == request.state_namespace);
     }
     auto bytes = tools::encode_resident_admin_request(requests.back(), 4U * py::kibibyte);
     REQUIRE(bytes);
@@ -1430,6 +1485,31 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
 }
 
 TEST_CASE("standalone admin client maps explicit lifecycle commands without trusting an actor field") {
+    const std::string source_digest {"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"};
+    tools::AdminCommand stage {.action = tools::AdminAction::stage,
+                               .operands = {"pack:test", source_digest, "6"},
+                               .options = {{"tenant", "tenant:test"},
+                                           {"expected-version", "2"},
+                                           {"state-schema", "sha256:state"},
+                                           {"state-namespace", "state:live"}},
+                               .request_id = "request:stage",
+                               .reason = "compile approved source",
+                               .preview = true};
+    const auto stage_request = tools::build_resident_admin_request(stage, 99U);
+    REQUIRE(stage_request);
+    CHECK(stage_request->kind == tools::ResidentAdminRequestKind::stage_preview);
+    CHECK(stage_request->source_digest == py::SourceDigest {source_digest});
+    CHECK(stage_request->target_generation == 6U);
+    CHECK(stage_request->state_schema_hash == "sha256:state");
+    CHECK(stage_request->state_namespace == "state:live");
+
+    stage.preview = false;
+    stage.reason.clear();
+    stage.options["expected-version"] = "3";
+    const auto stage_apply = tools::build_resident_admin_request(stage, 100U);
+    REQUIRE(stage_apply);
+    CHECK(stage_apply->kind == tools::ResidentAdminRequestKind::stage_apply);
+
     tools::AdminCommand preview {.action = tools::AdminAction::activate,
                                  .operands = {"pack:test", "7"},
                                  .options = {{"tenant", "tenant:test"}, {"expected-version", "3"}},
@@ -1466,6 +1546,35 @@ TEST_CASE("standalone admin client maps explicit lifecycle commands without trus
     const auto missing_tenant = tools::build_resident_admin_request(preview, 102U);
     REQUIRE_FALSE(missing_tenant);
     CHECK(missing_tenant.error().code == "ADMIN-TENANT");
+}
+
+TEST_CASE("resident stage authorization runs before source resolution") {
+    CountingControlStore store;
+    DenyAdminPolicy policy;
+    RecordingStageSourceBackend stages;
+    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, nullptr, &stages};
+    const tools::ResidentAdminRequest request {
+        .kind = tools::ResidentAdminRequestKind::stage_preview,
+        .request_id = "request:stage",
+        .tenant = py::TenantId {"tenant:test"},
+        .pack = py::PackId {"pack:test"},
+        .operation_id = "operation:stage",
+        .idempotency_key = "idempotency:stage",
+        .expected_pack_version = 0U,
+        .at_unix_ms = 10U,
+        .reason = "approved stage",
+        .target_generation = 1U,
+        .payload = {},
+        .source_digest = py::SourceDigest {"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+        .state_schema_hash = "sha256:state",
+        .state_namespace = "state:live",
+    };
+    const auto response = backend.execute(
+        proto::AuthenticatedPeer {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:admin"}}, request);
+    CHECK(response.status == tools::ResidentAdminResponseStatus::rejected);
+    CHECK(stages.calls == 0U);
+    CHECK(store.reads == 0U);
+    CHECK(store.commits == 0U);
 }
 
 TEST_CASE("standalone admin client resumes bounded upload and returns publication identity") {
@@ -1666,7 +1775,8 @@ TEST_CASE("resident admin v2 activation sequence is durable and idempotent acros
                           .drain_target = std::nullopt,
                           .pending_requeues = {}}};
     AllowAdminPolicy policy;
-    tools::AuthorizedResidentAdminBackend backend {store, policy};
+    DurableFakeAgentBackend agents;
+    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, nullptr, nullptr, &agents};
     const proto::AuthenticatedPeer peer {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:admin"}};
 
     const tools::ResidentAdminRequest preview {.kind = tools::ResidentAdminRequestKind::activation_preview,
@@ -1734,6 +1844,7 @@ TEST_CASE("resident admin v2 activation sequence is durable and idempotent acros
     REQUIRE(preview_after_lost_response.status == tools::ResidentAdminResponseStatus::ok);
     CHECK(preview_after_lost_response.operation_phase == "applied");
     CHECK(preview_after_lost_response.resource_version == 4U);
+    CHECK(agents.activation_fences == 2U);
     CHECK(store.state.storage_revision == 4U);
     CHECK(store.audit.size() == 4U);
     CHECK(policy.operations == std::vector<py::cluster::AdminControlOperation> {
@@ -1743,6 +1854,61 @@ TEST_CASE("resident admin v2 activation sequence is durable and idempotent acros
                                    py::cluster::AdminControlOperation::activation_flip,
                                    py::cluster::AdminControlOperation::activation_flip,
                                    py::cluster::AdminControlOperation::activation_preview,
+                               });
+}
+
+TEST_CASE("resident admin stage resolves trusted server metadata and freezes durable nodes") {
+    StatefulControlStore store;
+    store.nodes = {{.node_id = "node:test",
+                    .platform_abi = "windows-x64-v1",
+                    .lease_fence = 4U,
+                    .lease_until_unix_ms = 10'000U,
+                    .updated_at_unix_ms = 1U,
+                    .serving = true,
+                    .capability_hashes = {}}};
+    AllowAdminPolicy policy;
+    RecordingStageSourceBackend stages;
+    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, nullptr, &stages};
+    const proto::AuthenticatedPeer peer {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:admin"}};
+    const py::SourceDigest digest {"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"};
+    const tools::ResidentAdminRequest preview {
+        .kind = tools::ResidentAdminRequestKind::stage_preview,
+        .request_id = "request:stage:preview",
+        .tenant = py::TenantId {"tenant:test"},
+        .pack = py::PackId {"pack:test"},
+        .operation_id = "operation:stage",
+        .idempotency_key = "idempotency:stage",
+        .expected_pack_version = 0U,
+        .at_unix_ms = 10U,
+        .reason = "approved source",
+        .target_generation = 1U,
+        .payload = {},
+        .source_digest = digest,
+        .state_schema_hash = "sha256:state",
+        .state_namespace = "state:live",
+    };
+    const auto previewed = backend.execute(peer, preview);
+    REQUIRE(previewed.status == tools::ResidentAdminResponseStatus::ok);
+    CHECK(previewed.operation_phase == "previewed");
+    CHECK(stages.calls == 1U);
+
+    auto apply = preview;
+    apply.kind = tools::ResidentAdminRequestKind::stage_apply;
+    apply.request_id = "request:stage:apply";
+    apply.at_unix_ms = 11U;
+    apply.reason.clear();
+    const auto compiling = backend.execute(peer, apply);
+    REQUIRE(compiling.status == tools::ResidentAdminResponseStatus::ok);
+    CHECK(compiling.operation_phase == "previewed");
+    CHECK(compiling.resource_version == 1U);
+    CHECK(compiling.work_ids == std::vector<std::string> {"node:test"});
+    REQUIRE(store.state.generations.size() == 1U);
+    CHECK(store.state.generations.front().phase == py::cluster::GenerationPhase::compiling);
+    CHECK(store.state.generations.front().targets.front().lease_fence == 4U);
+    CHECK(stages.calls == 2U);
+    CHECK(policy.operations == std::vector<py::cluster::AdminControlOperation> {
+                                   py::cluster::AdminControlOperation::stage_preview,
+                                   py::cluster::AdminControlOperation::stage_apply,
                                });
 }
 

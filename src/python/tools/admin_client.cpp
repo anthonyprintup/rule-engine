@@ -175,11 +175,12 @@ namespace rule_engine::python::tools {
                     failure(ToolFailureKind::operation, "ADMIN-TENANT", "admin command requires --tenant ID"));
             }
             if (command.action != AdminAction::packs && command.action != AdminAction::operation &&
-                command.action != AdminAction::activate) {
+                command.action != AdminAction::stage && command.action != AdminAction::activate) {
                 return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-NOT-IMPLEMENTED",
                                                "admin command is not available on the resident v3 control channel"));
             }
-            if (command.action == AdminAction::activate && !command.options.contains("expected-version")) {
+            if ((command.action == AdminAction::stage || command.action == AdminAction::activate) &&
+                !command.options.contains("expected-version")) {
                 return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-EXPECTED-VERSION",
                                                "activation mutation requires --expected-version N"));
             }
@@ -205,6 +206,9 @@ namespace rule_engine::python::tools {
                 .upload_offset = 0U,
                 .upload_total_bytes = 0U,
                 .payload = {},
+                .source_digest = {},
+                .state_schema_hash = {},
+                .state_namespace = {},
             };
             if (command.action == AdminAction::packs) {
                 if (command.operands.size() != 1U || *expected_version != 0U) {
@@ -222,6 +226,38 @@ namespace rule_engine::python::tools {
                 request.kind = ResidentAdminRequestKind::operation_snapshot;
                 request.pack = PackId {command.operands[0]};
                 request.operation_id = command.operands[1];
+                return request;
+            }
+
+            if (command.action == AdminAction::stage) {
+                if (command.operands.size() != 3U || command.request_id.empty() ||
+                    (command.preview && command.reason.empty()) || (!command.preview && !command.reason.empty()) ||
+                    (command.preview && command.wait)) {
+                    return std::unexpected(
+                        failure(ToolFailureKind::operation, "ADMIN-ARGUMENT",
+                                "stage requires PACK_ID, SOURCE_DIGEST, GENERATION, --request-id, state metadata, "
+                                "and a preview reason"));
+                }
+                std::uint64_t generation {};
+                const auto text = std::string_view {command.operands[2]};
+                const auto parsed = std::from_chars(text.data(), text.data() + text.size(), generation);
+                const auto state_schema = option(command, "state-schema");
+                const auto state_namespace = option(command, "state-namespace");
+                if (parsed.ec != std::errc {} || parsed.ptr != text.data() + text.size() || generation == 0U ||
+                    state_schema.empty() || state_namespace.empty()) {
+                    return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-ARGUMENT",
+                                                   "stage generation and state metadata are invalid"));
+                }
+                request.kind =
+                    command.preview ? ResidentAdminRequestKind::stage_preview : ResidentAdminRequestKind::stage_apply;
+                request.pack = PackId {command.operands[0]};
+                request.operation_id = option(command, "operation-id", command.request_id);
+                request.idempotency_key = option(command, "idempotency-key", command.request_id);
+                request.reason = command.reason;
+                request.target_generation = generation;
+                request.source_digest = SourceDigest {command.operands[1]};
+                request.state_schema_hash = state_schema;
+                request.state_namespace = state_namespace;
                 return request;
             }
 
@@ -478,6 +514,9 @@ namespace rule_engine::python::tools {
                 .upload_offset = offset,
                 .upload_total_bytes = total_bytes,
                 .payload = std::move(payload),
+                .source_digest = {},
+                .state_schema_hash = {},
+                .state_namespace = {},
             };
         }
 
@@ -559,7 +598,8 @@ namespace rule_engine::python::tools {
         wait_for_operation(IResidentAdminRequestTransport *transport, const AdminEndpointConfiguration &endpoint,
                            const AdminCommand &command, const ResidentAdminRequest &initial_request,
                            ResidentAdminResponse response) {
-            if (command.action != AdminAction::operation && command.action != AdminAction::activate) {
+            if (command.action != AdminAction::operation && command.action != AdminAction::stage &&
+                command.action != AdminAction::activate) {
                 return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-WAIT-ARGUMENT",
                                                "--wait requires an operation or activation command"));
             }
@@ -600,6 +640,9 @@ namespace rule_engine::python::tools {
                 .upload_offset = 0U,
                 .upload_total_bytes = 0U,
                 .payload = {},
+                .source_digest = {},
+                .state_schema_hash = {},
+                .state_namespace = {},
             };
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds {timeout_ms};
             std::uint64_t attempt {};
@@ -634,7 +677,8 @@ namespace rule_engine::python::tools {
         if (command.action == AdminAction::upload) {
             return upload_archive(transport_, endpoint, command);
         }
-        if (command.wait && command.action != AdminAction::operation && command.action != AdminAction::activate) {
+        if (command.wait && command.action != AdminAction::operation && command.action != AdminAction::stage &&
+            command.action != AdminAction::activate) {
             return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-WAIT-ARGUMENT",
                                            "--wait requires an operation or activation command"));
         }

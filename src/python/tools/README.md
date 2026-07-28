@@ -101,11 +101,12 @@ OpenSSL allocator overhead, or backend-internal caches.
 - The worker's process and resource limits contain ordinary failure and abuse;
   they are not a hostile-code sandbox for a trusted generator.
 - The authenticated activation lifecycle and reads are connected end to end.
-  Upload, server-owned distributed stage compilation, rollback restaging,
-  policy mutation, and bounded `--wait` polling still fail closed with
-  `ADMIN-NOT-IMPLEMENTED`; they are not simulated by trusting client-supplied
-  compilation evidence. The offline file signer is currently implemented only
-  on Windows; HSM/KMS/PKCS#11 providers remain deployment integrations.
+  Verified resumable upload, server-owned distributed stage compilation,
+  bounded durable-operation polling, and live activation refresh are also
+  connected. Rollback restaging and policy mutation still fail closed with
+  `ADMIN-NOT-IMPLEMENTED`; no command accepts client-supplied compilation
+  evidence. The offline file signer is currently implemented only on Windows;
+  HSM/KMS/PKCS#11 providers remain deployment integrations.
 - The resident listener currently requires mTLS even when development
   configuration permits loopback plaintext; startup fails closed instead of
   dereferencing a missing TLS context. Accept and TLS handshake are serialized
