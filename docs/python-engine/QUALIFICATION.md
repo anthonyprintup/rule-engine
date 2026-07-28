@@ -73,6 +73,11 @@ verification, cross-process spool serialization, immutable no-replace
 content-addressed publication, and lost-finalize replay from durable evidence.
 It does not qualify registry quota/retention policy or distributed stage
 compilation.
+The admin client also passed focused request-transport coverage for bounded
+reconnect polling: it follows the authenticated durable operation identity,
+uses fresh correlated request IDs, stops on staged/applied/failed phases, and
+rejects invalid timeout or interval bounds. This is deterministic client and
+codec evidence, not a live network-partition qualification.
 This evidence does not qualify live
 PostgreSQL, multiple server processes, network partitions, Linux, or mixed-OS
 operation.

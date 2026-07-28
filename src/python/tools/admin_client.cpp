@@ -11,6 +11,7 @@
 #include <optional>
 #include <ranges>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 namespace rule_engine::python::tools {
@@ -20,6 +21,10 @@ namespace rule_engine::python::tools {
         constexpr std::size_t maximum_admin_frame_bytes = 4U * mebibyte;
         constexpr std::size_t upload_chunk_bytes = 1U * mebibyte;
         constexpr std::size_t maximum_upload_identity_bytes = 960U;
+        constexpr std::uint64_t default_wait_timeout_ms = 30'000U;
+        constexpr std::uint64_t maximum_wait_timeout_ms = 300'000U;
+        constexpr std::uint64_t default_poll_interval_ms = 250U;
+        constexpr std::uint64_t maximum_poll_interval_ms = 5'000U;
 
         [[nodiscard]] ToolFailure failure(const ToolFailureKind kind, std::string code, std::string message) {
             return {.kind = kind, .code = std::move(code), .message = std::move(message), .diagnostics = {}};
@@ -164,10 +169,6 @@ namespace rule_engine::python::tools {
                 return std::unexpected(
                     failure(ToolFailureKind::operation, "ADMIN-TIME", "admin request time must be non-zero"));
             }
-            if (command.wait) {
-                return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-NOT-IMPLEMENTED",
-                                               "bounded operation polling is not implemented yet"));
-            }
             const auto tenant = option(command, "tenant");
             if (tenant.empty()) {
                 return std::unexpected(
@@ -176,7 +177,7 @@ namespace rule_engine::python::tools {
             if (command.action != AdminAction::packs && command.action != AdminAction::operation &&
                 command.action != AdminAction::activate) {
                 return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-NOT-IMPLEMENTED",
-                                               "admin command is not available on the resident v2 control channel"));
+                                               "admin command is not available on the resident v3 control channel"));
             }
             if (command.action == AdminAction::activate && !command.options.contains("expected-version")) {
                 return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-EXPECTED-VERSION",
@@ -360,7 +361,13 @@ namespace rule_engine::python::tools {
         [[nodiscard]] std::expected<ResidentAdminResponse, ToolFailure>
         exchange_request(IResidentAdminRequestTransport *transport, const AdminEndpointConfiguration &endpoint,
                          const ResidentAdminRequest &request) {
-            return transport == nullptr ? exchange_mtls(endpoint, request) : transport->exchange(endpoint, request);
+            auto response =
+                transport == nullptr ? exchange_mtls(endpoint, request) : transport->exchange(endpoint, request);
+            if (response && response->request_id != request.request_id) {
+                return std::unexpected(failure(ToolFailureKind::unavailable_transport, "ADMIN-RESPONSE",
+                                               "admin response is uncorrelated"));
+            }
+            return response;
         }
 
         [[nodiscard]] std::expected<ResidentAdminResponse, ToolFailure>
@@ -543,6 +550,78 @@ namespace rule_engine::python::tools {
             return result_for(*finalized);
         }
 
+        [[nodiscard]] bool operation_terminal(const ResidentAdminResponse &response) noexcept {
+            return response.operation_phase == "applied" || response.operation_phase == "staged" ||
+                   response.operation_phase == "failed";
+        }
+
+        [[nodiscard]] std::expected<ResidentAdminResponse, ToolFailure>
+        wait_for_operation(IResidentAdminRequestTransport *transport, const AdminEndpointConfiguration &endpoint,
+                           const AdminCommand &command, const ResidentAdminRequest &initial_request,
+                           ResidentAdminResponse response) {
+            if (command.action != AdminAction::operation && command.action != AdminAction::activate) {
+                return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-WAIT-ARGUMENT",
+                                               "--wait requires an operation or activation command"));
+            }
+            if (response.status != ResidentAdminResponseStatus::ok || operation_terminal(response)) {
+                return response;
+            }
+            auto timeout = unsigned_option(command, "wait-timeout-ms");
+            auto interval = unsigned_option(command, "poll-interval-ms");
+            if (!timeout || !interval) {
+                return std::unexpected(!timeout ? timeout.error() : interval.error());
+            }
+            const auto timeout_ms = command.options.contains("wait-timeout-ms") ? *timeout : default_wait_timeout_ms;
+            const auto interval_ms =
+                command.options.contains("poll-interval-ms") ? *interval : default_poll_interval_ms;
+            if (timeout_ms == 0U || interval_ms == 0U || timeout_ms > maximum_wait_timeout_ms ||
+                interval_ms > maximum_poll_interval_ms || interval_ms > timeout_ms) {
+                return std::unexpected(
+                    failure(ToolFailureKind::operation, "ADMIN-WAIT-BOUND", "operation polling bounds are invalid"));
+            }
+            const auto base_request_id = command.request_id.empty() ? initial_request.request_id : command.request_id;
+            if (base_request_id.size() > maximum_upload_identity_bytes) {
+                return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-WAIT-IDENTITY",
+                                               "operation polling request identity is too long"));
+            }
+            ResidentAdminRequest poll {
+                .kind = ResidentAdminRequestKind::operation_snapshot,
+                .request_id = {},
+                .tenant = initial_request.tenant,
+                .pack = initial_request.pack,
+                .operation_id = initial_request.operation_id,
+                .idempotency_key = {},
+                .expected_pack_version = 0U,
+                .at_unix_ms = 0U,
+                .reason = {},
+                .target_generation = 0U,
+                .drain_boundary = 0U,
+                .work_ids = {},
+                .upload_offset = 0U,
+                .upload_total_bytes = 0U,
+                .payload = {},
+            };
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds {timeout_ms};
+            std::uint64_t attempt {};
+            while (std::chrono::steady_clock::now() < deadline) {
+                const auto remaining =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+                std::this_thread::sleep_for((std::min) (remaining, std::chrono::milliseconds {interval_ms}));
+                poll.request_id = base_request_id + ":poll:" + std::to_string(++attempt);
+                poll.at_unix_ms = now_unix_ms();
+                auto next = require_successful_response(exchange_request(transport, endpoint, poll));
+                if (!next) {
+                    return std::unexpected(next.error());
+                }
+                response = std::move(*next);
+                if (response.status != ResidentAdminResponseStatus::ok || operation_terminal(response)) {
+                    return response;
+                }
+            }
+            return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-WAIT-TIMEOUT",
+                                           "durable operation did not reach a terminal phase before the bound"));
+        }
+
     } // namespace
 
     std::expected<ResidentAdminRequest, ToolFailure> build_resident_admin_request(const AdminCommand &command,
@@ -555,6 +634,10 @@ namespace rule_engine::python::tools {
         if (command.action == AdminAction::upload) {
             return upload_archive(transport_, endpoint, command);
         }
+        if (command.wait && command.action != AdminAction::operation && command.action != AdminAction::activate) {
+            return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-WAIT-ARGUMENT",
+                                           "--wait requires an operation or activation command"));
+        }
         auto request = build_resident_admin_request(command, now_unix_ms());
         if (!request) {
             return std::unexpected(request.error());
@@ -562,6 +645,20 @@ namespace rule_engine::python::tools {
         auto response = require_successful_response(exchange_request(transport_, endpoint, *request));
         if (!response) {
             return std::unexpected(response.error());
+        }
+        if (command.wait) {
+            auto terminal = wait_for_operation(transport_, endpoint, command, *request, std::move(*response));
+            if (!terminal) {
+                return std::unexpected(terminal.error());
+            }
+            response = std::move(terminal);
+        }
+        if (response->operation_phase == "failed") {
+            response->status = ResidentAdminResponseStatus::rejected;
+            response->code = "ADMIN-OPERATION-FAILED";
+            if (response->diagnostic.empty()) {
+                response->diagnostic = "durable operation failed";
+            }
         }
         return result_for(*response);
     }

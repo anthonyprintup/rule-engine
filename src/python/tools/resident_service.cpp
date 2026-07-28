@@ -741,7 +741,7 @@ namespace rule_engine::python::tools {
             return {.status = ResidentAdminResponseStatus::ok,
                     .request_id = request.request_id,
                     .code = *operation ? "OK" : "NOT-FOUND",
-                    .diagnostic = {},
+                    .diagnostic = *operation ? (*operation)->failure : std::string {},
                     .storage_revision = 0U,
                     .resource_version = 0U,
                     .active_generation =

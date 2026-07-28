@@ -957,6 +957,38 @@ namespace {
         }
     };
 
+    struct PollingAdminTransport final: tools::IResidentAdminRequestTransport {
+        std::vector<tools::ResidentAdminRequest> requests;
+        std::size_t polls {};
+
+        [[nodiscard]] std::expected<tools::ResidentAdminResponse, tools::ToolFailure>
+        exchange(const tools::AdminEndpointConfiguration &, const tools::ResidentAdminRequest &request) override {
+            requests.push_back(request);
+            const auto poll = request.kind == tools::ResidentAdminRequestKind::operation_snapshot;
+            if (poll) {
+                ++polls;
+            }
+            return tools::ResidentAdminResponse {
+                .status = tools::ResidentAdminResponseStatus::ok,
+                .request_id = request.request_id,
+                .code = "OK",
+                .diagnostic = {},
+                .storage_revision = 0U,
+                .resource_version = poll && polls >= 2U ? 4U : 3U,
+                .active_generation = poll && polls >= 2U ? std::optional<std::uint64_t> {7U} : std::nullopt,
+                .previous_active_generation = std::nullopt,
+                .operation_phase = poll ? (polls >= 2U ? "applied" : "draining") : "previewed",
+                .target_generation = 7U,
+                .drain_boundary = poll ? 99U : 0U,
+                .assignment_fence = poll && polls >= 2U ? 2U : 0U,
+                .work_ids = {},
+                .upload_received_bytes = 0U,
+                .upload_total_bytes = 0U,
+                .source_digest = std::nullopt,
+            };
+        }
+    };
+
     [[nodiscard]] std::vector<std::byte> archive_bytes(const std::string_view value) {
         return {reinterpret_cast<const std::byte *>(value.data()),
                 reinterpret_cast<const std::byte *>(value.data() + value.size())};
@@ -1442,6 +1474,37 @@ TEST_CASE("standalone admin client resumes bounded upload and returns publicatio
     const auto digest = std::ranges::find(result->fields, "source_digest", &tools::DisplayField::name);
     REQUIRE(digest != result->fields.end());
     CHECK(digest->value == "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+}
+
+TEST_CASE("standalone admin client polls one durable operation to a bounded terminal phase") {
+    PollingAdminTransport transport;
+    tools::ResidentAdminClientAdapter client {&transport};
+    const tools::AdminCommand command {
+        .action = tools::AdminAction::activate,
+        .operands = {"pack:test", "7"},
+        .options = {{"tenant", "tenant:test"},
+                    {"expected-version", "3"},
+                    {"wait-timeout-ms", "100"},
+                    {"poll-interval-ms", "1"}},
+        .format = tools::OutputFormat::text,
+        .config_path = {},
+        .request_id = "request:wait",
+        .reason = "approved activation",
+        .wait = true,
+        .preview = true,
+    };
+    const auto result = client.execute({}, command);
+    REQUIRE(result);
+    REQUIRE(result->success);
+    REQUIRE(transport.requests.size() == 3U);
+    CHECK(transport.requests[0].kind == tools::ResidentAdminRequestKind::activation_preview);
+    CHECK(transport.requests[1].kind == tools::ResidentAdminRequestKind::operation_snapshot);
+    CHECK(transport.requests[1].operation_id == "request:wait");
+    CHECK(transport.requests[1].request_id == "request:wait:poll:1");
+    CHECK(transport.requests[2].request_id == "request:wait:poll:2");
+    const auto phase = std::ranges::find(result->fields, "operation_phase", &tools::DisplayField::name);
+    REQUIRE(phase != result->fields.end());
+    CHECK(phase->value == "applied");
 }
 
 TEST_CASE("resident upload authorizes every phase before touching the bounded backend") {

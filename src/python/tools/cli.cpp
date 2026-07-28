@@ -88,6 +88,8 @@ Options:
   --boundary CURSOR    Durable drain boundary for the drain phase
   --work-ids A,B       Explicit straggler IDs for the fence phase
   --wait               Wait by polling the durable operation record
+  --wait-timeout-ms N  Polling deadline, 1..300000 (default: 30000)
+  --poll-interval-ms N Poll interval, 1..5000 (default: 250)
   --preview            Force preview/dry-run
   --apply              Explicitly apply a command that defaults to preview
   --format FORMAT      text, json, or sarif (default: text)
@@ -95,8 +97,8 @@ Options:
   --version            Show the tool API version
 
 Upload is resumable when retried with the same request ID. Stage,
-rollback-restage, policy mutation, and bounded --wait polling remain reserved
-and fail closed with ADMIN-NOT-IMPLEMENTED.
+rollback-restage, and policy mutation remain reserved and fail closed with
+ADMIN-NOT-IMPLEMENTED.
 )";
 
         struct ParseError {
