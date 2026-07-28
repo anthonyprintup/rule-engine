@@ -156,6 +156,17 @@ This does not qualify the business meaning or implementation quality of a
 declared custom capability; operators must publish only capabilities actually
 provided by the deployed resident composition.
 
+The carry-mode resident-state slice then passed the complete 38-test Debug
+graph in 154.80 seconds. A hand-built, verifier-accepted bytecode fixture proves
+that a C++ VM state read is resolved from the server's durable store without
+producing agent work, the resulting write joins the same fenced terminal
+transaction, and two tenants using the same pack, activation namespace,
+executable, logical namespace, and key receive distinct physical state cells.
+Production composition now takes the state namespace only from durable
+active-generation metadata. This does not qualify Python source-level state
+lowering, transparent MVCC replay, migration bytecode, reset or retained-gap
+administration, live PostgreSQL, or multi-process state contention.
+
 ## Artifact identity
 
 | Artifact | SHA-256 |

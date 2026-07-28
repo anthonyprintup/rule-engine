@@ -67,6 +67,7 @@ namespace {
         };
         return tools::ResidentActivePack {
             .generation = 7U,
+            .state_namespace = "state-live",
             .compilation =
                 compiler::CompilationArtifact {
                     .pack = std::move(pack),
@@ -86,6 +87,23 @@ namespace {
                     .canonical_form = "resident-test",
                 },
         };
+    }
+
+    [[nodiscard]] tools::ResidentActivePack stateful_active_pack() {
+        auto result = active_pack();
+        result.compilation.pack.constants = {
+            vm::make_state_operand("rule", "enabled", SchemaId {"bool"}),
+            make_fact(true),
+        };
+        auto &function = result.compilation.pack.functions.front();
+        function.register_count = 3U;
+        function.instructions = {
+            instruction(Opcode::read_state, 1U, 0U, 0U, 0U, 0U),
+            instruction(Opcode::load_const, 2U, 0U, 0U, 1U, 1U),
+            instruction(Opcode::write_state, 0U, 2U, 0U, 0U, 2U),
+            instruction(Opcode::return_value, 0U, 2U, 0U, 0U, 3U),
+        };
+        return result;
     }
 
     [[nodiscard]] SubjectKey subject() {
@@ -189,6 +207,89 @@ namespace {
         CHECK(snapshot.results.front().evaluation.outcome == EvaluationOutcome::match);
         CHECK(snapshot.results.front().evaluation.verdict == true);
         CHECK((*scheduler)->take_work(agent, 4U, {})->empty());
+    }
+
+    TEST_CASE("resident state turns stay on the server and commit beneath a tenant-isolated activation namespace") {
+        cluster::AuditTrail audit;
+        cluster::InMemoryRuntimeStore store {audit};
+        auto scheduler = tools::ResidentEvaluationScheduler::create(store, audit, "node-a", std::chrono::seconds {30},
+                                                                    {stateful_active_pack()});
+        REQUIRE(scheduler.has_value());
+
+        const auto run_tenant = [&](tools::ResidentAgentSession agent, const std::string &snapshot_id) {
+            REQUIRE((*scheduler)->bind_session(agent).has_value());
+            auto selected_subject = subject();
+            selected_subject.peer = agent.authenticated_peer.peer;
+            const std::vector subjects {selected_subject};
+            const auto digest = protocol::authoritative_snapshot_digest(subjects);
+            REQUIRE(digest.has_value());
+            REQUIRE((*scheduler)
+                        ->ingest(agent, 1U,
+                                 protocol::AuthoritativeSnapshotBegin {
+                                     .session = agent.session,
+                                     .peer = agent.authenticated_peer.peer,
+                                     .session_fence = agent.session_fence,
+                                     .snapshot_id = snapshot_id,
+                                     .parent = {},
+                                     .subject_schema = SchemaId {"windows.process.v1"},
+                                     .generation = 1U,
+                                     .expected_count = 1U,
+                                     .expected_digest = *digest,
+                                 },
+                                 {})
+                        .has_value());
+            REQUIRE((*scheduler)
+                        ->ingest(agent, 2U,
+                                 protocol::AuthoritativeSnapshotChunk {
+                                     .session = agent.session,
+                                     .peer = agent.authenticated_peer.peer,
+                                     .session_fence = agent.session_fence,
+                                     .snapshot_id = snapshot_id,
+                                     .generation = 1U,
+                                     .chunk_index = 0U,
+                                     .subjects = subjects,
+                                 },
+                                 {})
+                        .has_value());
+            REQUIRE((*scheduler)
+                        ->ingest(agent, 3U,
+                                 protocol::AuthoritativeSnapshotCommit {
+                                     .session = agent.session,
+                                     .peer = agent.authenticated_peer.peer,
+                                     .session_fence = agent.session_fence,
+                                     .snapshot_id = snapshot_id,
+                                     .generation = 1U,
+                                     .item_count = 1U,
+                                     .canonical_digest = *digest,
+                                 },
+                                 {})
+                        .has_value());
+            auto external_work = (*scheduler)->take_work(agent, 1U, {});
+            REQUIRE(external_work.has_value());
+            CHECK(external_work->empty());
+        };
+
+        auto tenant_a = session();
+        run_tenant(tenant_a, "state-a");
+        auto tenant_b = tenant_a;
+        tenant_b.authenticated_peer.tenant = TenantId {"tenant-b"};
+        tenant_b.authenticated_peer.peer = PeerId {"peer-b"};
+        tenant_b.session = SessionId {"session-b"};
+        tenant_b.session_fence = 12U;
+        tenant_b.agent_epoch = "epoch-b";
+        run_tenant(tenant_b, "state-b");
+
+        const auto snapshot = store.snapshot();
+        REQUIRE(snapshot.results.size() == 2U);
+        REQUIRE(snapshot.state.size() == 2U);
+        CHECK(snapshot.state[0].key.namespace_name != "rule");
+        CHECK(snapshot.state[1].key.namespace_name != "rule");
+        CHECK(snapshot.state[0].key.namespace_name != snapshot.state[1].key.namespace_name);
+        for (const auto &cell : snapshot.state) {
+            CHECK(cell.version == 1U);
+            REQUIRE(cell.value.has_value());
+            CHECK(std::get<bool>(cell.value->value.node->data));
+        }
     }
 
     TEST_CASE("scheduler rebuilds snapshot work from the durable agent stream after restart") {

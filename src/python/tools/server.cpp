@@ -1811,6 +1811,7 @@ policy mutation remains fail-closed.
                 }
                 result.push_back(ResidentActivePack {
                     .generation = generation->request.generation,
+                    .state_namespace = generation->request.state_namespace,
                     .compilation = std::move(compiled->artifact),
                 });
             }

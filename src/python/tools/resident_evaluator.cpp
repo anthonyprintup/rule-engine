@@ -45,6 +45,22 @@ namespace rule_engine::python::tools {
             return schema.value + '\0' + (parent ? canonical_subject_key(*parent) : std::string {"-"});
         }
 
+        [[nodiscard]] std::string physical_state_namespace(const TenantId &tenant, const PackId &pack,
+                                                           const std::string_view activation_namespace,
+                                                           const std::string_view logical_namespace) {
+            std::string material;
+            material.reserve(tenant.value.size() + pack.value.size() + activation_namespace.size() +
+                             logical_namespace.size() + 3U);
+            material.append(tenant.value);
+            material.push_back('\0');
+            material.append(pack.value);
+            material.push_back('\0');
+            material.append(activation_namespace);
+            material.push_back('\0');
+            material.append(logical_namespace);
+            return "state:" + digest_key("resident-state-namespace-v1", material);
+        }
+
         [[nodiscard]] bool terminal(const VmStepState state) noexcept {
             return state == VmStepState::complete || state == VmStepState::faulted ||
                    state == VmStepState::quarantined || state == VmStepState::canceled;
@@ -143,6 +159,60 @@ namespace rule_engine::python::tools {
             const auto symbol =
                 std::ranges::find(pack.compilation.symbols, binding.executable, &compiler::BoundSymbol::executable);
             return symbol == pack.compilation.symbols.end() ? nullptr : std::addressof(*symbol);
+        }
+
+        [[nodiscard]] bool owns_executable(const ResidentActivePack &pack,
+                                           const ExecutableId &executable) const noexcept {
+            return std::ranges::any_of(pack.compilation.pack.functions,
+                                       [&executable](const auto &function) { return function.id == executable; });
+        }
+
+        [[nodiscard]] std::expected<HostResponses, protocol_v2::ProtocolError>
+        resolve_local_state(const EvaluationDefinition &definition, const ResidentActivePack &pack,
+                            const std::span<const StateReadRequest> requests) const {
+            HostResponses responses;
+            responses.state.reserve(requests.size());
+            for (const auto &request : requests) {
+                if (request.request_id.empty() || request.owner.empty() || request.namespace_name.empty() ||
+                    request.key.empty() || request.schema.empty() || !owns_executable(pack, request.owner)) {
+                    return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::provider_violation,
+                                                          "VM state request is invalid or crosses pack ownership"));
+                }
+                const cluster::StoredStateKey key {
+                    .owner = request.owner,
+                    .namespace_name = physical_state_namespace(definition.input.tenant, pack.compilation.pack.pack,
+                                                               pack.state_namespace, request.namespace_name),
+                    .key = request.key,
+                };
+                auto stored = store.load_state(key);
+                if (!stored) {
+                    return std::unexpected(
+                        protocol_error(protocol_v2::ProtocolErrorCode::persistence_error, "durable state read failed"));
+                }
+                responses.state.push_back(StateReadResponse {
+                    .request_id = request.request_id,
+                    .value = *stored ? (*stored)->value : std::optional<FrozenValue> {},
+                    .version = *stored ? (*stored)->version : 0U,
+                    .diagnostic = std::nullopt,
+                });
+            }
+            return responses;
+        }
+
+        [[nodiscard]] std::expected<EvaluationResult, protocol_v2::ProtocolError>
+        physicalize_state(const EvaluationDefinition &definition, const ResidentActivePack &pack,
+                          const EvaluationResult &evaluation) const {
+            auto result = evaluation;
+            for (auto &mutation : result.state_mutations) {
+                if (mutation.owner.empty() || mutation.namespace_name.empty() || mutation.key.empty() ||
+                    !owns_executable(pack, mutation.owner)) {
+                    return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::provider_violation,
+                                                          "VM state mutation is invalid or crosses pack ownership"));
+                }
+                mutation.namespace_name = physical_state_namespace(definition.input.tenant, pack.compilation.pack.pack,
+                                                                   pack.state_namespace, mutation.namespace_name);
+            }
+            return result;
         }
 
         [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
@@ -251,6 +321,10 @@ namespace rule_engine::python::tools {
                                                       "evaluation definition is absent"));
             }
             const auto &pack = packs[definition->second.pack_index];
+            auto durable_evaluation = physicalize_state(definition->second, pack, evaluation);
+            if (!durable_evaluation) {
+                return std::unexpected(std::move(durable_evaluation.error()));
+            }
             const VmInvocation invocation {
                 .execution = ExecutionId {"execution:" + work_id},
                 .invocation = InvocationId {"invocation:" + work_id},
@@ -262,7 +336,7 @@ namespace rule_engine::python::tools {
             };
             auto transaction =
                 project_runtime_transaction(definition->second.input, definition->second.cursor, invocation,
-                                            pack.compilation.pack, evaluation, active.lease.fence);
+                                            pack.compilation.pack, *durable_evaluation, active.lease.fence);
             if (!transaction) {
                 return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::persistence_error,
                                                       "terminal evaluation projection failed"));
@@ -296,12 +370,27 @@ namespace rule_engine::python::tools {
                     step.capability_requests.empty() && step.state_requests.empty() && step.history_requests.empty()) {
                     continue;
                 }
-                if (!step.capability_requests.empty() || !step.state_requests.empty() ||
-                    !step.history_requests.empty()) {
+                if (!step.capability_requests.empty() || !step.history_requests.empty()) {
                     static_cast<void>(state.coordinator->abandon(active.lease, now_unix_ms()));
                     return std::unexpected(protocol_error(
                         protocol_v2::ProtocolErrorCode::dependency_unavailable,
-                        "resident host turn requires a capability, state, or history service that is not configured"));
+                        "resident host turn requires a capability or history service that is not configured"));
+                }
+                if (!step.state_requests.empty()) {
+                    const auto definition = state.definitions.find(work_id);
+                    if (definition == state.definitions.end()) {
+                        static_cast<void>(state.coordinator->abandon(active.lease, now_unix_ms()));
+                        return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::stale_generation,
+                                                              "evaluation definition is absent"));
+                    }
+                    const auto &pack = packs[definition->second.pack_index];
+                    auto resolved = resolve_local_state(definition->second, pack, step.state_requests);
+                    if (!resolved) {
+                        static_cast<void>(state.coordinator->abandon(active.lease, now_unix_ms()));
+                        return std::unexpected(std::move(resolved.error()));
+                    }
+                    responses = std::move(*resolved);
+                    continue;
                 }
                 if (step.fact_requests.empty() && step.scan_requests.empty()) {
                     static_cast<void>(state.coordinator->abandon(active.lease, now_unix_ms()));
@@ -524,7 +613,7 @@ namespace rule_engine::python::tools {
                                         const protocol_v2::ProtocolLimits limits) {
         if (node_id.empty() || work_lease_duration.count() <= 0 ||
             std::ranges::any_of(active_packs, [](const ResidentActivePack &pack) {
-                return pack.generation == 0U || pack.compilation.pack.pack.empty() ||
+                return pack.generation == 0U || pack.state_namespace.empty() || pack.compilation.pack.pack.empty() ||
                        pack.compilation.pack.bindings.empty();
             })) {
             return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::invalid_value,

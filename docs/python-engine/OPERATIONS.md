@@ -259,12 +259,17 @@ VM from the authenticated result, and commits the terminal transaction through
 the same durable coordinator. Restart reconstructs pending work from committed
 snapshot messages.
 
-Current operations must account for two evaluator limits: one VM provider turn
-stays on one agent route, and capability/service/state/history host turns fail
-closed. Activation does not require a process restart: an atomic flip fences
-old sessions, residents verify and compile the new durable active identity, and
-new sessions are admitted only after the local scheduler has swapped. See
-[L-031](LIMITATIONS.md#l-031--resident-evaluation-supports-agent-fact-and-scan-turns-only).
+Current operations must account for three evaluator limits: one VM provider
+turn stays on one agent route, capability/service/history host turns fail
+closed, and a durable state conflict fails the attempt instead of replaying it
+transparently. For verified state bytecode, reads and writes stay on the server
+and are partitioned under the tenant and activation-selected namespace; no
+state request is sent to an agent. The Python frontend does not yet expose that
+bytecode to rule authors. Activation does not require a process restart: an
+atomic flip fences old sessions, residents verify and compile the new durable
+active identity, and new sessions are admitted only after the local scheduler
+has swapped. See
+[L-031](LIMITATIONS.md#l-031--resident-host-services-and-retry-are-partial).
 
 ## 5. Configure the Windows agent
 
