@@ -123,6 +123,15 @@ named policy profile. Inline database secrets are rejected; the supported
 reference form is `env:VARIABLE_NAME`, resolved once and then wiped from the
 server-owned buffer.
 
+The pack registry is content addressed. Place each canonical signed archive at
+`PACK_REGISTRY/sha256/SOURCE_CLOSURE_SHA256.rpack`, using exactly 64 lowercase
+hexadecimal characters for the digest and an absolute registry root. Startup
+does not scan for a convenient version: it resolves the digest recorded by the
+active generation, verifies that exact archive and signer, compiles it with the
+pinned private runtime, and compares all finalized compilation identities.
+Missing files, traversal-shaped digests, trust failures, and identity drift
+fail readiness.
+
 Both modes require these common keys:
 
 ```text
@@ -190,9 +199,17 @@ delay.
 The default store composition grants only the configured durable-message
 credit. Every accepted body and cumulative receipt commit atomically under the
 current session lease before ACK; a gap, changed replay, stale lease, or failed
-commit is NACKed without advancing the receipt. Detection work remains disabled
-until the activated pack/snapshot scheduler is composed; see
-[L-031](LIMITATIONS.md#l-031--resident-agent-ingress-is-durable-but-not-yet-scheduled).
+commit is NACKed without advancing the receipt. A committed authoritative
+snapshot is projected into deterministic subject/binding evaluations. The
+resident evaluator leases generation-fenced fact or scan work, resumes the C++
+VM from the authenticated result, and commits the terminal transaction through
+the same durable coordinator. Restart reconstructs pending work from committed
+snapshot messages.
+
+Current operations must account for three limits: one VM provider turn stays on
+one agent route, capability/service/state/history host turns fail closed, and a
+changed active generation is loaded only after server restart. See
+[L-031](LIMITATIONS.md#l-031--resident-evaluation-supports-agent-fact-and-scan-turns-only).
 
 ## 5. Configure the Windows agent
 

@@ -5,6 +5,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -1432,7 +1433,14 @@ namespace {
         REQUIRE_FALSE(artifact->fact_requirements.front().conditional);
         REQUIRE(artifact->pack.optimization_certificates.front().logical_facts ==
                 std::vector<std::string> {"process.is_signed"});
+        REQUIRE(artifact->symbols.front().subject_schema == SchemaId {"Process"});
         REQUIRE(verify_compiler_output(*artifact).has_value());
+        const std::array required_capabilities {CapabilityId {"windows.process.v1"}};
+        const auto defaults = default_rule_bindings(*artifact, required_capabilities);
+        REQUIRE(defaults.size() == 1);
+        REQUIRE(defaults.front().id == BindingId {"com.example.unsigned"});
+        REQUIRE(defaults.front().executable == ExecutableId {"com.example.unsigned"});
+        REQUIRE(defaults.front().capabilities == std::vector<CapabilityId> {CapabilityId {"windows.process.v1"}});
     }
 
     TEST_CASE("compiled direct subject fact rule resumes to a verdict in the real register VM",
@@ -1786,7 +1794,7 @@ namespace {
     }
 
     TEST_CASE("explicit Model declarations produce deterministic labeled schemas") {
-        auto nodes = constant_rule_nodes(false);
+        auto nodes = fact_rule_nodes();
         const auto module_body = std::ranges::find(nodes.front().fields, "body", &AstField::name);
         REQUIRE(module_body != nodes.front().fields.end());
         module_body->value = ast_sequence({ast_reference(20), ast_reference(2)});
@@ -1818,8 +1826,14 @@ namespace {
         REQUIRE(descriptor->fields.front().name == "is_signed");
         REQUIRE(descriptor->fields.front().type == SchemaId {"bool"});
         REQUIRE(descriptor->fields.front().label.classification == Classification::sensitive);
-        REQUIRE(descriptor->canonical_hash == second->pack.schemas.descriptors.front().canonical_hash);
+        const auto second_descriptor =
+            std::ranges::find(second->pack.schemas.descriptors, SchemaId {"rules.main.Process"}, &SchemaDescriptor::id);
+        REQUIRE(second_descriptor != second->pack.schemas.descriptors.end());
+        REQUIRE(descriptor->canonical_hash == second_descriptor->canonical_hash);
         REQUIRE(first->pack.schemas.canonical_hash == second->pack.schemas.canonical_hash);
+        const auto rule_symbol = std::ranges::find(first->symbols, SymbolKind::rule, &BoundSymbol::kind);
+        REQUIRE(rule_symbol != first->symbols.end());
+        REQUIRE(rule_symbol->subject_schema == SchemaId {"rules.main.Process"});
     }
 
     TEST_CASE("recursively constant list and dictionary displays allocate fresh VM containers") {
@@ -1966,6 +1980,41 @@ namespace {
         REQUIRE(different.has_value());
         REQUIRE(first->canonical_form != different->canonical_form);
         REQUIRE(first->pack.semantic_hash != different->pack.semantic_hash);
+    }
+
+    TEST_CASE("activation binding and executable identities are canonical and platform scoped") {
+        OperatorBindings first {
+            {.id = BindingId {"binding-b"},
+             .executable = ExecutableId {"rule-b"},
+             .capabilities = {CapabilityId {"capability-z"}, CapabilityId {"capability-a"}},
+             .budget = balanced_v1},
+            {.id = BindingId {"binding-a"},
+             .executable = ExecutableId {"rule-a"},
+             .capabilities = {},
+             .budget = balanced_v1},
+        };
+        auto reordered = first;
+        std::ranges::reverse(reordered);
+        std::ranges::reverse(reordered.back().capabilities);
+        REQUIRE(canonical_operator_bindings_hash(first) == canonical_operator_bindings_hash(reordered));
+
+        CompiledPack compiled {
+            .pack = PackId {"com.example.rules"},
+            .version = PackVersion {"1.0.0"},
+            .source_digest = SourceDigest {"sha256:source"},
+            .compiler_abi = std::string {python_static_compiler_abi_v1},
+            .semantic_hash = "fnv1a64:0000000000000001",
+            .schemas = {.descriptors = {}, .canonical_hash = "fnv1a64:0000000000000002"},
+            .constants = {},
+            .functions = {},
+            .bindings = std::move(first),
+            .optimization_certificates = {},
+        };
+        const auto windows = compiled_pack_executable_hash(compiled, "windows-x64-v1");
+        REQUIRE(windows == compiled_pack_executable_hash(compiled, "windows-x64-v1"));
+        REQUIRE(windows != compiled_pack_executable_hash(compiled, "linux-x64-v1"));
+        compiled.semantic_hash = "fnv1a64:0000000000000003";
+        REQUIRE(windows != compiled_pack_executable_hash(compiled, "windows-x64-v1"));
     }
 
     TEST_CASE("async declarations lower when simple and complex suspension is diagnosed precisely") {

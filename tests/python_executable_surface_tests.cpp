@@ -672,6 +672,7 @@ namespace {
         std::uint64_t fence {9U};
         std::size_t persists {};
         std::size_t closes {};
+        std::size_t take_calls {};
         bool return_invalid_session {};
 
         [[nodiscard]] std::expected<tools::ResidentAgentSession, proto::ProtocolError>
@@ -683,11 +684,16 @@ namespace {
                 .session_fence = return_invalid_session ? 0U : fence,
                 .agent_epoch = hello.agent_epoch,
                 .acknowledged_through = 0U,
-                .credit = {.bytes = 64U * py::kibibyte, .messages = 8U, .work_attempts = 1U, .snapshot_chunks = 1U}};
+                .credit = {.bytes = 64U * py::kibibyte, .messages = 8U, .work_attempts = 1U, .snapshot_chunks = 1U},
+                .schemas = {},
+                .capabilities = {}};
         }
 
         [[nodiscard]] std::expected<std::vector<proto::WorkLeaseMessage>, proto::ProtocolError>
         take_work(const tools::ResidentAgentSession &, std::size_t, std::stop_token) noexcept override {
+            if (take_calls++ != 0U) {
+                return std::vector<proto::WorkLeaseMessage> {};
+            }
             return std::vector<proto::WorkLeaseMessage> {service_work()};
         }
 

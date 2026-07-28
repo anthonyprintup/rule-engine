@@ -2,6 +2,7 @@
 
 #include "rule_engine/python/cluster/admin_authorization.hpp"
 #include "rule_engine/python/protocol/network.hpp"
+#include "rule_engine/python/tools/active_pack.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -66,6 +67,8 @@ namespace rule_engine::python::tools {
         std::string agent_epoch;
         std::uint64_t acknowledged_through {};
         protocol_v2::CreditWindow credit;
+        std::vector<protocol_v2::SchemaAdvertisement> schemas;
+        std::vector<protocol_v2::CapabilityAdvertisement> capabilities;
     };
 
     struct DurableAgentReceipt {
@@ -78,6 +81,16 @@ namespace rule_engine::python::tools {
     // durable. This is the point at which the service is allowed to emit ACK.
     struct IResidentAgentBackend {
         virtual ~IResidentAgentBackend() = default;
+        [[nodiscard]] virtual std::expected<void, protocol_v2::ProtocolError>
+        activate(std::span<const ResidentActivePack> packs) noexcept {
+            if (packs.empty()) {
+                return {};
+            }
+            return std::unexpected(protocol_v2::ProtocolError {
+                .code = protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                .message = "agent backend does not implement active-pack evaluation",
+            });
+        }
         [[nodiscard]] virtual std::expected<ResidentAgentSession, protocol_v2::ProtocolError>
         establish(const protocol_v2::AuthenticatedPeer &peer, const protocol_v2::AgentHelloMessage &hello,
                   std::stop_token cancellation) noexcept = 0;

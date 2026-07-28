@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -198,6 +199,13 @@ namespace rule_engine::python {
         std::vector<OperatorBinding> bindings;
         std::vector<OptimizationCertificate> optimization_certificates;
     };
+
+    // Canonical activation identities. The binding hash is platform-independent;
+    // the executable hash additionally binds the local platform ABI. Both use
+    // the compiler's versioned semantic-digest algorithm and must be compared
+    // with durable activation reports before a resident serves work.
+    [[nodiscard]] std::string canonical_operator_bindings_hash(std::span<const OperatorBinding> bindings);
+    [[nodiscard]] std::string compiled_pack_executable_hash(const CompiledPack &pack, std::string_view platform_abi);
 
     [[nodiscard]] std::expected<void, DiagnosticSet> verify_bytecode(const CompiledPack &pack);
 

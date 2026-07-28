@@ -26,6 +26,41 @@ namespace rule_engine::python::cluster {
 
     } // namespace
 
+    std::expected<void, StoreError> qualify_resident_compilation(const GenerationSnapshot &generation,
+                                                                 const std::string_view node_id,
+                                                                 const std::string_view platform_abi,
+                                                                 const CompiledPack &compiled) {
+        const auto reject = [](const StoreErrorCode code, std::string message) {
+            return std::unexpected(StoreError {.code = code, .message = std::move(message), .retryable = false});
+        };
+        if (node_id.empty() || platform_abi.empty()) {
+            return reject(StoreErrorCode::constraint_violation,
+                          "resident compilation qualification identity is invalid");
+        }
+        if (generation.phase != GenerationPhase::active) {
+            return reject(StoreErrorCode::stale_fence, "resident generation is not active");
+        }
+        if (compiled.pack != generation.request.pack || compiled.version != generation.request.version ||
+            compiled.source_digest != generation.request.source_digest ||
+            compiled.compiler_abi != python_static_compiler_abi_v1) {
+            return reject(StoreErrorCode::constraint_violation,
+                          "resident compiled pack does not match the durable source generation");
+        }
+        const auto report = std::ranges::find(generation.reports, node_id, &CompilationReport::node_id);
+        if (report == generation.reports.end() || !report->success || report->node_lease_fence == 0U) {
+            return reject(StoreErrorCode::stale_fence, "resident node has no successful staged compilation report");
+        }
+        const auto binding_hash = canonical_operator_bindings_hash(compiled.bindings);
+        const auto executable_hash = compiled_pack_executable_hash(compiled, platform_abi);
+        if (compiled.semantic_hash.empty() || generation.semantic_hash != compiled.semantic_hash ||
+            generation.binding_hash != binding_hash || report->semantic_hash != compiled.semantic_hash ||
+            report->binding_hash != binding_hash || report->executable_hash != executable_hash) {
+            return reject(StoreErrorCode::incompatible_schema,
+                          "resident compiler, binding, or executable identity differs from activation evidence");
+        }
+        return {};
+    }
+
     StoreError ActivationController::error(const StoreErrorCode code, std::string message, const bool retryable) {
         return StoreError {.code = code, .message = std::move(message), .retryable = retryable};
     }

@@ -391,6 +391,17 @@ namespace rule_engine::python::protocol_v2 {
         return delta;
     }
 
+    std::expected<void, ProtocolError>
+    AuthoritativeSnapshotAssembler::rebind_session(SessionId session, const std::uint64_t session_fence) {
+        if (stage_ || session.empty() || session_fence == 0U) {
+            return std::unexpected(
+                snapshot_error(ProtocolErrorCode::stale_session, "snapshot scope cannot rebind while staging"));
+        }
+        session_ = std::move(session);
+        session_fence_ = session_fence;
+        return {};
+    }
+
     void AuthoritativeSnapshotAssembler::abort() noexcept { stage_.reset(); }
 
     void AuthoritativeSnapshotAssembler::reject_stage() noexcept { stage_.reset(); }

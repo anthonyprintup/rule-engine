@@ -9,6 +9,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -76,6 +77,15 @@ namespace rule_engine::python {
                 value >>= 4U;
             }
             return std::string {result.data(), result.size()};
+        }
+
+        [[nodiscard]] std::string stable_compiler_digest(const std::string_view canonical) {
+            std::uint64_t value = 1469598103934665603ULL;
+            for (const auto character : canonical) {
+                value ^= static_cast<unsigned char>(character);
+                value *= 1099511628211ULL;
+            }
+            return "fnv1a64:" + hexadecimal(value);
         }
 
         [[nodiscard]] std::optional<std::string_view> builtin_schema_name(const std::string_view schema) noexcept {
@@ -363,6 +373,40 @@ namespace rule_engine::python {
         }
 
     } // namespace
+
+    std::string canonical_operator_bindings_hash(const std::span<const OperatorBinding> bindings) {
+        auto normalized = OperatorBindings {bindings.begin(), bindings.end()};
+        for (auto &binding : normalized) {
+            std::ranges::sort(binding.capabilities, {}, &CapabilityId::value);
+            binding.capabilities.erase(std::ranges::unique(binding.capabilities).begin(), binding.capabilities.end());
+        }
+        std::ranges::sort(normalized, [](const OperatorBinding &left, const OperatorBinding &right) {
+            return std::tie(left.id.value, left.executable.value) < std::tie(right.id.value, right.executable.value);
+        });
+
+        std::string canonical {"python-static-bindings-v1;"};
+        for (const auto &binding : normalized) {
+            append_token(canonical, binding.id.value);
+            append_token(canonical, binding.executable.value);
+            append_token(canonical, binding.budget.name);
+            append_token(canonical, std::to_string(binding.capabilities.size()));
+            for (const auto &capability : binding.capabilities) { append_token(canonical, capability.value); }
+        }
+        return stable_compiler_digest(canonical);
+    }
+
+    std::string compiled_pack_executable_hash(const CompiledPack &pack, const std::string_view platform_abi) {
+        std::string canonical {"python-static-executable-v1;"};
+        append_token(canonical, platform_abi);
+        append_token(canonical, pack.compiler_abi);
+        append_token(canonical, pack.pack.value);
+        append_token(canonical, pack.version.value);
+        append_token(canonical, pack.source_digest.value);
+        append_token(canonical, pack.semantic_hash);
+        append_token(canonical, canonical_operator_bindings_hash(pack.bindings));
+        append_token(canonical, pack.schemas.canonical_hash);
+        return stable_compiler_digest(canonical);
+    }
 
     std::string canonical_schema_hash(const std::string_view canonical_descriptor) {
         std::uint64_t value = 1469598103934665603ULL;

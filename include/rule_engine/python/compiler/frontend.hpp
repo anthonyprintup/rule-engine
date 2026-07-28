@@ -46,6 +46,8 @@ namespace rule_engine::python::compiler {
         std::string module;
         std::string name;
         std::string qualified_name;
+        ExecutableId executable;
+        SchemaId subject_schema;
         SymbolKind kind {SymbolKind::function};
         StaticType type;
         SourceSpan span;
@@ -92,6 +94,12 @@ namespace rule_engine::python::compiler {
                                                                                 const SchemaCatalog &schemas,
                                                                                 const OperatorBindings &bindings) const;
     };
+
+    // Plain @rule/@correlation entrypoints need no separate generator. Their
+    // stable executable IDs become stable binding IDs; templates remain
+    // unbound until an authorized generator supplies concrete bindings.
+    [[nodiscard]] OperatorBindings default_rule_bindings(const CompilationArtifact &discovery,
+                                                         std::span<const CapabilityId> required_capabilities = {});
 
     struct StaticPackCompiler final: PackCompiler {
         explicit StaticPackCompiler(AstEnvelopeProvider &provider) noexcept: provider_ {provider} {}

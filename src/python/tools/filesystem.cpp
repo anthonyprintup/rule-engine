@@ -338,188 +338,29 @@ namespace rule_engine::python::tools {
             return std::move(envelope->key_id);
         }
 
-        [[nodiscard]] std::string module_path(const std::string_view module) {
-            std::string result {"generator/"};
-            for (const char character : module) { result.push_back(character == '.' ? '/' : character); }
-            result += ".py";
-            return result;
-        }
-
-        [[nodiscard]] std::expected<CanonicalGeneratorOutput, ToolFailure>
-        execute_generator(const LoadedSourcePack &pack, const SourcePackArchive &archive,
-                          const compiler::CompilationArtifact &discovery, packaging::WorkerClient &client) {
-            if (!pack.manifest.generator.has_value()) {
-                return CanonicalGeneratorOutput {};
-            }
-            if (!pack.trust.generator_execution_authorized) {
-                return std::unexpected(failure(ToolFailureKind::authorization, "PACK-GENERATOR-AUTH",
-                                               "pack trust policy does not authorize generator execution"));
-            }
-            const auto &declaration = *pack.manifest.generator;
-            const auto path = module_path(declaration.module);
-            const auto *module = find_entry(archive, path);
-            if (module == nullptr) {
-                return std::unexpected(failure(ToolFailureKind::operation, "PACK-GENERATOR-SOURCE",
-                                               "declared generator module is absent"));
-            }
-
-            std::vector<packaging::WorkerGeneratorTemplate> templates;
-            for (const auto &symbol : discovery.symbols) {
-                if (symbol.kind != compiler::SymbolKind::rule_template) {
-                    continue;
-                }
-                const auto function = std::ranges::find(discovery.pack.functions, symbol.qualified_name,
-                                                        &BytecodeFunction::qualified_name);
-                if (function == discovery.pack.functions.end()) {
-                    continue;
-                }
-                templates.push_back(packaging::WorkerGeneratorTemplate {
-                    .factory = symbol.name,
-                    .template_id = function->id,
-                });
-            }
-            std::ranges::sort(templates, {}, &packaging::WorkerGeneratorTemplate::factory);
-
-            std::vector<packaging::WorkerGeneratorInput> inputs;
-            inputs.reserve(declaration.inputs.size());
-            for (const auto &input : declaration.inputs) {
-                const auto *entry = find_entry(archive, input.path);
-                if (entry == nullptr) {
-                    return std::unexpected(failure(ToolFailureKind::operation, "PACK-GENERATOR-INPUT",
-                                                   "declared generator input is absent"));
-                }
-                inputs.push_back(packaging::WorkerGeneratorInput {
-                    .name = input.name,
-                    .format = input.format,
-                    .bytes = entry->bytes,
-                });
-            }
-            const auto payload =
-                packaging::encode_trusted_generator_worker_payload(packaging::TrustedGeneratorWorkerPayload {
-                    .callable = declaration.callable,
-                    .module_source = module->bytes,
-                    .inputs = std::move(inputs),
-                    .templates = std::move(templates),
-                });
-            if (!payload.has_value()) {
-                return std::unexpected(packaging_failure(payload.error()));
-            }
-            packaging::PythonWorkerGeneratorExecutor executor;
-            executor.client = &client;
-            executor.request_id_prefix = RequestId {"tool-generator"};
-            executor.source = SourceId {path};
-            executor.canonical_payload = *payload;
-            executor.generator_execution_authorized = true;
-            auto generated = packaging::execute_generator_twice(executor, 0x13579U, 0x24680U);
-            if (!generated.has_value()) {
-                return std::unexpected(packaging_failure(generated.error()));
-            }
-            return std::move(*generated);
-        }
-
-        struct CompiledToolPack {
-            compiler::CompilationArtifact artifact;
-            std::optional<CanonicalGeneratorOutput> generated;
-        };
-
-        struct CapturedAstProvider final: compiler::AstEnvelopeProvider {
-            std::vector<std::byte> payload;
-
-            [[nodiscard]] std::expected<std::vector<std::byte>, DiagnosticSet> load(const VerifiedRulePack &) override {
-                return std::move(payload);
-            }
-        };
-
-        [[nodiscard]] std::expected<CompiledToolPack, ToolFailure>
+        [[nodiscard]] std::expected<compiler::SourcePackCompilation, ToolFailure>
         compile_pack(const LoadedSourcePack &pack, const SourcePackArchive &archive,
                      const packaging::PrivatePythonRuntime &runtime, const std::filesystem::path &worker_temporary_root,
                      const std::stop_token &cancellation) {
-            if (cancellation.stop_requested()) {
-                return std::unexpected(
-                    failure(ToolFailureKind::operation, "PY-CANCELLED", "check generation was cancelled"));
-            }
-            if (pack.manifest.generator.has_value() && !pack.trust.generator_execution_authorized) {
-                return std::unexpected(failure(ToolFailureKind::authorization, "PACK-GENERATOR-AUTH",
-                                               "pack trust policy does not authorize generator execution"));
-            }
             packaging::WindowsJobWorkerLauncher launcher;
             launcher.temporary_root = worker_temporary_root;
             packaging::WorkerClient client {.runtime = runtime, .launcher = launcher, .limits = {}};
-            compiler::WorkerAstEnvelopeProvider provider {client};
-            auto ast_payload = provider.load(pack.contract_pack);
-            if (!ast_payload.has_value()) {
-                return std::unexpected(ToolFailure {
-                    .kind = ToolFailureKind::operation,
-                    .code = "PY-WORKER",
-                    .message = "exact private parser worker rejected the pack",
-                    .diagnostics = std::move(ast_payload.error()),
-                });
+            auto compiled = compiler::compile_source_pack(pack, archive, client, {}, cancellation);
+            if (compiled) {
+                return std::move(*compiled);
             }
-            compiler::StaticCompiler static_compiler;
-            auto discovery = static_compiler.compile(pack.contract_pack, *ast_payload, {}, {});
-            if (!discovery.has_value()) {
-                return std::unexpected(ToolFailure {
-                    .kind = ToolFailureKind::operation,
-                    .code = "PY-COMPILE",
-                    .message = "static compilation failed",
-                    .diagnostics = std::move(discovery.error()),
-                });
+            auto kind = ToolFailureKind::operation;
+            if (compiled.error().kind == compiler::SourcePackCompileErrorKind::authorization) {
+                kind = ToolFailureKind::authorization;
+            } else if (compiled.error().kind == compiler::SourcePackCompileErrorKind::invariant) {
+                kind = ToolFailureKind::internal_invariant;
             }
-            OperatorBindings bindings;
-            std::optional<CanonicalGeneratorOutput> generated;
-            auto artifact = std::move(*discovery);
-            if (pack.manifest.generator.has_value()) {
-                auto output = execute_generator(pack, archive, artifact, client);
-                if (!output.has_value()) {
-                    return std::unexpected(output.error());
-                }
-                bindings.reserve(output->bindings.size());
-                for (const auto &binding : output->bindings) {
-                    bindings.push_back(OperatorBinding {
-                        .id = binding.id,
-                        .executable = binding.template_id,
-                        .capabilities = {},
-                        .budget = balanced_v1,
-                    });
-                }
-                auto bound = static_compiler.compile(pack.contract_pack, *ast_payload, {}, bindings);
-                if (!bound.has_value()) {
-                    return std::unexpected(ToolFailure {
-                        .kind = ToolFailureKind::operation,
-                        .code = "PY-COMPILE",
-                        .message = "generated binding compilation failed",
-                        .diagnostics = std::move(bound.error()),
-                    });
-                }
-                artifact = std::move(*bound);
-                generated = std::move(*output);
-            }
-            if (cancellation.stop_requested()) {
-                return std::unexpected(
-                    failure(ToolFailureKind::operation, "PY-CANCELLED", "check generation was cancelled"));
-            }
-
-            // Exercise the same PackCompiler adapter used by the server as the
-            // authoritative final compilation path. The richer StaticCompiler
-            // artifact above is retained only for tooling explanations.
-            CapturedAstProvider captured_provider;
-            captured_provider.payload = std::move(*ast_payload);
-            compiler::StaticPackCompiler pack_compiler {captured_provider};
-            auto compiled_pack = pack_compiler.compile(pack.contract_pack, {}, bindings);
-            if (!compiled_pack.has_value()) {
-                return std::unexpected(ToolFailure {
-                    .kind = ToolFailureKind::operation,
-                    .code = "PY-COMPILE",
-                    .message = "static pack compilation failed",
-                    .diagnostics = std::move(compiled_pack.error()),
-                });
-            }
-            if (compiled_pack->semantic_hash != artifact.pack.semantic_hash) {
-                return std::unexpected(failure(ToolFailureKind::internal_invariant, "PY-COMPILER-DIVERGENCE",
-                                               "tooling and server compiler paths produced different semantics"));
-            }
-            artifact.pack = std::move(*compiled_pack);
-            return CompiledToolPack {.artifact = std::move(artifact), .generated = std::move(generated)};
+            return std::unexpected(ToolFailure {
+                .kind = kind,
+                .code = std::move(compiled.error().code),
+                .message = std::move(compiled.error().message),
+                .diagnostics = std::move(compiled.error().diagnostics),
+            });
         }
 
         [[nodiscard]] std::string fallback_reason(const optimizer::ExactFallbackReason reason) {

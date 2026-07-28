@@ -48,6 +48,18 @@ The architecture's Q1 release gate is therefore **incomplete**. The Windows
 implementation and removal gate are locally qualified; Linux, live PostgreSQL,
 mixed-OS, and real distributed failure/scale claims are not qualified.
 
+### 2026-07-28 production-readiness continuation
+
+The `codex/python-production-readiness` Debug graph built successfully with
+clang-cl and Ninja after adding exact active-pack compilation and the resident
+evaluator. `ctest --test-dir build/Debug --output-on-failure` passed 38/38
+tests in 177.64 seconds after the final reconnect hardening. The added resident
+evaluator target covers snapshot-to-fact-to-match commit, restart reconstruction
+from durable snapshot ingress, reconnect work reclamation with stale-session
+isolation, and durable cross-epoch replay ordering. This is Windows-local
+component and process-restart evidence. It does not qualify live PostgreSQL,
+multiple server processes, network partitions, Linux, or mixed-OS operation.
+
 ## Artifact identity
 
 | Artifact | SHA-256 |

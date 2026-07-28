@@ -1415,4 +1415,19 @@ namespace rule_engine::python::packaging {
                                                      SignatureValidationMode::enforce_trust);
     }
 
+    std::expected<std::filesystem::path, PackagingError>
+    content_addressed_source_pack_path(const std::filesystem::path &root, const SourceDigest &closure_digest) {
+        constexpr std::string_view prefix = "sha256:";
+        if (root.empty() || !root.is_absolute() || !closure_digest.value.starts_with(prefix)) {
+            return std::unexpected(
+                error(PackagingErrorCode::invalid_path, "content-addressed source-pack identity is invalid"));
+        }
+        const auto digest = std::string_view {closure_digest.value}.substr(prefix.size());
+        if (!is_lower_hex_digest(digest)) {
+            return std::unexpected(error(PackagingErrorCode::invalid_path,
+                                         "content-addressed source-pack digest must be canonical SHA-256"));
+        }
+        return (root / "sha256" / (std::string {digest} + ".rpack")).lexically_normal();
+    }
+
 } // namespace rule_engine::python::packaging

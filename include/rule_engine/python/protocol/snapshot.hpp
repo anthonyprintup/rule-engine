@@ -29,6 +29,7 @@ namespace rule_engine::python::protocol_v2 {
         [[nodiscard]] std::expected<void, ProtocolError> begin(const AuthoritativeSnapshotBegin &message);
         [[nodiscard]] std::expected<void, ProtocolError> append(const AuthoritativeSnapshotChunk &message);
         [[nodiscard]] std::expected<SnapshotDelta, ProtocolError> commit(const AuthoritativeSnapshotCommit &message);
+        [[nodiscard]] std::expected<void, ProtocolError> rebind_session(SessionId session, std::uint64_t session_fence);
         void abort() noexcept;
 
         [[nodiscard]] bool staging() const noexcept { return stage_.has_value(); }

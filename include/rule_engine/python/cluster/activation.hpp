@@ -104,6 +104,15 @@ namespace rule_engine::python::cluster {
         std::vector<std::string> requeued_work;
     };
 
+    // Fail-closed startup check for the exact executable a node intends to
+    // serve. The caller separately proves a current node lease; the report
+    // fence here is historical staging evidence and intentionally need not
+    // equal a lease acquired after restart.
+    [[nodiscard]] std::expected<void, StoreError> qualify_resident_compilation(const GenerationSnapshot &generation,
+                                                                               std::string_view node_id,
+                                                                               std::string_view platform_abi,
+                                                                               const CompiledPack &compiled);
+
     struct ActivationController {
         explicit ActivationController(AuditTrail &audit): audit_ {audit} {}
 

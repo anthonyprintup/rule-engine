@@ -603,6 +603,54 @@ namespace {
         REQUIRE_FALSE(reference->production_allowed);
     }
 
+    TEST_CASE("resident compilation qualification binds source semantics bindings executable and node fence") {
+        CompiledPack compiled {
+            .pack = PackId {"pack-a"},
+            .version = PackVersion {"1.0.1"},
+            .source_digest = SourceDigest {"sha256:signed-source"},
+            .compiler_abi = std::string {python_static_compiler_abi_v1},
+            .semantic_hash = "fnv1a64:0000000000000001",
+            .schemas = {.descriptors = {}, .canonical_hash = "fnv1a64:0000000000000002"},
+            .constants = {},
+            .functions = {},
+            .bindings = {{.id = BindingId {"binding-a"},
+                          .executable = ExecutableId {"rule-a"},
+                          .capabilities = {},
+                          .budget = balanced_v1}},
+            .optimization_certificates = {},
+        };
+        const auto binding_hash = canonical_operator_bindings_hash(compiled.bindings);
+        const auto executable_hash = compiled_pack_executable_hash(compiled, "windows-x64-v1");
+        GenerationSnapshot active {
+            .request = generation(1, compiled.source_digest.value),
+            .phase = GenerationPhase::active,
+            .target_nodes = {"node-a"},
+            .reports = {{.node_id = "node-a",
+                         .node_lease_fence = 17,
+                         .success = true,
+                         .semantic_hash = compiled.semantic_hash,
+                         .binding_hash = binding_hash,
+                         .executable_hash = executable_hash,
+                         .capability_hashes = {},
+                         .diagnostics = {}}},
+            .semantic_hash = compiled.semantic_hash,
+            .binding_hash = binding_hash,
+            .requeued_work = {},
+            .failure = {},
+        };
+        REQUIRE(qualify_resident_compilation(active, "node-a", "windows-x64-v1", compiled).has_value());
+
+        auto changed = compiled;
+        changed.semantic_hash = "fnv1a64:0000000000000003";
+        const auto semantic_mismatch = qualify_resident_compilation(active, "node-a", "windows-x64-v1", changed);
+        REQUIRE_FALSE(semantic_mismatch.has_value());
+        REQUIRE(semantic_mismatch.error().code == StoreErrorCode::incompatible_schema);
+
+        auto restarted = active;
+        restarted.reports.front().node_lease_fence = 9U;
+        REQUIRE(qualify_resident_compilation(restarted, "node-a", "windows-x64-v1", compiled).has_value());
+    }
+
     TEST_CASE("authorized admin facade fails closed before touching persistence") {
         CountingControlStore store;
         DurableActivationAdmin durable {store};
@@ -753,9 +801,9 @@ namespace {
             REQUIRE((*store)
                         ->transact_event(transaction("durable-event", "durable:peer", 0, 3, 0, true, true))
                         .has_value());
-            const auto agent_lease = (*store)->claim_lease(
-                LeaseResource {.scope = "agent-session", .key = "tenant-durable/peer-durable"},
-                "session-durable", 10, 100);
+            const auto agent_lease =
+                (*store)->claim_lease(LeaseResource {.scope = "agent-session", .key = "tenant-durable/peer-durable"},
+                                      "session-durable", 10, 100);
             REQUIRE(agent_lease.has_value());
             REQUIRE((*store)
                         ->transact_agent_message(AgentMessageCommit {
@@ -796,9 +844,8 @@ namespace {
                     })
                     ->size() == 2);
         REQUIRE((*reopened)->inspect()->outbox.size() == 1);
-        const AgentStreamId durable_stream {.tenant = TenantId {"tenant-durable"},
-                                            .peer = PeerId {"peer-durable"},
-                                            .agent_epoch = "epoch-durable"};
+        const AgentStreamId durable_stream {
+            .tenant = TenantId {"tenant-durable"}, .peer = PeerId {"peer-durable"}, .agent_epoch = "epoch-durable"};
         REQUIRE((*reopened)->load_agent_receipt(durable_stream) == 1);
         REQUIRE((*reopened)->inspect()->agent_messages.size() == 1);
     }
@@ -1318,8 +1365,8 @@ namespace {
             .peer = PeerId {"peer-crash"},
             .agent_epoch = "epoch-crash",
         };
-        const auto lease = store.claim_lease(
-            LeaseResource {.scope = "agent-session", .key = "tenant-crash/peer-crash"}, "session-crash", 10, 100);
+        const auto lease = store.claim_lease(LeaseResource {.scope = "agent-session", .key = "tenant-crash/peer-crash"},
+                                             "session-crash", 10, 100);
         REQUIRE(lease.has_value());
         const AgentMessageCommit message {
             .stream = stream,

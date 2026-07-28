@@ -4,6 +4,7 @@ add_library(
     ast_json.cpp
     frontend.cpp
     operands.cpp
+    source_pack_compiler.cpp
     worker_adapter.cpp
 )
 add_library(rule_engine::python_compiler ALIAS rule_engine_python_compiler)

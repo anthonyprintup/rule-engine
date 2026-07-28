@@ -25,6 +25,7 @@ target_link_libraries(
 add_library(
     rule_engine_python_executable_support
     benchmark.cpp
+    resident_evaluator.cpp
     resident_service.cpp
     server.cpp
 )
@@ -153,10 +154,26 @@ if(BUILD_TESTING)
             $<$<AND:$<COMPILE_LANG_AND_ID:CXX,Clang>,$<CXX_COMPILER_FRONTEND_VARIANT:GNU>>:-Wno-c2y-extensions>
     )
 
+    add_executable(
+        rule_engine_python_resident_evaluator_tests
+        "${PROJECT_SOURCE_DIR}/tests/python_resident_evaluator_tests.cpp"
+    )
+    target_link_libraries(
+        rule_engine_python_resident_evaluator_tests
+        PRIVATE
+            Catch2::Catch2WithMain
+            rule_engine_test_options
+            rule_engine::python_executable_support
+    )
+
     add_test(NAME rule_engine_python_tools_tests COMMAND $<TARGET_FILE:rule_engine_python_tools_tests>)
     add_test(
         NAME rule_engine_python_executable_surface_tests
         COMMAND $<TARGET_FILE:rule_engine_python_executable_surface_tests>
+    )
+    add_test(
+        NAME rule_engine_python_resident_evaluator_tests
+        COMMAND $<TARGET_FILE:rule_engine_python_resident_evaluator_tests>
     )
     add_test(
         NAME rule_engine_python_tools_executable_smoke

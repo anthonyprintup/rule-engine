@@ -695,8 +695,8 @@ namespace rule_engine::python::tools {
             .peer = job.peer.peer,
             .session_fence = session->session_fence,
             .acknowledged_sequence = session->acknowledged_through,
-            .schemas = {},
-            .capabilities = {},
+            .schemas = session->schemas,
+            .capabilities = session->capabilities,
             .credit = session->credit,
             .heartbeat_interval_ms = static_cast<std::uint64_t>(limits_.maximum_session_duration.count()),
         };
@@ -711,40 +711,43 @@ namespace rule_engine::python::tools {
         const auto peer_work_limit = (std::min) ({limits_.maximum_inflight_work_per_session,
                                                   static_cast<std::size_t>(hello.receive_limit.work_attempts),
                                                   static_cast<std::size_t>(hello.receive_limit.messages)});
-        auto work = agents_.take_work(*session, peer_work_limit, cancellation);
-        if (!work || work->size() > peer_work_limit) {
-            return;
-        }
         std::uint64_t server_sequence {};
         std::size_t sent_work_bytes {};
         constexpr auto maximum_size = (std::numeric_limits<std::size_t>::max)();
         const auto peer_byte_limit =
             static_cast<std::size_t>((std::min) (hello.receive_limit.bytes, static_cast<std::uint64_t>(maximum_size)));
-        for (auto &lease : *work) {
-            lease.session = session->session;
-            lease.peer = job.peer.peer;
-            lease.session_fence = session->session_fence;
-            lease.server_sequence = ++server_sequence;
-            IgnoreCancel cancel;
-            auto valid = runtime::ProtocolV2ProviderResponsePort::create(lease, cancel);
-            if (!valid || outstanding.contains(lease.work_id) ||
-                outstanding.size() >= limits_.maximum_inflight_work_per_session) {
-                return;
+        const auto send_work = [&](std::vector<protocol_v2::WorkLeaseMessage> work) {
+            for (auto &lease : work) {
+                lease.session = session->session;
+                lease.peer = job.peer.peer;
+                lease.session_fence = session->session_fence;
+                lease.server_sequence = ++server_sequence;
+                IgnoreCancel cancel;
+                auto valid = runtime::ProtocolV2ProviderResponsePort::create(lease, cancel);
+                if (!valid || outstanding.contains(lease.work_id) ||
+                    outstanding.size() >= limits_.maximum_inflight_work_per_session) {
+                    return false;
+                }
+                const auto message_id = "server:" + session->session.value + ":work:" + std::to_string(server_sequence);
+                auto outbound = server_envelope(*session, message_id, lease);
+                auto measured = protocol_v2::encode_frame(
+                    outbound, protocol_v2::ProtocolLimits {.maximum_frame_bytes = limits_.maximum_frame_bytes});
+                if (!measured || sent_work_bytes > peer_byte_limit ||
+                    measured->size() > peer_byte_limit - sent_work_bytes) {
+                    return false;
+                }
+                sent_work_bytes += measured->size();
+                if (auto sent = job.channel->send_protocol(outbound, bounded_deadline(session_deadline), cancellation);
+                    !sent) {
+                    return false;
+                }
+                outstanding.emplace(lease.work_id, std::move(lease));
             }
-            const auto message_id = "server:" + session->session.value + ":work:" + std::to_string(server_sequence);
-            auto outbound = server_envelope(*session, message_id, lease);
-            auto measured = protocol_v2::encode_frame(
-                outbound, protocol_v2::ProtocolLimits {.maximum_frame_bytes = limits_.maximum_frame_bytes});
-            if (!measured || sent_work_bytes > peer_byte_limit ||
-                measured->size() > peer_byte_limit - sent_work_bytes) {
-                return;
-            }
-            sent_work_bytes += measured->size();
-            if (auto sent = job.channel->send_protocol(outbound, bounded_deadline(session_deadline), cancellation);
-                !sent) {
-                return;
-            }
-            outstanding.emplace(lease.work_id, std::move(lease));
+            return true;
+        };
+        auto work = agents_.take_work(*session, peer_work_limit, cancellation);
+        if (!work || work->size() > peer_work_limit || !send_work(std::move(*work))) {
+            return;
         }
 
         for (std::size_t count = 0U;
@@ -825,6 +828,13 @@ namespace rule_engine::python::tools {
                         bounded_deadline(session_deadline), cancellation);
                     !sent) {
                     return;
+                }
+                const auto available = peer_work_limit - outstanding.size();
+                if (available != 0U) {
+                    auto more = agents_.take_work(*session, available, cancellation);
+                    if (!more || more->size() > available || !send_work(std::move(*more))) {
+                        return;
+                    }
                 }
             }
         }

@@ -1483,4 +1483,18 @@ namespace rule_engine::python::packaging {
         REQUIRE(mismatch.error().code == PackagingErrorCode::generator_nondeterministic);
     }
 
+    TEST_CASE("source-pack registry paths are canonical and cannot escape the configured root") {
+        const auto root = std::filesystem::absolute("registry-root").lexically_normal();
+        const auto digest = SourceDigest {"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"};
+        const auto path = content_addressed_source_pack_path(root, digest);
+        REQUIRE(path.has_value());
+        REQUIRE(*path == root / "sha256" / "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.rpack");
+
+        CHECK_FALSE(content_addressed_source_pack_path(root, SourceDigest {"sha256:../../outside"}).has_value());
+        CHECK_FALSE(content_addressed_source_pack_path(
+                        root, SourceDigest {"sha256:ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789"})
+                        .has_value());
+        CHECK_FALSE(content_addressed_source_pack_path("relative", digest).has_value());
+    }
+
 } // namespace rule_engine::python::packaging

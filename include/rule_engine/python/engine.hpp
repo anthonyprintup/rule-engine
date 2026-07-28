@@ -35,6 +35,14 @@ namespace rule_engine::python {
         bool committed {};
     };
 
+    // Pure server-boundary projection shared by RuntimeEngine and resident
+    // cluster scheduling. It validates emitted events and materializes state,
+    // journal, and outbox rows without performing persistence.
+    [[nodiscard]] std::expected<RuntimeTransaction, EngineError>
+    project_runtime_transaction(EventEnvelope input, CursorAdvance cursor, const VmInvocation &invocation,
+                                const CompiledPack &pack, const EvaluationResult &evaluation,
+                                std::uint64_t fence_token);
+
     struct RuntimeEngine {
         RuntimeEngine(PackCompiler &compiler, VmFactory &vm_factory, IProviderDispatcher &providers,
                       IRuntimeStore &store) noexcept;

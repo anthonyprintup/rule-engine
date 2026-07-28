@@ -182,5 +182,9 @@ namespace rule_engine::python::packaging {
     [[nodiscard]] std::expected<LoadedSourcePack, PackagingError>
     read_verify_and_load_source_pack(const std::filesystem::path &path, const TrustPolicy &policy,
                                      const SignatureVerifier &signature_verifier, const SourcePackLimits &limits = {});
+    // Immutable registry layout: ROOT/sha256/<64-lowercase-hex>.rpack. The
+    // digest is the verified source-closure identity used by activation.
+    [[nodiscard]] std::expected<std::filesystem::path, PackagingError>
+    content_addressed_source_pack_path(const std::filesystem::path &root, const SourceDigest &closure_digest);
 
 } // namespace rule_engine::python::packaging

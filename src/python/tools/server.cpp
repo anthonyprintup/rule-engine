@@ -1,6 +1,8 @@
 #include "rule_engine/python/tools/server.hpp"
 
 #include "rule_engine/python/cluster/configuration.hpp"
+#include "rule_engine/python/compiler.hpp"
+#include "rule_engine/python/tools/resident_evaluator.hpp"
 
 #include <asio/ip/address.hpp>
 
@@ -1056,12 +1058,83 @@ final activation flip; other control-plane operations remain CLI/backend work.
         };
 
         struct StoreBackedAgentSessionBackend final: IResidentAgentBackend {
-            StoreBackedAgentSessionBackend(cluster::IClusterRuntimeStore &store, std::string node_id,
-                                           const std::chrono::milliseconds lease_duration,
+            StoreBackedAgentSessionBackend(cluster::IClusterRuntimeStore &store, cluster::AuditTrail &audit,
+                                           std::string node_id, const std::chrono::milliseconds lease_duration,
                                            const protocol_v2::CreditWindow credit,
                                            const std::size_t maximum_frame_bytes) noexcept:
-                store_ {store}, node_id_ {std::move(node_id)}, lease_duration_ {lease_duration}, credit_ {credit},
+                store_ {store},
+                audit_ {audit},
+                node_id_ {std::move(node_id)},
+                lease_duration_ {lease_duration},
+                credit_ {credit},
                 protocol_limits_ {.maximum_frame_bytes = maximum_frame_bytes} {}
+
+            [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
+            activate(const std::span<const ResidentActivePack> packs) noexcept override {
+                if (scheduler_) {
+                    return std::unexpected(protocol_v2::ProtocolError {
+                        .code = protocol_v2::ProtocolErrorCode::stale_generation,
+                        .message = "resident active packs were already installed",
+                    });
+                }
+                if (packs.empty()) {
+                    return {};
+                }
+                std::map<std::string, protocol_v2::SchemaAdvertisement, std::less<>> schemas;
+                std::set<std::string, std::less<>> required_schemas;
+                std::set<std::string, std::less<>> required_capabilities;
+                for (const auto &pack : packs) {
+                    for (const auto &descriptor : pack.compilation.pack.schemas.descriptors) {
+                        const protocol_v2::SchemaAdvertisement advertisement {
+                            .schema = descriptor.id,
+                            .major = 1U,
+                            .canonical_hash = descriptor.canonical_hash,
+                        };
+                        const auto [position, inserted] = schemas.emplace(descriptor.id.value, advertisement);
+                        if (!inserted && (position->second.major != advertisement.major ||
+                                          position->second.canonical_hash != advertisement.canonical_hash)) {
+                            return std::unexpected(protocol_v2::ProtocolError {
+                                .code = protocol_v2::ProtocolErrorCode::schema_mismatch,
+                                .message = "active packs disagree on one schema identity",
+                            });
+                        }
+                    }
+                    for (const auto &symbol : pack.compilation.symbols) {
+                        if (!symbol.subject_schema.empty()) {
+                            required_schemas.insert(symbol.subject_schema.value);
+                        }
+                    }
+                    for (const auto &requirement : pack.compilation.fact_requirements) {
+                        required_schemas.insert(requirement.expected_schema.value);
+                    }
+                    for (const auto &binding : pack.compilation.pack.bindings) {
+                        for (const auto &capability : binding.capabilities) {
+                            required_capabilities.insert(capability.value);
+                        }
+                    }
+                }
+                for (const auto &required : required_schemas) {
+                    if (!schemas.contains(required)) {
+                        return std::unexpected(protocol_v2::ProtocolError {
+                            .code = protocol_v2::ProtocolErrorCode::schema_mismatch,
+                            .message = "active pack requires a schema absent from its canonical catalog",
+                        });
+                    }
+                }
+                auto scheduler = ResidentEvaluationScheduler::create(
+                    store_, audit_, node_id_, lease_duration_,
+                    std::vector<ResidentActivePack> {packs.begin(), packs.end()}, protocol_limits_);
+                if (!scheduler) {
+                    return std::unexpected(std::move(scheduler.error()));
+                }
+                schema_advertisements_.clear();
+                schema_advertisements_.reserve(schemas.size());
+                for (auto &[_, advertisement] : schemas) { schema_advertisements_.push_back(std::move(advertisement)); }
+                required_schemas_ = std::move(required_schemas);
+                required_capabilities_ = std::move(required_capabilities);
+                scheduler_ = std::move(*scheduler);
+                return {};
+            }
 
             [[nodiscard]] std::expected<ResidentAgentSession, protocol_v2::ProtocolError>
             establish(const protocol_v2::AuthenticatedPeer &peer, const protocol_v2::AgentHelloMessage &hello,
@@ -1098,30 +1171,69 @@ final activation flip; other control-plane operations remain CLI/backend work.
                         .message = "durable agent receipt could not be loaded",
                     });
                 }
+                std::vector<protocol_v2::SchemaAdvertisement> selected_schemas;
+                for (const auto &required : required_schemas_) {
+                    const auto server = std::ranges::find(schema_advertisements_, SchemaId {required},
+                                                          &protocol_v2::SchemaAdvertisement::schema);
+                    const auto agent = std::ranges::find(hello.schemas, SchemaId {required},
+                                                         &protocol_v2::SchemaAdvertisement::schema);
+                    if (server == schema_advertisements_.end() || agent == hello.schemas.end() ||
+                        server->major != agent->major || server->canonical_hash != agent->canonical_hash) {
+                        static_cast<void>(store_.release_lease(*lease, now_unix_ms()));
+                        return std::unexpected(protocol_v2::ProtocolError {
+                            .code = protocol_v2::ProtocolErrorCode::schema_mismatch,
+                            .message = "agent does not advertise an exact schema required by active packs",
+                        });
+                    }
+                    selected_schemas.push_back(*server);
+                }
+                std::vector<protocol_v2::CapabilityAdvertisement> selected_capabilities;
+                for (const auto &required : required_capabilities_) {
+                    const auto capability = std::ranges::find(hello.capabilities, CapabilityId {required},
+                                                              &protocol_v2::CapabilityAdvertisement::capability);
+                    if (capability == hello.capabilities.end()) {
+                        static_cast<void>(store_.release_lease(*lease, now_unix_ms()));
+                        return std::unexpected(protocol_v2::ProtocolError {
+                            .code = protocol_v2::ProtocolErrorCode::capability_mismatch,
+                            .message = "agent does not advertise a capability required by active packs",
+                        });
+                    }
+                    selected_capabilities.push_back(*capability);
+                }
                 {
                     std::scoped_lock lock {mutex_};
                     sessions_.emplace(session_id, *lease);
                 }
-                return ResidentAgentSession {
+                ResidentAgentSession session {
                     .authenticated_peer = peer,
                     .session = SessionId {session_id},
                     .session_fence = lease->fence,
                     .agent_epoch = hello.agent_epoch,
                     .acknowledged_through = *acknowledged,
                     .credit = credit_,
+                    .schemas = std::move(selected_schemas),
+                    .capabilities = std::move(selected_capabilities),
                 };
+                if (scheduler_) {
+                    auto bound = scheduler_->bind_session(session);
+                    if (!bound) {
+                        close(session);
+                        return std::unexpected(std::move(bound.error()));
+                    }
+                }
+                return session;
             }
 
             [[nodiscard]] std::expected<std::vector<protocol_v2::WorkLeaseMessage>, protocol_v2::ProtocolError>
-            take_work(const ResidentAgentSession &, const std::size_t,
+            take_work(const ResidentAgentSession &session, const std::size_t limit,
                       const std::stop_token cancellation) noexcept override {
                 if (cancellation.stop_requested()) {
                     return std::unexpected(protocol_v2::ProtocolError {.code = protocol_v2::ProtocolErrorCode::canceled,
                                                                        .message = "agent work poll canceled"});
                 }
-                // No event-to-compiled-pack scheduler exists in the current
-                // composition. Returning no work is safe and keeps C++ as the
-                // only future owner of semantic requests.
+                if (scheduler_) {
+                    return scheduler_->take_work(session, limit, cancellation);
+                }
                 return std::vector<protocol_v2::WorkLeaseMessage> {};
             }
 
@@ -1152,10 +1264,19 @@ final activation flip; other control-plane operations remain CLI/backend work.
                 if (!receipt) {
                     return std::unexpected(store_protocol_error(receipt.error()));
                 }
+                if (scheduler_) {
+                    auto ingested = scheduler_->ingest(session, sequence, body, cancellation);
+                    if (!ingested) {
+                        return std::unexpected(std::move(ingested.error()));
+                    }
+                }
                 return DurableAgentReceipt {.acknowledged_through = receipt->acknowledged_through, .credit = credit_};
             }
 
             void close(const ResidentAgentSession &session) noexcept override {
+                if (scheduler_) {
+                    scheduler_->close(session);
+                }
                 std::optional<cluster::FencedLease> lease;
                 {
                     std::scoped_lock lock {mutex_};
@@ -1197,6 +1318,7 @@ final activation flip; other control-plane operations remain CLI/backend work.
             }
 
             cluster::IClusterRuntimeStore &store_;
+            cluster::AuditTrail &audit_;
             std::string node_id_;
             std::chrono::milliseconds lease_duration_;
             protocol_v2::CreditWindow credit_;
@@ -1204,6 +1326,10 @@ final activation flip; other control-plane operations remain CLI/backend work.
             std::atomic<std::uint64_t> next_session_ {};
             std::mutex mutex_;
             std::map<std::string, cluster::FencedLease, std::less<>> sessions_;
+            std::unique_ptr<ResidentEvaluationScheduler> scheduler_;
+            std::vector<protocol_v2::SchemaAdvertisement> schema_advertisements_;
+            std::set<std::string, std::less<>> required_schemas_;
+            std::set<std::string, std::less<>> required_capabilities_;
         };
 
         [[nodiscard]] std::expected<cluster::StoreBackendCapabilities, ToolFailure>
@@ -1326,8 +1452,7 @@ final activation flip; other control-plane operations remain CLI/backend work.
         };
 
         [[nodiscard]] ActivationQualification qualify_control_state(const cluster::DurableControlState &state,
-                                                                    const ServerConfig &config,
-                                                                    const std::uint64_t node_lease_fence) {
+                                                                    const ServerConfig &config) {
             ActivationQualification result;
             if (state.packs.empty()) {
                 result.active_generation_compiled = config.allow_empty_activation;
@@ -1363,9 +1488,8 @@ final activation flip; other control-plane operations remain CLI/backend work.
                 const auto report = std::ranges::find_if(generation->reports, [&config](const auto &candidate) {
                     return candidate.node_id == config.node_id;
                 });
-                if (report == generation->reports.end() || !report->success ||
-                    report->node_lease_fence != node_lease_fence || report->executable_hash.empty() ||
-                    report->semantic_hash != generation->semantic_hash ||
+                if (report == generation->reports.end() || !report->success || report->node_lease_fence == 0U ||
+                    report->executable_hash.empty() || report->semantic_hash != generation->semantic_hash ||
                     report->binding_hash != generation->binding_hash) {
                     result.active_generation_compiled = false;
                     continue;
@@ -1375,6 +1499,102 @@ final activation flip; other control-plane operations remain CLI/backend work.
                         result.required_capabilities_available = false;
                     }
                 }
+            }
+            return result;
+        }
+
+        [[nodiscard]] std::expected<std::vector<ResidentActivePack>, ToolFailure>
+        compile_active_generations(const cluster::DurableControlState &state, const ResidentServerContext &context) {
+            std::vector<ResidentActivePack> result;
+            if (state.packs.empty()) {
+                if (context.config.allow_empty_activation) {
+                    return result;
+                }
+                return std::unexpected(
+                    unavailable("SRV-ACTIVATION-EMPTY", "no active source-pack generation is configured"));
+            }
+
+            std::error_code filesystem_error;
+            const auto temporary_root = std::filesystem::temp_directory_path(filesystem_error);
+            const auto temporary_status = std::filesystem::symlink_status(temporary_root, filesystem_error);
+            if (filesystem_error || !std::filesystem::is_directory(temporary_status) ||
+                std::filesystem::is_symlink(temporary_status)) {
+                return std::unexpected(
+                    unavailable("SRV-WORKER-TEMP", "the private parser worker temporary root is unavailable"));
+            }
+            packaging::WindowsJobWorkerLauncher launcher;
+            launcher.temporary_root = temporary_root;
+            packaging::WorkerClient worker {.runtime = context.runtime, .launcher = launcher, .limits = {}};
+            packaging::OpenSsl3Ed25519Verifier verifier;
+            verifier.crypto_library = context.runtime.crypto_library;
+
+            result.reserve(state.packs.size());
+            for (const auto &pack : state.packs) {
+                if (!pack.active_generation || !pack.accepting_assignments || pack.drain_target) {
+                    return std::unexpected(
+                        unavailable("SRV-ACTIVATION-STATE", "pack control is not in a stable active assignment state"));
+                }
+                const auto generation = std::ranges::find_if(state.generations, [&pack](const auto &candidate) {
+                    return candidate.request.pack == pack.pack &&
+                           candidate.request.generation == *pack.active_generation;
+                });
+                if (generation == state.generations.end() || generation->phase != cluster::GenerationPhase::active ||
+                    !generation->request.signature_verified) {
+                    return std::unexpected(unavailable("SRV-ACTIVATION-GENERATION",
+                                                       "active pack generation evidence is absent or incomplete"));
+                }
+                if (!generation->target_nodes.empty() &&
+                    std::ranges::find(generation->target_nodes, context.config.node_id) ==
+                        generation->target_nodes.end()) {
+                    return std::unexpected(unavailable("SRV-ACTIVATION-TARGET",
+                                                       "active pack generation does not target this resident node"));
+                }
+
+                auto path = packaging::content_addressed_source_pack_path(context.config.pack_registry_path,
+                                                                          generation->request.source_digest);
+                if (!path) {
+                    return std::unexpected(unavailable("SRV-PACK-REGISTRY-IDENTITY",
+                                                       "active generation has a noncanonical source-pack digest"));
+                }
+                auto archive = packaging::read_canonical_source_pack(*path);
+                if (!archive) {
+                    return std::unexpected(unavailable("SRV-PACK-REGISTRY-READ",
+                                                       "the active content-addressed source pack is unavailable"));
+                }
+                auto loaded = packaging::verify_and_load_source_pack(*archive, context.pack_trust_policy, verifier);
+                if (!loaded) {
+                    return std::unexpected(
+                        unavailable("SRV-PACK-TRUST", "the active source pack failed canonical trust verification"));
+                }
+                if (loaded->manifest.pack != generation->request.pack ||
+                    loaded->manifest.version != generation->request.version ||
+                    loaded->closure_digest != generation->request.source_digest) {
+                    return std::unexpected(unavailable(
+                        "SRV-PACK-IDENTITY", "the registry source pack does not match the active generation"));
+                }
+
+                auto compiled = compiler::compile_source_pack(*loaded, *archive, worker);
+                if (!compiled) {
+                    return std::unexpected(ToolFailure {
+                        .kind = compiled.error().kind == compiler::SourcePackCompileErrorKind::authorization ?
+                                    ToolFailureKind::authorization :
+                                    ToolFailureKind::operation,
+                        .code = "SRV-" + compiled.error().code,
+                        .message = "the active source pack did not compile under the exact private runtime",
+                        .diagnostics = std::move(compiled.error().diagnostics),
+                    });
+                }
+                auto qualified = cluster::qualify_resident_compilation(
+                    *generation, context.config.node_id, context.config.platform_abi, compiled->artifact.pack);
+                if (!qualified) {
+                    return std::unexpected(
+                        unavailable("SRV-COMPILATION-IDENTITY",
+                                    "fresh resident compilation differs from finalized activation evidence"));
+                }
+                result.push_back(ResidentActivePack {
+                    .generation = generation->request.generation,
+                    .compilation = std::move(compiled->artifact),
+                });
             }
             return result;
         }
@@ -1922,7 +2142,18 @@ final activation flip; other control-plane operations remain CLI/backend work.
             return std::unexpected(
                 unavailable("SRV-ACTIVATION-LOAD", "durable active-generation state could not be loaded"));
         }
-        const auto activation = qualify_control_state(*control_state, context.config, impl_->node_lease->fence);
+        const auto activation = qualify_control_state(*control_state, context.config);
+        auto active_compilations = compile_active_generations(*control_state, context);
+        if (!active_compilations) {
+            static_cast<void>(impl_->release_node_lease());
+            return std::unexpected(std::move(active_compilations.error()));
+        }
+        auto activated_agent = context.agent_backend->activate(*active_compilations);
+        if (!activated_agent) {
+            static_cast<void>(impl_->release_node_lease());
+            return std::unexpected(unavailable("SRV-EVALUATION-SCHEDULER",
+                                               "active packs could not be installed in the resident scheduler"));
+        }
         auto current = context.store.lease_is_current(*impl_->node_lease, now_unix_ms());
         const auto node_lease_current = current && *current;
 
@@ -2210,9 +2441,12 @@ final activation flip; other control-plane operations remain CLI/backend work.
         if (!health.driver_available || !health.connected || !health.migrations_compatible) {
             return failure_output(unavailable("SRV-STORE-NOT-READY", health.detail));
         }
-        StoreBackedAgentSessionBackend agent_backend {**store, config->node_id, config->lease_duration,
-                                                       config->service.inbound_credit,
-                                                       config->service.maximum_frame_bytes};
+        StoreBackedAgentSessionBackend agent_backend {**store,
+                                                      audit,
+                                                      config->node_id,
+                                                      config->lease_duration,
+                                                      config->service.inbound_credit,
+                                                      config->service.maximum_frame_bytes};
         FileAdminSecurityAudit admin_security_audit {config->audit_path};
         AuthorizedResidentAdminBackend admin_backend {**activation_store, **operator_bindings, &admin_security_audit};
         const ResidentServerContext context {

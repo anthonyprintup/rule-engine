@@ -96,6 +96,46 @@ namespace rule_engine::python {
         return step;
     }
 
+    std::expected<RuntimeTransaction, EngineError>
+    project_runtime_transaction(EventEnvelope input, CursorAdvance cursor, const VmInvocation &invocation,
+                                const CompiledPack &pack, const EvaluationResult &evaluation,
+                                const std::uint64_t fence_token) {
+        std::vector<EventEnvelope> emitted_events;
+        if (!evaluation.committed_events.empty()) {
+            auto projected = project_committed_events(input, invocation, pack.schemas, evaluation.committed_events);
+            if (!projected) {
+                return std::unexpected(EngineError {.code = EngineErrorCode::event_projection_failure,
+                                                    .message = projected.error().message,
+                                                    .store = std::nullopt,
+                                                    .event = std::move(projected.error())});
+            }
+            emitted_events = std::move(*projected);
+        }
+
+        RuntimeTransaction transaction {
+            .input = std::move(input),
+            .cursor = std::move(cursor),
+            .evaluation = evaluation,
+            .state = evaluation.state_mutations,
+            .emitted_events = std::move(emitted_events),
+            .journal = evaluation.committed_effects,
+            .outbox = {},
+            .fence_token = fence_token,
+        };
+        transaction.outbox.reserve(transaction.journal.size());
+        for (const auto &intent : transaction.journal) {
+            if (intent.disposition != EffectDisposition::committed) {
+                continue;
+            }
+            transaction.outbox.push_back(OutboxRecord {.intent = intent.id,
+                                                       .destination = intent.kind,
+                                                       .payload = intent.payload,
+                                                       .idempotency_key = intent.idempotency_key,
+                                                       .not_before_unix_ms = 0});
+        }
+        return transaction;
+    }
+
     std::expected<TransactionReceipt, EngineError> RuntimeEngine::commit(EvaluationHandle &evaluation,
                                                                          EventEnvelope input, CursorAdvance cursor,
                                                                          const std::uint64_t fence_token) {
@@ -112,42 +152,13 @@ namespace rule_engine::python {
                                                 .event = std::nullopt});
         }
 
-        std::vector<EventEnvelope> emitted_events;
-        if (!evaluation.terminal_result->committed_events.empty()) {
-            auto projected = project_committed_events(input, evaluation.invocation, evaluation.pack->schemas,
-                                                      evaluation.terminal_result->committed_events);
-            if (!projected) {
-                return std::unexpected(EngineError {.code = EngineErrorCode::event_projection_failure,
-                                                    .message = projected.error().message,
-                                                    .store = std::nullopt,
-                                                    .event = std::move(projected.error())});
-            }
-            emitted_events = std::move(*projected);
+        auto transaction = project_runtime_transaction(std::move(input), std::move(cursor), evaluation.invocation,
+                                                       *evaluation.pack, *evaluation.terminal_result, fence_token);
+        if (!transaction) {
+            return std::unexpected(std::move(transaction.error()));
         }
 
-        RuntimeTransaction transaction {
-            .input = std::move(input),
-            .cursor = std::move(cursor),
-            .evaluation = *evaluation.terminal_result,
-            .state = evaluation.terminal_result->state_mutations,
-            .emitted_events = std::move(emitted_events),
-            .journal = evaluation.terminal_result->committed_effects,
-            .outbox = {},
-            .fence_token = fence_token,
-        };
-        transaction.outbox.reserve(transaction.journal.size());
-        for (const auto &intent : transaction.journal) {
-            if (intent.disposition != EffectDisposition::committed) {
-                continue;
-            }
-            transaction.outbox.push_back(OutboxRecord {.intent = intent.id,
-                                                       .destination = intent.kind,
-                                                       .payload = intent.payload,
-                                                       .idempotency_key = intent.idempotency_key,
-                                                       .not_before_unix_ms = 0});
-        }
-
-        auto receipt = store_.transact_event(transaction);
+        auto receipt = store_.transact_event(*transaction);
         if (!receipt) {
             return std::unexpected(EngineError {.code = EngineErrorCode::store_failure,
                                                 .message = receipt.error().message,

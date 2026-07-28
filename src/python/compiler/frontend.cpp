@@ -633,6 +633,8 @@ namespace rule_engine::python::compiler {
             symbols.push_back(BoundSymbol {.module = module,
                                            .name = name,
                                            .qualified_name = qualified_name,
+                                           .executable = {},
+                                           .subject_schema = {},
                                            .kind = SymbolKind::model,
                                            .type = {.kind = StaticTypeKind::model, .qualified_name = qualified_name},
                                            .span = node.span,
@@ -666,6 +668,8 @@ namespace rule_engine::python::compiler {
                     .module = current_module,
                     .name = bound_name,
                     .qualified_name = name,
+                    .executable = {},
+                    .subject_schema = {},
                     .kind = SymbolKind::imported,
                     .type = {.kind = StaticTypeKind::unknown, .qualified_name = "module"},
                     .span = alias->span,
@@ -703,6 +707,8 @@ namespace rule_engine::python::compiler {
                     .module = current_module,
                     .name = as_name.empty() ? name : as_name,
                     .qualified_name = std::move(qualified_name),
+                    .executable = {},
+                    .subject_schema = {},
                     .kind = SymbolKind::imported,
                     .type = {.kind = StaticTypeKind::unknown, .qualified_name = "imported"},
                     .span = alias->span,
@@ -900,6 +906,8 @@ namespace rule_engine::python::compiler {
                             "PY-ID-DUPLICATE", "reportable stable ID '" + executable.value + "' is not unique",
                             statement->span));
                     }
+                    const auto subject_schema =
+                        parameters.empty() ? SchemaId {} : SchemaId {parameters.front().second.qualified_name};
                     functions.push_back(FunctionModel {
                         .module = module.name,
                         .name = name,
@@ -918,6 +926,8 @@ namespace rule_engine::python::compiler {
                         .module = module.name,
                         .name = name,
                         .qualified_name = qualified_name,
+                        .executable = executable,
+                        .subject_schema = subject_schema,
                         .kind = decorator.kind,
                         .type = {.kind = StaticTypeKind::callable, .qualified_name = qualified_name},
                         .span = statement->span,
@@ -1029,6 +1039,23 @@ namespace rule_engine::python::compiler {
                 return std::tie(left.id.value, left.qualified_name) < std::tie(right.id.value, right.qualified_name);
             });
             return schemas;
+        }
+
+        void install_builtin_schemas(SchemaCatalog &schemas) {
+            constexpr std::array<std::string_view, 5U> builtin {"bool", "int", "float", "str", "bytes"};
+            for (const auto name : builtin) {
+                const SchemaId id {std::string {name}};
+                if (std::ranges::find(schemas.descriptors, id, &SchemaDescriptor::id) != schemas.descriptors.end()) {
+                    continue;
+                }
+                schemas.descriptors.push_back(SchemaDescriptor {
+                    .id = id,
+                    .kind = SchemaKind::fact,
+                    .qualified_name = std::string {name},
+                    .canonical_hash = canonical_schema_hash("rule-engine.schema/builtin/" + std::string {name} + "/v1"),
+                    .fields = {},
+                });
+            }
         }
 
         OperatorBindings normalize_bindings(OperatorBindings bindings) {
@@ -3024,6 +3051,7 @@ namespace rule_engine::python::compiler {
         }
 
         auto merged_schemas = schemas;
+        install_builtin_schemas(merged_schemas);
         for (auto &descriptor : generated_schemas.descriptors) {
             if (std::ranges::find(merged_schemas.descriptors, descriptor.id, &SchemaDescriptor::id) !=
                 merged_schemas.descriptors.end()) {
@@ -3038,6 +3066,19 @@ namespace rule_engine::python::compiler {
             return std::unexpected(std::move(diagnostics));
         }
         merged_schemas = normalize_schemas(std::move(merged_schemas));
+        for (auto &symbol : symbols) {
+            if (symbol.subject_schema.empty()) {
+                continue;
+            }
+            const auto local = SchemaId {symbol.module + "." + symbol.subject_schema.value};
+            const auto descriptor = std::ranges::find_if(merged_schemas.descriptors, [&](const auto &candidate) {
+                return candidate.id == symbol.subject_schema || candidate.id == local ||
+                       candidate.qualified_name == symbol.subject_schema.value;
+            });
+            if (descriptor != merged_schemas.descriptors.end()) {
+                symbol.subject_schema = descriptor->id;
+            }
+        }
         std::string schema_identity = merged_schemas.canonical_hash;
         for (const auto &descriptor : merged_schemas.descriptors) {
             schema_identity += '|';
@@ -3176,6 +3217,23 @@ namespace rule_engine::python::compiler {
             return std::unexpected(std::move(artifact.error()));
         }
         return std::move(artifact->pack);
+    }
+
+    OperatorBindings default_rule_bindings(const CompilationArtifact &discovery,
+                                           const std::span<const CapabilityId> required_capabilities) {
+        OperatorBindings result;
+        for (const auto &symbol : discovery.symbols) {
+            if (!symbol.public_api || (symbol.kind != SymbolKind::rule && symbol.kind != SymbolKind::correlation)) {
+                continue;
+            }
+            result.push_back(OperatorBinding {
+                .id = BindingId {symbol.executable.value},
+                .executable = symbol.executable,
+                .capabilities = {required_capabilities.begin(), required_capabilities.end()},
+                .budget = balanced_v1,
+            });
+        }
+        return normalize_bindings(std::move(result));
     }
 
     std::expected<void, DiagnosticSet> verify_compiler_output(const CompilationArtifact &artifact) {
