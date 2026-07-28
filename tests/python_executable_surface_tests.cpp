@@ -150,6 +150,7 @@ namespace {
                "service.maximum_messages_per_session = 4096\n"
                "service.maximum_inflight_work_per_session = 64\n"
                "service.maximum_session_duration_ms = 30000\n"
+               "service.work_poll_interval_ms = 250\n"
                "service.inbound_credit_bytes = 16777216\n"
                "service.inbound_credit_messages = 256\n"
                "service.inbound_credit_work_attempts = 64\n"
@@ -204,6 +205,7 @@ namespace {
                "service.maximum_messages_per_session = 4096\n"
                "service.maximum_inflight_work_per_session = 64\n"
                "service.maximum_session_duration_ms = 30000\n"
+               "service.work_poll_interval_ms = 250\n"
                "service.inbound_credit_bytes = 16777216\n"
                "service.inbound_credit_messages = 256\n"
                "service.inbound_credit_work_attempts = 64\n"
@@ -449,6 +451,12 @@ TEST_CASE("server configuration parser bounds hostile input and duplicate state"
     REQUIRE_FALSE(unsafe_service.has_value());
     CHECK(unsafe_service.error().code == "SRV-CONFIG-SERVICE-BOUNDS");
 
+    auto slow_work_poll = development_config(temporary);
+    replace_once(slow_work_poll, "service.work_poll_interval_ms = 250", "service.work_poll_interval_ms = 30001");
+    const auto unsafe_work_poll = parse_server_config(slow_work_poll);
+    REQUIRE_FALSE(unsafe_work_poll.has_value());
+    CHECK(unsafe_work_poll.error().code == "SRV-CONFIG-SERVICE-BOUNDS");
+
     auto inverted_registry_quota = development_config(temporary);
     replace_once(inverted_registry_quota, "pack.maximum_tenant_bytes = 268435456",
                  "pack.maximum_tenant_bytes = 2147483648");
@@ -667,6 +675,7 @@ namespace {
         std::deque<std::vector<std::byte>> application_input;
         std::vector<std::vector<std::byte>> protocol_output;
         std::vector<std::vector<std::byte>> application_output;
+        std::stop_source *stop_after_work {};
         std::atomic<bool> shutdown {};
     };
 
@@ -674,7 +683,8 @@ namespace {
         explicit FakeByteChannel(std::shared_ptr<FakeChannelState> state): state_ {std::move(state)} {}
 
         [[nodiscard]] std::expected<proto::PeerEnvelope, proto::ProtocolError>
-        receive_protocol(std::chrono::steady_clock::time_point, std::stop_token cancellation) noexcept override {
+        receive_protocol(const std::chrono::steady_clock::time_point deadline,
+                         std::stop_token cancellation) noexcept override {
             if (cancellation.stop_requested()) {
                 return std::unexpected(proto::ProtocolError {.code = proto::ProtocolErrorCode::canceled,
                                                              .message = "fake channel canceled"});
@@ -683,16 +693,38 @@ namespace {
             {
                 std::scoped_lock lock {state_->mutex};
                 if (state_->protocol_input.empty()) {
-                    return std::unexpected(timeout_error());
+                    frame.clear();
+                } else {
+                    frame = std::move(state_->protocol_input.front());
+                    state_->protocol_input.pop_front();
                 }
-                frame = std::move(state_->protocol_input.front());
-                state_->protocol_input.pop_front();
+            }
+            if (frame.empty()) {
+                std::this_thread::sleep_until(deadline);
+                return std::unexpected(timeout_error());
             }
             auto decoded = proto::decode_frame(frame);
             if (!decoded) {
                 return std::unexpected(std::move(decoded.error()));
             }
             return std::move(decoded->envelope);
+        }
+
+        [[nodiscard]] std::expected<bool, proto::ProtocolError>
+        wait_protocol_input(const std::chrono::steady_clock::time_point deadline,
+                            std::stop_token cancellation) noexcept override {
+            if (cancellation.stop_requested()) {
+                return std::unexpected(
+                    proto::ProtocolError {.code = proto::ProtocolErrorCode::canceled, .message = "fake canceled"});
+            }
+            {
+                std::scoped_lock lock {state_->mutex};
+                if (!state_->protocol_input.empty()) {
+                    return true;
+                }
+            }
+            std::this_thread::sleep_until(deadline);
+            return false;
         }
 
         [[nodiscard]] std::expected<void, proto::ProtocolError>
@@ -708,6 +740,9 @@ namespace {
             }
             std::scoped_lock lock {state_->mutex};
             state_->protocol_output.push_back(std::move(*encoded));
+            if (state_->stop_after_work != nullptr && std::holds_alternative<proto::WorkLeaseMessage>(envelope.body)) {
+                state_->stop_after_work->request_stop();
+            }
             return {};
         }
 
@@ -785,8 +820,11 @@ namespace {
         std::size_t persists {};
         std::size_t closes {};
         std::size_t take_calls {};
+        std::size_t deliver_on_take_call {1U};
+        std::size_t work_batch_size {1U};
         std::size_t activation_fences {};
         bool return_invalid_session {};
+        bool work_delivered {};
 
         [[nodiscard]] std::expected<tools::ResidentAgentSession, proto::ProtocolError>
         establish(const proto::AuthenticatedPeer &peer, const proto::AgentHelloMessage &hello,
@@ -804,10 +842,12 @@ namespace {
 
         [[nodiscard]] std::expected<std::vector<proto::WorkLeaseMessage>, proto::ProtocolError>
         take_work(const tools::ResidentAgentSession &, std::size_t, std::stop_token) noexcept override {
-            if (take_calls++ != 0U) {
+            ++take_calls;
+            if (work_delivered || take_calls < deliver_on_take_call) {
                 return std::vector<proto::WorkLeaseMessage> {};
             }
-            return std::vector<proto::WorkLeaseMessage> {service_work()};
+            work_delivered = true;
+            return std::vector<proto::WorkLeaseMessage>(work_batch_size, service_work());
         }
 
         [[nodiscard]] std::expected<tools::DurableAgentReceipt, proto::ProtocolError>
@@ -846,7 +886,8 @@ namespace {
                 .maximum_frame_bytes = 4U * py::kibibyte,
                 .maximum_messages_per_session = 8U,
                 .maximum_inflight_work_per_session = 1U,
-                .maximum_session_duration = std::chrono::milliseconds {500},
+                .maximum_session_duration = std::chrono::milliseconds {100},
+                .work_poll_interval = std::chrono::milliseconds {10},
                 .inbound_credit = {
                     .bytes = 64U * py::kibibyte, .messages = 8U, .work_attempts = 1U, .snapshot_chunks = 1U}};
     }
@@ -1336,6 +1377,80 @@ TEST_CASE("resident agent service consumes framed bytes and ACKs only a durable 
     CHECK(agents.persists == 1U);
     CHECK(agents.closes == 1U);
     CHECK(state->shutdown);
+}
+
+TEST_CASE("resident agent service polls and delivers work to an otherwise idle session") {
+    AllowTrust trust;
+    DurableFakeAgentBackend agents;
+    agents.deliver_on_take_call = 2U;
+    RejectAdmin admin;
+    tools::ResidentApplicationService service {test_service_limits(), trust, agents, admin};
+    auto state = std::make_shared<FakeChannelState>();
+    std::stop_source stop;
+    state->stop_after_work = &stop;
+    enqueue_protocol(state, agent_hello_envelope());
+
+    service.run({.role = tools::ResidentSessionRole::agent,
+                 .peer = {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:test"}},
+                 .channel = std::make_unique<FakeByteChannel>(state)},
+                stop.get_token());
+
+    REQUIRE(state->protocol_output.size() == 2U);
+    const auto hello = proto::decode_frame(state->protocol_output[0]);
+    const auto work = proto::decode_frame(state->protocol_output[1]);
+    REQUIRE(hello);
+    REQUIRE(work);
+    CHECK(std::holds_alternative<proto::ServerHelloMessage>(hello->envelope.body));
+    CHECK(std::holds_alternative<proto::WorkLeaseMessage>(work->envelope.body));
+    CHECK(agents.take_calls == 2U);
+    CHECK(agents.persists == 0U);
+    CHECK(agents.closes == 1U);
+    CHECK(stop.stop_requested());
+    CHECK(state->shutdown);
+}
+
+TEST_CASE("resident idle polling enforces negotiated work and byte ceilings") {
+    AllowTrust trust;
+    RejectAdmin admin;
+
+    SECTION("backend batch cannot exceed available work slots") {
+        DurableFakeAgentBackend agents;
+        agents.deliver_on_take_call = 2U;
+        agents.work_batch_size = 2U;
+        tools::ResidentApplicationService service {test_service_limits(), trust, agents, admin};
+        auto state = std::make_shared<FakeChannelState>();
+        enqueue_protocol(state, agent_hello_envelope());
+
+        service.run({.role = tools::ResidentSessionRole::agent,
+                     .peer = {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:test"}},
+                     .channel = std::make_unique<FakeByteChannel>(state)},
+                    {});
+
+        REQUIRE(state->protocol_output.size() == 1U);
+        CHECK(agents.take_calls == 2U);
+        CHECK(agents.closes == 1U);
+        CHECK(state->shutdown);
+    }
+
+    SECTION("encoded work cannot exceed the peer byte ceiling") {
+        DurableFakeAgentBackend agents;
+        agents.deliver_on_take_call = 2U;
+        tools::ResidentApplicationService service {test_service_limits(), trust, agents, admin};
+        auto state = std::make_shared<FakeChannelState>();
+        auto hello = agent_hello_envelope();
+        std::get<proto::AgentHelloMessage>(hello.body).receive_limit.bytes = 1U;
+        enqueue_protocol(state, hello);
+
+        service.run({.role = tools::ResidentSessionRole::agent,
+                     .peer = {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:test"}},
+                     .channel = std::make_unique<FakeByteChannel>(state)},
+                    {});
+
+        REQUIRE(state->protocol_output.size() == 1U);
+        CHECK(agents.take_calls == 2U);
+        CHECK(agents.closes == 1U);
+        CHECK(state->shutdown);
+    }
 }
 
 TEST_CASE("resident agent service closes an established session that fails value validation") {
@@ -2229,4 +2344,18 @@ TEST_CASE("resident scheduler rejects overload and joins owned workers on shutdo
     CHECK(snapshot.rejected_sessions == 2U);
     CHECK(first->shutdown);
     CHECK(second->shutdown);
+}
+
+TEST_CASE("resident service limits reject zero and longer-than-session work polling") {
+    auto limits = test_service_limits();
+    limits.work_poll_interval = std::chrono::milliseconds::zero();
+    auto zero = tools::validate_resident_service_limits(limits);
+    REQUIRE_FALSE(zero.has_value());
+    CHECK(zero.error().code == proto::ProtocolErrorCode::limit_exceeded);
+
+    limits = test_service_limits();
+    limits.work_poll_interval = limits.maximum_session_duration + std::chrono::milliseconds {1};
+    auto too_slow = tools::validate_resident_service_limits(limits);
+    REQUIRE_FALSE(too_slow.has_value());
+    CHECK(too_slow.error().code == proto::ProtocolErrorCode::limit_exceeded);
 }

@@ -418,6 +418,47 @@ namespace rule_engine::python::protocol_v2 {
             .deadline = (std::min) (deadline, deadline_after(impl_->timeouts.read)), .cancellation = cancellation});
     }
 
+    std::expected<bool, ProtocolError>
+    TlsPeerConnection::wait_readable_until(const Clock::time_point deadline,
+                                           const std::stop_token cancellation) noexcept {
+        if (!established()) {
+            return std::unexpected(
+                network_error(ProtocolErrorCode::transport_error, "owned TLS connection is not established"));
+        }
+        if (cancellation.stop_requested()) {
+            return std::unexpected(canceled_error("TLS input wait"));
+        }
+
+        std::mutex mutex;
+        std::condition_variable condition;
+        std::stop_callback on_stop {cancellation, [&] {
+                                        std::scoped_lock lock {mutex};
+                                        condition.notify_all();
+                                    }};
+        std::unique_lock lock {mutex};
+        constexpr auto readiness_poll = std::chrono::milliseconds {10};
+        while (!cancellation.stop_requested()) {
+            if (impl_->tls.pending_input()) {
+                return true;
+            }
+            asio::error_code error;
+            const auto available = impl_->socket.available(error);
+            if (error) {
+                return std::unexpected(asio_error("TLS input readiness", error));
+            }
+            if (available != 0U) {
+                return true;
+            }
+            const auto now = Clock::now();
+            if (now >= deadline) {
+                return false;
+            }
+            condition.wait_until(lock, (std::min) (deadline, now + readiness_poll),
+                                 [&cancellation] { return cancellation.stop_requested(); });
+        }
+        return std::unexpected(canceled_error("TLS input wait"));
+    }
+
     std::expected<void, ProtocolError>
     TlsPeerConnection::send_application_frame_until(const std::span<const std::byte> payload,
                                                     const Clock::time_point deadline,

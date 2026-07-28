@@ -208,6 +208,18 @@ recovery retention is hard-capped at 16 MiB per work item and 64 MiB per
 scheduler construction. The warning-clean complete Debug graph passed all 38
 tests in 175.17 seconds.
 
+The bounded idle-work delivery slice adds a required
+`service.work_poll_interval_ms` setting. Focused executable-surface coverage
+proves that work absent during establishment is delivered after one idle
+readiness timeout without any agent message, while the same session owner
+retains the negotiated outstanding-work and byte ceilings. The loopback mTLS
+test proves the readiness wait reports no data without consuming input, then
+reports and preserves a subsequently replayed frame. Configuration coverage
+rejects intervals below 10 ms or longer than the session, and cancellation
+still closes the established session. This is byte-faithful component evidence,
+not a live many-peer backend-load or database-notification qualification. The
+warning-clean complete Debug graph passed all 38 tests in 175.81 seconds.
+
 This evidence does not qualify state records or wider authoring forms,
 migration bytecode, arbitrary VM checkpoints or crash-continuous resource
 accounting, immediate cross-node lease takeover, reset or retained-gap

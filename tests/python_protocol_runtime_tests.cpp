@@ -860,6 +860,8 @@ namespace {
         std::optional<AuthenticatedPeer> authenticated_peer;
         std::optional<AgentHelloMessage> received_hello;
         std::optional<std::uint64_t> replayed_sequence;
+        std::optional<bool> idle_readable;
+        std::optional<bool> replay_readable;
         std::jthread server {[&] {
             auto accepted = listener->accept(policy);
             if (!accepted) {
@@ -879,6 +881,13 @@ namespace {
                 return;
             }
             received_hello = std::get<AgentHelloMessage>(std::move(hello->body));
+            auto idle = accepted->connection.wait_readable_until(std::chrono::steady_clock::now() +
+                                                                 std::chrono::milliseconds {25});
+            if (!idle) {
+                server_error = idle.error();
+                return;
+            }
+            idle_readable = *idle;
 
             const auto welcome = runtime_server_hello();
             PeerEnvelope welcome_envelope {
@@ -895,6 +904,13 @@ namespace {
                 server_error = sent.error();
                 return;
             }
+            auto ready =
+                accepted->connection.wait_readable_until(std::chrono::steady_clock::now() + std::chrono::seconds {2});
+            if (!ready) {
+                server_error = ready.error();
+                return;
+            }
+            replay_readable = *ready;
             auto replay = accepted->connection.receive();
             if (!replay) {
                 server_error = replay.error();
@@ -919,6 +935,8 @@ namespace {
         REQUIRE(received_hello.has_value());
         REQUIRE(received_hello->agent_epoch == spool->agent_epoch());
         REQUIRE(received_hello->next_sequence == 2);
+        REQUIRE(idle_readable == false);
+        REQUIRE(replay_readable == true);
         REQUIRE(replayed_sequence == 1);
         REQUIRE(connected->replayed_records == 1);
         REQUIRE(connected->server_hello.session.value == "session-1");

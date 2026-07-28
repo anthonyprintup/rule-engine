@@ -100,6 +100,9 @@ namespace rule_engine::python::protocol_v2 {
         [[nodiscard]] std::expected<PeerEnvelope, ProtocolError> receive(std::stop_token cancellation = {}) noexcept;
         [[nodiscard]] std::expected<PeerEnvelope, ProtocolError>
         receive_until(std::chrono::steady_clock::time_point deadline, std::stop_token cancellation = {}) noexcept;
+        // Returns false at the deadline without consuming TLS or frame bytes.
+        [[nodiscard]] std::expected<bool, ProtocolError>
+        wait_readable_until(std::chrono::steady_clock::time_point deadline, std::stop_token cancellation = {}) noexcept;
         [[nodiscard]] std::expected<void, ProtocolError>
         send_application_frame_until(std::span<const std::byte> payload, std::chrono::steady_clock::time_point deadline,
                                      std::stop_token cancellation = {}) noexcept;

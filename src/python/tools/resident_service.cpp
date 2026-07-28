@@ -379,6 +379,12 @@ namespace rule_engine::python::tools {
                 return connection_.receive_until(deadline, cancellation);
             }
 
+            [[nodiscard]] std::expected<bool, protocol_v2::ProtocolError>
+            wait_protocol_input(const std::chrono::steady_clock::time_point deadline,
+                                const std::stop_token cancellation) noexcept override {
+                return connection_.wait_readable_until(deadline, cancellation);
+            }
+
             [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
             send_protocol(const protocol_v2::PeerEnvelope &envelope,
                           const std::chrono::steady_clock::time_point deadline,
@@ -415,7 +421,9 @@ namespace rule_engine::python::tools {
             limits.maximum_messages_per_session == 0U || limits.maximum_messages_per_session > 1'000'000U ||
             limits.maximum_inflight_work_per_session == 0U || limits.maximum_inflight_work_per_session > 4'096U ||
             limits.maximum_session_duration < std::chrono::milliseconds {100} ||
-            limits.maximum_session_duration > std::chrono::hours {24} || limits.inbound_credit.bytes == 0U ||
+            limits.maximum_session_duration > std::chrono::hours {24} ||
+            limits.work_poll_interval < std::chrono::milliseconds {10} ||
+            limits.work_poll_interval > limits.maximum_session_duration || limits.inbound_credit.bytes == 0U ||
             limits.inbound_credit.bytes > limits.maximum_memory_bytes || limits.inbound_credit.messages == 0U ||
             limits.inbound_credit.work_attempts == 0U) {
             return std::unexpected(
@@ -1332,19 +1340,37 @@ namespace rule_engine::python::tools {
             }
             return true;
         };
-        auto work = agents_.take_work(*session, peer_work_limit, cancellation);
-        if (!work || work->size() > peer_work_limit || !send_work(std::move(*work))) {
+        const auto poll_work = [&]() {
+            const auto available = peer_work_limit - outstanding.size();
+            if (available == 0U) {
+                return true;
+            }
+            auto work = agents_.take_work(*session, available, cancellation);
+            return work && work->size() <= available && send_work(std::move(*work));
+        };
+        if (!poll_work()) {
             return;
         }
 
-        for (std::size_t count = 0U;
-             count < limits_.maximum_messages_per_session && std::chrono::steady_clock::now() < session_deadline &&
-             !cancellation.stop_requested();
-             ++count) {
+        std::size_t received_messages {};
+        while (received_messages < limits_.maximum_messages_per_session &&
+               std::chrono::steady_clock::now() < session_deadline && !cancellation.stop_requested()) {
+            auto readable = job.channel->wait_protocol_input(
+                bounded_deadline(session_deadline, limits_.work_poll_interval), cancellation);
+            if (!readable) {
+                break;
+            }
+            if (!*readable) {
+                if (!poll_work()) {
+                    return;
+                }
+                continue;
+            }
             auto received = job.channel->receive_protocol(bounded_deadline(session_deadline), cancellation);
             if (!received) {
                 break;
             }
+            ++received_messages;
             const auto sequence = received->agent_sequence;
             auto admitted = gate->admit(std::move(*received));
             if (!admitted) {
@@ -1416,12 +1442,8 @@ namespace rule_engine::python::tools {
                     !sent) {
                     return;
                 }
-                const auto available = peer_work_limit - outstanding.size();
-                if (available != 0U) {
-                    auto more = agents_.take_work(*session, available, cancellation);
-                    if (!more || more->size() > available || !send_work(std::move(*more))) {
-                        return;
-                    }
+                if (!poll_work()) {
+                    return;
                 }
             }
         }

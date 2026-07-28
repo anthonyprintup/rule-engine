@@ -620,6 +620,14 @@ namespace rule_engine::python::protocol_v2 {
 #endif
     }
 
+    bool OpenSslTlsSession::pending_input() const noexcept {
+#if RULE_ENGINE_PROTOCOL_HAS_OPENSSL
+        return impl_ != nullptr && impl_->ssl != nullptr && impl_->established && SSL_pending(impl_->ssl) > 0;
+#else
+        return false;
+#endif
+    }
+
     bool OpenSslTlsSession::established() const noexcept { return impl_ != nullptr && impl_->established; }
 
     void OpenSslTlsSession::shutdown() noexcept {

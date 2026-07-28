@@ -163,6 +163,7 @@ service.maximum_frame_bytes
 service.maximum_messages_per_session
 service.maximum_inflight_work_per_session
 service.maximum_session_duration_ms
+service.work_poll_interval_ms
 service.inbound_credit_bytes
 service.inbound_credit_messages
 service.inbound_credit_work_attempts
@@ -258,6 +259,18 @@ resident evaluator leases generation-fenced fact or scan work, resumes the C++
 VM from the authenticated result, and commits the terminal transaction through
 the same durable coordinator. Restart reconstructs pending work from committed
 snapshot messages.
+
+An authenticated agent session checks for newly ready work at establishment,
+after each durable inbound message, and whenever an otherwise idle,
+non-consuming TLS/socket input-readiness wait reaches
+`service.work_poll_interval_ms`. The interval must be at least 10 ms and no
+longer than `service.maximum_session_duration_ms`. Polling stays on the
+session's single channel-owning worker; it does not add concurrent TLS writes
+or apply the short poll deadline to a partially received frame. Every poll is
+still bounded by the negotiated peer work/message/byte limits and the
+configured outstanding-work ceiling. Choose the interval as an explicit
+delivery-latency versus backend-load tradeoff: shorter intervals reduce idle
+delivery delay but multiply empty durable-store checks across connected peers.
 
 Current operations must account for three evaluator limits: one VM provider
 turn stays on one agent route, capability/service/history host turns fail

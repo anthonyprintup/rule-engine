@@ -27,6 +27,7 @@ namespace rule_engine::python::tools {
         std::size_t maximum_messages_per_session {4'096U};
         std::size_t maximum_inflight_work_per_session {64U};
         std::chrono::milliseconds maximum_session_duration {30'000};
+        std::chrono::milliseconds work_poll_interval {250};
         protocol_v2::CreditWindow inbound_credit {
             .bytes = 16U * mebibyte,
             .messages = 256U,
@@ -45,6 +46,10 @@ namespace rule_engine::python::tools {
         virtual ~IResidentSecureChannel() = default;
         [[nodiscard]] virtual std::expected<protocol_v2::PeerEnvelope, protocol_v2::ProtocolError>
         receive_protocol(std::chrono::steady_clock::time_point deadline, std::stop_token cancellation) noexcept = 0;
+        // False means the deadline elapsed. Implementations must not consume a
+        // partial frame while checking readiness.
+        [[nodiscard]] virtual std::expected<bool, protocol_v2::ProtocolError>
+        wait_protocol_input(std::chrono::steady_clock::time_point deadline, std::stop_token cancellation) noexcept = 0;
         [[nodiscard]] virtual std::expected<void, protocol_v2::ProtocolError>
         send_protocol(const protocol_v2::PeerEnvelope &envelope, std::chrono::steady_clock::time_point deadline,
                       std::stop_token cancellation) noexcept = 0;

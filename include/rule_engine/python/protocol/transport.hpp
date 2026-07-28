@@ -65,6 +65,7 @@ namespace rule_engine::python::protocol_v2 {
         send_application_frame(std::span<const std::byte> payload, const TransportOperation &operation = {}) noexcept;
         [[nodiscard]] std::expected<std::vector<std::byte>, ProtocolError>
         receive_application_frame(const TransportOperation &operation = {}) noexcept;
+        [[nodiscard]] bool pending_input() const noexcept;
         [[nodiscard]] bool established() const noexcept;
         void shutdown() noexcept;
 

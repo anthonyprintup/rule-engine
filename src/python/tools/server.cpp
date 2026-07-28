@@ -63,7 +63,8 @@ Required common configuration keys:
   service.worker_threads, service.maximum_queued_sessions,
   service.maximum_memory_bytes, service.maximum_frame_bytes,
   service.maximum_messages_per_session, service.maximum_inflight_work_per_session,
-  service.maximum_session_duration_ms, service.inbound_credit_bytes,
+  service.maximum_session_duration_ms, service.work_poll_interval_ms,
+  service.inbound_credit_bytes,
   service.inbound_credit_messages, service.inbound_credit_work_attempts,
   service.inbound_credit_snapshot_chunks,
   runtime.root, pack.registry_path, pack.maximum_published_bytes,
@@ -195,6 +196,7 @@ policy mutation remains fail-closed.
                 {"service.maximum_messages_per_session", ValueKind::integer},
                 {"service.maximum_inflight_work_per_session", ValueKind::integer},
                 {"service.maximum_session_duration_ms", ValueKind::integer},
+                {"service.work_poll_interval_ms", ValueKind::integer},
                 {"service.inbound_credit_bytes", ValueKind::integer},
                 {"service.inbound_credit_messages", ValueKind::integer},
                 {"service.inbound_credit_work_attempts", ValueKind::integer},
@@ -2108,6 +2110,7 @@ policy mutation remains fail-closed.
             "service.maximum_messages_per_session",
             "service.maximum_inflight_work_per_session",
             "service.maximum_session_duration_ms",
+            "service.work_poll_interval_ms",
             "service.inbound_credit_bytes",
             "service.inbound_credit_messages",
             "service.inbound_credit_work_attempts",
@@ -2171,6 +2174,7 @@ policy mutation remains fail-closed.
         const auto maximum_messages_per_session = uint32_value(*entries, "service.maximum_messages_per_session");
         const auto maximum_inflight_work = uint32_value(*entries, "service.maximum_inflight_work_per_session");
         const auto maximum_session_duration = milliseconds_value(*entries, "service.maximum_session_duration_ms");
+        const auto work_poll_interval = milliseconds_value(*entries, "service.work_poll_interval_ms");
         const auto inbound_credit_bytes = uint32_value(*entries, "service.inbound_credit_bytes");
         const auto inbound_credit_messages = uint32_value(*entries, "service.inbound_credit_messages");
         const auto inbound_credit_work = uint32_value(*entries, "service.inbound_credit_work_attempts");
@@ -2182,8 +2186,8 @@ policy mutation remains fail-closed.
             !write_timeout || !listen_backlog || !maximum_consecutive_failures || !worker_threads ||
             !maximum_queued_sessions || !maximum_memory_bytes || !maximum_frame_bytes ||
             !maximum_messages_per_session || !maximum_inflight_work || !maximum_session_duration ||
-            !inbound_credit_bytes || !inbound_credit_messages || !inbound_credit_work || !inbound_credit_snapshots ||
-            !partial_session_ttl || !unreferenced_retention) {
+            !work_poll_interval || !inbound_credit_bytes || !inbound_credit_messages || !inbound_credit_work ||
+            !inbound_credit_snapshots || !partial_session_ttl || !unreferenced_retention) {
             return std::unexpected(!schema_version               ? std::move(schema_version.error()) :
                                    !processes                    ? std::move(processes.error()) :
                                    !server_major                 ? std::move(server_major.error()) :
@@ -2205,6 +2209,7 @@ policy mutation remains fail-closed.
                                    !maximum_messages_per_session ? std::move(maximum_messages_per_session.error()) :
                                    !maximum_inflight_work        ? std::move(maximum_inflight_work.error()) :
                                    !maximum_session_duration     ? std::move(maximum_session_duration.error()) :
+                                   !work_poll_interval           ? std::move(work_poll_interval.error()) :
                                    !inbound_credit_bytes         ? std::move(inbound_credit_bytes.error()) :
                                    !inbound_credit_messages      ? std::move(inbound_credit_messages.error()) :
                                    !inbound_credit_work          ? std::move(inbound_credit_work.error()) :
@@ -2244,6 +2249,7 @@ policy mutation remains fail-closed.
         result.service.maximum_messages_per_session = *maximum_messages_per_session;
         result.service.maximum_inflight_work_per_session = *maximum_inflight_work;
         result.service.maximum_session_duration = *maximum_session_duration;
+        result.service.work_poll_interval = *work_poll_interval;
         result.service.inbound_credit = {
             .bytes = *inbound_credit_bytes,
             .messages = *inbound_credit_messages,
