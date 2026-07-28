@@ -45,19 +45,30 @@ namespace rule_engine::python::tools {
             return schema.value + '\0' + (parent ? canonical_subject_key(*parent) : std::string {"-"});
         }
 
-        [[nodiscard]] std::string physical_state_namespace(const TenantId &tenant, const PackId &pack,
-                                                           const std::string_view activation_namespace,
-                                                           const std::string_view logical_namespace) {
+        [[nodiscard]] std::optional<std::string> physical_state_namespace(const EventEnvelope &input,
+                                                                          const PackId &pack,
+                                                                          const std::string_view activation_namespace,
+                                                                          const std::string_view logical_namespace) {
             std::string material;
-            material.reserve(tenant.value.size() + pack.value.size() + activation_namespace.size() +
+            material.reserve(input.tenant.value.size() + pack.value.size() + activation_namespace.size() +
                              logical_namespace.size() + 3U);
-            material.append(tenant.value);
+            material.append(input.tenant.value);
             material.push_back('\0');
             material.append(pack.value);
             material.push_back('\0');
             material.append(activation_namespace);
             material.push_back('\0');
             material.append(logical_namespace);
+            if (logical_namespace.starts_with("state-key-v1/peer/")) {
+                material.push_back('\0');
+                material.append(input.peer.value);
+            } else if (logical_namespace.starts_with("state-key-v1/subject/")) {
+                if (!input.subject) {
+                    return std::nullopt;
+                }
+                material.push_back('\0');
+                material.append(canonical_subject_key(*input.subject));
+            }
             return "state:" + digest_key("resident-state-namespace-v1", material);
         }
 
@@ -178,10 +189,15 @@ namespace rule_engine::python::tools {
                     return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::provider_violation,
                                                           "VM state request is invalid or crosses pack ownership"));
                 }
+                auto state_namespace = physical_state_namespace(definition.input, pack.compilation.pack.pack,
+                                                                pack.state_namespace, request.namespace_name);
+                if (!state_namespace) {
+                    return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::invalid_identity,
+                                                          "state scope requires an unavailable subject identity"));
+                }
                 const cluster::StoredStateKey key {
                     .owner = request.owner,
-                    .namespace_name = physical_state_namespace(definition.input.tenant, pack.compilation.pack.pack,
-                                                               pack.state_namespace, request.namespace_name),
+                    .namespace_name = std::move(*state_namespace),
                     .key = request.key,
                 };
                 auto stored = store.load_state(key);
@@ -209,8 +225,13 @@ namespace rule_engine::python::tools {
                     return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::provider_violation,
                                                           "VM state mutation is invalid or crosses pack ownership"));
                 }
-                mutation.namespace_name = physical_state_namespace(definition.input.tenant, pack.compilation.pack.pack,
-                                                                   pack.state_namespace, mutation.namespace_name);
+                auto state_namespace = physical_state_namespace(definition.input, pack.compilation.pack.pack,
+                                                                pack.state_namespace, mutation.namespace_name);
+                if (!state_namespace) {
+                    return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::invalid_identity,
+                                                          "state scope requires an unavailable subject identity"));
+                }
+                mutation.namespace_name = std::move(*state_namespace);
             }
             return result;
         }

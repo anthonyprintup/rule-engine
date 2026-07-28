@@ -279,6 +279,12 @@ namespace rule_engine::python::compiler {
             return {.kind = StaticTypeKind::unknown, .qualified_name = annotation->kind};
         }
 
+        [[nodiscard]] bool state_capability_type(const StaticType &type) noexcept {
+            return type.kind == StaticTypeKind::model &&
+                   (type.qualified_name == "State" || type.qualified_name == "SharedState" ||
+                    type.qualified_name.ends_with(".State") || type.qualified_name.ends_with(".SharedState"));
+        }
+
         bool valid_stable_id(const std::string_view id) {
             if (id.empty() || id.size() > 128) {
                 return false;
@@ -461,6 +467,142 @@ namespace rule_engine::python::compiler {
 
         std::string stable_digest(std::string_view canonical);
         SchemaId schema_for_type(const StaticType &type);
+
+        struct StateKeyModel {
+            std::string module;
+            std::string name;
+            std::string stable_id;
+            std::string state_namespace;
+            StaticType value_type;
+            SchemaId schema;
+            SourceSpan span;
+        };
+
+        [[nodiscard]] bool bind_state_key(const AstIndex &index, const AstNode &statement, const std::string &module,
+                                          std::vector<StateKeyModel> &state_keys,
+                                          std::set<std::string, std::less<>> &stable_ids, DiagnosticSet &diagnostics) {
+            const auto *value = index.reference(statement, "value");
+            if (value == nullptr || value->kind != "Call") {
+                return false;
+            }
+            const auto *constructor = index.reference(*value, "func");
+            if (constructor == nullptr || root_name(index, *constructor) != "StateKey") {
+                return false;
+            }
+
+            const AstNode *target {};
+            if (statement.kind == "Assign") {
+                const auto targets = index.sequence(statement, "targets");
+                if (targets.size() == 1U) {
+                    target = targets.front();
+                }
+            } else if (statement.kind == "AnnAssign") {
+                target = index.reference(statement, "target");
+            }
+            if (target == nullptr || target->kind != "Name") {
+                diagnostics.push_back(make_diagnostic(
+                    "PY-STATE-KEY", "StateKey declarations require one module-level name", statement.span));
+                return true;
+            }
+
+            const auto arguments = index.sequence(*value, "args");
+            if (arguments.size() != 2U || arguments[0]->kind != "Constant") {
+                diagnostics.push_back(make_diagnostic(
+                    "PY-STATE-KEY", "StateKey requires a literal stable ID and one scalar value type", value->span));
+                return true;
+            }
+            const auto stable_id = index.string(*arguments[0], "value").value_or(std::string {});
+            const auto value_type = annotation_type(index, arguments[1]);
+            if (!valid_stable_id(stable_id)) {
+                diagnostics.push_back(
+                    make_diagnostic("PY-STATE-KEY", "StateKey has an invalid stable ID", arguments[0]->span));
+                return true;
+            }
+            if (value_type.kind != StaticTypeKind::boolean && value_type.kind != StaticTypeKind::integer &&
+                value_type.kind != StaticTypeKind::floating && value_type.kind != StaticTypeKind::string &&
+                value_type.kind != StaticTypeKind::bytes) {
+                diagnostics.push_back(make_diagnostic(
+                    "PY-STATE-KEY", "the first state-authoring slice supports bool, int, float, str, or bytes values",
+                    arguments[1]->span));
+                return true;
+            }
+
+            std::string scope;
+            for (const auto *keyword : index.sequence(*value, "keywords")) {
+                const auto name = index.string(*keyword, "arg").value_or(std::string {});
+                const auto *keyword_value = index.reference(*keyword, "value");
+                if (name == "scope") {
+                    const auto path = keyword_value == nullptr ? std::optional<std::string> {} :
+                                                                 attribute_path(index, *keyword_value);
+                    if (path == "StateScope.PEER") {
+                        scope = "peer";
+                    } else if (path == "StateScope.SUBJECT") {
+                        scope = "subject";
+                    } else {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-STATE-SCOPE",
+                            "the first state-authoring slice supports StateScope.PEER or StateScope.SUBJECT",
+                            keyword->span));
+                    }
+                    continue;
+                }
+                if (name == "default") {
+                    const auto *constant =
+                        keyword_value == nullptr ? nullptr : AstIndex::field(*keyword_value, "value");
+                    if (keyword_value == nullptr || keyword_value->kind != "Constant" || constant == nullptr ||
+                        !std::holds_alternative<std::monostate>(constant->value.data)) {
+                        diagnostics.push_back(make_diagnostic("PY-NYI-STATE-DEFAULT",
+                                                              "StateKey defaults other than None are not lowered yet",
+                                                              keyword->span));
+                    }
+                    continue;
+                }
+                if (name == "classification") {
+                    const auto classification = keyword_value == nullptr ?
+                                                    std::string {} :
+                                                    index.string(*keyword_value, "value").value_or(std::string {});
+                    if (classification != "internal") {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-NYI-STATE-CLASSIFICATION",
+                            "state classifications other than internal require a durable label-ceiling descriptor",
+                            keyword->span));
+                    }
+                    continue;
+                }
+                diagnostics.push_back(
+                    make_diagnostic("PY-STATE-KEY", "unsupported StateKey keyword '" + name + "'", keyword->span));
+            }
+            if (scope.empty()) {
+                diagnostics.push_back(
+                    make_diagnostic("PY-STATE-SCOPE", "StateKey requires an explicit supported scope", value->span));
+                return true;
+            }
+
+            const auto name = index.string(*target, "id").value_or(std::string {});
+            const auto qualified_name = module + "." + name;
+            if (name.empty() || std::ranges::find(state_keys, qualified_name, [](const StateKeyModel &key) {
+                                    return key.module + "." + key.name;
+                                }) != state_keys.end()) {
+                diagnostics.push_back(
+                    make_diagnostic("PY-STATE-KEY", "StateKey declaration name is empty or duplicated", target->span));
+                return true;
+            }
+            if (!stable_ids.insert(stable_id).second) {
+                diagnostics.push_back(make_diagnostic(
+                    "PY-STATE-KEY", "StateKey stable ID '" + stable_id + "' is duplicated", arguments[0]->span));
+                return true;
+            }
+            state_keys.push_back(StateKeyModel {
+                .module = module,
+                .name = name,
+                .stable_id = stable_id,
+                .state_namespace = "state-key-v1/" + scope + "/" + stable_id,
+                .value_type = value_type,
+                .schema = schema_for_type(value_type),
+                .span = statement.span,
+            });
+            return true;
+        }
 
         [[nodiscard]] Classification annotation_classification(const AstIndex &index, const AstNode *annotation) {
             if (annotation == nullptr || annotation->kind != "Subscript") {
@@ -908,11 +1050,12 @@ namespace rule_engine::python::compiler {
 
         std::vector<FunctionModel> bind_modules(const AstEnvelope &envelope, const AstIndex &index,
                                                 std::vector<BoundSymbol> &symbols, SchemaCatalog &generated_schemas,
-                                                DiagnosticSet &diagnostics) {
+                                                std::vector<StateKeyModel> &state_keys, DiagnosticSet &diagnostics) {
             std::vector<FunctionModel> functions;
             std::set<std::string, std::less<>> modules;
             std::set<std::string, std::less<>> declared_functions;
             std::set<std::string, std::less<>> reportable_ids;
+            std::set<std::string, std::less<>> state_key_ids;
             for (const auto &module : envelope.modules) { modules.insert(module.name); }
             diagnose_import_cycles(envelope, index, modules, diagnostics);
             for (const auto &module : envelope.modules) {
@@ -922,6 +1065,10 @@ namespace rule_engine::python::compiler {
                 }
                 inspect_forbidden(index, *root, diagnostics);
                 for (const auto *statement : index.sequence(*root, "body")) {
+                    if ((statement->kind == "Assign" || statement->kind == "AnnAssign") &&
+                        bind_state_key(index, *statement, module.name, state_keys, state_key_ids, diagnostics)) {
+                        continue;
+                    }
                     if (statement->kind == "Import") {
                         bind_import(index, *statement, modules, module.name, symbols, diagnostics);
                         continue;
@@ -1251,6 +1398,7 @@ namespace rule_engine::python::compiler {
             const AstIndex &index;
             const FunctionModel &function;
             const std::vector<FunctionModel> &functions;
+            const std::vector<StateKeyModel> &state_keys;
             CompiledPack &pack;
             std::vector<FactRequirement> &requirements;
             DiagnosticSet &diagnostics;
@@ -1270,6 +1418,7 @@ namespace rule_engine::python::compiler {
             std::vector<HandlerFrame> handlers;
             std::set<std::string, std::less<>> statically_bound_names;
             std::map<std::string, std::uint32_t, std::less<>> event_operands;
+            std::map<std::string, std::uint32_t, std::less<>> state_operands;
             std::uint32_t conditional_depth {};
             std::uint32_t direct_await_depth {};
             std::uint32_t finalizer_depth {};
@@ -1277,27 +1426,32 @@ namespace rule_engine::python::compiler {
             bool may_fault {};
 
             Lowerer(const AstIndex &index_value, const FunctionModel &function_value,
-                    const std::vector<FunctionModel> &functions_value, CompiledPack &pack_value,
+                    const std::vector<FunctionModel> &functions_value,
+                    const std::vector<StateKeyModel> &state_keys_value, CompiledPack &pack_value,
                     std::vector<FactRequirement> &requirements_value, DiagnosticSet &diagnostics_value):
                 index {index_value},
                 function {function_value},
                 functions {functions_value},
+                state_keys {state_keys_value},
                 pack {pack_value},
                 requirements {requirements_value},
                 diagnostics {diagnostics_value},
                 bytecode {.id = function.executable,
                           .qualified_name = function.qualified_name,
-                          .register_count = static_cast<std::uint32_t>(function.parameters.size()),
-                          .parameter_count = static_cast<std::uint32_t>(function.parameters.size()),
+                          .register_count = 0U,
+                          .parameter_count = 0U,
                           .generator = function.generator,
                           .async = function.async,
                           .instructions = {},
                           .exception_regions = {}} {
-                for (std::size_t position = 0; position < function.parameters.size(); ++position) {
-                    locals.emplace(function.parameters[position].first,
-                                   ExpressionResult {.reg = static_cast<std::uint32_t>(position),
-                                                     .type = function.parameters[position].second});
-                    statically_bound_names.insert(function.parameters[position].first);
+                for (const auto &[name, type] : function.parameters) {
+                    const auto injected = state_capability_type(type);
+                    const auto position = injected ? 0U : bytecode.register_count++;
+                    if (!injected) {
+                        ++bytecode.parameter_count;
+                    }
+                    locals.emplace(name, ExpressionResult {.reg = position, .type = type});
+                    statically_bound_names.insert(name);
                 }
                 collect_function_bindings(*function.node, true);
                 collect_module_bindings();
@@ -1646,10 +1800,119 @@ namespace rule_engine::python::compiler {
                        kind == StaticTypeKind::bytes || kind == StaticTypeKind::unknown;
             }
 
-            [[nodiscard]] static bool state_capability_type(const StaticType &type) noexcept {
-                return type.kind == StaticTypeKind::model &&
-                       (type.qualified_name == "State" || type.qualified_name == "SharedState" ||
-                        type.qualified_name.ends_with(".State") || type.qualified_name.ends_with(".SharedState"));
+            [[nodiscard]] const StateKeyModel *state_key(const AstNode &node) const noexcept {
+                if (node.kind != "Name") {
+                    return nullptr;
+                }
+                const auto name = index.string(node, "id").value_or(std::string {});
+                const auto found = std::ranges::find_if(state_keys, [&](const StateKeyModel &key) {
+                    return key.module == function.module && key.name == name;
+                });
+                return found == state_keys.end() ? nullptr : std::addressof(*found);
+            }
+
+            [[nodiscard]] std::uint32_t state_operand(const StateKeyModel &key) {
+                const auto found = state_operands.find(key.stable_id);
+                if (found != state_operands.end()) {
+                    return found->second;
+                }
+                const auto operand = static_cast<std::uint32_t>(pack.constants.size());
+                pack.constants.push_back(make_vm_state_operand(key.state_namespace, "value", key.schema));
+                state_operands.emplace(key.stable_id, operand);
+                return operand;
+            }
+
+            [[nodiscard]] std::optional<ExpressionResult> none_result(const SourceSpan &span) {
+                AstNode synthetic {
+                    .id = 0U,
+                    .kind = "Constant",
+                    .span = span,
+                    .fields = {AstField {.name = "value", .value = ast_none()}},
+                };
+                return constant(synthetic);
+            }
+
+            [[nodiscard]] std::optional<ExpressionResult> state_call(const AstNode &node, const AstNode &target,
+                                                                     const std::string_view operation) {
+                const auto *owner = index.reference(target, "value");
+                const auto owner_name = owner != nullptr && owner->kind == "Name" ?
+                                            index.string(*owner, "id").value_or(std::string {}) :
+                                            std::string {};
+                const auto local = locals.find(owner_name);
+                if (local == locals.end() || !state_capability_type(local->second.type)) {
+                    return std::nullopt;
+                }
+                if (local->second.type.qualified_name == "SharedState" ||
+                    local->second.type.qualified_name.ends_with(".SharedState")) {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-NYI-SHARED-STATE",
+                        "SharedState requires an operator-bound cross-owner authorization descriptor", node.span));
+                    return std::nullopt;
+                }
+                if (!function.public_api) {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-NYI-STATE-HELPER",
+                        "state operations in helper functions require consuming-binding ownership propagation",
+                        node.span));
+                    return std::nullopt;
+                }
+                if (!index.sequence(node, "keywords").empty()) {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-NYI-STATE-IDENTITY",
+                        "state identity arguments are not lowered by the first state-authoring slice", node.span));
+                    return std::nullopt;
+                }
+                const auto arguments = index.sequence(node, "args");
+                const auto expected_arguments = operation == "set" ? 2U : 1U;
+                if (arguments.size() != expected_arguments) {
+                    diagnostics.push_back(make_diagnostic(
+                        "PY-STATE-CALL", "state." + std::string {operation} + " has the wrong argument count",
+                        node.span));
+                    return std::nullopt;
+                }
+                const auto *key = state_key(*arguments.front());
+                if (key == nullptr) {
+                    diagnostics.push_back(
+                        make_diagnostic("PY-STATE-KEY", "state operation requires a module-local StateKey declaration",
+                                        arguments.front()->span));
+                    return std::nullopt;
+                }
+                const auto operand = state_operand(*key);
+                if (operation == "get") {
+                    const auto destination = allocate();
+                    emit(Opcode::read_state, destination, 0U, 0U, operand, node.span);
+                    may_fault = true;
+                    return ExpressionResult {
+                        .reg = destination,
+                        .type = {.kind = StaticTypeKind::unknown,
+                                 .qualified_name = key->value_type.qualified_name + " | None"},
+                    };
+                }
+                if (operation == "set") {
+                    const auto value = expression(*arguments[1]);
+                    if (!value) {
+                        return std::nullopt;
+                    }
+                    if (!assignable(value->type, key->value_type)) {
+                        diagnostics.push_back(make_diagnostic("PY-STATE-TYPE",
+                                                              "state.set value is incompatible with its StateKey type",
+                                                              arguments[1]->span));
+                        return std::nullopt;
+                    }
+                    emit(Opcode::write_state, 0U, value->reg, 0U, operand, node.span);
+                    may_fault = true;
+                    return none_result(node.span);
+                }
+                if (operation == "delete") {
+                    emit(Opcode::delete_state, 0U, 0U, 0U, operand, node.span);
+                    may_fault = true;
+                    return none_result(node.span);
+                }
+                diagnostics.push_back(make_diagnostic("PY-NYI-STATE-LOWERING",
+                                                      "state." + std::string {operation} +
+                                                          " is not lowered by the first state-authoring slice",
+                                                      node.span));
+                return std::nullopt;
             }
 
             [[nodiscard]] static StaticType subscription_result_type(const StaticType &container) {
@@ -1896,6 +2159,13 @@ namespace rule_engine::python::compiler {
                     if (found == locals.end()) {
                         diagnostics.push_back(
                             make_diagnostic("PY-NAME", "name '" + name + "' is not bound", node.span));
+                        return std::nullopt;
+                    }
+                    if (state_capability_type(found->second.type)) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-STATE-CAPABILITY",
+                            "State and SharedState are injected static capabilities and cannot be materialized",
+                            node.span));
                         return std::nullopt;
                     }
                     return found->second;
@@ -2235,6 +2505,17 @@ namespace rule_engine::python::compiler {
                     if (contains_name(forbidden_calls, name)) {
                         return std::nullopt;
                     }
+                    if (target != nullptr && target->kind == "Attribute") {
+                        const auto operation = index.string(*target, "attr").value_or(std::string {});
+                        const auto *owner = index.reference(*target, "value");
+                        const auto owner_name = owner != nullptr && owner->kind == "Name" ?
+                                                    index.string(*owner, "id").value_or(std::string {}) :
+                                                    std::string {};
+                        const auto local = locals.find(owner_name);
+                        if (local != locals.end() && state_capability_type(local->second.type)) {
+                            return state_call(node, *target, operation);
+                        }
+                    }
                     if (telemetry_emit_call(node)) {
                         diagnostics.push_back(make_diagnostic(
                             "PY-EVENT-RECEIPT",
@@ -2246,22 +2527,6 @@ namespace rule_engine::python::compiler {
                     if (target != nullptr) {
                         if (const auto *descriptor = event_descriptor(*target)) {
                             return event_record_constructor(node, *descriptor);
-                        }
-                    }
-                    if (target != nullptr && target->kind == "Attribute" &&
-                        index.string(*target, "attr").value_or(std::string {}) == "delete") {
-                        const auto *owner = index.reference(*target, "value");
-                        const auto owner_name = owner != nullptr && owner->kind == "Name" ?
-                                                    index.string(*owner, "id").value_or(std::string {}) :
-                                                    std::string {};
-                        const auto local = locals.find(owner_name);
-                        if (local != locals.end() && state_capability_type(local->second.type)) {
-                            diagnostics.push_back(make_diagnostic(
-                                "PY-NYI-STATE-LOWERING",
-                                "state.delete(...) requires StateKey declaration and injected State/SharedState "
-                                "capability lowering before delete_state can be emitted",
-                                node.span));
-                            return std::nullopt;
                         }
                     }
                     const auto target_index = target == nullptr ? std::nullopt : function_index(*target);
@@ -3276,7 +3541,8 @@ namespace rule_engine::python::compiler {
         const AstIndex index {*decoded};
         std::vector<BoundSymbol> symbols;
         SchemaCatalog generated_schemas;
-        const auto functions = bind_modules(*decoded, index, symbols, generated_schemas, diagnostics);
+        std::vector<StateKeyModel> state_keys;
+        const auto functions = bind_modules(*decoded, index, symbols, generated_schemas, state_keys, diagnostics);
         std::set<std::string, std::less<>> reportable_executables;
         for (const auto &function : functions) {
             if (function.public_api) {
@@ -3356,7 +3622,7 @@ namespace rule_engine::python::compiler {
         };
         std::vector<FactRequirement> requirements;
         for (const auto &function : functions) {
-            Lowerer lowerer {index, function, functions, compiled, requirements, diagnostics};
+            Lowerer lowerer {index, function, functions, state_keys, compiled, requirements, diagnostics};
             auto bytecode = lowerer.lower();
             std::vector<std::string> logical_facts;
             for (const auto &requirement : requirements) {
@@ -3374,13 +3640,16 @@ namespace rule_engine::python::compiler {
             const auto emits_events = std::ranges::any_of(bytecode.instructions, [](const Instruction &instruction) {
                 return instruction.opcode == Opcode::emit_event;
             });
+            const auto reads_state = std::ranges::any_of(bytecode.instructions, [](const Instruction &instruction) {
+                return instruction.opcode == Opcode::read_state;
+            });
             compiled.functions.push_back(std::move(bytecode));
             compiled.optimization_certificates.push_back(OptimizationCertificate {
                 .executable = function.executable,
                 .transitively_pure = trivially_pure,
                 .recorder_observable = !trivially_pure,
                 .may_fault = lowerer.may_fault,
-                .reads_state = false,
+                .reads_state = reads_state,
                 .reads_history = false,
                 .calls_services = false,
                 .emits_effects = false,

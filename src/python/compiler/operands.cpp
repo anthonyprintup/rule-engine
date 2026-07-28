@@ -74,6 +74,15 @@ namespace rule_engine::python::compiler {
                               });
     }
 
+    FactValue make_vm_state_operand(std::string state_namespace, std::string key, SchemaId schema) {
+        return operand_record(vm_state_operand_schema,
+                              {
+                                  FactRecordField {.field_id = 1U, .value = text_fact(std::move(state_namespace))},
+                                  FactRecordField {.field_id = 2U, .value = text_fact(std::move(key))},
+                                  FactRecordField {.field_id = 3U, .value = text_fact(std::move(schema.value))},
+                              });
+    }
+
     FactValue make_vm_event_operand(SchemaId schema, std::string schema_hash) {
         return operand_record(python_event_operand_schema_v1,
                               {

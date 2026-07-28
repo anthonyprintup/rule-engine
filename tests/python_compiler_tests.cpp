@@ -1335,7 +1335,7 @@ namespace {
         CHECK(has_code("PY-NYI-RAISE-EXPRESSION"));
     }
 
-    TEST_CASE("exact worker keeps state deletion and comprehension prerequisites fail closed") {
+    TEST_CASE("exact worker lowers typed peer state through the real register VM") {
         auto &runtime = shared_runtime();
         if (!runtime.runtime) {
             if (!runtime.staging_failure.empty()) {
@@ -1346,7 +1346,72 @@ namespace {
             return;
         }
 
-        SECTION("state delete requires StateKey and injected capability lowering") {
+        const auto compiled =
+            compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                 "from rule_engine import State, StateKey, StateScope, rule\n"
+                                 "\n"
+                                 "FLAG = StateKey(\"com.example.peer-flag\", bool, scope=StateScope.PEER)\n"
+                                 "SUBJECT_FLAG = StateKey(\"com.example.subject-flag\", bool, "
+                                 "scope=StateScope.SUBJECT)\n"
+                                 "\n"
+                                 "@rule(\"com.example.stateful\")\n"
+                                 "def remember(subject: bool, state: State) -> bool:\n"
+                                 "    previous = state.get(FLAG)\n"
+                                 "    state.delete(FLAG)\n"
+                                 "    state.set(FLAG, True)\n"
+                                 "    state.set(SUBJECT_FLAG, True)\n"
+                                 "    return previous == None\n",
+                                 "com.example.stateful");
+        INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
+        REQUIRE(compiled.has_value());
+        REQUIRE(compiled->functions.size() == 1U);
+        const auto &function = compiled->functions.front();
+        CHECK(function.parameter_count == 1U);
+        CHECK(std::ranges::count(function.instructions, Opcode::read_state, &Instruction::opcode) == 1);
+        CHECK(std::ranges::count(function.instructions, Opcode::write_state, &Instruction::opcode) == 2);
+        CHECK(std::ranges::count(function.instructions, Opcode::delete_state, &Instruction::opcode) == 1);
+        REQUIRE(compiled->optimization_certificates.size() == 1U);
+        CHECK(compiled->optimization_certificates.front().reads_state);
+
+        auto session = vm::RegisterVmSession::create(*compiled, invocation());
+        INFO((session.has_value() ? std::string {} : diagnostic_text(session.error())));
+        REQUIRE(session.has_value());
+        const auto waiting = (*session)->step({});
+        REQUIRE(waiting.state_requests.size() == 1U);
+        CHECK(waiting.state_requests.front().namespace_name == "state-key-v1/peer/com.example.peer-flag");
+        CHECK(waiting.state_requests.front().key == "value");
+        CHECK(waiting.state_requests.front().schema == SchemaId {"bool"});
+
+        HostResponses response;
+        response.state.push_back(StateReadResponse {
+            .request_id = waiting.state_requests.front().request_id,
+            .value = std::nullopt,
+            .version = 0U,
+            .diagnostic = std::nullopt,
+        });
+        const auto completed = (*session)->step(std::move(response));
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        CHECK(completed.result->verdict == true);
+        REQUIRE(completed.result->state_mutations.size() == 2U);
+        CHECK(completed.result->state_mutations.front().namespace_name == "state-key-v1/peer/com.example.peer-flag");
+        CHECK(completed.result->state_mutations.front().expected_version == 0U);
+        CHECK(completed.result->state_mutations.back().namespace_name ==
+              "state-key-v1/subject/com.example.subject-flag");
+    }
+
+    TEST_CASE("exact worker keeps deferred state and comprehension prerequisites fail closed") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+
+        SECTION("state delete requires a module-level StateKey declaration") {
             const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
                                                        "from rule_engine import State, StateKey, rule\n"
                                                        "\n"
@@ -1357,10 +1422,35 @@ namespace {
                                                        "com.example.state-delete");
             REQUIRE_FALSE(compiled.has_value());
             CHECK(std::ranges::any_of(compiled.error(), [](const Diagnostic &diagnostic) {
-                return diagnostic.code == "PY-NYI-STATE-LOWERING" &&
-                       diagnostic.message.find("StateKey") != std::string::npos &&
-                       diagnostic.message.find("delete_state") != std::string::npos;
+                return diagnostic.code == "PY-STATE-KEY" &&
+                       diagnostic.message.find("module-local StateKey") != std::string::npos;
             }));
+        }
+
+        SECTION("deferred state scope default and classification fail closed") {
+            const auto compiled = compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                                       "from rule_engine import StateKey, StateScope, rule\n"
+                                                       "\n"
+                                                       "FLAG = StateKey(\n"
+                                                       "    \"com.example.deferred-state\",\n"
+                                                       "    bool,\n"
+                                                       "    scope=StateScope.SHARED,\n"
+                                                       "    default=False,\n"
+                                                       "    classification=\"secret\",\n"
+                                                       ")\n"
+                                                       "\n"
+                                                       "@rule(\"com.example.deferred-state\")\n"
+                                                       "def deferred(subject: bool) -> bool:\n"
+                                                       "    return True\n",
+                                                       "com.example.deferred-state");
+            REQUIRE_FALSE(compiled.has_value());
+            const auto has_code = [&](const std::string_view code) {
+                return std::ranges::any_of(compiled.error(),
+                                           [&](const Diagnostic &diagnostic) { return diagnostic.code == code; });
+            };
+            CHECK(has_code("PY-STATE-SCOPE"));
+            CHECK(has_code("PY-NYI-STATE-DEFAULT"));
+            CHECK(has_code("PY-NYI-STATE-CLASSIFICATION"));
         }
 
         SECTION("comprehensions require a bounded result builder and scope model") {

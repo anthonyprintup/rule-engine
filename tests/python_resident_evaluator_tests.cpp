@@ -89,10 +89,11 @@ namespace {
         };
     }
 
-    [[nodiscard]] tools::ResidentActivePack stateful_active_pack() {
+    [[nodiscard]] tools::ResidentActivePack
+    stateful_active_pack(std::string logical_namespace = "state-key-v1/peer/com.example.peer-flag") {
         auto result = active_pack();
         result.compilation.pack.constants = {
-            vm::make_state_operand("rule", "enabled", SchemaId {"bool"}),
+            vm::make_state_operand(std::move(logical_namespace), "value", SchemaId {"bool"}),
             make_fact(true),
         };
         auto &function = result.compilation.pack.functions.front();
@@ -209,86 +210,114 @@ namespace {
         CHECK((*scheduler)->take_work(agent, 4U, {})->empty());
     }
 
-    TEST_CASE("resident state turns stay on the server and commit beneath a tenant-isolated activation namespace") {
-        cluster::AuditTrail audit;
-        cluster::InMemoryRuntimeStore store {audit};
-        auto scheduler = tools::ResidentEvaluationScheduler::create(store, audit, "node-a", std::chrono::seconds {30},
-                                                                    {stateful_active_pack()});
-        REQUIRE(scheduler.has_value());
-
-        const auto run_tenant = [&](tools::ResidentAgentSession agent, const std::string &snapshot_id) {
-            REQUIRE((*scheduler)->bind_session(agent).has_value());
-            auto selected_subject = subject();
-            selected_subject.peer = agent.authenticated_peer.peer;
-            const std::vector subjects {selected_subject};
+    TEST_CASE("resident state turns stay on the server and isolate declared peer and subject scopes") {
+        const auto run_snapshot = [](tools::ResidentEvaluationScheduler &scheduler,
+                                     const tools::ResidentAgentSession &agent, const std::string &snapshot_id,
+                                     const std::vector<SubjectKey> &subjects) {
+            REQUIRE(scheduler.bind_session(agent).has_value());
             const auto digest = protocol::authoritative_snapshot_digest(subjects);
             REQUIRE(digest.has_value());
-            REQUIRE((*scheduler)
-                        ->ingest(agent, 1U,
-                                 protocol::AuthoritativeSnapshotBegin {
-                                     .session = agent.session,
-                                     .peer = agent.authenticated_peer.peer,
-                                     .session_fence = agent.session_fence,
-                                     .snapshot_id = snapshot_id,
-                                     .parent = {},
-                                     .subject_schema = SchemaId {"windows.process.v1"},
-                                     .generation = 1U,
-                                     .expected_count = 1U,
-                                     .expected_digest = *digest,
-                                 },
-                                 {})
+            REQUIRE(scheduler
+                        .ingest(agent, 1U,
+                                protocol::AuthoritativeSnapshotBegin {
+                                    .session = agent.session,
+                                    .peer = agent.authenticated_peer.peer,
+                                    .session_fence = agent.session_fence,
+                                    .snapshot_id = snapshot_id,
+                                    .parent = {},
+                                    .subject_schema = SchemaId {"windows.process.v1"},
+                                    .generation = 1U,
+                                    .expected_count = subjects.size(),
+                                    .expected_digest = *digest,
+                                },
+                                {})
                         .has_value());
-            REQUIRE((*scheduler)
-                        ->ingest(agent, 2U,
-                                 protocol::AuthoritativeSnapshotChunk {
-                                     .session = agent.session,
-                                     .peer = agent.authenticated_peer.peer,
-                                     .session_fence = agent.session_fence,
-                                     .snapshot_id = snapshot_id,
-                                     .generation = 1U,
-                                     .chunk_index = 0U,
-                                     .subjects = subjects,
-                                 },
-                                 {})
+            REQUIRE(scheduler
+                        .ingest(agent, 2U,
+                                protocol::AuthoritativeSnapshotChunk {
+                                    .session = agent.session,
+                                    .peer = agent.authenticated_peer.peer,
+                                    .session_fence = agent.session_fence,
+                                    .snapshot_id = snapshot_id,
+                                    .generation = 1U,
+                                    .chunk_index = 0U,
+                                    .subjects = subjects,
+                                },
+                                {})
                         .has_value());
-            REQUIRE((*scheduler)
-                        ->ingest(agent, 3U,
-                                 protocol::AuthoritativeSnapshotCommit {
-                                     .session = agent.session,
-                                     .peer = agent.authenticated_peer.peer,
-                                     .session_fence = agent.session_fence,
-                                     .snapshot_id = snapshot_id,
-                                     .generation = 1U,
-                                     .item_count = 1U,
-                                     .canonical_digest = *digest,
-                                 },
-                                 {})
+            REQUIRE(scheduler
+                        .ingest(agent, 3U,
+                                protocol::AuthoritativeSnapshotCommit {
+                                    .session = agent.session,
+                                    .peer = agent.authenticated_peer.peer,
+                                    .session_fence = agent.session_fence,
+                                    .snapshot_id = snapshot_id,
+                                    .generation = 1U,
+                                    .item_count = subjects.size(),
+                                    .canonical_digest = *digest,
+                                },
+                                {})
                         .has_value());
-            auto external_work = (*scheduler)->take_work(agent, 1U, {});
+            auto external_work = scheduler.take_work(agent, static_cast<std::uint32_t>(subjects.size()), {});
             REQUIRE(external_work.has_value());
             CHECK(external_work->empty());
         };
 
-        auto tenant_a = session();
-        run_tenant(tenant_a, "state-a");
-        auto tenant_b = tenant_a;
-        tenant_b.authenticated_peer.tenant = TenantId {"tenant-b"};
-        tenant_b.authenticated_peer.peer = PeerId {"peer-b"};
-        tenant_b.session = SessionId {"session-b"};
-        tenant_b.session_fence = 12U;
-        tenant_b.agent_epoch = "epoch-b";
-        run_tenant(tenant_b, "state-b");
+        {
+            cluster::AuditTrail audit;
+            cluster::InMemoryRuntimeStore store {audit};
+            auto scheduler = tools::ResidentEvaluationScheduler::create(
+                store, audit, "node-a", std::chrono::seconds {30}, {stateful_active_pack()});
+            REQUIRE(scheduler.has_value());
 
-        const auto snapshot = store.snapshot();
-        REQUIRE(snapshot.results.size() == 2U);
-        REQUIRE(snapshot.state.size() == 2U);
-        CHECK(snapshot.state[0].key.namespace_name != "rule");
-        CHECK(snapshot.state[1].key.namespace_name != "rule");
-        CHECK(snapshot.state[0].key.namespace_name != snapshot.state[1].key.namespace_name);
-        for (const auto &cell : snapshot.state) {
-            CHECK(cell.version == 1U);
-            REQUIRE(cell.value.has_value());
-            CHECK(std::get<bool>(cell.value->value.node->data));
+            auto tenant_a_peer_a = session();
+            auto subject_a = subject();
+            run_snapshot(**scheduler, tenant_a_peer_a, "state-a-peer-a", {subject_a});
+            auto tenant_a_peer_b = tenant_a_peer_a;
+            tenant_a_peer_b.authenticated_peer.peer = PeerId {"peer-b"};
+            tenant_a_peer_b.session = SessionId {"session-b"};
+            tenant_a_peer_b.session_fence = 12U;
+            tenant_a_peer_b.agent_epoch = "epoch-b";
+            auto subject_b = subject_a;
+            subject_b.peer = tenant_a_peer_b.authenticated_peer.peer;
+            run_snapshot(**scheduler, tenant_a_peer_b, "state-a-peer-b", {subject_b});
+            auto tenant_b = tenant_a_peer_a;
+            tenant_b.authenticated_peer.tenant = TenantId {"tenant-b"};
+            tenant_b.session = SessionId {"session-c"};
+            tenant_b.session_fence = 13U;
+            tenant_b.agent_epoch = "epoch-c";
+            run_snapshot(**scheduler, tenant_b, "state-b-peer-a", {subject_a});
+
+            const auto snapshot = store.snapshot();
+            REQUIRE(snapshot.results.size() == 3U);
+            REQUIRE(snapshot.state.size() == 3U);
+            CHECK(snapshot.state[0].key.namespace_name != "state-key-v1/peer/com.example.peer-flag");
+            CHECK(snapshot.state[1].key.namespace_name != "state-key-v1/peer/com.example.peer-flag");
+            CHECK(snapshot.state[2].key.namespace_name != "state-key-v1/peer/com.example.peer-flag");
+            CHECK(snapshot.state[0].key.namespace_name != snapshot.state[1].key.namespace_name);
+            CHECK(snapshot.state[0].key.namespace_name != snapshot.state[2].key.namespace_name);
+            CHECK(snapshot.state[1].key.namespace_name != snapshot.state[2].key.namespace_name);
+        }
+
+        {
+            cluster::AuditTrail audit;
+            cluster::InMemoryRuntimeStore store {audit};
+            auto scheduler = tools::ResidentEvaluationScheduler::create(
+                store, audit, "node-a", std::chrono::seconds {30},
+                {stateful_active_pack("state-key-v1/subject/com.example.subject-flag")});
+            REQUIRE(scheduler.has_value());
+            const auto agent = session();
+            auto subject_a = subject();
+            auto subject_b = subject_a;
+            subject_b.identity.front().value = std::uint64_t {43U};
+            run_snapshot(**scheduler, agent, "state-subjects", {subject_a, subject_b});
+
+            const auto snapshot = store.snapshot();
+            REQUIRE(snapshot.results.size() == 2U);
+            REQUIRE(snapshot.state.size() == 2U);
+            CHECK(snapshot.state[0].key.namespace_name != "state-key-v1/subject/com.example.subject-flag");
+            CHECK(snapshot.state[1].key.namespace_name != "state-key-v1/subject/com.example.subject-flag");
+            CHECK(snapshot.state[0].key.namespace_name != snapshot.state[1].key.namespace_name);
         }
     }
 

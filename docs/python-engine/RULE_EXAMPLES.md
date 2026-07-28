@@ -166,7 +166,49 @@ The requested context and match cap are part of the scan request and its
 budget. Reaching a configured result limit is a typed failure, not an
 unbounded list.
 
-## History filters, correlations, state, and effects
+## Typed state that is runnable now
+
+**Runnable now.** A rule may declare a module-level scalar `StateKey` with
+peer or subject scope, then use an injected `State` parameter. The capability
+is static: it cannot be inspected, returned, or sent to an agent.
+
+```python
+from rule_engine import Model, State, StateKey, StateScope, provider_fact, rule
+
+
+class Process(Model):
+    is_signed: bool = provider_fact(route="process.signer.is_signed")
+
+
+SEEN_UNSIGNED = StateKey(
+    "com.acme.seen-unsigned",
+    bool,
+    scope=StateScope.PEER,
+)
+
+
+@rule("com.acme.first-unsigned-process")
+def first_unsigned_process(process: Process, state: State) -> bool:
+    seen = state.get(SEEN_UNSIGNED)
+    if process.is_signed:
+        return False
+
+    state.set(SEEN_UNSIGNED, True)
+    return seen is None
+```
+
+The compiler derives the state operand from the stable key declaration. The
+resident server adds tenant, pack, active state namespace, and the declared
+peer identity before reading or committing a cell. `get`, `set`, and `delete`
+are supported directly in reportable entrypoints.
+
+This first slice intentionally rejects non-`None` defaults, dynamic
+`identity=...`, session/correlation/shared scopes, non-`internal`
+classification, `require`, `compare_and_set`, helper-function ownership, and
+migrations. A store conflict also fails the current resident attempt until
+captured-input retry is connected.
+
+## History filters, correlations, wider state, and effects
 
 **Contract example.** This compact example shows how the remaining pieces fit
 together. It is intentionally a sketch of one flow rather than a production
@@ -200,7 +242,6 @@ ALERT_COUNT = StateKey(
     "com.acme.alert-count",
     int,
     scope=StateScope.PEER,
-    default=0,
 )
 
 
@@ -266,7 +307,10 @@ and using an in-rule `EventReceipt` are not yet supported.
 | Closed `try`/`except`/`else`/`finally` subset | Runnable now |
 | Pattern declarations, scans, and `MatchSet` filtering | Contract; lowering incomplete |
 | History and correlation source | Contract; lowering incomplete |
-| State records, transactions, telemetry, and services | Contract; lowering incomplete |
+| Scalar peer/subject `StateKey`; entrypoint `get`/`set`/`delete` | Runnable now |
+| State records, other scopes/defaults, transactions, and migrations | Contract; lowering incomplete |
+| Telemetry event emission | Runnable now with the strict form described above |
+| History, correlations, and services | Contract; lowering incomplete |
 | Ambient/runtime imports, reflection, dynamic code, and native extensions | Deliberately unsupported |
 
 The SDK may expose a contract before its complete lowering exists so authors

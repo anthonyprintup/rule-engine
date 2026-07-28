@@ -37,11 +37,15 @@ flowchart TD
 
     E -->|"pure operation or control edge"| C
     E -->|"fact or capability request"| F["Suspend with typed request and exact continuation"]
-    E -->|"state or history request"| G["Yield with typed request vector"]
+    E -->|"state read"| G["Resolve durable cell in the resident"]
+    E -->|"history request"| W["Yield with typed request vector"]
     E -->|"fairness yield"| H["Requeue the same session"]
 
     F --> I["Coordinator dispatches a data-only request"]
-    G --> I
+    W --> I
+    G --> X{"Owner, scope, schema, and fence valid?"}
+    X -->|"yes"| K
+    X -->|"no"| L
     I --> J{"Identity, schema, subject, bounds, fence, and result valid?"}
     J -->|"yes"| K["Capture response for replay"]
     K --> C
@@ -61,8 +65,7 @@ flowchart TD
     Q -->|"recovery faults or aborts"| P
     R --> S{"Atomic durable commit"}
     S -->|"success"| T["Committed receipt; outbox becomes eligible"]
-    S -->|"MVCC conflict and retry remains"| U["Fresh session; reuse captured external inputs"]
-    U --> B
+    S -->|"MVCC conflict today"| Y["Fail attempt; transparent replay is not implemented"]
     P --> V["Rollback journals; terminal fault state"]
 ```
 
@@ -87,6 +90,27 @@ The VM returns one of these states to its owner:
 A step can also carry bounded fact, scan, capability, state, and history
 request vectors, plus journal, event, and recorder deltas. The coordinator
 must inspect both the state and those vectors.
+
+## Typed state path
+
+State is an injected static capability, not a Python object passed to the VM.
+The compiler therefore erases an entrypoint's `State` parameter from the
+runtime argument list. A supported module-level declaration such as
+`FLAG = StateKey("com.acme.flag", bool, scope=StateScope.PEER)` becomes a
+verifier-visible logical state operand.
+
+`state.get(FLAG)` emits `read_state`; `set` and `delete` append mutations to the
+session journal. The resident, not the rule or agent, turns the logical operand
+into a physical identity using the tenant, pack, active state namespace,
+executable owner, and declared peer or canonical-subject scope. Reads are
+resolved on the server. Mutations become visible only in the same fenced atomic
+transaction as the terminal rule result.
+
+The current authoring slice is deliberately narrow: scalar values, peer or
+subject scope, internal classification, no custom default, direct use in a
+reportable entrypoint, and `get`/`set`/`delete` only. State records, explicit
+identity overrides, wider scopes and classifications, compare-and-set,
+helpers/shared state, and migration programs remain compile-time errors.
 
 ## Instruction families
 

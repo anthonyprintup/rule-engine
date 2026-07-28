@@ -163,9 +163,20 @@ producing agent work, the resulting write joins the same fenced terminal
 transaction, and two tenants using the same pack, activation namespace,
 executable, logical namespace, and key receive distinct physical state cells.
 Production composition now takes the state namespace only from durable
-active-generation metadata. This does not qualify Python source-level state
-lowering, transparent MVCC replay, migration bytecode, reset or retained-gap
-administration, live PostgreSQL, or multi-process state contention.
+active-generation metadata.
+
+The source-authored state slice adds exact private-worker source-to-compiler-to-
+verified-VM coverage for scalar module-level `StateKey` declarations, static
+erasure of the injected `State` capability from the runtime ABI, and direct
+`get`/`set`/`delete` bytecode and journals. Resident coverage proves that the
+same logical operand contract remains server-local and that otherwise identical
+tenant, peer, and subject scopes cannot alias physical cells. The complete-suite
+timing for this slice was 158.82 seconds: all 38 Debug tests passed.
+
+This evidence does not qualify compiler-derived state-schema attestation,
+transparent MVCC replay, state records or wider authoring forms, migration
+bytecode, reset or retained-gap administration, live PostgreSQL, or
+multi-process state contention.
 
 ## Artifact identity
 

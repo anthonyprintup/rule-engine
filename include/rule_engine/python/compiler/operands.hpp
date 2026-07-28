@@ -9,6 +9,7 @@ namespace rule_engine::python::compiler {
 
     inline constexpr std::string_view vm_fact_operand_schema = "rule-engine.vm.fact-operand.v1";
     inline constexpr std::string_view vm_capability_operand_schema = "rule-engine.vm.capability-operand.v1";
+    inline constexpr std::string_view vm_state_operand_schema = "rule-engine.vm.state-operand.v1";
 
     struct FactOperand {
         FactRoute route;
@@ -28,6 +29,7 @@ namespace rule_engine::python::compiler {
 
     [[nodiscard]] FactValue make_vm_fact_operand(FactRoute route, SchemaId expected_schema);
     [[nodiscard]] FactValue make_vm_capability_operand(CapabilityId capability, SchemaId request_schema);
+    [[nodiscard]] FactValue make_vm_state_operand(std::string state_namespace, std::string key, SchemaId schema);
     [[nodiscard]] FactValue make_vm_event_operand(SchemaId schema, std::string schema_hash);
     [[nodiscard]] std::expected<FactOperand, DiagnosticSet> decode_vm_fact_operand(const FactValue &value);
     [[nodiscard]] std::expected<CapabilityOperand, DiagnosticSet> decode_vm_capability_operand(const FactValue &value);

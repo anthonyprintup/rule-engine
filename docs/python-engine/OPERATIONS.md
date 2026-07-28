@@ -262,14 +262,22 @@ snapshot messages.
 Current operations must account for three evaluator limits: one VM provider
 turn stays on one agent route, capability/service/history host turns fail
 closed, and a durable state conflict fails the attempt instead of replaying it
-transparently. For verified state bytecode, reads and writes stay on the server
-and are partitioned under the tenant and activation-selected namespace; no
-state request is sent to an agent. The Python frontend does not yet expose that
-bytecode to rule authors. Activation does not require a process restart: an
+transparently. Scalar module-level `StateKey` declarations with peer or subject
+scope and direct entrypoint `get`/`set`/`delete` are executable now. Reads and
+writes stay on the server and are partitioned under tenant, pack,
+activation-selected namespace, executable owner, and the peer or canonical
+subject; no state request is sent to an agent. Records, custom defaults,
+explicit identities, wider scopes/classifications, compare-and-set, shared
+state, helpers, and migrations remain closed. The activation state-schema hash
+is still operator-supplied rather than derived from the compiled declarations,
+so it must be reviewed as a deployment invariant. Activation does not require
+a process restart: an
 atomic flip fences old sessions, residents verify and compile the new durable
 active identity, and new sessions are admitted only after the local scheduler
 has swapped. See
-[L-031](LIMITATIONS.md#l-031--resident-host-services-and-retry-are-partial).
+[L-026](LIMITATIONS.md#l-026--container-and-iteration-frontend-is-intentionally-partial),
+[L-031](LIMITATIONS.md#l-031--resident-host-services-and-retry-are-partial),
+and [L-033](LIMITATIONS.md#l-033--filesystem-and-administration-adapters-are-intentionally-narrow).
 
 ## 5. Configure the Windows agent
 
