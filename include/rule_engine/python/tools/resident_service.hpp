@@ -188,15 +188,25 @@ namespace rule_engine::python::tools {
         std::optional<SourceDigest> source_digest;
     };
 
+    struct ResidentPackRegistryMaintenanceReceipt {
+        std::uint64_t expired_partial_sessions {};
+        std::uint64_t removed_completion_records {};
+        std::uint64_t removed_objects {};
+        std::uint64_t reclaimed_bytes {};
+    };
+
     struct IResidentPackUploadBackend {
         virtual ~IResidentPackUploadBackend() = default;
         [[nodiscard]] virtual std::expected<ResidentPackUploadReceipt, protocol_v2::ProtocolError>
-        begin(const PackId &pack, std::string_view upload_id, std::uint64_t total_bytes) noexcept = 0;
+        begin(const TenantId &tenant, const PackId &pack, std::string_view upload_id,
+              std::uint64_t total_bytes) noexcept = 0;
         [[nodiscard]] virtual std::expected<ResidentPackUploadReceipt, protocol_v2::ProtocolError>
-        append(const PackId &pack, std::string_view upload_id, std::uint64_t offset,
+        append(const TenantId &tenant, const PackId &pack, std::string_view upload_id, std::uint64_t offset,
                std::span<const std::byte> payload) noexcept = 0;
         [[nodiscard]] virtual std::expected<ResidentPackUploadReceipt, protocol_v2::ProtocolError>
-        finalize(const PackId &pack, std::string_view upload_id) noexcept = 0;
+        finalize(const TenantId &tenant, const PackId &pack, std::string_view upload_id) noexcept = 0;
+        [[nodiscard]] virtual std::expected<ResidentPackRegistryMaintenanceReceipt, protocol_v2::ProtocolError>
+        maintain(std::span<const SourceDigest> reachable_source_digests, std::uint64_t now_unix_ms) noexcept = 0;
     };
 
     struct IResidentStageSourceBackend {

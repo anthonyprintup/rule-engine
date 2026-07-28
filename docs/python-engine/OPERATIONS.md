@@ -123,7 +123,9 @@ named policy profile. Inline database secrets are rejected; the supported
 reference form is `env:VARIABLE_NAME`, resolved once and then wiped from the
 server-owned buffer.
 
-The pack registry is content addressed. Place each canonical signed archive at
+Server configuration schema version 2 adds explicit registry lifecycle bounds.
+The pack registry is content addressed. Authenticated upload publishes each
+canonical signed archive as
 `PACK_REGISTRY/sha256/SOURCE_CLOSURE_SHA256.rpack`, using exactly 64 lowercase
 hexadecimal characters for the digest and an absolute registry root. Startup
 does not scan for a convenient version: it resolves the digest recorded by the
@@ -165,6 +167,10 @@ service.inbound_credit_snapshot_chunks
 network.require_hard_resolver_bounds
 runtime.root
 pack.registry_path
+pack.maximum_published_bytes
+pack.maximum_tenant_bytes
+pack.partial_session_ttl_ms
+pack.unreferenced_retention_ms
 bindings.operator_path
 schemas.catalog_path
 profiles.budget_path
@@ -173,6 +179,31 @@ observability.prometheus_endpoint
 observability.json_log_path
 observability.audit_path
 ```
+
+`pack.maximum_published_bytes` bounds canonical object bytes across the
+registry; `pack.maximum_tenant_bytes` bounds each tenant's published identities
+and in-progress reservations. Both must allow at least one 16 MiB source pack,
+the tenant bound cannot exceed the global bound, and the global bound cannot
+exceed 1 PiB. Partial-session TTL must be between one minute and 30 days.
+Unreferenced retention must be between one hour and 365 days. A conservative
+example is:
+
+```text
+schema.version = 2
+pack.maximum_published_bytes = 1073741824
+pack.maximum_tenant_bytes = 268435456
+pack.partial_session_ttl_ms = 3600000
+pack.unreferenced_retention_ms = 604800000
+```
+
+Registry maintenance runs before readiness and once per minute. Every durable
+generation—compiling, ready, active, retired, or failed—keeps its source
+reachable. An uploaded object is collected only after no generation references
+it and its newest successful publication is older than the retention window.
+Abandoned reservations expire from their creation time. Upload metadata format
+v1 is not accepted by schema-v2 servers; finish uploads before upgrade or clear
+only the ACL-protected `.uploads` spool after confirming no upload is in
+progress. Never delete `sha256` objects manually to recover quota.
 
 Run `rule_engine_server --help` from the same installed version for the
 production-only keys. Unknown and duplicate keys fail closed. Listener hosts

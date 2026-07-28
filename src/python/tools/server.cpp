@@ -65,7 +65,9 @@ Required common configuration keys:
   service.maximum_session_duration_ms, service.inbound_credit_bytes,
   service.inbound_credit_messages, service.inbound_credit_work_attempts,
   service.inbound_credit_snapshot_chunks,
-  runtime.root, pack.registry_path, bindings.operator_path,
+  runtime.root, pack.registry_path, pack.maximum_published_bytes,
+  pack.maximum_tenant_bytes, pack.partial_session_ttl_ms,
+  pack.unreferenced_retention_ms, bindings.operator_path,
   schemas.catalog_path, profiles.budget_path, profiles.retention_path,
   observability.prometheus_endpoint, observability.json_log_path,
   observability.audit_path.
@@ -86,11 +88,15 @@ are rule-engine.trusted-signers.v1 and rule-engine.revocations.v1.
 Authenticated application sessions run on a fixed owned worker pool with a
 bounded queue and memory reservation. Agent ACKs require a backend-declared
 durable receipt. Agent message bodies and their cumulative receipts commit in
-one fenced store transaction before an ACK is emitted. The current production
-composition does not yet assign event-to-pack work. The bounded admin wire
-surface supports pack/operation reads, verified resumable upload, server-owned
-distributed stage, and explicit activation phases. Rollback restaging and
-versioned policy/registry administration remain fail-closed.
+one fenced store transaction before an ACK is emitted. Committed authoritative
+snapshots schedule generation-fenced fact and scan work through the C++ VM. The
+bounded admin wire surface supports pack/operation reads, verified resumable
+upload, server-owned distributed stage, forward rollback restaging, and
+explicit activation phases.
+Stages bind the complete immutable activation-policy identity. Registry uploads
+are tenant-accounted; abandoned partials expire and unreferenced objects are
+retained then collected from durable generation reachability. Authenticated
+policy mutation remains fail-closed.
 )";
 
         enum struct ValueKind : std::uint8_t { text, integer, boolean };
@@ -197,6 +203,10 @@ versioned policy/registry administration remain fail-closed.
                 {"tls.require_crl", ValueKind::boolean},
                 {"runtime.root", ValueKind::text},
                 {"pack.registry_path", ValueKind::text},
+                {"pack.maximum_published_bytes", ValueKind::integer},
+                {"pack.maximum_tenant_bytes", ValueKind::integer},
+                {"pack.partial_session_ttl_ms", ValueKind::integer},
+                {"pack.unreferenced_retention_ms", ValueKind::integer},
                 {"trust.trusted_signers_path", ValueKind::text},
                 {"trust.revocations_path", ValueKind::text},
                 {"trust.peer_enrollment_path", ValueKind::text},
@@ -1804,6 +1814,30 @@ versioned policy/registry administration remain fail-closed.
             return result;
         }
 
+        [[nodiscard]] std::vector<SourceDigest> reachable_registry_sources(const cluster::DurableControlState &state) {
+            std::vector<SourceDigest> result;
+            result.reserve(state.generations.size());
+            for (const auto &generation : state.generations) { result.push_back(generation.request.source_digest); }
+            std::ranges::sort(result, {}, &SourceDigest::value);
+            const auto unique = std::ranges::unique(result, {}, &SourceDigest::value);
+            result.erase(unique.begin(), unique.end());
+            return result;
+        }
+
+        [[nodiscard]] std::expected<void, ToolFailure>
+        maintain_pack_registry(const ResidentServerContext &context, const cluster::DurableControlState &state) {
+            if (context.pack_registry == nullptr) {
+                return {};
+            }
+            const auto reachable = reachable_registry_sources(state);
+            auto maintained = context.pack_registry->maintain(reachable, now_unix_ms());
+            if (!maintained) {
+                return std::unexpected(
+                    unavailable("SRV-PACK-REGISTRY-MAINTENANCE", "bounded pack registry maintenance failed"));
+            }
+            return {};
+        }
+
         [[nodiscard]] bool process_resident_compilation_once(const ResidentServerContext &context) {
             auto inspection = context.activation_store.inspect();
             if (!inspection) {
@@ -2009,6 +2043,10 @@ versioned policy/registry administration remain fail-closed.
             "service.inbound_credit_snapshot_chunks",
             "runtime.root",
             "pack.registry_path",
+            "pack.maximum_published_bytes",
+            "pack.maximum_tenant_bytes",
+            "pack.partial_session_ttl_ms",
+            "pack.unreferenced_retention_ms",
             "bindings.operator_path",
             "schemas.catalog_path",
             "profiles.budget_path",
@@ -2066,12 +2104,15 @@ versioned policy/registry administration remain fail-closed.
         const auto inbound_credit_messages = uint32_value(*entries, "service.inbound_credit_messages");
         const auto inbound_credit_work = uint32_value(*entries, "service.inbound_credit_work_attempts");
         const auto inbound_credit_snapshots = uint32_value(*entries, "service.inbound_credit_snapshot_chunks");
+        const auto partial_session_ttl = milliseconds_value(*entries, "pack.partial_session_ttl_ms");
+        const auto unreferenced_retention = milliseconds_value(*entries, "pack.unreferenced_retention_ms");
         if (!schema_version || !processes || !server_major || !pool_size || !lease_duration || !lease_renew_interval ||
             !statement_timeout || !busy_timeout || !accept_timeout || !handshake_timeout || !read_timeout ||
             !write_timeout || !listen_backlog || !maximum_consecutive_failures || !worker_threads ||
             !maximum_queued_sessions || !maximum_memory_bytes || !maximum_frame_bytes ||
             !maximum_messages_per_session || !maximum_inflight_work || !maximum_session_duration ||
-            !inbound_credit_bytes || !inbound_credit_messages || !inbound_credit_work || !inbound_credit_snapshots) {
+            !inbound_credit_bytes || !inbound_credit_messages || !inbound_credit_work || !inbound_credit_snapshots ||
+            !partial_session_ttl || !unreferenced_retention) {
             return std::unexpected(!schema_version               ? std::move(schema_version.error()) :
                                    !processes                    ? std::move(processes.error()) :
                                    !server_major                 ? std::move(server_major.error()) :
@@ -2096,7 +2137,9 @@ versioned policy/registry administration remain fail-closed.
                                    !inbound_credit_bytes         ? std::move(inbound_credit_bytes.error()) :
                                    !inbound_credit_messages      ? std::move(inbound_credit_messages.error()) :
                                    !inbound_credit_work          ? std::move(inbound_credit_work.error()) :
-                                                                   std::move(inbound_credit_snapshots.error()));
+                                   !inbound_credit_snapshots     ? std::move(inbound_credit_snapshots.error()) :
+                                   !partial_session_ttl          ? std::move(partial_session_ttl.error()) :
+                                                                   std::move(unreferenced_retention.error()));
         }
         result.schema_version = *schema_version;
         result.node_id = *entry_value<std::string>(*entries, "node.id");
@@ -2144,6 +2187,12 @@ versioned policy/registry administration remain fail-closed.
         result.tls.require_crl = entry_value<bool>(*entries, "tls.require_crl").value_or(false);
         result.runtime_root = *entry_value<std::string>(*entries, "runtime.root");
         result.pack_registry_path = *entry_value<std::string>(*entries, "pack.registry_path");
+        result.pack_registry_limits = {
+            .maximum_published_bytes = *entry_value<std::uint64_t>(*entries, "pack.maximum_published_bytes"),
+            .maximum_tenant_bytes = *entry_value<std::uint64_t>(*entries, "pack.maximum_tenant_bytes"),
+            .partial_session_ttl = *partial_session_ttl,
+            .unreferenced_retention = *unreferenced_retention,
+        };
         result.trusted_signers_path = entry_value<std::string>(*entries, "trust.trusted_signers_path").value_or("");
         result.revocations_path = entry_value<std::string>(*entries, "trust.revocations_path").value_or("");
         result.peer_enrollment_path = entry_value<std::string>(*entries, "trust.peer_enrollment_path").value_or("");
@@ -2245,7 +2294,7 @@ versioned policy/registry administration remain fail-closed.
     std::expected<void, ServerConfigError> validate_server_config(const ServerConfig &config) {
         if (config.schema_version != server_config_schema_version) {
             return std::unexpected(
-                config_error("SRV-CONFIG-VERSION", "only server configuration schema version 1 is supported"));
+                config_error("SRV-CONFIG-VERSION", "only server configuration schema version 2 is supported"));
         }
         if (config.node_id.empty() || config.platform_abi.empty() || config.lease_duration.count() <= 0 ||
             config.lease_renew_interval.count() <= 0 || config.lease_renew_interval >= config.lease_duration) {
@@ -2294,6 +2343,18 @@ versioned policy/registry administration remain fail-closed.
             return std::unexpected(
                 config_error("SRV-CONFIG-SERVICE-BOUNDS",
                              "service worker, queue, frame, memory, credit, or session bounds are invalid"));
+        }
+        if (config.pack_registry_limits.maximum_published_bytes < balanced_v1.compile.source_closure_bytes ||
+            config.pack_registry_limits.maximum_published_bytes > maximum_pack_registry_bytes ||
+            config.pack_registry_limits.maximum_tenant_bytes < balanced_v1.compile.source_closure_bytes ||
+            config.pack_registry_limits.maximum_tenant_bytes > config.pack_registry_limits.maximum_published_bytes ||
+            config.pack_registry_limits.partial_session_ttl < std::chrono::minutes {1} ||
+            config.pack_registry_limits.partial_session_ttl > std::chrono::days {30} ||
+            config.pack_registry_limits.unreferenced_retention < std::chrono::hours {1} ||
+            config.pack_registry_limits.unreferenced_retention > std::chrono::days {365}) {
+            return std::unexpected(
+                config_error("SRV-CONFIG-REGISTRY-BOUNDS",
+                             "pack registry quota, partial expiry, or unreferenced retention is invalid"));
         }
         const std::pair<const std::filesystem::path *, std::string_view> common_paths[] {
             {&config.runtime_root, "runtime.root"},
@@ -2545,6 +2606,10 @@ versioned policy/registry administration remain fail-closed.
             return std::unexpected(
                 unavailable("SRV-ACTIVATION-LOAD", "durable active-generation state could not be loaded"));
         }
+        if (auto maintained = maintain_pack_registry(context, *control_state); !maintained) {
+            static_cast<void>(impl_->release_node_lease());
+            return std::unexpected(std::move(maintained.error()));
+        }
         const auto activation = qualify_control_state(*control_state, context.config);
         auto active_compilations = compile_active_generations(*control_state, context);
         if (!active_compilations) {
@@ -2641,25 +2706,31 @@ versioned policy/registry administration remain fail-closed.
             return std::unexpected(recorded.error());
         }
         auto initial_active_identity = stable_active_identity(*control_state).value_or(std::string {});
-        impl_->control_worker = std::jthread {[&context, active_identity = std::move(initial_active_identity)](
-                                                  const std::stop_token cancellation) mutable {
-            while (!cancellation.stop_requested()) {
-                const auto progressed = process_resident_compilation_once(context);
-                auto state = context.activation_store.load_state();
-                auto identity = state ? stable_active_identity(*state) : std::optional<std::string> {};
-                if (identity && *identity != active_identity) {
-                    auto compilations = compile_active_generations(*state, context);
-                    if (compilations) {
-                        auto activated = context.agent_backend->activate(*compilations);
-                        if (activated) {
-                            active_identity = std::move(*identity);
+        impl_->control_worker =
+            std::jthread {[&context, active_identity = std::move(initial_active_identity),
+                           next_registry_maintenance = std::chrono::steady_clock::now() + std::chrono::minutes {1}](
+                              const std::stop_token cancellation) mutable {
+                while (!cancellation.stop_requested()) {
+                    const auto progressed = process_resident_compilation_once(context);
+                    auto state = context.activation_store.load_state();
+                    if (state && std::chrono::steady_clock::now() >= next_registry_maintenance) {
+                        static_cast<void>(maintain_pack_registry(context, *state));
+                        next_registry_maintenance = std::chrono::steady_clock::now() + std::chrono::minutes {1};
+                    }
+                    auto identity = state ? stable_active_identity(*state) : std::optional<std::string> {};
+                    if (identity && *identity != active_identity) {
+                        auto compilations = compile_active_generations(*state, context);
+                        if (compilations) {
+                            auto activated = context.agent_backend->activate(*compilations);
+                            if (activated) {
+                                active_identity = std::move(*identity);
+                            }
                         }
                     }
+                    const auto pause = progressed ? std::chrono::milliseconds {10} : std::chrono::milliseconds {250};
+                    std::this_thread::sleep_for(pause);
                 }
-                const auto pause = progressed ? std::chrono::milliseconds {10} : std::chrono::milliseconds {250};
-                std::this_thread::sleep_for(pause);
-            }
-        }};
+            }};
         impl_->peer_trust_policy = std::addressof(context.peer_trust_policy);
         impl_->qualified = true;
         return {};
@@ -2877,8 +2948,8 @@ versioned policy/registry administration remain fail-closed.
         if (!activation_store) {
             return failure_output(activation_store.error());
         }
-        auto uploads = FilesystemResidentPackUploadBackend::create(config->pack_registry_path, *pack_trust_policy,
-                                                                   runtime->crypto_library);
+        auto uploads = FilesystemResidentPackUploadBackend::create(
+            config->pack_registry_path, *pack_trust_policy, runtime->crypto_library, config->pack_registry_limits);
         if (!uploads) {
             return failure_output(
                 unavailable("SRV-PACK-UPLOAD-UNAVAILABLE", "the verified source-pack upload registry is unavailable"));
@@ -2912,6 +2983,7 @@ versioned policy/registry administration remain fail-closed.
             .admin_tls = admin_tls->has_value() ? std::addressof(**admin_tls) : nullptr,
             .agent_backend = std::addressof(agent_backend),
             .admin_backend = std::addressof(staged_admin_backend),
+            .pack_registry = uploads->get(),
         };
         if (auto active = backend.qualify_activation(context); !active) {
             return failure_output(active.error());

@@ -122,7 +122,7 @@ namespace {
 
     [[nodiscard]] std::string development_config(const TemporaryDirectory &temporary) {
         const auto database = (temporary.path / "runtime.sqlite").generic_string();
-        return "schema.version = 1\n"
+        return "schema.version = 2\n"
                "deployment.mode = \"single_node_dev\"\n"
                "node.id = \"node-dev\"\n"
                "node.platform_abi = \"windows-x86_64-clang\"\n"
@@ -156,6 +156,10 @@ namespace {
                "network.require_hard_resolver_bounds = true\n"
                "runtime.root = \"missing-runtime\"\n"
                "pack.registry_path = \"missing-registry\"\n"
+               "pack.maximum_published_bytes = 1073741824\n"
+               "pack.maximum_tenant_bytes = 268435456\n"
+               "pack.partial_session_ttl_ms = 3600000\n"
+               "pack.unreferenced_retention_ms = 604800000\n"
                "bindings.operator_path = \"missing-bindings.json\"\n"
                "schemas.catalog_path = \"missing-schemas.json\"\n"
                "profiles.budget_path = \"missing-budget.json\"\n"
@@ -169,7 +173,7 @@ namespace {
     }
 
     [[nodiscard]] std::string production_config() {
-        return "schema.version = 1\n"
+        return "schema.version = 2\n"
                "deployment.mode = \"production_cluster\"\n"
                "node.id = \"node-production\"\n"
                "node.platform_abi = \"windows-x86_64-clang\"\n"
@@ -210,6 +214,10 @@ namespace {
                "tls.require_crl = true\n"
                "runtime.root = \"missing-runtime\"\n"
                "pack.registry_path = \"missing-registry\"\n"
+               "pack.maximum_published_bytes = 1073741824\n"
+               "pack.maximum_tenant_bytes = 268435456\n"
+               "pack.partial_session_ttl_ms = 3600000\n"
+               "pack.unreferenced_retention_ms = 604800000\n"
                "trust.trusted_signers_path = \"missing-signers.json\"\n"
                "trust.revocations_path = \"missing-revocations.json\"\n"
                "trust.peer_enrollment_path = \"missing-peers.json\"\n"
@@ -378,9 +386,15 @@ TEST_CASE("server configuration parser bounds hostile input and duplicate state"
     CHECK(oversized.error().code == "SRV-CONFIG-SIZE");
 
     TemporaryDirectory temporary;
-    const auto duplicate = parse_server_config(development_config(temporary) + "schema.version = 1\n");
+    const auto duplicate = parse_server_config(development_config(temporary) + "schema.version = 2\n");
     REQUIRE_FALSE(duplicate.has_value());
     CHECK(duplicate.error().code == "SRV-CONFIG-DUPLICATE-KEY");
+
+    auto legacy_schema = development_config(temporary);
+    replace_once(legacy_schema, "schema.version = 2", "schema.version = 1");
+    const auto legacy = parse_server_config(legacy_schema);
+    REQUIRE_FALSE(legacy.has_value());
+    CHECK(legacy.error().code == "SRV-CONFIG-VERSION");
 
     auto excessive_duration = development_config(temporary);
     replace_once(excessive_duration, "node.lease_duration_ms = 30000", "node.lease_duration_ms = 18446744073709551615");
@@ -430,6 +444,19 @@ TEST_CASE("server configuration parser bounds hostile input and duplicate state"
     const auto unsafe_service = parse_server_config(unbounded_service);
     REQUIRE_FALSE(unsafe_service.has_value());
     CHECK(unsafe_service.error().code == "SRV-CONFIG-SERVICE-BOUNDS");
+
+    auto inverted_registry_quota = development_config(temporary);
+    replace_once(inverted_registry_quota, "pack.maximum_tenant_bytes = 268435456",
+                 "pack.maximum_tenant_bytes = 2147483648");
+    const auto unsafe_registry_quota = parse_server_config(inverted_registry_quota);
+    REQUIRE_FALSE(unsafe_registry_quota.has_value());
+    CHECK(unsafe_registry_quota.error().code == "SRV-CONFIG-REGISTRY-BOUNDS");
+
+    auto short_partial_ttl = development_config(temporary);
+    replace_once(short_partial_ttl, "pack.partial_session_ttl_ms = 3600000", "pack.partial_session_ttl_ms = 1000");
+    const auto unsafe_partial_ttl = parse_server_config(short_partial_ttl);
+    REQUIRE_FALSE(unsafe_partial_ttl.has_value());
+    CHECK(unsafe_partial_ttl.error().code == "SRV-CONFIG-REGISTRY-BOUNDS");
 }
 
 TEST_CASE("server validates explicit configuration and fails closed before resident startup") {
@@ -936,7 +963,7 @@ namespace {
         std::uint64_t total_bytes {};
 
         [[nodiscard]] std::expected<tools::ResidentPackUploadReceipt, proto::ProtocolError>
-        begin(const py::PackId &, std::string_view, const std::uint64_t total) noexcept override {
+        begin(const py::TenantId &, const py::PackId &, std::string_view, const std::uint64_t total) noexcept override {
             calls.push_back(tools::ResidentAdminRequestKind::upload_begin);
             total_bytes = total;
             return tools::ResidentPackUploadReceipt {
@@ -944,7 +971,7 @@ namespace {
         }
 
         [[nodiscard]] std::expected<tools::ResidentPackUploadReceipt, proto::ProtocolError>
-        append(const py::PackId &, std::string_view, const std::uint64_t offset,
+        append(const py::TenantId &, const py::PackId &, std::string_view, const std::uint64_t offset,
                const std::span<const std::byte> payload) noexcept override {
             calls.push_back(tools::ResidentAdminRequestKind::upload_chunk);
             if (offset != bytes.size() || offset > total_bytes || payload.size() > total_bytes - offset) {
@@ -957,7 +984,7 @@ namespace {
         }
 
         [[nodiscard]] std::expected<tools::ResidentPackUploadReceipt, proto::ProtocolError>
-        finalize(const py::PackId &, std::string_view) noexcept override {
+        finalize(const py::TenantId &, const py::PackId &, std::string_view) noexcept override {
             calls.push_back(tools::ResidentAdminRequestKind::upload_finalize);
             if (bytes.size() != total_bytes) {
                 return std::unexpected(proto::ProtocolError {.code = proto::ProtocolErrorCode::digest_mismatch,
@@ -969,6 +996,11 @@ namespace {
                 .source_digest =
                     py::SourceDigest {"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
             };
+        }
+
+        [[nodiscard]] std::expected<tools::ResidentPackRegistryMaintenanceReceipt, proto::ProtocolError>
+        maintain(std::span<const py::SourceDigest>, std::uint64_t) noexcept override {
+            return tools::ResidentPackRegistryMaintenanceReceipt {};
         }
     };
 
@@ -1790,33 +1822,40 @@ TEST_CASE("filesystem upload resumes exact bytes and replays immutable publicati
     auto archive = unsigned_upload_archive();
     auto encoded = py::packaging::encode_canonical_source_pack(archive);
     REQUIRE(encoded);
-    auto backend = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library);
+    const tools::PackRegistryLimits limits {
+        .maximum_published_bytes = 32U * py::mebibyte,
+        .maximum_tenant_bytes = 16U * py::mebibyte,
+        .partial_session_ttl = std::chrono::minutes {1},
+        .unreferenced_retention = std::chrono::hours {1},
+    };
+    auto backend = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library, limits);
     REQUIRE(backend);
 
+    const py::TenantId tenant {"tenant:upload"};
     const auto split = encoded->size() / 2U;
-    auto begun = (*backend)->begin(py::PackId {"com.acme.upload"}, "upload:restart", encoded->size());
+    auto begun = (*backend)->begin(tenant, py::PackId {"com.acme.upload"}, "upload:restart", encoded->size());
     REQUIRE(begun);
     CHECK(begun->received_bytes == 0U);
-    auto first = (*backend)->append(py::PackId {"com.acme.upload"}, "upload:restart", 0U,
+    auto first = (*backend)->append(tenant, py::PackId {"com.acme.upload"}, "upload:restart", 0U,
                                     std::span<const std::byte> {*encoded}.first(split));
     REQUIRE(first);
     CHECK(first->received_bytes == split);
-    auto replayed = (*backend)->append(py::PackId {"com.acme.upload"}, "upload:restart", 0U,
+    auto replayed = (*backend)->append(tenant, py::PackId {"com.acme.upload"}, "upload:restart", 0U,
                                        std::span<const std::byte> {*encoded}.first(split));
     REQUIRE(replayed);
     CHECK(replayed->received_bytes == split);
 
     backend->reset();
-    backend = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library);
+    backend = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library, limits);
     REQUIRE(backend);
-    auto resumed = (*backend)->begin(py::PackId {"com.acme.upload"}, "upload:restart", encoded->size());
+    auto resumed = (*backend)->begin(tenant, py::PackId {"com.acme.upload"}, "upload:restart", encoded->size());
     REQUIRE(resumed);
     CHECK(resumed->received_bytes == split);
-    auto second = (*backend)->append(py::PackId {"com.acme.upload"}, "upload:restart", split,
+    auto second = (*backend)->append(tenant, py::PackId {"com.acme.upload"}, "upload:restart", split,
                                      std::span<const std::byte> {*encoded}.subspan(split));
     REQUIRE(second);
     CHECK(second->received_bytes == encoded->size());
-    auto finalized = (*backend)->finalize(py::PackId {"com.acme.upload"}, "upload:restart");
+    auto finalized = (*backend)->finalize(tenant, py::PackId {"com.acme.upload"}, "upload:restart");
     REQUIRE(finalized);
     REQUIRE(finalized->source_digest);
 
@@ -1824,12 +1863,28 @@ TEST_CASE("filesystem upload resumes exact bytes and replays immutable publicati
     REQUIRE(destination);
     CHECK(std::filesystem::is_regular_file(*destination));
     backend->reset();
-    backend = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library);
+    backend = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library, limits);
     REQUIRE(backend);
-    auto replayed_finalize = (*backend)->finalize(py::PackId {"com.acme.upload"}, "upload:restart");
+    auto replayed_finalize = (*backend)->finalize(tenant, py::PackId {"com.acme.upload"}, "upload:restart");
     REQUIRE(replayed_finalize);
     CHECK(replayed_finalize->source_digest == finalized->source_digest);
     CHECK(replayed_finalize->received_bytes == encoded->size());
+
+    const auto maintenance_now = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    const auto after_retention = maintenance_now + 2U * 60U * 60U * 1'000U;
+    const std::array reachable {*finalized->source_digest};
+    auto retained = (*backend)->maintain(reachable, after_retention);
+    REQUIRE(retained);
+    CHECK(retained->removed_objects == 0U);
+    CHECK(std::filesystem::is_regular_file(*destination));
+    auto collected = (*backend)->maintain({}, after_retention);
+    REQUIRE(collected);
+    CHECK(collected->removed_completion_records == 1U);
+    CHECK(collected->removed_objects == 1U);
+    CHECK(collected->reclaimed_bytes == encoded->size());
+    CHECK_FALSE(std::filesystem::exists(*destination));
 
     std::error_code filesystem_error;
     std::size_t partial_files {};
@@ -1841,6 +1896,43 @@ TEST_CASE("filesystem upload resumes exact bytes and replays immutable publicati
     }
     CHECK_FALSE(filesystem_error);
     CHECK(partial_files == 0U);
+}
+
+TEST_CASE("filesystem upload enforces tenant reservation quota and expires abandoned sessions") {
+    TemporaryDirectory temporary;
+    const std::filesystem::path crypto_library {RULE_ENGINE_PYTHON_SERVER_PATH};
+    py::packaging::TrustPolicy trust {
+        .mode = py::packaging::TrustMode::development,
+        .allow_unsigned_packs = true,
+        .allow_unsigned_generators = false,
+        .signers = {},
+    };
+    const tools::PackRegistryLimits limits {
+        .maximum_published_bytes = 32U * py::mebibyte,
+        .maximum_tenant_bytes = 16U * py::mebibyte,
+        .partial_session_ttl = std::chrono::minutes {1},
+        .unreferenced_retention = std::chrono::hours {1},
+    };
+    auto backend = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library, limits);
+    REQUIRE(backend);
+
+    const py::TenantId tenant {"tenant:quota"};
+    const py::PackId pack {"com.acme.upload"};
+    auto reserved = (*backend)->begin(tenant, pack, "upload:reserved", 16U * py::mebibyte);
+    REQUIRE(reserved);
+    auto exhausted = (*backend)->begin(tenant, pack, "upload:blocked", 1U);
+    REQUIRE_FALSE(exhausted);
+    CHECK(exhausted.error().code == proto::ProtocolErrorCode::limit_exceeded);
+
+    const auto maintenance_now = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    auto expired = (*backend)->maintain({}, maintenance_now + 2U * 60U * 1'000U);
+    REQUIRE(expired);
+    CHECK(expired->expired_partial_sessions == 1U);
+    auto admitted = (*backend)->begin(tenant, pack, "upload:blocked", 1U);
+    REQUIRE(admitted);
+    CHECK(admitted->received_bytes == 0U);
 }
 
 TEST_CASE("resident admin v2 activation sequence is durable and idempotent across lost responses") {

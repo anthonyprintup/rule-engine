@@ -8,6 +8,7 @@
 #include "rule_engine/python/protocol/network.hpp"
 #include "rule_engine/python/protocol/session.hpp"
 #include "rule_engine/python/tools/common.hpp"
+#include "rule_engine/python/tools/pack_upload.hpp"
 #include "rule_engine/python/tools/resident_service.hpp"
 
 #include <chrono>
@@ -22,7 +23,7 @@
 
 namespace rule_engine::python::tools {
 
-    inline constexpr std::uint32_t server_config_schema_version = 1U;
+    inline constexpr std::uint32_t server_config_schema_version = 2U;
 
     enum struct ServerDeploymentMode : std::uint8_t { production_cluster, single_node_dev };
     enum struct ServerStoreKind : std::uint8_t { postgresql17, sqlite_dev };
@@ -73,6 +74,7 @@ namespace rule_engine::python::tools {
         ServerTlsConfig tls;
         std::filesystem::path runtime_root;
         std::filesystem::path pack_registry_path;
+        PackRegistryLimits pack_registry_limits;
         std::filesystem::path trusted_signers_path;
         std::filesystem::path revocations_path;
         std::filesystem::path peer_enrollment_path;
@@ -121,6 +123,7 @@ namespace rule_engine::python::tools {
         protocol_v2::OpenSslTlsContext *admin_tls;
         IResidentAgentBackend *agent_backend {};
         IResidentAdminBackend *admin_backend {};
+        IResidentPackUploadBackend *pack_registry {};
     };
 
     // The backend seam keeps process tests injectable while production owns the

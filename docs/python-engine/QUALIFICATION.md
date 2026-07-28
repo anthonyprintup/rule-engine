@@ -131,6 +131,19 @@ evidence; it does not qualify an authenticated policy mutation API, semantic
 policy canonicalization, registry lifecycle, or any open distributed platform
 cell.
 
+The bounded registry-lifecycle slice then passed the complete 38-test Debug
+graph in 156.98 seconds. Executable-surface coverage proves server
+configuration schema-v2 range checks, tenant-scoped resumable upload and
+restart, write-through chunk acknowledgement, conservative tenant reservation
+quota, abandoned-session expiry, referenced-source preservation, and
+retention-delayed reclamation of completion evidence plus its canonical
+object. Production composition derives reachability from every durable
+generation phase, requires safe maintenance before readiness, and repeats it
+once per minute. This evidence is Windows-local filesystem/component evidence;
+it does not qualify a remote object store, exported maintenance metrics/audit,
+generation-metadata pruning, Linux filesystem behavior, or multi-process
+failure injection.
+
 ## Artifact identity
 
 | Artifact | SHA-256 |

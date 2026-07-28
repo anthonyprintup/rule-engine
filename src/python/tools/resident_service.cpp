@@ -728,10 +728,11 @@ namespace rule_engine::python::tools {
             }
             std::expected<ResidentPackUploadReceipt, protocol_v2::ProtocolError> uploaded =
                 request.kind == ResidentAdminRequestKind::upload_begin ?
-                    uploads_->begin(request.pack, request.operation_id, request.upload_total_bytes) :
+                    uploads_->begin(request.tenant, request.pack, request.operation_id, request.upload_total_bytes) :
                 request.kind == ResidentAdminRequestKind::upload_chunk ?
-                    uploads_->append(request.pack, request.operation_id, request.upload_offset, request.payload) :
-                    uploads_->finalize(request.pack, request.operation_id);
+                    uploads_->append(request.tenant, request.pack, request.operation_id, request.upload_offset,
+                                     request.payload) :
+                    uploads_->finalize(request.tenant, request.pack, request.operation_id);
             if (!uploaded) {
                 const auto unavailable =
                     uploaded.error().code == protocol_v2::ProtocolErrorCode::dependency_unavailable ||

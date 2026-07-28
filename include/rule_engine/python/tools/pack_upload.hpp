@@ -3,10 +3,21 @@
 #include "rule_engine/python/packaging/source_pack.hpp"
 #include "rule_engine/python/tools/resident_service.hpp"
 
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 
 namespace rule_engine::python::tools {
+
+    inline constexpr std::uint64_t maximum_pack_registry_bytes = 1ULL << 50U;
+
+    struct PackRegistryLimits {
+        std::uint64_t maximum_published_bytes {};
+        std::uint64_t maximum_tenant_bytes {};
+        std::chrono::milliseconds partial_session_ttl {};
+        std::chrono::milliseconds unreferenced_retention {};
+    };
 
     // Bounded resumable upload spool. Partial bytes are never activation
     // evidence: finalize re-parses the canonical archive, verifies signer
@@ -16,19 +27,22 @@ namespace rule_engine::python::tools {
         [[nodiscard]] static std::expected<std::unique_ptr<FilesystemResidentPackUploadBackend>,
                                            protocol_v2::ProtocolError>
         create(std::filesystem::path registry_root, packaging::TrustPolicy trust_policy,
-               std::filesystem::path crypto_library) noexcept;
+               std::filesystem::path crypto_library, PackRegistryLimits limits) noexcept;
         ~FilesystemResidentPackUploadBackend() override;
 
         FilesystemResidentPackUploadBackend(const FilesystemResidentPackUploadBackend &) = delete;
         FilesystemResidentPackUploadBackend &operator=(const FilesystemResidentPackUploadBackend &) = delete;
 
         [[nodiscard]] std::expected<ResidentPackUploadReceipt, protocol_v2::ProtocolError>
-        begin(const PackId &pack, std::string_view upload_id, std::uint64_t total_bytes) noexcept override;
+        begin(const TenantId &tenant, const PackId &pack, std::string_view upload_id,
+              std::uint64_t total_bytes) noexcept override;
         [[nodiscard]] std::expected<ResidentPackUploadReceipt, protocol_v2::ProtocolError>
-        append(const PackId &pack, std::string_view upload_id, std::uint64_t offset,
+        append(const TenantId &tenant, const PackId &pack, std::string_view upload_id, std::uint64_t offset,
                std::span<const std::byte> payload) noexcept override;
         [[nodiscard]] std::expected<ResidentPackUploadReceipt, protocol_v2::ProtocolError>
-        finalize(const PackId &pack, std::string_view upload_id) noexcept override;
+        finalize(const TenantId &tenant, const PackId &pack, std::string_view upload_id) noexcept override;
+        [[nodiscard]] std::expected<ResidentPackRegistryMaintenanceReceipt, protocol_v2::ProtocolError>
+        maintain(std::span<const SourceDigest> reachable_source_digests, std::uint64_t now_unix_ms) noexcept override;
 
     private:
         struct Impl;
