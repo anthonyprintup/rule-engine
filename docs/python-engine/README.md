@@ -7,6 +7,12 @@ requirements, accepted ADRs, and verified implementation behavior. External
 brainstorming notes are non-normative and do not define language, security,
 runtime, or compatibility contracts.
 
+For a practical quick start, read
+[`RULE_EXAMPLES.md`](RULE_EXAMPLES.md): it begins with four runnable process,
+filtering, state, and telemetry examples, then clearly labels the system-event,
+scan, trace, post/session, correlation, service, malware, and cheat examples
+that remain contract-only.
+
 ## Reading order
 
 1. [`architecture/00-system-context.md`](architecture/00-system-context.md) — ownership, deployment, and end-to-end flows.

@@ -156,6 +156,9 @@ set(required_files
     "libexec/rule_engine/python/rule_engine_python_worker.py"
     "share/rule_engine/docs/python-engine/README.md"
     "share/rule_engine/examples/python/unsigned_process/rulepack.toml"
+    "share/rule_engine/examples/python/authoring_tour/rulepack.toml"
+    "share/rule_engine/examples/python/authoring_tour/src/authoring_tour/rules.py"
+    "share/rule_engine/examples/python/authoring_tour/contract/08_combined_cheat_detection.py"
     "share/rule_engine/package/INSTALL_PACKAGE.md"
 )
 if(WIN32)

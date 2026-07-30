@@ -220,6 +220,17 @@ still closes the established session. This is byte-faithful component evidence,
 not a live many-peer backend-load or database-notification qualification. The
 warning-clean complete Debug graph passed all 38 tests in 175.81 seconds.
 
+The progressive authoring-example slice adds a source-only `authoring_tour`
+pack with four compiler-supported process, lazy-filter, scalar-state, and typed
+telemetry rules. The repository-built pack/check tools and exact private
+CPython 3.14.6 runtime produced four verified functions with no diagnostics.
+System-event, scan/match, trace, post/session-reporting, history/correlation,
+service, combined malware, and combined cheat examples are stored outside the
+pack entry modules and explicitly labeled as contract-only. The install smoke
+checks both runnable and contract example surfaces. From the Visual Studio
+developer shell, the complete Debug graph passed all 38 tests in 183.17
+seconds.
+
 This evidence does not qualify state records or wider authoring forms,
 migration bytecode, arbitrary VM checkpoints or crash-continuous resource
 accounting, immediate cross-node lease takeover, reset or retained-gap

@@ -1,341 +1,274 @@
 # Python Rule Examples
 
-This is the short, practical guide to reading and writing rules on the Python
-branch. It starts with code that works end to end today, then shows the wider
-authoring contract for pattern matches, history, state, correlations, and
-effects.
+This is the shortest path from a one-condition process rule to a composed
+detection. The complete, copyable tour lives in
+[`examples/python/authoring_tour`](../../examples/python/authoring_tour/README.md).
 
-Python is the authoring language, not the runtime. The pinned CPython worker
-turns source into bounded syntax data; C++ validates, compiles, verifies, and
-executes it. Rule modules are never imported to make a decision.
+Python is the authoring language, not the execution runtime. The pinned CPython
+worker parses source as data; C++ type-checks, lowers, verifies, budgets, and
+executes it. Endpoints return typed facts and observations. They never receive
+the rule predicate or make the match decision.
 
-## Status labels
+## Read the status labels first
 
-The examples use two labels:
+- **Runnable now** — checked-in below the tour's `src/` directory, lowered to
+  verified bytecode, and executable by the C++ VM.
+- **Contract example** — checked-in below `contract/`, where it documents the
+  intended authoring API. The current checker rejects at least one construct
+  until that execution lane is implemented.
 
-- **Runnable now** means `rule_engine_check` can lower the shown source to
-  verified bytecode and the C++ VM can execute it.
-- **Contract example** means the SDK and engine design define the API, but
-  source lowering is not complete. The checker rejects it rather than silently
-  changing its meaning.
+Contract examples are deliberately not entry modules. Moving one into `src/`
+does not enable it, and the engine must never approximate its meaning. See
+[`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for the current boundary
+and [`VM_SEMANTICS.md`](VM_SEMANTICS.md) for the execution graph, suspension,
+budgets, journals, retries, and commits.
 
-For the exact boundary, see
-[`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) and
-[`LIMITATIONS.md`](LIMITATIONS.md).
+## 1. Start with one Boolean decision
 
-## A runnable rule pack
-
-**Runnable now.** A minimal pack has one manifest and one or more modules below
-`src/`:
-
-```text
-endpoint-rules/
-|-- rulepack.toml
-`-- src/
-    `-- acme/
-        `-- endpoint_rules.py
-```
-
-`rulepack.toml`:
-
-```toml
-format = 1
-
-[pack]
-id = "com.acme.endpoint-rules"
-version = "1.0.0"
-kind = "rules"
-engine_api = 1
-python = "3.14.6"
-entry_modules = ["acme.endpoint_rules"]
-budget_profile = "balanced.v1"
-policy_profile = "development.v1"
-
-[capabilities]
-required = []
-optional = []
-```
-
-`src/acme/endpoint_rules.py`:
+**Runnable now.** The smallest useful process rule requests one fact and returns
+one verdict:
 
 ```python
-from rule_engine import Model, provider_fact, rule
+@rule("com.example.tour.01-unsigned-process")
+def unsigned_process(process: Process) -> bool:
+    return not process.is_signed
+```
 
+`process.is_signed` is a lazy provider fact. C++ requests it only when evaluation
+reaches that expression, validates the returned value, resumes the VM, and
+retains ownership of the decision.
 
-class Process(Model):
-    is_signed: bool = provider_fact(route="process.signer.is_signed")
-    thread_count: int = provider_fact(route="process.thread_count")
+Full source:
+[`src/authoring_tour/rules.py`](../../examples/python/authoring_tour/src/authoring_tour/rules.py).
 
+## 2. Filter before requesting more
 
-@rule("com.acme.unsigned-high-thread-count")
-def unsigned_high_thread_count(process: Process) -> bool:
-    # Cheap, selective filters go first. Because fact reads are lazy, a signed
-    # process returns before thread_count is requested.
-    signed = process.is_signed
-    if signed:
+**Runnable now.** Put cheap or selective conditions first:
+
+```python
+@rule("com.example.tour.02-filtered-process")
+def filtered_process(process: Process) -> bool:
+    if process.is_signed:
         return False
-
-    thread_count = process.thread_count
-    thresholds = [4, 16, 64]
-    votes = 0
-
-    for threshold in thresholds:
-        if thread_count > threshold:
-            votes = votes + 1
-
-    return votes >= 2
+    return process.thread_count >= 32
 ```
 
-The rule illustrates four useful habits:
+A signed process returns before `thread_count` is requested. Python's
+left-to-right evaluation order is observable and is preserved by the compiler.
+This is the basic pattern for process filtering: narrow the population, then
+request the next fact.
 
-1. Put cheap filters before expensive facts.
-2. Save a fact in a local when it will be used more than once.
-3. Keep loops over fresh, visibly bounded collections.
-4. Return a Boolean verdict; providers never receive the predicate.
+## 3. Remember a result
 
-Evaluation order is Python's left-to-right order. Reordering the two fact reads
-would be an observable semantic change and is not allowed.
-
-## Pattern declarations and match filtering
-
-**Contract example.** These four declarations cover exact bytes, encoded text,
-masked bytes, and RE2 regular expressions:
+**Runnable now.** Scalar peer- or subject-scoped state lets a rule report a
+condition only once:
 
 ```python
-from rule_engine import ScanSpace, pattern, rule
-
-
-DOS_HEADER = pattern.bytes(
-    b"MZ",
-    id="com.acme.pattern.dos-header",
-)
-POWERSHELL_UTF16 = pattern.text(
-    "powershell",
-    encoding="utf-16-le",
-    case="ascii_insensitive",
-    id="com.acme.pattern.powershell",
-)
-FUNCTION_PROLOGUE = pattern.masked(
-    "48 8B ?? ?5 A? ??",
-    id="com.acme.pattern.function-prologue",
-)
-URL = pattern.regex(
-    r"https?://[^\s]+",
-    dialect="re2",
-    encoding="utf-8",
-    id="com.acme.pattern.url",
-)
-
-
-@rule("com.acme.suspicious-executable-content")
-def suspicious_executable_content(memory: ScanSpace) -> bool:
-    matches = memory.scan(
-        [POWERSHELL_UTF16, FUNCTION_PROLOGUE, URL],
-        before=8,
-        after=16,
-        maximum_matches=64,
-    )
-
-    for match in matches:
-        # This is a rule-side filter over typed match metadata. The endpoint
-        # returns observations; it never evaluates this predicate.
-        if match.pattern_id != POWERSHELL_UTF16.id:
-            continue
-        if "execute" not in match.permissions:
-            continue
-        if match.length < 10:
-            continue
-        return True
-
-    return False
-```
-
-`MatchSet` is ordered and bounded. Each `Match` exposes:
-
-| Field | Meaning |
-|---|---|
-| `pattern_id` | Stable ID of the declaration that matched |
-| `subject` | Typed subject that was scanned |
-| `offset` | Offset within the scan space |
-| `absolute_address` | Address when the scan space has one |
-| `length` | Matched byte length |
-| `permissions` | Read, write, and execute labels |
-| `before`, `matched`, `after` | Optional bounded context bytes |
-
-The requested context and match cap are part of the scan request and its
-budget. Reaching a configured result limit is a typed failure, not an
-unbounded list.
-
-## Typed state that is runnable now
-
-**Runnable now.** A rule may declare a module-level scalar `StateKey` with
-peer or subject scope, then use an injected `State` parameter. The capability
-is static: it cannot be inspected, returned, or sent to an agent.
-
-```python
-from rule_engine import Model, State, StateKey, StateScope, provider_fact, rule
-
-
-class Process(Model):
-    is_signed: bool = provider_fact(route="process.signer.is_signed")
-
-
-SEEN_UNSIGNED = StateKey(
-    "com.acme.seen-unsigned",
-    bool,
-    scope=StateScope.PEER,
-)
-
-
-@rule("com.acme.first-unsigned-process")
+@rule("com.example.tour.03-first-unsigned-process")
 def first_unsigned_process(process: Process, state: State) -> bool:
-    seen = state.get(SEEN_UNSIGNED)
     if process.is_signed:
         return False
 
+    seen = state.get(SEEN_UNSIGNED)
     state.set(SEEN_UNSIGNED, True)
     return seen is None
 ```
 
-The compiler derives the state operand from the stable key declaration. The
-resident server adds tenant, pack, active state namespace, and the declared
-peer identity before reading or committing a cell. `get`, `set`, and `delete`
-are supported directly in reportable entrypoints.
+The read and write use a statically declared `StateKey`. Reached writes are
+journaled and become visible only with the rule result and cursor in the durable
+commit.
 
-This first slice intentionally rejects non-`None` defaults, dynamic
-`identity=...`, session/correlation/shared scopes, non-`internal`
-classification, `require`, `compare_and_set`, helper-function ownership, and
-migrations. A store conflict also fails the current resident attempt until
-captured-input retry is connected.
+## 4. Emit a typed report
 
-## History filters, correlations, wider state, and effects
-
-**Contract example.** This compact example shows how the remaining pieces fit
-together. It is intentionally a sketch of one flow rather than a production
-rule pack:
+**Runnable now.** `telemetry.emit(...)` records an internal typed event in the
+same result transaction:
 
 ```python
-from datetime import datetime, timedelta
-
-from rule_engine import (
-    EventEnvelope,
-    EventRecord,
-    History,
-    State,
-    StateKey,
-    StateScope,
-    correlation,
-    schema,
-    telemetry,
-    transaction,
-    wire_field,
-)
-
-
-@schema("com.acme.alert.v1")
-class Alert(EventRecord):
-    process_id: int = wire_field(id=1)
-    reason: str = wire_field(id=2)
-
-
-ALERT_COUNT = StateKey(
-    "com.acme.alert-count",
-    int,
-    scope=StateScope.PEER,
-)
-
-
-@correlation(
-    "com.acme.repeated-alerts",
-    group_by=lambda event: event.peer_id,
-    order_by="event_time",
-    allowed_lateness=timedelta(minutes=5),
-)
-async def repeated_alerts(
-    event: EventEnvelope[Alert],
-    history: History,
-    state: State,
-) -> bool:
-    if event.peer_id is None:
-        return False
-
-    window = (
-        history.events(Alert)
-        .peer(event.peer_id)
-        .between(datetime(2026, 1, 1), datetime(2026, 1, 2))
-        .where(lambda item: item.payload.reason == event.payload.reason)
-        .order_by("producer")
-        .limit(20)
+telemetry.emit(
+    UnsignedProcessAlert(
+        process_id=process.pid,
+        creation_time=process.creation_time,
+        reason="unsigned-process",
     )
-
-    if not await window.exists():
-        return False
-
-    with transaction() as tx:
-        count = state.get(ALERT_COUNT)
-        state.set(ALERT_COUNT, 1 if count is None else count + 1)
-        telemetry.emit(
-            Alert(process_id=event.payload.process_id, reason="repeated-alert")
-        )
-        tx.commit()
-
-    return True
+)
+return True
 ```
 
-The history chain is declarative and bounded: tenant/peer/time predicates are
-eligible for store pushdown, `.where(...)` is still defined by C++ semantics,
-and `.limit(...)` is mandatory protection against open-ended reads.
+The event must have a stable `@schema`; each field has a unique positive
+`wire_field` ID; construction is by keyword; and `telemetry.emit(...)` is a
+standalone statement. A failed or cancelled attempt publishes neither the
+verdict nor the event.
 
-State writes and emitted events are journaled. They become visible only with
-the rule result and cursor in one durable commit. A fault, cancellation, or
-uncommitted transaction discards them.
+This is different from posting to an external system. External posts use a
+durable outbox and remain a contract example below.
 
-The custom-event portion of this example is intentionally strict:
-`EventRecord` requires one stable `@schema`, every field needs a unique positive
-`wire_field` ID, construction supplies every field by keyword, and
-`telemetry.emit(...)` is a standalone statement. Positional/default construction
-and using an in-rule `EventReceipt` are not yet supported.
+## 5. Consume a system event
 
-## What is usable today
+**Contract example.** A validated observation can become the typed input to a
+system-event rule:
 
-| Authoring area | Current branch |
-|---|---|
-| `@rule`, models, and `provider_fact(route="...")` | Runnable now |
-| Scalar expressions, branches, calls, and Boolean return | Runnable now |
-| Fresh list/tuple/dict values and subscriptions | Runnable now |
-| Bounded synchronous `for` loops | Runnable now |
-| Closed `try`/`except`/`else`/`finally` subset | Runnable now |
-| Pattern declarations, scans, and `MatchSet` filtering | Contract; lowering incomplete |
-| History and correlation source | Contract; lowering incomplete |
-| Scalar peer/subject `StateKey`; entrypoint `get`/`set`/`delete` | Runnable now |
-| State records, other scopes/defaults, transactions, and migrations | Contract; lowering incomplete |
-| Telemetry event emission | Runnable now with the strict form described above |
-| History, correlations, and services | Contract; lowering incomplete |
-| Ambient/runtime imports, reflection, dynamic code, and native extensions | Deliberately unsupported |
+```python
+@correlation(
+    "com.example.system-event.suspicious-process-start",
+    group_by=lambda event: (event.peer_id, event.payload.process_id),
+)
+def suspicious_process_start(event: ObservationEvent[ProcessStart]) -> bool:
+    start = event.payload
+    if "powershell" not in start.image_path.casefold():
+        return False
+    return "-encodedcommand" in start.command_line.casefold()
+```
 
-The SDK may expose a contract before its complete lowering exists so authors
-can type-check designs without the engine pretending they are executable.
+This keeps provider collection separate from server-owned filtering. Full
+example:
+[`01_system_event_rule.py`](../../examples/python/authoring_tour/contract/01_system_event_rule.py).
 
-## Build and check
+## 6. Scan, then filter typed matches
 
-Use the repository-built tools and the checksum-verified private runtime:
+**Contract example.** Pattern declarations cover exact bytes, encoded text,
+masked bytes, and RE2 regular expressions. A bounded scan returns an ordered
+`MatchSet`, and the rule filters typed metadata such as `pattern_id`,
+permissions, length, offset, address, and bounded context:
+
+```python
+matches = memory.scan(
+    [MZ_HEADER, POWERSHELL_UTF16, INJECTOR_PROLOGUE, DOWNLOAD_URL],
+    before=8,
+    after=16,
+    maximum_matches=64,
+)
+for match in matches:
+    if match.pattern_id == POWERSHELL_UTF16.id:
+        if "execute" in match.permissions and match.length >= 10:
+            return True
+return False
+```
+
+The endpoint performs only the requested bounded observation; the server owns
+the match filter and verdict. Full example:
+[`02_scan_and_match_filtering.py`](../../examples/python/authoring_tour/contract/02_scan_and_match_filtering.py).
+
+## 7. Select diagnostic traces
+
+**Contract example.** Trace calls select already captured, bounded flight-
+recorder information for publication:
+
+```python
+signed = process.is_signed
+trace(signed, label="signer-result")
+if signed:
+    return False
+
+trace.enable()
+with trace.scope(enabled=True):
+    thread_count = process.thread_count
+    trace(thread_count, label="unsigned-thread-count")
+    return thread_count >= 32
+```
+
+Recording must be armed by pack/operator policy before execution starts.
+Rule-side `trace.enable()` cannot retroactively create unbounded history. Full
+example:
+[`03_execution_tracing.py`](../../examples/python/authoring_tour/contract/03_execution_tracing.py).
+
+## 8. Post a session report
+
+**Contract example.** A `PostSink` creates a durable external-delivery intent,
+while session-scoped state records reporting progress:
+
+```python
+reports(
+    SessionReport(
+        session_id=session_id,
+        matched_rule="com.example.report.session-match",
+        process_id=process_id,
+    )
+)
+state.set(SESSION_REPORT_COUNT, 1 if sent is None else sent + 1)
+return True
+```
+
+The post is dispatched only from the committed outbox; the rule never performs
+ambient network I/O. Queue, dry-run, or suppression policy does not change the
+detection verdict. Full example:
+[`04_post_and_session_reporting.py`](../../examples/python/authoring_tour/contract/04_post_and_session_reporting.py).
+
+## 9. Correlate bounded history
+
+**Contract example.** History queries must be bounded, and correlation keys
+serialize related events:
+
+```python
+recent = (
+    history.events(UnsignedProcessAlert)
+    .peer(event.peer_id)
+    .between(
+        event.ingest_timestamp - timedelta(minutes=10),
+        event.ingest_timestamp,
+    )
+    .where(lambda item: item.payload.process_id == event.payload.process_id)
+    .order_by("producer")
+    .limit(20)
+)
+return await recent.count() >= 3
+```
+
+Full example:
+[`05_history_and_correlation.py`](../../examples/python/authoring_tour/contract/05_history_and_correlation.py).
+
+## 10. Enrich through an optional service
+
+**Contract example.** Services are typed capabilities, not arbitrary Python
+clients. Structured async bounds their lifetime:
+
+```python
+if reputation is None:
+    return False
+
+async with TaskGroup(on_exit=TaskGroupExit.CANCEL_PENDING) as group:
+    lookup = group.start(reputation.lookup(ReputationRequest(sha256=sha256)))
+    result = await lookup
+    return result.score < 20
+```
+
+Full example:
+[`06_service_enrichment.py`](../../examples/python/authoring_tour/contract/06_service_enrichment.py).
+
+## 11. Put the stages together
+
+The larger examples are intentionally last:
+
+- **Dummy malware detection — contract example.** Filter signed processes,
+  avoid duplicate work with subject state, scan readable memory for a
+  reflective-loader pattern, request optional reputation, select trace
+  evidence, emit a typed alert, and enqueue a SOC ticket:
+  [`07_combined_malware_detection.py`](../../examples/python/authoring_tour/contract/07_combined_malware_detection.py).
+- **Dummy cheat detection — contract example.** Consume remote-thread system
+  events, group them by protected game process, query a bounded recent window,
+  select trace evidence, emit an alert, and enqueue a human-review request:
+  [`08_combined_cheat_detection.py`](../../examples/python/authoring_tour/contract/08_combined_cheat_detection.py).
+
+These examples show how the capabilities compose; they do not claim the
+unfinished lanes are runnable.
+
+## Build the runnable tour
+
+Use repository-built tools and the checksum-verified private runtime. Do not run
+the modules directly or substitute a system Python:
 
 ```powershell
-rule_engine_pack build C:/rules/endpoint-rules `
-  --output C:/packs/endpoint-rules.rpack `
+rule_engine_pack build examples/python/authoring_tour `
+  --output authoring-tour.rpack `
   --trust-mode development
 
 rule_engine_check `
-  --pack C:/packs/endpoint-rules.rpack `
-  --runtime-root C:/runtime/python-3.14.6 `
+  --pack authoring-tour.rpack `
+  --runtime-root C:/rule-engine/libexec/rule_engine/python/runtime/3.14.6 `
   --trust-mode development `
   --format text
 ```
 
-`rule_engine_pack` creates a deterministic source-only archive.
-`rule_engine_check` invokes the parser worker and the C++ compiler/verifier. Do
-not use a system Python or run the module directly.
-
-For the full language contract, continue with
-[`architecture/02-authoring-language-and-types.md`](architecture/02-authoring-language-and-types.md).
-For VM behavior, read [`VM_SEMANTICS.md`](VM_SEMANTICS.md).
+Continue with the tour's
+[`README`](../../examples/python/authoring_tour/README.md), the
+[`VM semantics`](VM_SEMANTICS.md), and the full
+[`authoring-language contract`](architecture/02-authoring-language-and-types.md).
