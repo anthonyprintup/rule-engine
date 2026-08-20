@@ -362,12 +362,13 @@ active_generation = 1
 inventory_refresh_interval_ms = 300000
 ```
 
-All filesystem paths are absolute. `crl_path` and `require_crl = true` must be
-configured together; omitting both leaves local-CRL enforcement disabled. When
-enabled, OpenSSL checks the full certificate chain and rejects missing issuer
-coverage, malformed or stale CRLs, a wrong CRL issuer, and revoked server
-certificates. The TLS chain, DNS name, exact URI SAN, and SHA-256 leaf
-fingerprint must still agree.
+All filesystem paths are absolute. Production agents require both `crl_path`
+and `require_crl = true`; there is no production switch that disables local
+revocation checking. `--validate-config` rejects missing, malformed,
+not-yet-valid, or expired CRLs before dialing. During connection, OpenSSL checks
+the full certificate chain and additionally rejects missing issuer coverage, a
+wrong CRL issuer, and revoked server certificates. The TLS chain, DNS name,
+exact URI SAN, and SHA-256 leaf fingerprint must still agree.
 
 CRL acquisition remains an operator responsibility: publish a refreshed file
 atomically and restart the agent before its `nextUpdate`. The agent performs no

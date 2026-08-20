@@ -305,8 +305,9 @@ namespace rule_engine::python::windows {
             return std::unexpected(
                 configuration_error("production agent requires require_hard_resolver_bounds = true"));
         }
-        if (configuration.require_crl != !configuration.crl_path.empty()) {
-            return std::unexpected(configuration_error("crl_path and require_crl = true must be configured together"));
+        if (!configuration.require_crl || configuration.crl_path.empty()) {
+            return std::unexpected(
+                configuration_error("production agent requires an absolute crl_path and require_crl = true"));
         }
         return configuration;
     }
@@ -332,8 +333,9 @@ namespace rule_engine::python::windows {
 
     std::expected<void, AgentFailure>
     validate_windows_agent_config_files(const WindowsAgentConfig &configuration) noexcept {
-        if (configuration.require_crl != !configuration.crl_path.empty()) {
-            return std::unexpected(configuration_error("crl_path and require_crl = true must be configured together"));
+        if (!configuration.require_crl || configuration.crl_path.empty()) {
+            return std::unexpected(
+                configuration_error("production agent requires an absolute crl_path and require_crl = true"));
         }
         const std::array tls_files {&configuration.certificate_path, &configuration.private_key_path,
                                     &configuration.ca_path, &configuration.crl_path};
@@ -364,8 +366,9 @@ namespace rule_engine::python::windows {
 
     std::expected<void, AgentFailure>
     validate_windows_agent_dependencies(const WindowsAgentConfig &configuration) noexcept {
-        if (configuration.require_crl != !configuration.crl_path.empty()) {
-            return std::unexpected(configuration_error("crl_path and require_crl = true must be configured together"));
+        if (!configuration.require_crl || configuration.crl_path.empty()) {
+            return std::unexpected(
+                configuration_error("production agent requires an absolute crl_path and require_crl = true"));
         }
         const auto tls = protocol_v2::tls_backend_status();
         if (!tls.available) {

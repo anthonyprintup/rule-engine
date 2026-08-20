@@ -387,6 +387,8 @@ TEST_CASE("Windows agent configuration and command line are strict and productio
                               "certificate_path = C:\\agent\\client.pem\n"
                               "private_key_path = C:\\agent\\client-key.pem\n"
                               "ca_path = C:\\agent\\ca.pem\n"
+                              "crl_path = C:\\agent\\server.crl.pem\n"
+                              "require_crl = true\n"
                               "server_endpoint = 127.0.0.1:7443\n"
                               "server_endpoint = [::1]:7443\n"
                               "server_name = coordinator.example\n"
@@ -403,14 +405,8 @@ TEST_CASE("Windows agent configuration and command line are strict and productio
     CHECK(parsed->endpoints.size() == 2U);
     CHECK(parsed->require_hard_resolver_bounds);
     CHECK(parsed->reconnect_policy.require_hard_resolver_bounds);
-    CHECK_FALSE(parsed->require_crl);
-    CHECK(parsed->crl_path.empty());
-
-    const auto with_crl = valid + "crl_path = C:\\agent\\server.crl.pem\nrequire_crl = true\n";
-    const auto parsed_crl = win::parse_windows_agent_config(with_crl);
-    REQUIRE(parsed_crl.has_value());
-    CHECK(parsed_crl->require_crl);
-    CHECK(parsed_crl->crl_path == std::filesystem::path {"C:\\agent\\server.crl.pem"});
+    CHECK(parsed->require_crl);
+    CHECK(parsed->crl_path == std::filesystem::path {"C:\\agent\\server.crl.pem"});
     CHECK(parsed->inventory_refresh_interval == std::chrono::minutes {5});
 
     auto legacy_schema = valid;
@@ -422,9 +418,22 @@ TEST_CASE("Windows agent configuration and command line are strict and productio
     CHECK_FALSE(win::parse_windows_agent_config(valid + "peer_id = duplicate\n").has_value());
     auto unsafe = valid + "require_hard_resolver_bounds = false\n";
     CHECK_FALSE(win::parse_windows_agent_config(unsafe).has_value());
-    CHECK_FALSE(win::parse_windows_agent_config(valid + "require_crl = true\n").has_value());
-    CHECK_FALSE(win::parse_windows_agent_config(valid + "crl_path = C:\\agent\\server.crl.pem\n").has_value());
-    CHECK_FALSE(win::parse_windows_agent_config(valid + "crl_path = server.crl.pem\nrequire_crl = true\n").has_value());
+    auto missing_crl_path = valid;
+    missing_crl_path.erase(missing_crl_path.find("crl_path = "),
+                           std::string_view {"crl_path = C:\\agent\\server.crl.pem\n"}.size());
+    CHECK_FALSE(win::parse_windows_agent_config(missing_crl_path).has_value());
+    auto missing_crl_enablement = valid;
+    missing_crl_enablement.erase(missing_crl_enablement.find("require_crl = "),
+                                 std::string_view {"require_crl = true\n"}.size());
+    CHECK_FALSE(win::parse_windows_agent_config(missing_crl_enablement).has_value());
+    auto disabled_crl = valid;
+    disabled_crl.replace(disabled_crl.find("require_crl = true"), std::string_view {"require_crl = true"}.size(),
+                         "require_crl = false");
+    CHECK_FALSE(win::parse_windows_agent_config(disabled_crl).has_value());
+    auto relative_crl = valid;
+    relative_crl.replace(relative_crl.find("C:\\agent\\server.crl.pem"),
+                         std::string_view {"C:\\agent\\server.crl.pem"}.size(), "server.crl.pem");
+    CHECK_FALSE(win::parse_windows_agent_config(relative_crl).has_value());
     auto dns = valid;
     dns.replace(dns.find("127.0.0.1:7443"), std::string_view {"127.0.0.1:7443"}.size(), "example.test:7443");
     CHECK_FALSE(win::parse_windows_agent_config(dns).has_value());

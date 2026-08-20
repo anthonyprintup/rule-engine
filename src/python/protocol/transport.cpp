@@ -39,6 +39,57 @@ namespace rule_engine::python::protocol_v2 {
 #if RULE_ENGINE_PROTOCOL_HAS_OPENSSL
         constexpr std::string_view peer_alpn = "rule-engine-peer/2";
 
+        [[nodiscard]] std::expected<void, ProtocolError> validate_crl_times(X509_STORE *store,
+                                                                            const std::time_t verification_time) {
+#if OPENSSL_VERSION_MAJOR >= 4
+            auto *objects = X509_STORE_get1_objects(store);
+#else
+            const auto *objects = X509_STORE_get0_objects(store);
+#endif
+            auto *now = ASN1_TIME_set(nullptr, verification_time);
+            if (objects == nullptr || now == nullptr) {
+                ASN1_TIME_free(now);
+#if OPENSSL_VERSION_MAJOR >= 4
+                sk_X509_OBJECT_pop_free(objects, X509_OBJECT_free);
+#endif
+                return std::unexpected(
+                    transport_error(ProtocolErrorCode::unauthenticated, "TLS revocation policy validation failed"));
+            }
+
+            std::size_t crl_count {};
+            bool times_are_current {true};
+            const auto count = sk_X509_OBJECT_num(objects);
+            for (int index = 0; index < count; ++index) {
+                const auto *object = sk_X509_OBJECT_value(objects, index);
+                if (object == nullptr || X509_OBJECT_get_type(object) != X509_LU_CRL) {
+                    continue;
+                }
+                ++crl_count;
+                const auto *crl = X509_OBJECT_get0_X509_CRL(object);
+                const auto *last_update = crl == nullptr ? nullptr : X509_CRL_get0_lastUpdate(crl);
+                const auto *next_update = crl == nullptr ? nullptr : X509_CRL_get0_nextUpdate(crl);
+                const auto last_comparison = last_update == nullptr ? -2 : ASN1_TIME_compare(last_update, now);
+                const auto next_comparison = next_update == nullptr ? -2 : ASN1_TIME_compare(now, next_update);
+                if (last_comparison == -2 || next_comparison == -2 || last_comparison > 0 || next_comparison >= 0) {
+                    times_are_current = false;
+                    break;
+                }
+            }
+            ASN1_TIME_free(now);
+#if OPENSSL_VERSION_MAJOR >= 4
+            sk_X509_OBJECT_pop_free(objects, X509_OBJECT_free);
+#endif
+            if (!times_are_current) {
+                return std::unexpected(transport_error(ProtocolErrorCode::unauthenticated,
+                                                       "TLS revocation policy is not currently valid"));
+            }
+            if (crl_count == 0U) {
+                return std::unexpected(
+                    transport_error(ProtocolErrorCode::unauthenticated, "TLS revocation policy contains no CRL"));
+            }
+            return {};
+        }
+
         enum struct SocketReadiness : std::uint8_t { read, write };
 
         [[nodiscard]] std::expected<void, ProtocolError> wait_for_socket(const int socket,
@@ -365,6 +416,17 @@ namespace rule_engine::python::protocol_v2 {
                 X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL) != 1) {
                 return std::unexpected(
                     transport_error(ProtocolErrorCode::unauthenticated, "TLS revocation policy loading failed"));
+            }
+            const auto verification_time =
+                impl->configuration.verification_time_unix_seconds.has_value() ?
+                    static_cast<std::time_t>(*impl->configuration.verification_time_unix_seconds) :
+                    std::time(nullptr);
+            if (verification_time == static_cast<std::time_t>(-1)) {
+                return std::unexpected(
+                    transport_error(ProtocolErrorCode::unauthenticated, "TLS verification time is unavailable"));
+            }
+            if (auto current = validate_crl_times(store, verification_time); !current) {
+                return std::unexpected(std::move(current.error()));
             }
         }
 

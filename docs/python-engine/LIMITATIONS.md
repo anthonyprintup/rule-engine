@@ -180,9 +180,9 @@ Every entry records impact, rationale, mitigation, observability, and revisit co
 
 ## L-025 — Agent certificate revocation is not checked online
 
-- **Impact:** The production agent can enforce an operator-provisioned local CRL, but it does not fetch OCSP/CRL data or reload a replaced CRL while running. An agent without explicit local-CRL enablement still relies on its exact certificate fingerprint and trust bundle.
+- **Impact:** The production agent requires an operator-provisioned local CRL, but it does not fetch OCSP/CRL data or reload a replaced CRL while running.
 - **Rationale:** Ambient online revocation introduces an independently failure-prone and potentially unbounded network dependency. Local files keep acquisition and refresh under deployment control while OpenSSL performs deterministic verification during the bounded TLS handshake.
-- **Mitigation:** Configure `crl_path` and `require_crl = true` together. Startup rejects a missing or malformed CRL, and full-chain CRL verification rejects missing issuer coverage, a stale CRL, a wrong issuer, or a revoked server certificate. Publish refreshed CRLs atomically and restart agents before `nextUpdate`; continue rotating the exact fingerprint and trust bundle through controlled deployment.
+- **Mitigation:** Every production configuration must contain an absolute `crl_path` and `require_crl = true`. Configuration validation rejects a missing, malformed, not-yet-valid, or expired CRL before dialing; full-chain verification rejects missing issuer coverage, a wrong issuer, or a revoked server certificate during the bounded TLS handshake. Publish refreshed CRLs atomically and restart agents before `nextUpdate`; continue rotating the exact fingerprint and trust bundle through controlled deployment.
 - **Observability:** Configuration and authentication failures expose only the failure class and never certificate, private-key, CRL, or trust-bundle contents.
 - **Revisit:** Add a bounded atomic local-file reload lifecycle or separately bounded stapled-status design before claiming live refresh or online revocation coverage.
 

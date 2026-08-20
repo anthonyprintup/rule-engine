@@ -189,6 +189,7 @@ namespace {
         std::filesystem::path clean_crl;
         std::filesystem::path revoked_crl;
         std::filesystem::path stale_crl;
+        std::filesystem::path future_crl;
         std::filesystem::path wrong_issuer_crl;
         std::filesystem::path malformed_crl;
 
@@ -205,6 +206,7 @@ namespace {
                 .clean_crl = root / "clean.crl.pem",
                 .revoked_crl = root / "revoked.crl.pem",
                 .stale_crl = root / "stale.crl.pem",
+                .future_crl = root / "future.crl.pem",
                 .wrong_issuer_crl = root / "wrong-issuer.crl.pem",
                 .malformed_crl = root / "malformed.crl.pem",
             };
@@ -286,6 +288,9 @@ namespace {
                 !run_openssl("ca -batch -gencrl -config " + quoted(ca_config) +
                              " -crl_lastupdate 20200101000000Z -crl_nextupdate 20200102000000Z -out " +
                              quoted(result.stale_crl)) ||
+                !run_openssl("ca -batch -gencrl -config " + quoted(ca_config) +
+                             " -crl_lastupdate 20990101000000Z -crl_nextupdate 21000101000000Z -out " +
+                             quoted(result.future_crl)) ||
                 !run_openssl("ca -batch -gencrl -config " + quoted(alternate_config) + " -out " +
                              quoted(result.wrong_issuer_crl)) ||
                 !run_openssl("ca -batch -config " + quoted(ca_config) + " -revoke " +
@@ -879,8 +884,10 @@ namespace {
         REQUIRE_FALSE(OpenSslTlsContext::create(std::move(missing_crl_file)).has_value());
         auto malformed_crl = client_with_crl(certificates->malformed_crl);
         REQUIRE_FALSE(OpenSslTlsContext::create(std::move(malformed_crl)).has_value());
-        REQUIRE_FALSE(succeeds(server_configuration(certificates->server_certificate, certificates->server_key),
-                               client_with_crl(certificates->stale_crl)));
+        auto stale_crl = client_with_crl(certificates->stale_crl);
+        REQUIRE_FALSE(OpenSslTlsContext::create(std::move(stale_crl)).has_value());
+        auto future_crl = client_with_crl(certificates->future_crl);
+        REQUIRE_FALSE(OpenSslTlsContext::create(std::move(future_crl)).has_value());
         REQUIRE_FALSE(succeeds(server_configuration(certificates->server_certificate, certificates->server_key),
                                client_with_crl(certificates->wrong_issuer_crl)));
         REQUIRE_FALSE(succeeds(server_configuration(certificates->server_certificate, certificates->server_key),

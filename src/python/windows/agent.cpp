@@ -325,10 +325,10 @@ namespace rule_engine::python::windows {
             return std::unexpected(AgentFailure {.code = AgentFailureCode::configuration,
                                                  .message = "production TLS session requires hard resolver bounds"});
         }
-        if (configuration.require_crl != !configuration.crl_path.empty()) {
+        if (!configuration.require_crl || configuration.crl_path.empty()) {
             return std::unexpected(
                 AgentFailure {.code = AgentFailureCode::configuration,
-                              .message = "crl_path and require_crl = true must be configured together"});
+                              .message = "production agent requires an absolute crl_path and require_crl = true"});
         }
         auto context = protocol_v2::OpenSslTlsContext::create(protocol_v2::TlsConfiguration {
             .role = protocol_v2::TlsEndpointRole::client,
