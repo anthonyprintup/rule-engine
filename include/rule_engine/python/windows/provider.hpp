@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -54,6 +55,7 @@ namespace rule_engine::python::windows {
         malformed,
         result_limit,
         arithmetic_overflow,
+        canceled,
     };
 
     struct ProviderError {
@@ -113,12 +115,15 @@ namespace rule_engine::python::windows {
 
     [[nodiscard]] InventorySnapshot make_inventory_snapshot(PeerId peer, SchemaId schema,
                                                             std::optional<SubjectKey> parent, std::uint64_t generation,
-                                                            std::vector<SubjectObservation> items);
+                                                            std::vector<SubjectObservation> items,
+                                                            std::uint64_t deadline_unix_ms = 0,
+                                                            std::stop_token cancellation = {});
     [[nodiscard]] InventorySnapshot invalid_inventory_snapshot(PeerId peer, SchemaId schema, std::uint64_t generation,
                                                                ProviderError error);
 
     [[nodiscard]] InventorySnapshot enumerate_process_inventory(PeerId peer, std::uint64_t generation,
-                                                                std::uint64_t deadline_unix_ms = 0);
+                                                                std::uint64_t deadline_unix_ms = 0,
+                                                                std::stop_token cancellation = {});
     [[nodiscard]] InventorySnapshot enumerate_memory_region_inventory(const SubjectKey &process,
                                                                       std::uint64_t generation,
                                                                       std::uint64_t deadline_unix_ms = 0);

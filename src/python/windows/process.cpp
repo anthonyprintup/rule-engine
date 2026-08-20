@@ -23,9 +23,11 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -190,6 +192,15 @@ namespace rule_engine::python::windows {
                 error(ProviderErrorCode::timed_out, std::move(operation), "provider deadline expired"));
         }
 
+        [[nodiscard]] std::expected<void, ProviderError>
+        check_inventory_bounds(const std::uint64_t deadline_unix_ms, const std::stop_token cancellation) {
+            if (cancellation.stop_requested()) {
+                return std::unexpected(error(ProviderErrorCode::canceled, "process inventory",
+                                             "process inventory enumeration was canceled"));
+            }
+            return check_deadline(deadline_unix_ms, "process inventory");
+        }
+
         [[nodiscard]] std::optional<std::string> utf8(const std::wstring_view value) {
             if (value.empty()) {
                 return std::string {};
@@ -236,9 +247,9 @@ namespace rule_engine::python::windows {
         }
 
         [[nodiscard]] std::expected<std::vector<ProcessEntry>, ProviderError>
-        query_process_entries(const std::uint64_t deadline_unix_ms) {
-            if (auto deadline = check_deadline(deadline_unix_ms, "process inventory"); !deadline) {
-                return std::unexpected(std::move(deadline.error()));
+        query_process_entries(const std::uint64_t deadline_unix_ms, const std::stop_token cancellation = {}) {
+            if (auto bound = check_inventory_bounds(deadline_unix_ms, cancellation); !bound) {
+                return std::unexpected(std::move(bound.error()));
             }
 
             const auto query = load_ntdll_function<NtQuerySystemInformationFn>("NtQuerySystemInformation");
@@ -252,6 +263,9 @@ namespace rule_engine::python::windows {
                 ULONG needed {};
                 const auto length = static_cast<ULONG>(buffer.size());
                 const auto status = query(system_process_information, buffer.data(), length, &needed);
+                if (auto bound = check_inventory_bounds(deadline_unix_ms, cancellation); !bound) {
+                    return std::unexpected(std::move(bound.error()));
+                }
                 if (status >= 0) {
                     break;
                 }
@@ -270,6 +284,9 @@ namespace rule_engine::python::windows {
             std::vector<ProcessEntry> entries;
             std::size_t offset {};
             for (;;) {
+                if (auto bound = check_inventory_bounds(deadline_unix_ms, cancellation); !bound) {
+                    return std::unexpected(std::move(bound.error()));
+                }
                 if (offset > buffer.size() || buffer.size() - offset < sizeof(NativeSystemProcessInformation)) {
                     return std::unexpected(error(ProviderErrorCode::malformed, "process inventory",
                                                  "native process snapshot is truncated"));
@@ -325,6 +342,9 @@ namespace rule_engine::python::windows {
                                                  "native process snapshot has an invalid record offset"));
                 }
                 offset += entry->next_entry_offset;
+            }
+            if (auto bound = check_inventory_bounds(deadline_unix_ms, cancellation); !bound) {
+                return std::unexpected(std::move(bound.error()));
             }
             return entries;
         }
@@ -1399,8 +1419,9 @@ namespace rule_engine::python::windows {
     } // namespace
 
     InventorySnapshot enumerate_process_inventory(PeerId peer, const std::uint64_t generation,
-                                                  const std::uint64_t deadline_unix_ms) {
-        auto entries = query_process_entries(deadline_unix_ms);
+                                                  const std::uint64_t deadline_unix_ms,
+                                                  const std::stop_token cancellation) {
+        auto entries = query_process_entries(deadline_unix_ms, cancellation);
         if (!entries) {
             return invalid_inventory_snapshot(std::move(peer), SchemaId {std::string {process_schema}}, generation,
                                               std::move(entries.error()));
@@ -1408,8 +1429,21 @@ namespace rule_engine::python::windows {
 
         std::vector<SubjectObservation> observations;
         observations.reserve(entries->size());
+        std::unordered_map<std::uint32_t, std::uint64_t> creation_times;
+        creation_times.reserve(entries->size());
         for (const auto &entry : *entries) {
-            const auto *parent = find_entry(*entries, entry.parent_pid);
+            if (auto bound = check_inventory_bounds(deadline_unix_ms, cancellation); !bound) {
+                return invalid_inventory_snapshot(std::move(peer), SchemaId {std::string {process_schema}}, generation,
+                                                  std::move(bound.error()));
+            }
+            creation_times.insert_or_assign(entry.pid, entry.creation_time);
+        }
+        for (const auto &entry : *entries) {
+            if (auto bound = check_inventory_bounds(deadline_unix_ms, cancellation); !bound) {
+                return invalid_inventory_snapshot(std::move(peer), SchemaId {std::string {process_schema}}, generation,
+                                                  std::move(bound.error()));
+            }
+            const auto parent = creation_times.find(entry.parent_pid);
             observations.push_back(SubjectObservation {
                 .subject = process_subject(peer, entry.pid, entry.creation_time),
                 .eager_fields = {{.field_id = 1, .value = integer(static_cast<std::uint64_t>(entry.pid))},
@@ -1417,14 +1451,18 @@ namespace rule_engine::python::windows {
                                  {.field_id = 3, .value = text(entry.name)},
                                  {.field_id = 4, .value = integer(static_cast<std::uint64_t>(entry.parent_pid))},
                                  {.field_id = 5,
-                                  .value = parent == nullptr ? make_fact(std::monostate {}) :
-                                                               integer(parent->creation_time)},
+                                  .value = parent == creation_times.end() ? make_fact(std::monostate {}) :
+                                                                            integer(parent->second)},
                                  {.field_id = 6, .value = integer(static_cast<std::uint64_t>(entry.thread_count))},
                                  {.field_id = 7, .value = integer(static_cast<std::uint64_t>(entry.session_id))}},
             });
         }
+        if (auto bound = check_inventory_bounds(deadline_unix_ms, cancellation); !bound) {
+            return invalid_inventory_snapshot(std::move(peer), SchemaId {std::string {process_schema}}, generation,
+                                              std::move(bound.error()));
+        }
         return make_inventory_snapshot(std::move(peer), SchemaId {std::string {process_schema}}, std::nullopt,
-                                       generation, std::move(observations));
+                                       generation, std::move(observations), deadline_unix_ms, cancellation);
     }
 
     InventorySnapshot enumerate_memory_region_inventory(const SubjectKey &process, const std::uint64_t generation,

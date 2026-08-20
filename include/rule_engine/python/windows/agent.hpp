@@ -116,7 +116,8 @@ namespace rule_engine::python::windows {
         [[nodiscard]] virtual std::expected<void, AgentRuntimeError>
         cancel(const protocol_v2::CancelWorkMessage &message) = 0;
         [[nodiscard]] virtual std::expected<std::optional<InventoryProjection>, AgentRuntimeError>
-        process_inventory(std::string snapshot_id, std::uint64_t inventory_generation) = 0;
+        process_inventory(std::string snapshot_id, std::uint64_t inventory_generation,
+                          std::stop_token cancellation) = 0;
     };
 
     struct IWindowsAgentProviderFactory {
@@ -154,7 +155,10 @@ namespace rule_engine::python::windows {
         [[nodiscard]] std::expected<void, AgentFailure> process(const protocol_v2::PeerEnvelope &envelope,
                                                                 IWindowsAgentProviderRuntime &provider) noexcept;
         [[nodiscard]] std::expected<void, AgentFailure>
-        publish_process_inventory(IWindowsAgentProviderRuntime &provider) noexcept;
+        publish_process_inventory(IWindowsAgentProviderRuntime &provider, std::stop_token cancellation) noexcept;
+        [[nodiscard]] std::expected<void, AgentFailure>
+        publish_process_inventory_if_due(IWindowsAgentProviderRuntime &provider,
+                                         std::stop_token cancellation) noexcept;
         [[nodiscard]] std::expected<bool, AgentFailure>
         result_is_pending(const protocol_v2::WorkLeaseMessage &work) const noexcept;
         [[nodiscard]] std::expected<bool, AgentFailure>

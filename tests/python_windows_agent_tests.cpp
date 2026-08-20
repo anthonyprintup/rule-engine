@@ -18,6 +18,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -169,6 +170,7 @@ namespace {
         proto::SqliteAgentSpool *spool {};
         std::size_t reconnects {};
         bool fail_next_send {};
+        std::chrono::milliseconds readable_delay {};
     };
 
     struct FakeSession final: win::IWindowsAgentSession {
@@ -225,8 +227,11 @@ namespace {
         }
 
         [[nodiscard]] std::expected<bool, proto::ProtocolError>
-        wait_readable_until(const std::chrono::steady_clock::time_point,
+        wait_readable_until(const std::chrono::steady_clock::time_point deadline,
                             const std::stop_token cancellation) noexcept override {
+            if (state_->readable_delay > std::chrono::milliseconds::zero()) {
+                std::this_thread::sleep_for(state_->readable_delay);
+            }
             if (cancellation.stop_requested()) {
                 return std::unexpected(canceled());
             }
@@ -239,7 +244,11 @@ namespace {
             }
             auto &offset = state_->readability_offsets[connection];
             const auto &events = state_->readability_by_connection[connection];
-            return offset >= events.size() ? true : events[offset++];
+            const auto readable = offset >= events.size() ? true : events[offset++];
+            if (!readable) {
+                std::this_thread::sleep_until(deadline);
+            }
+            return readable;
         }
 
         [[nodiscard]] std::expected<void, proto::ProtocolError>
@@ -271,6 +280,7 @@ namespace {
         bool publish_inventory {};
         std::vector<bool> authoritative_inventories;
         std::vector<std::uint64_t> inventory_generations;
+        std::stop_source *cancel_after_inventory {};
     };
 
     struct FakeProvider final: win::IWindowsAgentProviderRuntime {
@@ -313,7 +323,11 @@ namespace {
         }
 
         [[nodiscard]] std::expected<std::optional<win::InventoryProjection>, win::AgentRuntimeError>
-        process_inventory(std::string snapshot_id, const std::uint64_t inventory_generation) override {
+        process_inventory(std::string snapshot_id, const std::uint64_t inventory_generation,
+                          const std::stop_token cancellation) override {
+            if (cancellation.stop_requested()) {
+                return std::optional<win::InventoryProjection> {};
+            }
             ++state_->inventories;
             state_->inventory_generations.push_back(inventory_generation);
             const auto attempt = state_->inventories - 1U;
@@ -344,6 +358,9 @@ namespace {
                                                                       .generation = inventory_generation,
                                                                       .item_count = 0U,
                                                                       .canonical_digest = *digest});
+            if (state_->cancel_after_inventory != nullptr) {
+                state_->cancel_after_inventory->request_stop();
+            }
             return std::optional<win::InventoryProjection> {win::InventoryProjection {
                 .generation = inventory_generation,
                 .inventory_digest = *digest,
@@ -543,6 +560,66 @@ TEST_CASE("Windows agent periodically publishes complete durable process invento
     CHECK(first_begin->snapshot_id == first_commit->snapshot_id);
     CHECK(second_begin->snapshot_id == second_commit->snapshot_id);
     CHECK(first_begin->snapshot_id != second_begin->snapshot_id);
+}
+
+TEST_CASE("Windows agent refresh cadence is not starved by continuous inbound frames") {
+    if (!proto::spool_backend_status().available) {
+        SKIP("SQLite spool backend is unavailable");
+    }
+    TemporarySpool temporary;
+    auto configuration = test_configuration(temporary.path);
+    auto spool = open_spool(configuration);
+    REQUIRE(spool.has_value());
+    const auto server = hello("session:busy-inventory", 7U);
+    const auto epoch = spool->agent_epoch();
+    auto session_state = std::make_shared<FakeSessionState>();
+    session_state->hellos = {server};
+    session_state->readable_delay = std::chrono::milliseconds {220};
+    auto &incoming_events = session_state->incoming_by_connection.emplace_back();
+    for (std::size_t index = 0; index < 6U; ++index) {
+        incoming_events.push_back(incoming(
+            envelope(server, epoch, proto::CreditUpdateMessage {.credit = server.credit})));
+    }
+    incoming_events.push_back(failure(canceled()));
+    session_state->spool = &*spool;
+    auto provider_state = std::make_shared<FakeProviderState>();
+    provider_state->publish_inventory = true;
+
+    win::WindowsAgentService service {configuration, *spool, std::make_unique<FakeSession>(session_state),
+                                      std::make_unique<FakeProviderFactory>(provider_state)};
+    const auto result = service.run({});
+    REQUIRE(result.has_value());
+    CHECK(result->inventory_refreshes_attempted == 2U);
+    CHECK(result->inventory_generations_spooled == 2U);
+    CHECK(provider_state->inventories == 2U);
+    CHECK(provider_state->inventory_generations == std::vector<std::uint64_t> {4U, 6U});
+}
+
+TEST_CASE("Windows agent never spools an inventory completed after cancellation") {
+    if (!proto::spool_backend_status().available) {
+        SKIP("SQLite spool backend is unavailable");
+    }
+    TemporarySpool temporary;
+    auto configuration = test_configuration(temporary.path);
+    auto spool = open_spool(configuration);
+    REQUIRE(spool.has_value());
+    auto session_state = std::make_shared<FakeSessionState>();
+    session_state->hellos = {hello("session:canceled-inventory", 7U)};
+    session_state->spool = &*spool;
+    std::stop_source cancellation;
+    auto provider_state = std::make_shared<FakeProviderState>();
+    provider_state->publish_inventory = true;
+    provider_state->cancel_after_inventory = &cancellation;
+
+    win::WindowsAgentService service {configuration, *spool, std::make_unique<FakeSession>(session_state),
+                                      std::make_unique<FakeProviderFactory>(provider_state)};
+    const auto result = service.run(cancellation.get_token());
+    REQUIRE(result.has_value());
+    CHECK(result->inventory_refreshes_attempted == 1U);
+    CHECK(result->inventory_generations_spooled == 0U);
+    CHECK(result->snapshot_records_spooled == 0U);
+    CHECK(provider_state->inventories == 1U);
+    CHECK(spool->pending_records() == 0U);
 }
 
 TEST_CASE("SQLite snapshot batch admission is atomic at the record limit") {

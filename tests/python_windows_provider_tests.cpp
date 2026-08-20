@@ -272,6 +272,24 @@ TEST_CASE("Windows process inventory is authoritative and includes the current c
     REQUIRE(found != snapshot.items.end());
 }
 
+TEST_CASE("Windows process inventory never grants authority after cancellation or deadline expiry") {
+    std::stop_source cancellation;
+    cancellation.request_stop();
+    const auto canceled =
+        win::enumerate_process_inventory(py::PeerId {"peer:test"}, 2U, 0U, cancellation.get_token());
+    REQUIRE_FALSE(canceled.authoritative);
+    REQUIRE(canceled.status == py::FactTerminalStatus::canceled);
+    REQUIRE(canceled.items.empty());
+    REQUIRE(canceled.diagnostic.has_value());
+
+    const auto expired =
+        win::enumerate_process_inventory(py::PeerId {"peer:test"}, 3U, win::unix_time_ms());
+    REQUIRE_FALSE(expired.authoritative);
+    REQUIRE(expired.status == py::FactTerminalStatus::timed_out);
+    REQUIRE(expired.items.empty());
+    REQUIRE(expired.diagnostic.has_value());
+}
+
 TEST_CASE("Windows fact dispatch returns typed values and typed terminal statuses") {
     const auto subject = current_process();
     for (const auto route :

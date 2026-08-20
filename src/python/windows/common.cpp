@@ -318,6 +318,7 @@ namespace rule_engine::python::windows {
             case ProviderErrorCode::unsupported: return FactTerminalStatus::unsupported;
             case ProviderErrorCode::access_denied: return FactTerminalStatus::denied;
             case ProviderErrorCode::timed_out: return FactTerminalStatus::timed_out;
+            case ProviderErrorCode::canceled: return FactTerminalStatus::canceled;
             case ProviderErrorCode::invalid_request:
             case ProviderErrorCode::invalid_subject:
             case ProviderErrorCode::malformed:
@@ -409,11 +410,29 @@ namespace rule_engine::python::windows {
     }
 
     InventorySnapshot make_inventory_snapshot(PeerId peer, SchemaId schema, std::optional<SubjectKey> parent,
-                                              const std::uint64_t generation, std::vector<SubjectObservation> items) {
+                                              const std::uint64_t generation, std::vector<SubjectObservation> items,
+                                              const std::uint64_t deadline_unix_ms,
+                                              const std::stop_token cancellation) {
         const auto invalid = [&](ProviderError error) {
             return invalid_inventory_snapshot(std::move(peer), std::move(schema), generation, std::move(error));
         };
+        const auto bound_error = [&]() -> std::optional<ProviderError> {
+            if (cancellation.stop_requested()) {
+                return ProviderError {.code = ProviderErrorCode::canceled,
+                                      .operation = "inventory snapshot",
+                                      .message = "inventory snapshot construction was canceled"};
+            }
+            if (deadline_unix_ms != 0U && unix_time_ms() >= deadline_unix_ms) {
+                return ProviderError {.code = ProviderErrorCode::timed_out,
+                                      .operation = "inventory snapshot",
+                                      .message = "provider deadline expired during snapshot construction"};
+            }
+            return std::nullopt;
+        };
 
+        if (auto bound = bound_error(); bound.has_value()) {
+            return invalid(std::move(*bound));
+        }
         if (peer.empty() || schema.empty() || generation == 0U) {
             return invalid(snapshot_error("peer, schema, and nonzero generation are required"));
         }
@@ -425,6 +444,9 @@ namespace rule_engine::python::windows {
         std::vector<std::pair<std::string, std::string>> canonical_items;
         canonical_items.reserve(items.size());
         for (const auto &item : items) {
+            if (auto bound = bound_error(); bound.has_value()) {
+                return invalid(std::move(*bound));
+            }
             if (!item.subject.valid() || item.subject.peer != peer || item.subject.descriptor != schema ||
                 !parent_matches(item.subject, parent) || !eager_fields_valid(item.eager_fields)) {
                 return invalid(snapshot_error("snapshot contains an invalid subject, parent, schema, or eager field"));
@@ -438,7 +460,13 @@ namespace rule_engine::python::windows {
             canonical_items.emplace_back(std::move(key), canonical_provider_value(eager));
         }
 
+        if (auto bound = bound_error(); bound.has_value()) {
+            return invalid(std::move(*bound));
+        }
         std::ranges::sort(canonical_items, {}, &std::pair<std::string, std::string>::first);
+        if (auto bound = bound_error(); bound.has_value()) {
+            return invalid(std::move(*bound));
+        }
         std::string canonical;
         append_token(canonical, "windows-inventory-v1");
         append_token(canonical, peer.value);
@@ -450,12 +478,18 @@ namespace rule_engine::python::windows {
             append_token(canonical, "root");
         }
         for (const auto &[key, eager] : canonical_items) {
+            if (auto bound = bound_error(); bound.has_value()) {
+                return invalid(std::move(*bound));
+            }
             append_token(canonical, key);
             append_token(canonical, eager);
         }
 
         const auto bytes = std::as_bytes(std::span {canonical});
         const auto digest = sha256_digest(bytes);
+        if (auto bound = bound_error(); bound.has_value()) {
+            return invalid(std::move(*bound));
+        }
         if (digest.empty()) {
             return invalid(snapshot_error("failed to calculate the snapshot digest"));
         }

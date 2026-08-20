@@ -191,8 +191,10 @@ namespace rule_engine::python::windows {
             }
 
             [[nodiscard]] std::expected<std::optional<InventoryProjection>, AgentRuntimeError>
-            process_inventory(std::string snapshot_id, const std::uint64_t inventory_generation) override {
-                auto inventory = enumerate_process_inventory(peer_, inventory_generation, unix_time_ms() + 15'000U);
+            process_inventory(std::string snapshot_id, const std::uint64_t inventory_generation,
+                              const std::stop_token cancellation) override {
+                auto inventory =
+                    enumerate_process_inventory(peer_, inventory_generation, unix_time_ms() + 15'000U, cancellation);
                 if (!inventory.authoritative || inventory.status != FactTerminalStatus::value) {
                     return std::optional<InventoryProjection> {};
                 }
@@ -455,7 +457,7 @@ namespace rule_engine::python::windows {
                 return std::unexpected(std::move(provider.error()));
             }
             if (!inventory_started_) {
-                if (auto inventory = publish_process_inventory(**provider); !inventory) {
+                if (auto inventory = publish_process_inventory(**provider, cancellation); !inventory) {
                     session_->shutdown();
                     persistent_session_.disconnect();
                     active_session_.reset();
@@ -476,6 +478,13 @@ namespace rule_engine::python::windows {
 
             bool reconnect_required {};
             while (!cancellation.stop_requested()) {
+                if (auto inventory = publish_process_inventory_if_due(**provider, cancellation); !inventory) {
+                    session_->shutdown();
+                    persistent_session_.disconnect();
+                    active_session_.reset();
+                    active_session_fence_ = 0U;
+                    return std::unexpected(std::move(inventory.error()));
+                }
                 if (auto flushed = flush(cancellation); !flushed) {
                     if (!retryable(flushed.error()) && flushed.error().code != AgentFailureCode::canceled) {
                         session_->shutdown();
@@ -501,15 +510,13 @@ namespace rule_engine::python::windows {
                     break;
                 }
                 if (!*readable) {
-                    if (auto inventory = publish_process_inventory(**provider); !inventory) {
+                    if (auto inventory = publish_process_inventory_if_due(**provider, cancellation); !inventory) {
                         session_->shutdown();
                         persistent_session_.disconnect();
                         active_session_.reset();
                         active_session_fence_ = 0U;
                         return std::unexpected(std::move(inventory.error()));
                     }
-                    next_inventory_refresh_ =
-                        std::chrono::steady_clock::now() + configuration_.inventory_refresh_interval;
                     continue;
                 }
                 auto envelope = session_->receive(cancellation);
@@ -534,6 +541,13 @@ namespace rule_engine::python::windows {
                     active_session_.reset();
                     active_session_fence_ = 0U;
                     return std::unexpected(std::move(processed.error()));
+                }
+                if (auto inventory = publish_process_inventory_if_due(**provider, cancellation); !inventory) {
+                    session_->shutdown();
+                    persistent_session_.disconnect();
+                    active_session_.reset();
+                    active_session_fence_ = 0U;
+                    return std::unexpected(std::move(inventory.error()));
                 }
             }
             session_->shutdown();
@@ -650,7 +664,11 @@ namespace rule_engine::python::windows {
     }
 
     std::expected<void, AgentFailure>
-    WindowsAgentService::publish_process_inventory(IWindowsAgentProviderRuntime &provider) noexcept {
+    WindowsAgentService::publish_process_inventory(IWindowsAgentProviderRuntime &provider,
+                                                   const std::stop_token cancellation) noexcept {
+        if (cancellation.stop_requested()) {
+            return {};
+        }
         const auto next_sequence = spool_->next_sequence();
         if (next_sequence == 0U ||
             next_sequence > (std::numeric_limits<std::uint64_t>::max)() - configuration_.active_generation) {
@@ -671,7 +689,10 @@ namespace rule_engine::python::windows {
             return {};
         }
         ++stats_.inventory_refreshes_attempted;
-        auto projection = provider.process_inventory(snapshot_id, inventory_generation);
+        auto projection = provider.process_inventory(snapshot_id, inventory_generation, cancellation);
+        if (cancellation.stop_requested()) {
+            return {};
+        }
         if (!projection) {
             return std::unexpected(provider_failure(projection.error()));
         }
@@ -686,12 +707,33 @@ namespace rule_engine::python::windows {
                 AgentFailure {.code = AgentFailureCode::provider,
                               .message = "provider returned an invalid process inventory projection"});
         }
+        if (cancellation.stop_requested()) {
+            return {};
+        }
         auto sequences = spool_->enqueue_batch((*projection)->durable_messages);
         if (!sequences) {
             return std::unexpected(protocol_failure(sequences.error()));
         }
         stats_.snapshot_records_spooled += sequences->size();
         ++stats_.inventory_generations_spooled;
+        return {};
+    }
+
+    std::expected<void, AgentFailure>
+    WindowsAgentService::publish_process_inventory_if_due(IWindowsAgentProviderRuntime &provider,
+                                                          const std::stop_token cancellation) noexcept {
+        if (!next_inventory_refresh_.has_value()) {
+            return std::unexpected(AgentFailure {.code = AgentFailureCode::invariant,
+                                                 .message = "inventory refresh schedule is not initialized"});
+        }
+        if (std::chrono::steady_clock::now() < *next_inventory_refresh_) {
+            return {};
+        }
+        auto published = publish_process_inventory(provider, cancellation);
+        if (!published) {
+            return std::unexpected(std::move(published.error()));
+        }
+        next_inventory_refresh_ = std::chrono::steady_clock::now() + configuration_.inventory_refresh_interval;
         return {};
     }
 
