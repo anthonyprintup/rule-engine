@@ -790,6 +790,81 @@ namespace rule_engine::python::tools {
         }
 
         [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
+        validate_ingest_locked(const ResidentAgentSession &session, const std::uint64_t sequence,
+                               const protocol_v2::DurableAgentBody &body) const {
+            const auto state_position =
+                peers.find(peer_key(session.authenticated_peer.tenant, session.authenticated_peer.peer));
+            if (state_position == peers.end() || state_position->second.current_session != session.session ||
+                state_position->second.current_session_fence != session.session_fence) {
+                return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::stale_fence,
+                                                      "scheduler session fence is no longer current"));
+            }
+            const auto &state = state_position->second;
+            const auto processed_position = state.processed_epochs.find(session.agent_epoch);
+            const auto processed = processed_position == state.processed_epochs.end() ? 0U : processed_position->second;
+            if (sequence <= processed) {
+                return {};
+            }
+            if (sequence != processed + 1U) {
+                return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::sequence_gap,
+                                                      "scheduler durable sequence is not contiguous"));
+            }
+
+            if (const auto *begin = std::get_if<protocol_v2::AuthoritativeSnapshotBegin>(&body)) {
+                if (state.staging_snapshot_scopes.contains(begin->snapshot_id)) {
+                    return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::stale_generation,
+                                                          "snapshot identifier is already staging"));
+                }
+                const auto scope_key = snapshot_scope_key(begin->subject_schema, begin->parent);
+                const auto scope = state.snapshots.find(scope_key);
+                if (scope == state.snapshots.end()) {
+                    protocol_v2::AuthoritativeSnapshotAssembler candidate {
+                        session.authenticated_peer.peer, session.session, session.session_fence,
+                        begin->subject_schema,           begin->parent,   limits};
+                    return candidate.begin(*begin);
+                }
+                auto candidate = *scope->second.assembler;
+                return candidate.begin(*begin);
+            }
+            if (const auto *chunk = std::get_if<protocol_v2::AuthoritativeSnapshotChunk>(&body)) {
+                const auto scope_key = state.staging_snapshot_scopes.find(chunk->snapshot_id);
+                if (scope_key == state.staging_snapshot_scopes.end()) {
+                    return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::stale_generation,
+                                                          "snapshot chunk has no active scope"));
+                }
+                auto candidate = *state.snapshots.at(scope_key->second).assembler;
+                return candidate.append(*chunk);
+            }
+            if (const auto *commit = std::get_if<protocol_v2::AuthoritativeSnapshotCommit>(&body)) {
+                const auto scope_key = state.staging_snapshot_scopes.find(commit->snapshot_id);
+                if (scope_key == state.staging_snapshot_scopes.end()) {
+                    return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::stale_generation,
+                                                          "snapshot commit has no active scope"));
+                }
+                auto candidate = *state.snapshots.at(scope_key->second).assembler;
+                auto delta = candidate.commit(*commit);
+                if (!delta) {
+                    return std::unexpected(std::move(delta.error()));
+                }
+                return {};
+            }
+            const auto &result = std::get<protocol_v2::WorkResultMessage>(body);
+            const auto active = state.active_rounds.find(result.work_id);
+            if (active == state.active_rounds.end() || active->second.session != session.session ||
+                active->second.session_fence != session.session_fence ||
+                result.originating_session != session.session ||
+                result.originating_session_fence != session.session_fence ||
+                result.work_fence != active->second.lease.fence ||
+                result.generation != active->second.lease.work.generation ||
+                result.attempt_id != "attempt:" + std::to_string(active->second.protocol_attempt) + ':' +
+                                         std::to_string(active->second.round)) {
+                return std::unexpected(protocol_error(protocol_v2::ProtocolErrorCode::stale_fence,
+                                                      "work result does not match an active VM round"));
+            }
+            return {};
+        }
+
+        [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
         ingest_locked(const ResidentAgentSession &session, const std::uint64_t sequence,
                       const protocol_v2::DurableAgentBody &body, const bool recovering) {
             auto &state = state_for(session);
@@ -999,6 +1074,18 @@ namespace rule_engine::python::tools {
             return bound;
         }
         return impl_->catch_up(session);
+    }
+
+    std::expected<void, protocol_v2::ProtocolError>
+    ResidentEvaluationScheduler::validate_ingest(const ResidentAgentSession &session, const std::uint64_t sequence,
+                                                 const protocol_v2::DurableAgentBody &body,
+                                                 const std::stop_token cancellation) noexcept {
+        if (cancellation.stop_requested()) {
+            return std::unexpected(
+                protocol_error(protocol_v2::ProtocolErrorCode::canceled, "scheduler ingest validation was canceled"));
+        }
+        std::scoped_lock lock {impl_->mutex};
+        return impl_->validate_ingest_locked(session, sequence, body);
     }
 
     std::expected<void, protocol_v2::ProtocolError>

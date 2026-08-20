@@ -1431,6 +1431,21 @@ policy mutation remains fail-closed.
                     scheduler = scheduler_;
                     activation_epoch = activation_epoch_;
                 }
+                if (!scheduler) {
+                    return std::unexpected(protocol_v2::ProtocolError {
+                        .code = protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                        .message = "resident evaluator is unavailable; reconnect after activation",
+                    });
+                }
+                // Stateful validation happens before the receipt transaction:
+                // a stale fence, non-contiguous generation, malformed chunk,
+                // or invalid commit must never become the durable high-water
+                // mark. The authenticated peer has one fenced stream owner,
+                // so the subsequent ingest applies the same sequence state.
+                auto valid = scheduler->validate_ingest(session, sequence, body, cancellation);
+                if (!valid) {
+                    return std::unexpected(std::move(valid.error()));
+                }
                 auto encoded = protocol_v2::encode_durable_body(body, protocol_limits_);
                 if (!encoded) {
                     return std::unexpected(std::move(encoded.error()));
@@ -1459,11 +1474,9 @@ policy mutation remains fail-closed.
                                        "replay the acknowledged message",
                         });
                     }
-                    if (scheduler) {
-                        auto ingested = scheduler->ingest(session, sequence, body, cancellation);
-                        if (!ingested) {
-                            return std::unexpected(std::move(ingested.error()));
-                        }
+                    auto ingested = scheduler->ingest(session, sequence, body, cancellation);
+                    if (!ingested) {
+                        return std::unexpected(std::move(ingested.error()));
                     }
                 }
                 return DurableAgentReceipt {.acknowledged_through = receipt->acknowledged_through, .credit = credit_};

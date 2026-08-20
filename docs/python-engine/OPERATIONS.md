@@ -279,6 +279,19 @@ VM from the authenticated result, and commits the terminal transaction through
 the same durable coordinator. Restart reconstructs pending work from committed
 snapshot messages.
 
+Snapshot rows keep their original bytes in the agent spool across reconnect.
+After a replacement mTLS session authenticates the same peer and agent epoch,
+the resident rebinds only snapshot begin/chunk/commit transport session fields
+to the new session fence before sequence admission. It never rebinds a work
+result, because that result belongs to the exact work lease which issued it.
+The evaluator performs a pure, state-aware preflight before the body/receipt
+transaction, so a stale generation, missing stage, malformed chunk or invalid
+commit cannot advance the durable high-water mark without scheduler
+application. The durable write still precedes actual scheduler mutation, which
+preserves crash recovery for a valid accepted body. A resident with no active
+evaluator NACKs durable agent input without advancing its receipt; the agent
+keeps the spool rows and retries after activation.
+
 An authenticated agent session checks for newly ready work at establishment,
 after each durable inbound message, and whenever an otherwise idle,
 non-consuming TLS/socket input-readiness wait reaches
@@ -413,6 +426,15 @@ upgraded agent continues above its prior sequence. An enumeration failure emits
 no replacement snapshot, leaving the
 coordinator's last-good process view authoritative until a later refresh
 succeeds.
+
+The Windows inventory syscall itself is synchronous and cannot be interrupted
+after `NtQuerySystemInformation` enters the kernel. Stop/deadline checks occur
+before and after each query/retry and while parsing; a result that returns late
+is discarded and never spooled. This is not a hard shutdown bound. Configure
+the Windows service supervisor with a finite shutdown grace, then terminate the
+agent process if it has not exited by that deadline. Do not delete the SQLite
+spool after forced termination; WAL recovery retains complete committed batches
+for replay.
 
 Cadence is currently fixed per agent and has no fleet jitter. Stagger agent
 service starts when rolling out a short interval, monitor snapshot ingress and

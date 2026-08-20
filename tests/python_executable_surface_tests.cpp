@@ -2,6 +2,7 @@
 
 #include "rule_engine/python/packaging/source_pack.hpp"
 #include "rule_engine/python/protocol/codec.hpp"
+#include "rule_engine/python/protocol/snapshot.hpp"
 #include "rule_engine/python/tools/admin_client.hpp"
 #include "rule_engine/python/tools/benchmark.hpp"
 #include "rule_engine/python/tools/pack_upload.hpp"
@@ -852,6 +853,7 @@ namespace {
         bool return_invalid_session {};
         bool deliver_every_time {};
         std::atomic<bool> work_delivered {};
+        std::vector<proto::DurableAgentBody> persisted_bodies;
 
         [[nodiscard]] std::expected<tools::ResidentAgentSession, proto::ProtocolError>
         establish(const proto::AuthenticatedPeer &peer, const proto::AgentHelloMessage &hello,
@@ -884,9 +886,10 @@ namespace {
         }
 
         [[nodiscard]] std::expected<tools::DurableAgentReceipt, proto::ProtocolError>
-        persist(const tools::ResidentAgentSession &, const std::uint64_t sequence, const proto::DurableAgentBody &,
+        persist(const tools::ResidentAgentSession &, const std::uint64_t sequence, const proto::DurableAgentBody &body,
                 std::stop_token) noexcept override {
             ++persists;
+            persisted_bodies.push_back(body);
             return tools::DurableAgentReceipt {
                 .acknowledged_through = sequence,
                 .credit = {.bytes = 64U * py::kibibyte, .messages = 8U, .work_attempts = 1U, .snapshot_chunks = 1U},
@@ -973,6 +976,16 @@ namespace {
                 .agent_epoch = "epoch:test",
                 .agent_sequence = 1U,
                 .body = result};
+    }
+
+    [[nodiscard]] proto::PeerEnvelope snapshot_envelope(proto::DurableAgentBody body, const std::uint64_t sequence) {
+        return {.message_id = "agent:snapshot:" + std::to_string(sequence),
+                .session = py::SessionId {"session:test"},
+                .agent_epoch = "epoch:test",
+                .agent_sequence = sequence,
+                .body = std::visit(
+                    [](auto &&message) -> proto::MessageBody { return std::forward<decltype(message)>(message); },
+                    std::move(body))};
     }
 
     void enqueue_protocol(const std::shared_ptr<FakeChannelState> &state, const proto::PeerEnvelope &envelope) {
@@ -1473,6 +1486,63 @@ TEST_CASE("resident agent service consumes framed bytes and ACKs only a durable 
     CHECK(agents.persists == 1U);
     CHECK(agents.closes == 1U);
     CHECK(state->shutdown);
+}
+
+TEST_CASE("resident agent service rebinds a durable snapshot replay to its authenticated replacement session") {
+    AllowTrust trust;
+    DurableFakeAgentBackend agents;
+    agents.deliver_on_take_call = (std::numeric_limits<std::size_t>::max)();
+    RejectAdmin admin;
+    tools::ResidentApplicationService service {test_service_limits(), trust, agents, admin};
+    auto state = std::make_shared<FakeChannelState>();
+    const std::vector<py::SubjectKey> subjects;
+    const auto digest = proto::authoritative_snapshot_digest(subjects);
+    REQUIRE(digest);
+    enqueue_protocol(state, agent_hello_envelope());
+    enqueue_protocol(state, snapshot_envelope(
+                                proto::AuthoritativeSnapshotBegin {
+                                    .session = py::SessionId {"session:disconnected"},
+                                    .peer = py::PeerId {"peer:test"},
+                                    .session_fence = 3U,
+                                    .snapshot_id = "snapshot:replay",
+                                    .parent = {},
+                                    .subject_schema = py::SchemaId {"windows.process.v1"},
+                                    .generation = 1U,
+                                    .expected_count = 0U,
+                                    .expected_digest = *digest,
+                                },
+                                1U));
+    enqueue_protocol(state, snapshot_envelope(
+                                proto::AuthoritativeSnapshotCommit {
+                                    .session = py::SessionId {"session:disconnected"},
+                                    .peer = py::PeerId {"peer:test"},
+                                    .session_fence = 3U,
+                                    .snapshot_id = "snapshot:replay",
+                                    .generation = 1U,
+                                    .item_count = 0U,
+                                    .canonical_digest = *digest,
+                                },
+                                2U));
+
+    service.run({.role = tools::ResidentSessionRole::agent,
+                 .peer = {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:test"}},
+                 .channel = std::make_unique<FakeByteChannel>(state)},
+                {});
+
+    REQUIRE(agents.persisted_bodies.size() == 2U);
+    const auto &begin = std::get<proto::AuthoritativeSnapshotBegin>(agents.persisted_bodies[0]);
+    const auto &commit = std::get<proto::AuthoritativeSnapshotCommit>(agents.persisted_bodies[1]);
+    CHECK(begin.session == py::SessionId {"session:test"});
+    CHECK(begin.session_fence == agents.fence);
+    CHECK(commit.session == py::SessionId {"session:test"});
+    CHECK(commit.session_fence == agents.fence);
+    REQUIRE(state->protocol_output.size() == 3U);
+    for (std::size_t index = 1U; index < state->protocol_output.size(); ++index) {
+        const auto ack = proto::decode_frame(state->protocol_output[index]);
+        REQUIRE(ack);
+        REQUIRE(std::holds_alternative<proto::AckMessage>(ack->envelope.body));
+        CHECK(std::get<proto::AckMessage>(ack->envelope.body).acknowledged_through == index);
+    }
 }
 
 TEST_CASE("resident agent service polls and delivers work to an otherwise idle session") {

@@ -49,6 +49,39 @@ namespace rule_engine::python::tools {
             return {.code = code, .message = std::move(message), .byte_offset = 0U};
         }
 
+        [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
+        rebind_authenticated_snapshot(protocol_v2::PeerEnvelope &envelope, const ResidentAgentSession &session) {
+            if (!envelope.session || *envelope.session != session.session ||
+                envelope.agent_epoch != session.agent_epoch) {
+                return std::unexpected(error(protocol_v2::ProtocolErrorCode::stale_fence,
+                                             "agent envelope does not match the authenticated session"));
+            }
+            const auto rebind = [&](auto &snapshot) -> std::expected<void, protocol_v2::ProtocolError> {
+                if (snapshot.peer != session.authenticated_peer.peer) {
+                    return std::unexpected(error(protocol_v2::ProtocolErrorCode::invalid_identity,
+                                                 "snapshot peer does not match the authenticated peer"));
+                }
+                // The durable agent stream is identified by authenticated
+                // peer + agent epoch + sequence. Snapshot session fields are
+                // transport fences, so a replay on a newly authenticated
+                // connection must adopt that connection's fence. Work results
+                // deliberately remain bound to the lease which created them.
+                snapshot.session = session.session;
+                snapshot.session_fence = session.session_fence;
+                return {};
+            };
+            if (auto *begin = std::get_if<protocol_v2::AuthoritativeSnapshotBegin>(&envelope.body)) {
+                return rebind(*begin);
+            }
+            if (auto *chunk = std::get_if<protocol_v2::AuthoritativeSnapshotChunk>(&envelope.body)) {
+                return rebind(*chunk);
+            }
+            if (auto *commit = std::get_if<protocol_v2::AuthoritativeSnapshotCommit>(&envelope.body)) {
+                return rebind(*commit);
+            }
+            return {};
+        }
+
         [[nodiscard]] std::chrono::steady_clock::time_point
         bounded_deadline(const std::chrono::steady_clock::time_point session_deadline,
                          const std::chrono::milliseconds operation_timeout = std::chrono::seconds {5}) noexcept {
@@ -1527,6 +1560,17 @@ namespace rule_engine::python::tools {
             }
             ++received_messages;
             const auto sequence = received->agent_sequence;
+            if (auto rebound = rebind_authenticated_snapshot(*received, *session); !rebound) {
+                const protocol_v2::NackMessage nack {.agent_epoch = session->agent_epoch,
+                                                     .sequence = sequence,
+                                                     .reason = rebound.error().code,
+                                                     .permanent = false,
+                                                     .diagnostic = rebound.error().message.substr(0U, 512U)};
+                static_cast<void>(job.channel->send_protocol(
+                    server_envelope(*session, "server:" + session->session.value + ":nack", nack),
+                    bounded_deadline(session_deadline), cancellation));
+                break;
+            }
             auto admitted = gate->admit(std::move(*received));
             if (!admitted) {
                 const protocol_v2::NackMessage nack {.agent_epoch = session->agent_epoch,

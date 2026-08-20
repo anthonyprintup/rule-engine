@@ -146,6 +146,58 @@ namespace {
         };
     }
 
+    TEST_CASE("scheduler preflight is pure and rejects malformed snapshot commits before receipt persistence") {
+        cluster::AuditTrail audit;
+        cluster::InMemoryRuntimeStore store {audit};
+        auto scheduler = tools::ResidentEvaluationScheduler::create(store, audit, "node-a", std::chrono::seconds {30},
+                                                                    {active_pack()});
+        REQUIRE(scheduler);
+        const auto agent = session();
+        REQUIRE((*scheduler)->bind_session(agent));
+        const std::vector<SubjectKey> subjects;
+        const auto digest = protocol::authoritative_snapshot_digest(subjects);
+        REQUIRE(digest);
+        const protocol::AuthoritativeSnapshotBegin begin {
+            .session = agent.session,
+            .peer = agent.authenticated_peer.peer,
+            .session_fence = agent.session_fence,
+            .snapshot_id = "snapshot:preflight",
+            .parent = {},
+            .subject_schema = SchemaId {"windows.process.v1"},
+            .generation = 1U,
+            .expected_count = 0U,
+            .expected_digest = *digest,
+        };
+        const protocol::AuthoritativeSnapshotCommit malformed {
+            .session = agent.session,
+            .peer = agent.authenticated_peer.peer,
+            .session_fence = agent.session_fence,
+            .snapshot_id = "snapshot:preflight",
+            .generation = 1U,
+            .item_count = 1U,
+            .canonical_digest = *digest,
+        };
+        const protocol::AuthoritativeSnapshotCommit valid {
+            .session = agent.session,
+            .peer = agent.authenticated_peer.peer,
+            .session_fence = agent.session_fence,
+            .snapshot_id = "snapshot:preflight",
+            .generation = 1U,
+            .item_count = 0U,
+            .canonical_digest = *digest,
+        };
+
+        // Validation does not stage or advance the sequence itself.
+        REQUIRE((*scheduler)->validate_ingest(agent, 1U, begin, {}));
+        REQUIRE((*scheduler)->validate_ingest(agent, 1U, begin, {}));
+        REQUIRE((*scheduler)->ingest(agent, 1U, begin, {}));
+        const auto rejected = (*scheduler)->validate_ingest(agent, 2U, malformed, {});
+        REQUIRE_FALSE(rejected);
+        CHECK(rejected.error().code == protocol::ProtocolErrorCode::malformed);
+        REQUIRE((*scheduler)->validate_ingest(agent, 2U, valid, {}));
+        REQUIRE((*scheduler)->ingest(agent, 2U, valid, {}));
+    }
+
     TEST_CASE("durable authoritative snapshot drives a fenced VM provider round to a committed result") {
         cluster::AuditTrail audit;
         cluster::InMemoryRuntimeStore store {audit};

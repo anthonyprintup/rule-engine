@@ -32,6 +32,11 @@ namespace rule_engine::python::tools {
 
         [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
         bind_session(const ResidentAgentSession &session) noexcept;
+        // Pure, state-aware validation used before the durable receipt is
+        // advanced. Callers must still invoke ingest after persistence.
+        [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
+        validate_ingest(const ResidentAgentSession &session, std::uint64_t sequence,
+                        const protocol_v2::DurableAgentBody &body, std::stop_token cancellation) noexcept;
         [[nodiscard]] std::expected<void, protocol_v2::ProtocolError> ingest(const ResidentAgentSession &session,
                                                                              std::uint64_t sequence,
                                                                              const protocol_v2::DurableAgentBody &body,
