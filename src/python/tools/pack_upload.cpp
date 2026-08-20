@@ -463,6 +463,15 @@ namespace rule_engine::python::tools {
                 return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
                                                     "registry maintenance audit cannot be replaced durably"));
             }
+#ifndef _WIN32
+            const auto directory = ::open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            const auto directory_synced = directory >= 0 && ::fsync(directory) == 0;
+            const auto directory_closed = directory >= 0 && ::close(directory) == 0;
+            if (!directory_synced || !directory_closed) {
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                                                    "registry maintenance audit directory cannot be synced"));
+            }
+#endif
             return {};
         }
 
@@ -1117,7 +1126,11 @@ namespace rule_engine::python::tools {
             return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
                                                 "registry maintenance observation is unavailable"));
         }
-        std::scoped_lock lock {impl_->mutex};
+        std::unique_lock lock {impl_->mutex, std::try_to_lock};
+        if (!lock.owns_lock()) {
+            return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                                                "registry maintenance observation is busy"));
+        }
         auto spool_lock = ScopedSpoolLock::acquire(impl_->spool / ".spool.lock");
         if (!spool_lock) {
             return std::unexpected(std::move(spool_lock.error()));

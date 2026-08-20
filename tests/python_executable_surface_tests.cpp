@@ -2285,6 +2285,65 @@ TEST_CASE("filesystem upload enforces tenant reservation quota and expires aband
     CHECK(admitted->received_bytes == 0U);
 }
 
+TEST_CASE("authorized registry observation does not wait behind filesystem maintenance") {
+    TemporaryDirectory temporary;
+    const std::filesystem::path crypto_library {RULE_ENGINE_PYTHON_SERVER_PATH};
+    py::packaging::TrustPolicy trust {
+        .mode = py::packaging::TrustMode::development,
+        .allow_unsigned_packs = true,
+        .allow_unsigned_generators = false,
+        .signers = {},
+    };
+    const tools::PackRegistryLimits limits {
+        .maximum_published_bytes = 32U * py::mebibyte,
+        .maximum_tenant_bytes = 16U * py::mebibyte,
+        .partial_session_ttl = std::chrono::minutes {1},
+        .unreferenced_retention = std::chrono::hours {1},
+    };
+    auto registry = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library, limits);
+    REQUIRE(registry);
+    CountingControlStore store;
+    AllowAdminPolicy policy;
+    tools::AuthorizedResidentAdminBackend admin {store, policy, nullptr, registry->get()};
+    const proto::AuthenticatedPeer peer {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:admin"}};
+    const tools::ResidentAdminRequest request {.kind = tools::ResidentAdminRequestKind::pack_snapshot,
+                                               .request_id = "request:registry:concurrent",
+                                               .tenant = py::TenantId {"tenant:test"},
+                                               .pack = py::PackId {"pack:test"},
+                                               .at_unix_ms = 10U};
+    std::atomic<bool> started {};
+    std::atomic<bool> finished {};
+    std::atomic<bool> maintenance_failed {};
+    std::jthread maintainer {[&] {
+        started.store(true, std::memory_order_release);
+        for (std::uint64_t pass = 0U; pass < 32U; ++pass) {
+            if (!(*registry)->maintain({}, 1'000U + pass)) {
+                maintenance_failed.store(true, std::memory_order_release);
+                break;
+            }
+        }
+        finished.store(true, std::memory_order_release);
+    }};
+    while (!started.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+
+    bool rejected_busy {};
+    while (!finished.load(std::memory_order_acquire)) {
+        const auto response = admin.execute(peer, request);
+        if (response.status == tools::ResidentAdminResponseStatus::unavailable &&
+            response.code == "ADMIN-REGISTRY-OBSERVATION-UNAVAILABLE") {
+            rejected_busy = true;
+            break;
+        }
+    }
+    maintainer.join();
+
+    CHECK_FALSE(maintenance_failed.load(std::memory_order_acquire));
+    CHECK(rejected_busy);
+    const auto observed = (*registry)->observe_maintenance();
+    REQUIRE(observed);
+    CHECK(observed->successful_maintenance_runs == 32U);
+}
+
 TEST_CASE("resident admin v2 activation sequence is durable and idempotent across lost responses") {
     StatefulControlStore store;
     store.state.storage_revision = 0U;
