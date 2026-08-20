@@ -327,17 +327,22 @@ namespace rule_engine::python::windows {
             return std::unexpected(AgentFailure {.code = AgentFailureCode::configuration,
                                                  .message = "production TLS session requires hard resolver bounds"});
         }
-        if (!configuration.require_crl || configuration.crl_path.empty()) {
+        if (!configuration.require_crl) {
             return std::unexpected(
                 AgentFailure {.code = AgentFailureCode::configuration,
                               .message = "production agent requires an absolute crl_path and require_crl = true"});
+        }
+        auto crl = load_windows_agent_local_crl(configuration.crl_path);
+        if (!crl) {
+            return std::unexpected(std::move(crl.error()));
         }
         auto context = protocol_v2::OpenSslTlsContext::create(protocol_v2::TlsConfiguration {
             .role = protocol_v2::TlsEndpointRole::client,
             .trust_anchors_pem = configuration.ca_path.string(),
             .certificate_chain_pem = configuration.certificate_path.string(),
             .private_key_pem = configuration.private_key_path.string(),
-            .crl_pem = configuration.crl_path.string(),
+            .crl_pem = {},
+            .crl_pem_contents = std::move(*crl),
             .expected_server_name = configuration.server_name,
             .require_crl = configuration.require_crl,
             .verification_time_unix_seconds = std::nullopt,

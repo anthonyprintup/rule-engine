@@ -68,6 +68,8 @@ namespace rule_engine::python::windows {
     load_windows_agent_config(const std::filesystem::path &path) noexcept;
     [[nodiscard]] std::expected<void, AgentFailure>
     validate_windows_agent_config_files(const WindowsAgentConfig &configuration) noexcept;
+    [[nodiscard]] std::expected<std::string, AgentFailure>
+    load_windows_agent_local_crl(const std::filesystem::path &path) noexcept;
     [[nodiscard]] std::expected<void, AgentFailure>
     validate_windows_agent_dependencies(const WindowsAgentConfig &configuration) noexcept;
 

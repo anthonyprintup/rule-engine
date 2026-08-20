@@ -372,11 +372,16 @@ inventory_refresh_interval_ms = 300000
 
 All filesystem paths are absolute. Production agents require both `crl_path`
 and `require_crl = true`; there is no production switch that disables local
-revocation checking. `--validate-config` rejects missing, malformed,
-not-yet-valid, or expired CRLs before dialing. During connection, OpenSSL checks
-the full certificate chain and additionally rejects missing issuer coverage, a
-wrong CRL issuer, and revoked server certificates. The TLS chain, DNS name,
-exact URI SAN, and SHA-256 leaf fingerprint must still agree.
+revocation checking. The CRL path must be normalized, remain on a fixed local
+drive, and traverse no reparse point; relative paths, UNC paths, mapped drives,
+alternate data streams, and symbolic-link or junction traversal are rejected.
+The bounded file may contain only PEM `X509 CRL` blocks. Certificates and other
+PEM objects are rejected rather than being allowed to alter the configured trust
+store. `--validate-config` rejects missing, malformed, not-yet-valid, or expired
+CRLs before dialing. During connection, OpenSSL checks the full certificate
+chain and additionally rejects missing issuer coverage, a wrong CRL issuer, and
+revoked server certificates. The TLS chain, DNS name, exact URI SAN, and SHA-256
+leaf fingerprint must still agree.
 
 Schema v2 makes the inventory interval explicit; schema-v1 agent files are
 rejected and must add the bounded interval during upgrade.

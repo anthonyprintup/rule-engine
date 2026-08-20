@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -48,6 +49,27 @@ namespace {
             std::filesystem::remove(path.string() + "-wal", ignored);
             std::filesystem::remove(path.string() + "-shm", ignored);
         }
+
+        std::filesystem::path path;
+    };
+
+    struct TemporaryDirectory {
+        TemporaryDirectory() {
+            static std::atomic<std::uint64_t> next {};
+            path = std::filesystem::temp_directory_path() /
+                   ("rule-engine-agent-files-" + std::to_string(GetCurrentProcessId()) + "-" +
+                    std::to_string(next.fetch_add(1U)));
+            std::error_code error;
+            std::filesystem::create_directories(path, error);
+        }
+
+        ~TemporaryDirectory() {
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+        }
+
+        TemporaryDirectory(const TemporaryDirectory &) = delete;
+        TemporaryDirectory &operator=(const TemporaryDirectory &) = delete;
 
         std::filesystem::path path;
     };
@@ -451,6 +473,20 @@ TEST_CASE("Windows agent configuration and command line are strict and productio
     relative_crl.replace(relative_crl.find("C:\\agent\\server.crl.pem"),
                          std::string_view {"C:\\agent\\server.crl.pem"}.size(), "server.crl.pem");
     CHECK_FALSE(win::parse_windows_agent_config(relative_crl).has_value());
+    auto unc_crl = valid;
+    unc_crl.replace(unc_crl.find("C:\\agent\\server.crl.pem"), std::string_view {"C:\\agent\\server.crl.pem"}.size(),
+                    "\\\\server\\share\\server.crl.pem");
+    CHECK_FALSE(win::parse_windows_agent_config(unc_crl).has_value());
+    auto non_normal_crl = valid;
+    non_normal_crl.replace(non_normal_crl.find("C:\\agent\\server.crl.pem"),
+                           std::string_view {"C:\\agent\\server.crl.pem"}.size(),
+                           "C:\\agent\\nested\\..\\server.crl.pem");
+    CHECK_FALSE(win::parse_windows_agent_config(non_normal_crl).has_value());
+    auto alternate_stream_crl = valid;
+    alternate_stream_crl.replace(alternate_stream_crl.find("C:\\agent\\server.crl.pem"),
+                                 std::string_view {"C:\\agent\\server.crl.pem"}.size(),
+                                 "C:\\agent\\server.crl.pem:stream");
+    CHECK_FALSE(win::parse_windows_agent_config(alternate_stream_crl).has_value());
     auto dns = valid;
     dns.replace(dns.find("127.0.0.1:7443"), std::string_view {"127.0.0.1:7443"}.size(), "example.test:7443");
     CHECK_FALSE(win::parse_windows_agent_config(dns).has_value());
@@ -484,6 +520,37 @@ TEST_CASE("Windows agent configuration and command line are strict and productio
     missing_crl.crl_path = temporary.path.string() + ".crl.pem";
     missing_crl.require_crl = true;
     CHECK_FALSE(win::validate_windows_agent_config_files(missing_crl).has_value());
+
+    auto relative_programmatic = missing_crl;
+    relative_programmatic.crl_path = "relative.crl.pem";
+    CHECK_FALSE(win::validate_windows_agent_config_files(relative_programmatic).has_value());
+    CHECK_FALSE(win::validate_windows_agent_dependencies(relative_programmatic).has_value());
+    CHECK_FALSE(win::make_tls_windows_agent_session(relative_programmatic).has_value());
+
+    auto unc_programmatic = missing_crl;
+    unc_programmatic.crl_path = "\\\\server\\share\\server.crl.pem";
+    CHECK_FALSE(win::validate_windows_agent_config_files(unc_programmatic).has_value());
+    CHECK_FALSE(win::validate_windows_agent_dependencies(unc_programmatic).has_value());
+    CHECK_FALSE(win::make_tls_windows_agent_session(unc_programmatic).has_value());
+
+    TemporaryDirectory files;
+    const auto target = files.path / "target.crl.pem";
+    std::ofstream {target, std::ios::binary} << "not parsed by the local-file boundary\n";
+    const auto local_contents = win::load_windows_agent_local_crl(target);
+    REQUIRE(local_contents.has_value());
+    CHECK(*local_contents == "not parsed by the local-file boundary\n");
+    const auto file_link = files.path / "linked.crl.pem";
+    if (CreateSymbolicLinkW(file_link.c_str(), target.c_str(), SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0) {
+        CHECK_FALSE(win::load_windows_agent_local_crl(file_link).has_value());
+    }
+    const auto target_directory = files.path / "target-directory";
+    std::filesystem::create_directories(target_directory);
+    std::ofstream {target_directory / "issuer.crl.pem", std::ios::binary} << "not parsed by the local-file boundary\n";
+    const auto directory_link = files.path / "linked-directory";
+    if (CreateSymbolicLinkW(directory_link.c_str(), target_directory.c_str(),
+                            SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0) {
+        CHECK_FALSE(win::load_windows_agent_local_crl(directory_link / "issuer.crl.pem").has_value());
+    }
 }
 
 TEST_CASE("Windows agent spools an entire typed inventory projection before its first send") {

@@ -376,6 +376,7 @@ namespace rule_engine::python::tools {
                 .certificate_chain_pem = std::move(*certificate),
                 .private_key_pem = std::move(*key),
                 .crl_pem = {},
+                .crl_pem_contents = {},
                 .expected_server_name = address->host,
                 .require_crl = false,
                 .verification_time_unix_seconds = std::nullopt,

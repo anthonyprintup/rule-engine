@@ -23,6 +23,7 @@ namespace rule_engine::python::protocol_v2 {
         std::string certificate_chain_pem;
         std::string private_key_pem;
         std::string crl_pem;
+        std::string crl_pem_contents;
         std::string expected_server_name;
         bool require_crl {};
         std::optional<std::int64_t> verification_time_unix_seconds;

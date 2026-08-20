@@ -191,6 +191,7 @@ namespace {
         std::filesystem::path stale_crl;
         std::filesystem::path future_crl;
         std::filesystem::path wrong_issuer_crl;
+        std::filesystem::path mixed_crl;
         std::filesystem::path malformed_crl;
 
         [[nodiscard]] static std::optional<CertificateFixture> generate(const std::filesystem::path &root) {
@@ -208,6 +209,7 @@ namespace {
                 .stale_crl = root / "stale.crl.pem",
                 .future_crl = root / "future.crl.pem",
                 .wrong_issuer_crl = root / "wrong-issuer.crl.pem",
+                .mixed_crl = root / "mixed.crl.pem",
                 .malformed_crl = root / "malformed.crl.pem",
             };
             const auto ca_key = root / "ca.key";
@@ -299,6 +301,13 @@ namespace {
                              quoted(result.revoked_crl))) {
                 return std::nullopt;
             }
+            std::ifstream clean {result.clean_crl, std::ios::binary};
+            std::ifstream certificate {result.alternate_ca, std::ios::binary};
+            std::ofstream mixed {result.mixed_crl, std::ios::binary};
+            mixed << clean.rdbuf() << certificate.rdbuf();
+            if (!clean.good() || !certificate.good() || !mixed.good()) {
+                return std::nullopt;
+            }
             std::ofstream {result.malformed_crl, std::ios::binary} << "not a PEM CRL\n";
             return result;
         }
@@ -311,6 +320,7 @@ namespace {
             .certificate_chain_pem = certificates.server_certificate.string(),
             .private_key_pem = certificates.server_key.string(),
             .crl_pem = {},
+            .crl_pem_contents = {},
             .expected_server_name = {},
             .require_crl = false,
             .verification_time_unix_seconds = std::nullopt,
@@ -325,6 +335,7 @@ namespace {
             .certificate_chain_pem = certificates.client_certificate.string(),
             .private_key_pem = certificates.client_key.string(),
             .crl_pem = {},
+            .crl_pem_contents = {},
             .expected_server_name = "localhost",
             .require_crl = false,
             .verification_time_unix_seconds = std::nullopt,
@@ -755,6 +766,7 @@ namespace {
                 .certificate_chain_pem = certificate.string(),
                 .private_key_pem = key.string(),
                 .crl_pem = {},
+                .crl_pem_contents = {},
                 .expected_server_name = {},
                 .require_crl = false,
                 .verification_time_unix_seconds = std::nullopt,
@@ -770,6 +782,7 @@ namespace {
                 .certificate_chain_pem = certificate.string(),
                 .private_key_pem = key.string(),
                 .crl_pem = {},
+                .crl_pem_contents = {},
                 .expected_server_name = std::move(hostname),
                 .require_crl = false,
                 .verification_time_unix_seconds = std::nullopt,
@@ -880,10 +893,26 @@ namespace {
         REQUIRE(succeeds(server_configuration(certificates->server_certificate, certificates->server_key),
                          client_with_crl(certificates->clean_crl)));
 
+        const auto clean_crl_bytes = read_bytes(certificates->clean_crl);
+        REQUIRE_FALSE(clean_crl_bytes.empty());
+        auto in_memory_crl =
+            client_configuration(certificates->ca, certificates->client_certificate, certificates->client_key);
+        in_memory_crl.crl_pem_contents.assign(reinterpret_cast<const char *>(clean_crl_bytes.data()),
+                                              clean_crl_bytes.size());
+        in_memory_crl.require_crl = true;
+        REQUIRE(succeeds(server_configuration(certificates->server_certificate, certificates->server_key),
+                         std::move(in_memory_crl)));
+        auto ambiguous_crl = client_with_crl(certificates->clean_crl);
+        ambiguous_crl.crl_pem_contents.assign(reinterpret_cast<const char *>(clean_crl_bytes.data()),
+                                              clean_crl_bytes.size());
+        REQUIRE_FALSE(OpenSslTlsContext::create(std::move(ambiguous_crl)).has_value());
+
         auto missing_crl_file = client_with_crl(temporary.path / "missing.crl.pem");
         REQUIRE_FALSE(OpenSslTlsContext::create(std::move(missing_crl_file)).has_value());
         auto malformed_crl = client_with_crl(certificates->malformed_crl);
         REQUIRE_FALSE(OpenSslTlsContext::create(std::move(malformed_crl)).has_value());
+        auto mixed_crl = client_with_crl(certificates->mixed_crl);
+        REQUIRE_FALSE(OpenSslTlsContext::create(std::move(mixed_crl)).has_value());
         auto stale_crl = client_with_crl(certificates->stale_crl);
         REQUIRE_FALSE(OpenSslTlsContext::create(std::move(stale_crl)).has_value());
         auto future_crl = client_with_crl(certificates->future_crl);

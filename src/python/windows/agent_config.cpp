@@ -3,6 +3,7 @@
 #endif
 #include <WS2tcpip.h>
 #include <WinSock2.h>
+#include <Windows.h>
 
 #include "rule_engine/python/windows/agent.hpp"
 
@@ -26,6 +27,22 @@ namespace rule_engine::python::windows {
         constexpr std::size_t maximum_line_bytes = 2U * 1024U;
         constexpr std::size_t maximum_path_bytes = 1U * 1024U;
         constexpr std::size_t maximum_endpoints = 8U;
+        constexpr std::size_t maximum_crl_file_bytes = 8U * 1024U * 1024U;
+
+        struct UniqueHandle {
+            HANDLE value {INVALID_HANDLE_VALUE};
+
+            explicit UniqueHandle(const HANDLE handle): value(handle) {}
+            ~UniqueHandle() {
+                if (value != INVALID_HANDLE_VALUE) {
+                    CloseHandle(value);
+                }
+            }
+            UniqueHandle(const UniqueHandle &) = delete;
+            UniqueHandle &operator=(const UniqueHandle &) = delete;
+            UniqueHandle(UniqueHandle &&other) noexcept: value(std::exchange(other.value, INVALID_HANDLE_VALUE)) {}
+            UniqueHandle &operator=(UniqueHandle &&other) = delete;
+        };
 
         [[nodiscard]] AgentFailure configuration_error(std::string message, const std::size_t line = 0U) {
             return AgentFailure {.code = AgentFailureCode::configuration, .message = std::move(message), .line = line};
@@ -131,6 +148,28 @@ namespace rule_engine::python::windows {
             return path;
         }
 
+        [[nodiscard]] bool normalized_local_drive_path(const std::filesystem::path &path) {
+            const auto root_name = path.root_name().native();
+            const auto native = path.native();
+            const bool local_drive =
+                root_name.size() == 2U &&
+                ((root_name[0] >= L'A' && root_name[0] <= L'Z') || (root_name[0] >= L'a' && root_name[0] <= L'z')) &&
+                root_name[1] == L':';
+            return path.is_absolute() && path.has_filename() && local_drive &&
+                   native.find(L':', 2U) == std::wstring::npos && path.lexically_normal() == path;
+        }
+
+        [[nodiscard]] std::expected<void, AgentFailure>
+        validate_local_crl_path_syntax(const std::filesystem::path &path, const std::size_t line = 0U) {
+            const auto native = path.native();
+            if (native.empty() || native.size() > maximum_path_bytes || native.find(L'\0') != std::wstring::npos ||
+                !normalized_local_drive_path(path)) {
+                return std::unexpected(configuration_error(
+                    "crl_path must be a normalized absolute local-drive file path without alternate streams", line));
+            }
+            return {};
+        }
+
         [[nodiscard]] bool same_endpoint(const protocol_v2::TcpEndpoint &left,
                                          const protocol_v2::TcpEndpoint &right) noexcept {
             return left.host == right.host && left.port == right.port;
@@ -222,6 +261,9 @@ namespace rule_engine::python::windows {
                 auto parsed = absolute_path(value, line_number, key);
                 if (!parsed) {
                     return std::unexpected(std::move(parsed.error()));
+                }
+                if (auto local = validate_local_crl_path_syntax(*parsed, line_number); !local) {
+                    return std::unexpected(std::move(local.error()));
                 }
                 configuration.crl_path = std::move(*parsed);
             } else if (key == "server_endpoint") {
@@ -331,14 +373,94 @@ namespace rule_engine::python::windows {
         return parse_windows_agent_config(source);
     }
 
+    std::expected<std::string, AgentFailure> load_windows_agent_local_crl(const std::filesystem::path &path) noexcept {
+        if (auto syntax = validate_local_crl_path_syntax(path); !syntax) {
+            return std::unexpected(std::move(syntax.error()));
+        }
+        const auto root = path.root_path().native();
+        if (GetDriveTypeW(root.c_str()) != DRIVE_FIXED) {
+            return std::unexpected(
+                configuration_error("crl_path must reside on a fixed local drive, not a mapped or remote drive"));
+        }
+
+        std::vector<UniqueHandle> held_components;
+        auto current = path.root_path();
+        for (const auto &component : path.relative_path()) {
+            current /= component;
+            const auto final_component = current == path;
+            const auto access = final_component ? GENERIC_READ : FILE_READ_ATTRIBUTES;
+            const auto flags = FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS |
+                               (final_component ? FILE_FLAG_SEQUENTIAL_SCAN : 0U);
+            UniqueHandle handle {
+                CreateFileW(current.c_str(), access, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr)};
+            if (handle.value == INVALID_HANDLE_VALUE || GetFileType(handle.value) != FILE_TYPE_DISK) {
+                return std::unexpected(configuration_error("crl_path is missing or is not a regular local file"));
+            }
+            BY_HANDLE_FILE_INFORMATION information {};
+            FILE_STANDARD_INFO standard {};
+            if (GetFileInformationByHandle(handle.value, &information) == 0 ||
+                GetFileInformationByHandleEx(handle.value, FileStandardInfo, &standard, sizeof(standard)) == 0 ||
+                (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U ||
+                (final_component ? standard.Directory == TRUE : standard.Directory == FALSE)) {
+                return std::unexpected(
+                    configuration_error("crl_path may not traverse a reparse point and must name a regular file"));
+            }
+            held_components.push_back(std::move(handle));
+        }
+        if (held_components.empty()) {
+            return std::unexpected(configuration_error("crl_path is missing or is not a regular local file"));
+        }
+
+        const auto handle = held_components.back().value;
+        const auto required = GetFinalPathNameByHandleW(handle, nullptr, 0U, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (required == 0U) {
+            return std::unexpected(configuration_error("crl_path target could not be resolved locally"));
+        }
+        std::vector<wchar_t> resolved(static_cast<std::size_t>(required) + 1U);
+        const auto written = GetFinalPathNameByHandleW(handle, resolved.data(), static_cast<DWORD>(resolved.size()),
+                                                       FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (written == 0U || written >= resolved.size()) {
+            return std::unexpected(configuration_error("crl_path target could not be resolved locally"));
+        }
+        const std::wstring_view final_path {resolved.data(), written};
+        const bool local_drive =
+            written >= 7U && final_path.starts_with(L"\\\\?\\") &&
+            ((final_path[4] >= L'A' && final_path[4] <= L'Z') || (final_path[4] >= L'a' && final_path[4] <= L'z')) &&
+            final_path[5] == L':' && final_path[6] == L'\\';
+        if (!local_drive) {
+            return std::unexpected(configuration_error("crl_path target must remain on a fixed local drive"));
+        }
+
+        LARGE_INTEGER size {};
+        if (GetFileSizeEx(handle, &size) == 0 || size.QuadPart <= 0 ||
+            size.QuadPart > static_cast<LONGLONG>(maximum_crl_file_bytes)) {
+            return std::unexpected(configuration_error("crl_path is empty or exceeds the CRL file-size limit"));
+        }
+        std::string contents(static_cast<std::size_t>(size.QuadPart), '\0');
+        DWORD read {};
+        if (ReadFile(handle, contents.data(), static_cast<DWORD>(contents.size()), &read, nullptr) == 0 ||
+            read != static_cast<DWORD>(contents.size())) {
+            return std::unexpected(configuration_error("crl_path could not be read completely"));
+        }
+        char trailing {};
+        DWORD trailing_read {};
+        if (ReadFile(handle, &trailing, 1U, &trailing_read, nullptr) == 0 || trailing_read != 0U) {
+            return std::unexpected(configuration_error("crl_path changed while it was being read"));
+        }
+        return contents;
+    }
+
     std::expected<void, AgentFailure>
     validate_windows_agent_config_files(const WindowsAgentConfig &configuration) noexcept {
-        if (!configuration.require_crl || configuration.crl_path.empty()) {
+        if (!configuration.require_crl) {
             return std::unexpected(
                 configuration_error("production agent requires an absolute crl_path and require_crl = true"));
         }
+        if (auto crl = load_windows_agent_local_crl(configuration.crl_path); !crl) {
+            return std::unexpected(std::move(crl.error()));
+        }
         const std::array tls_files {&configuration.certificate_path, &configuration.private_key_path,
-                                    &configuration.ca_path, &configuration.crl_path};
+                                    &configuration.ca_path};
         for (const auto *path : tls_files) {
             if (path->empty()) {
                 continue;
@@ -366,9 +488,13 @@ namespace rule_engine::python::windows {
 
     std::expected<void, AgentFailure>
     validate_windows_agent_dependencies(const WindowsAgentConfig &configuration) noexcept {
-        if (!configuration.require_crl || configuration.crl_path.empty()) {
+        if (!configuration.require_crl) {
             return std::unexpected(
                 configuration_error("production agent requires an absolute crl_path and require_crl = true"));
+        }
+        auto crl = load_windows_agent_local_crl(configuration.crl_path);
+        if (!crl) {
+            return std::unexpected(std::move(crl.error()));
         }
         const auto tls = protocol_v2::tls_backend_status();
         if (!tls.available) {
@@ -383,7 +509,8 @@ namespace rule_engine::python::windows {
             .trust_anchors_pem = configuration.ca_path.string(),
             .certificate_chain_pem = configuration.certificate_path.string(),
             .private_key_pem = configuration.private_key_path.string(),
-            .crl_pem = configuration.crl_path.string(),
+            .crl_pem = {},
+            .crl_pem_contents = std::move(*crl),
             .expected_server_name = configuration.server_name,
             .require_crl = configuration.require_crl,
             .verification_time_unix_seconds = std::nullopt,

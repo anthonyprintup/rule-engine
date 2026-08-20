@@ -6,7 +6,10 @@
 #include <chrono>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -25,6 +28,7 @@
 #if RULE_ENGINE_PROTOCOL_HAS_OPENSSL
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 #endif
@@ -38,6 +42,99 @@ namespace rule_engine::python::protocol_v2 {
 
 #if RULE_ENGINE_PROTOCOL_HAS_OPENSSL
         constexpr std::string_view peer_alpn = "rule-engine-peer/2";
+        constexpr std::size_t maximum_crl_file_bytes = 8U * 1024U * 1024U;
+        constexpr std::size_t maximum_crls = 64U;
+
+        struct BioHandle {
+            BIO *value {};
+
+            explicit BioHandle(BIO *bio): value(bio) {}
+            ~BioHandle() { BIO_free(value); }
+            BioHandle(const BioHandle &) = delete;
+            BioHandle &operator=(const BioHandle &) = delete;
+        };
+
+        struct CrlHandle {
+            X509_CRL *value {};
+
+            explicit CrlHandle(X509_CRL *crl): value(crl) {}
+            ~CrlHandle() { X509_CRL_free(value); }
+            CrlHandle(const CrlHandle &) = delete;
+            CrlHandle &operator=(const CrlHandle &) = delete;
+        };
+
+        [[nodiscard]] std::expected<std::string, ProtocolError> read_bounded_crl_file(const std::string &path) {
+            std::error_code filesystem_error;
+            const auto size = std::filesystem::file_size(std::filesystem::path {path}, filesystem_error);
+            if (filesystem_error || size == 0U || size > maximum_crl_file_bytes) {
+                return std::unexpected(
+                    transport_error(ProtocolErrorCode::unauthenticated, "TLS revocation policy file is invalid"));
+            }
+            std::ifstream input {std::filesystem::path {path}, std::ios::binary};
+            if (!input) {
+                return std::unexpected(
+                    transport_error(ProtocolErrorCode::unauthenticated, "TLS revocation policy loading failed"));
+            }
+            std::string result(static_cast<std::size_t>(size), '\0');
+            input.read(result.data(), static_cast<std::streamsize>(result.size()));
+            if (!input || static_cast<std::size_t>(input.gcount()) != result.size() ||
+                input.peek() != std::ifstream::traits_type::eof()) {
+                return std::unexpected(
+                    transport_error(ProtocolErrorCode::unauthenticated, "TLS revocation policy changed while loading"));
+            }
+            return result;
+        }
+
+        [[nodiscard]] constexpr bool pem_space(const char value) noexcept {
+            return value == ' ' || value == '\t' || value == '\r' || value == '\n';
+        }
+
+        [[nodiscard]] std::expected<void, ProtocolError> load_crls_only(X509_STORE *store,
+                                                                        const std::string_view contents) {
+            constexpr std::string_view begin_marker = "-----BEGIN X509 CRL-----";
+            constexpr std::string_view end_marker = "-----END X509 CRL-----";
+            if (contents.empty() || contents.size() > maximum_crl_file_bytes) {
+                return std::unexpected(
+                    transport_error(ProtocolErrorCode::unauthenticated, "TLS revocation policy file is invalid"));
+            }
+
+            std::size_t offset {};
+            std::size_t count {};
+            while (offset < contents.size()) {
+                while (offset < contents.size() && pem_space(contents[offset])) { ++offset; }
+                if (offset == contents.size()) {
+                    break;
+                }
+                if (count >= maximum_crls || !contents.substr(offset).starts_with(begin_marker)) {
+                    return std::unexpected(transport_error(ProtocolErrorCode::unauthenticated,
+                                                           "TLS revocation policy must contain only bounded PEM CRLs"));
+                }
+                const auto end = contents.find(end_marker, offset + begin_marker.size());
+                if (end == std::string_view::npos) {
+                    return std::unexpected(transport_error(ProtocolErrorCode::unauthenticated,
+                                                           "TLS revocation policy must contain only bounded PEM CRLs"));
+                }
+                const auto block_end = end + end_marker.size();
+                const auto block = contents.substr(offset, block_end - offset);
+                BioHandle input {BIO_new_mem_buf(block.data(), static_cast<int>(block.size()))};
+                if (input.value == nullptr) {
+                    return std::unexpected(
+                        transport_error(ProtocolErrorCode::unauthenticated, "TLS revocation policy validation failed"));
+                }
+                CrlHandle crl {PEM_read_bio_X509_CRL(input.value, nullptr, nullptr, nullptr)};
+                if (crl.value == nullptr || X509_STORE_add_crl(store, crl.value) != 1) {
+                    return std::unexpected(
+                        transport_error(ProtocolErrorCode::unauthenticated, "TLS revocation policy loading failed"));
+                }
+                ++count;
+                offset = block_end;
+            }
+            if (count == 0U) {
+                return std::unexpected(
+                    transport_error(ProtocolErrorCode::unauthenticated, "TLS revocation policy contains no CRL"));
+            }
+            return {};
+        }
 
         [[nodiscard]] std::expected<void, ProtocolError> validate_crl_times(X509_STORE *store,
                                                                             const std::time_t verification_time) {
@@ -376,10 +473,13 @@ namespace rule_engine::python::protocol_v2 {
 
     std::expected<OpenSslTlsContext, ProtocolError> OpenSslTlsContext::create(TlsConfiguration configuration) noexcept {
 #if RULE_ENGINE_PROTOCOL_HAS_OPENSSL
+        const auto has_crl_path = !configuration.crl_pem.empty();
+        const auto has_crl_contents = !configuration.crl_pem_contents.empty();
         if (configuration.trust_anchors_pem.empty() || configuration.certificate_chain_pem.empty() ||
             configuration.private_key_pem.empty() ||
             (configuration.role == TlsEndpointRole::client && configuration.expected_server_name.empty()) ||
-            (configuration.require_crl != !configuration.crl_pem.empty())) {
+            (configuration.require_crl && has_crl_path == has_crl_contents) ||
+            (!configuration.require_crl && (has_crl_path || has_crl_contents))) {
             return std::unexpected(transport_error(ProtocolErrorCode::malformed, "TLS configuration is incomplete"));
         }
 
@@ -412,8 +512,16 @@ namespace rule_engine::python::protocol_v2 {
 
         auto *store = SSL_CTX_get_cert_store(impl->context);
         if (impl->configuration.require_crl) {
-            if (X509_STORE_load_file(store, impl->configuration.crl_pem.c_str()) != 1 ||
-                X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL) != 1) {
+            auto crl_contents = impl->configuration.crl_pem_contents.empty() ?
+                                    read_bounded_crl_file(impl->configuration.crl_pem) :
+                                    std::expected<std::string, ProtocolError> {impl->configuration.crl_pem_contents};
+            if (!crl_contents) {
+                return std::unexpected(std::move(crl_contents.error()));
+            }
+            if (auto loaded = load_crls_only(store, *crl_contents); !loaded) {
+                return std::unexpected(std::move(loaded.error()));
+            }
+            if (X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL) != 1) {
                 return std::unexpected(
                     transport_error(ProtocolErrorCode::unauthenticated, "TLS revocation policy loading failed"));
             }

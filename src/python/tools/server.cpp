@@ -1591,6 +1591,7 @@ policy mutation remains fail-closed.
                 .certificate_chain_pem = config.tls.certificate_chain_pem.string(),
                 .private_key_pem = config.tls.private_key_pem.string(),
                 .crl_pem = config.tls.crl_pem.string(),
+                .crl_pem_contents = {},
                 .expected_server_name = {},
                 .require_crl = config.tls.require_crl,
                 .verification_time_unix_seconds = std::nullopt,
