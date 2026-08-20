@@ -56,6 +56,7 @@ namespace {
         configuration.spool_path = spool;
         configuration.peer = py::PeerId {"peer:test"};
         configuration.active_generation = 3U;
+        configuration.inventory_refresh_interval = std::chrono::seconds {1};
         configuration.require_hard_resolver_bounds = true;
         configuration.reconnect_policy.require_hard_resolver_bounds = true;
         configuration.reconnect_policy.initial_backoff = std::chrono::milliseconds {1};
@@ -159,7 +160,9 @@ namespace {
     struct FakeSessionState {
         std::vector<proto::ServerHelloMessage> hellos;
         std::vector<std::vector<ReceiveEvent>> incoming_by_connection;
+        std::vector<std::vector<bool>> readability_by_connection;
         std::vector<std::size_t> receive_offsets;
+        std::vector<std::size_t> readability_offsets;
         std::vector<proto::AgentHelloMessage> agent_hellos;
         std::vector<proto::PeerEnvelope> sent;
         std::vector<std::size_t> pending_at_send;
@@ -221,6 +224,24 @@ namespace {
             return std::move(*event.message);
         }
 
+        [[nodiscard]] std::expected<bool, proto::ProtocolError>
+        wait_readable_until(const std::chrono::steady_clock::time_point,
+                            const std::stop_token cancellation) noexcept override {
+            if (cancellation.stop_requested()) {
+                return std::unexpected(canceled());
+            }
+            const auto connection = state_->reconnects - 1U;
+            if (connection >= state_->readability_by_connection.size()) {
+                return true;
+            }
+            if (state_->readability_offsets.size() <= connection) {
+                state_->readability_offsets.resize(connection + 1U);
+            }
+            auto &offset = state_->readability_offsets[connection];
+            const auto &events = state_->readability_by_connection[connection];
+            return offset >= events.size() ? true : events[offset++];
+        }
+
         [[nodiscard]] std::expected<void, proto::ProtocolError>
         send(const proto::PeerEnvelope &message, const std::stop_token cancellation) noexcept override {
             if (cancellation.stop_requested()) {
@@ -248,6 +269,8 @@ namespace {
         std::size_t cancellations {};
         std::size_t inventories {};
         bool publish_inventory {};
+        std::vector<bool> authoritative_inventories;
+        std::vector<std::uint64_t> inventory_generations;
     };
 
     struct FakeProvider final: win::IWindowsAgentProviderRuntime {
@@ -290,9 +313,14 @@ namespace {
         }
 
         [[nodiscard]] std::expected<std::optional<win::InventoryProjection>, win::AgentRuntimeError>
-        initial_process_inventory(std::string snapshot_id) override {
+        process_inventory(std::string snapshot_id, const std::uint64_t inventory_generation) override {
             ++state_->inventories;
-            if (!state_->publish_inventory) {
+            state_->inventory_generations.push_back(inventory_generation);
+            const auto attempt = state_->inventories - 1U;
+            const auto authoritative = attempt < state_->authoritative_inventories.size() ?
+                                           state_->authoritative_inventories[attempt] :
+                                           state_->publish_inventory;
+            if (!authoritative) {
                 return std::optional<win::InventoryProjection> {};
             }
             const std::vector<py::SubjectKey> subjects;
@@ -306,18 +334,18 @@ namespace {
                                                    .snapshot_id = snapshot_id,
                                                    .parent = std::nullopt,
                                                    .subject_schema = py::SchemaId {std::string {win::process_schema}},
-                                                   .generation = identity_.generation,
+                                                   .generation = inventory_generation,
                                                    .expected_count = 0U,
                                                    .expected_digest = *digest});
             messages.emplace_back(proto::AuthoritativeSnapshotCommit {.session = identity_.session,
                                                                       .peer = identity_.peer,
                                                                       .session_fence = identity_.session_fence,
                                                                       .snapshot_id = snapshot_id,
-                                                                      .generation = identity_.generation,
+                                                                      .generation = inventory_generation,
                                                                       .item_count = 0U,
                                                                       .canonical_digest = *digest});
             return std::optional<win::InventoryProjection> {win::InventoryProjection {
-                .generation = identity_.generation,
+                .generation = inventory_generation,
                 .inventory_digest = *digest,
                 .protocol_digest = *digest,
                 .durable_messages = std::move(messages),
@@ -354,7 +382,7 @@ namespace {
 } // namespace
 
 TEST_CASE("Windows agent configuration and command line are strict and production bounded") {
-    const std::string valid = "schema_version = 1\n"
+    const std::string valid = "schema_version = 2\n"
                               "spool_path = C:\\agent\\spool.sqlite3\n"
                               "certificate_path = C:\\agent\\client.pem\n"
                               "private_key_path = C:\\agent\\client-key.pem\n"
@@ -367,7 +395,8 @@ TEST_CASE("Windows agent configuration and command line are strict and productio
                               std::string(64U, 'a') +
                               "\n"
                               "peer_id = peer:test\n"
-                              "active_generation = 3\n";
+                              "active_generation = 3\n"
+                              "inventory_refresh_interval_ms = 300000\n";
 
     const auto parsed = win::parse_windows_agent_config(valid);
     REQUIRE(parsed.has_value());
@@ -382,6 +411,12 @@ TEST_CASE("Windows agent configuration and command line are strict and productio
     REQUIRE(parsed_crl.has_value());
     CHECK(parsed_crl->require_crl);
     CHECK(parsed_crl->crl_path == std::filesystem::path {"C:\\agent\\server.crl.pem"});
+    CHECK(parsed->inventory_refresh_interval == std::chrono::minutes {5});
+
+    auto legacy_schema = valid;
+    legacy_schema.replace(legacy_schema.find("schema_version = 2"), std::string_view {"schema_version = 2"}.size(),
+                          "schema_version = 1");
+    CHECK_FALSE(win::parse_windows_agent_config(legacy_schema).has_value());
 
     CHECK_FALSE(win::parse_windows_agent_config(valid + "unknown_key = value\n").has_value());
     CHECK_FALSE(win::parse_windows_agent_config(valid + "peer_id = duplicate\n").has_value());
@@ -397,6 +432,15 @@ TEST_CASE("Windows agent configuration and command line are strict and productio
     relative.replace(relative.find("C:\\agent\\spool.sqlite3"), std::string_view {"C:\\agent\\spool.sqlite3"}.size(),
                      "spool.sqlite3");
     CHECK_FALSE(win::parse_windows_agent_config(relative).has_value());
+    auto too_fast = valid;
+    too_fast.replace(too_fast.find("300000"), std::string_view {"300000"}.size(), "999");
+    CHECK_FALSE(win::parse_windows_agent_config(too_fast).has_value());
+    auto too_slow = valid;
+    too_slow.replace(too_slow.find("300000"), std::string_view {"300000"}.size(), "86400001");
+    CHECK_FALSE(win::parse_windows_agent_config(too_slow).has_value());
+    auto missing_interval = valid;
+    missing_interval.erase(missing_interval.find("inventory_refresh_interval_ms"));
+    CHECK_FALSE(win::parse_windows_agent_config(missing_interval).has_value());
 
     const std::vector<std::string_view> run {"--config", "agent.conf"};
     const std::vector<std::string_view> validate {"--config", "agent.conf", "--validate-config"};
@@ -437,12 +481,59 @@ TEST_CASE("Windows agent spools an entire typed inventory projection before its 
     const auto result = service.run({});
     REQUIRE(result.has_value());
     CHECK(result->snapshot_records_spooled == 2U);
+    CHECK(result->inventory_refreshes_attempted == 1U);
+    CHECK(result->inventory_generations_spooled == 1U);
     CHECK(provider_state->inventories == 1U);
+    CHECK(provider_state->inventory_generations == std::vector<std::uint64_t> {4U});
     REQUIRE(session_state->sent.size() == 2U);
     REQUIRE_FALSE(session_state->pending_at_send.empty());
     CHECK(session_state->pending_at_send.front() == 2U);
     CHECK(std::holds_alternative<proto::AuthoritativeSnapshotBegin>(session_state->sent[0].body));
     CHECK(std::holds_alternative<proto::AuthoritativeSnapshotCommit>(session_state->sent[1].body));
+}
+
+TEST_CASE("Windows agent periodically publishes complete durable process inventories and skips failed enumeration") {
+    if (!proto::spool_backend_status().available) {
+        SKIP("SQLite spool backend is unavailable");
+    }
+    TemporarySpool temporary;
+    auto configuration = test_configuration(temporary.path);
+    auto spool = open_spool(configuration);
+    REQUIRE(spool.has_value());
+    const auto server = hello("session:periodic-inventory", 7U);
+    auto session_state = std::make_shared<FakeSessionState>();
+    session_state->hellos = {server};
+    session_state->incoming_by_connection = {{failure(canceled())}};
+    session_state->readability_by_connection = {{false, false, true}};
+    session_state->spool = &*spool;
+    auto provider_state = std::make_shared<FakeProviderState>();
+    provider_state->authoritative_inventories = {true, false, true};
+
+    win::WindowsAgentService service {configuration, *spool, std::make_unique<FakeSession>(session_state),
+                                      std::make_unique<FakeProviderFactory>(provider_state)};
+    const auto result = service.run({});
+    REQUIRE(result.has_value());
+    CHECK(result->inventory_refreshes_attempted == 3U);
+    CHECK(result->inventory_generations_spooled == 2U);
+    CHECK(result->inventory_refreshes_without_authority == 1U);
+    CHECK(result->snapshot_records_spooled == 4U);
+    CHECK(provider_state->inventory_generations == std::vector<std::uint64_t> {4U, 6U, 6U});
+    REQUIRE(session_state->sent.size() == 4U);
+    const auto *first_begin = std::get_if<proto::AuthoritativeSnapshotBegin>(&session_state->sent[0].body);
+    const auto *first_commit = std::get_if<proto::AuthoritativeSnapshotCommit>(&session_state->sent[1].body);
+    const auto *second_begin = std::get_if<proto::AuthoritativeSnapshotBegin>(&session_state->sent[2].body);
+    const auto *second_commit = std::get_if<proto::AuthoritativeSnapshotCommit>(&session_state->sent[3].body);
+    REQUIRE(first_begin != nullptr);
+    REQUIRE(first_commit != nullptr);
+    REQUIRE(second_begin != nullptr);
+    REQUIRE(second_commit != nullptr);
+    CHECK(first_begin->generation == 4U);
+    CHECK(first_commit->generation == first_begin->generation);
+    CHECK(second_begin->generation == 6U);
+    CHECK(second_commit->generation == second_begin->generation);
+    CHECK(first_begin->snapshot_id == first_commit->snapshot_id);
+    CHECK(second_begin->snapshot_id == second_commit->snapshot_id);
+    CHECK(first_begin->snapshot_id != second_begin->snapshot_id);
 }
 
 TEST_CASE("SQLite snapshot batch admission is atomic at the record limit") {
@@ -513,6 +604,7 @@ TEST_CASE("Windows agent reconnects and replays a durable result without duplica
     CHECK(result->replayed_records == 1U);
     CHECK(result->duplicate_leases == 1U);
     CHECK(provider_state->dispatches == 1U);
+    CHECK(provider_state->inventories == 1U);
     REQUIRE(session_state->sent.size() == 1U);
     CHECK(std::holds_alternative<proto::WorkResultMessage>(session_state->sent.front().body));
 }

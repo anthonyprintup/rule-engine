@@ -19,6 +19,8 @@
 namespace rule_engine::python::windows {
 
     inline constexpr std::string_view agent_version = "1.0.0";
+    inline constexpr auto minimum_inventory_refresh_interval = std::chrono::seconds {1};
+    inline constexpr auto maximum_inventory_refresh_interval = std::chrono::hours {24};
 
     enum struct AgentFailureCode : std::uint8_t {
         configuration,
@@ -57,6 +59,7 @@ namespace rule_engine::python::windows {
         protocol_v2::SocketTimeouts socket_timeouts;
         protocol_v2::ReconnectPolicy reconnect_policy;
         std::chrono::milliseconds maximum_work_horizon {60'000};
+        std::chrono::milliseconds inventory_refresh_interval {300'000};
     };
 
     [[nodiscard]] std::expected<WindowsAgentConfig, AgentFailure>
@@ -94,6 +97,9 @@ namespace rule_engine::python::windows {
                   std::stop_token cancellation) noexcept = 0;
         [[nodiscard]] virtual std::expected<protocol_v2::PeerEnvelope, protocol_v2::ProtocolError>
         receive(std::stop_token cancellation) noexcept = 0;
+        // Returns false at the deadline without consuming TLS or frame bytes.
+        [[nodiscard]] virtual std::expected<bool, protocol_v2::ProtocolError>
+        wait_readable_until(std::chrono::steady_clock::time_point deadline, std::stop_token cancellation) noexcept = 0;
         [[nodiscard]] virtual std::expected<void, protocol_v2::ProtocolError>
         send(const protocol_v2::PeerEnvelope &envelope, std::stop_token cancellation) noexcept = 0;
         virtual void shutdown() noexcept = 0;
@@ -109,7 +115,7 @@ namespace rule_engine::python::windows {
         [[nodiscard]] virtual std::expected<void, AgentRuntimeError>
         cancel(const protocol_v2::CancelWorkMessage &message) = 0;
         [[nodiscard]] virtual std::expected<std::optional<InventoryProjection>, AgentRuntimeError>
-        initial_process_inventory(std::string snapshot_id) = 0;
+        process_inventory(std::string snapshot_id, std::uint64_t inventory_generation) = 0;
     };
 
     struct IWindowsAgentProviderFactory {
@@ -128,6 +134,9 @@ namespace rule_engine::python::windows {
         std::size_t canceled_work {};
         std::size_t work_results_spooled {};
         std::size_t snapshot_records_spooled {};
+        std::size_t inventory_refreshes_attempted {};
+        std::size_t inventory_generations_spooled {};
+        std::size_t inventory_refreshes_without_authority {};
         std::size_t acknowledgements {};
         std::size_t rejections {};
     };
@@ -144,7 +153,7 @@ namespace rule_engine::python::windows {
         [[nodiscard]] std::expected<void, AgentFailure> process(const protocol_v2::PeerEnvelope &envelope,
                                                                 IWindowsAgentProviderRuntime &provider) noexcept;
         [[nodiscard]] std::expected<void, AgentFailure>
-        publish_initial_inventory(IWindowsAgentProviderRuntime &provider) noexcept;
+        publish_process_inventory(IWindowsAgentProviderRuntime &provider) noexcept;
         [[nodiscard]] std::expected<bool, AgentFailure>
         result_is_pending(const protocol_v2::WorkLeaseMessage &work) const noexcept;
         [[nodiscard]] std::expected<bool, AgentFailure>
@@ -156,8 +165,8 @@ namespace rule_engine::python::windows {
         std::unique_ptr<IWindowsAgentSession> session_;
         std::unique_ptr<IWindowsAgentProviderFactory> providers_;
         AgentRunStats stats_;
-        bool inventory_attempted_ {};
-        std::string inventory_snapshot_id_;
+        bool inventory_started_ {};
+        std::optional<std::chrono::steady_clock::time_point> next_inventory_refresh_;
         std::optional<SessionId> active_session_;
         std::uint64_t active_session_fence_ {};
     };

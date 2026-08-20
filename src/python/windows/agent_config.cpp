@@ -191,8 +191,8 @@ namespace rule_engine::python::windows {
 
             if (key == "schema_version") {
                 schema_version = parse_integer<std::uint32_t>(value);
-                if (!schema_version.has_value() || *schema_version != 1U) {
-                    return std::unexpected(configuration_error("schema_version must be exactly 1", line_number));
+                if (!schema_version.has_value() || *schema_version != 2U) {
+                    return std::unexpected(configuration_error("schema_version must be exactly 2", line_number));
                 }
             } else if (key == "spool_path") {
                 auto parsed = absolute_path(value, line_number, key);
@@ -264,6 +264,17 @@ namespace rule_engine::python::windows {
                     return std::unexpected(configuration_error("active_generation must be nonzero", line_number));
                 }
                 configuration.active_generation = *generation;
+            } else if (key == "inventory_refresh_interval_ms") {
+                const auto interval = parse_integer<std::uint64_t>(value);
+                if (!interval.has_value() ||
+                    *interval < static_cast<std::uint64_t>(minimum_inventory_refresh_interval.count()) * 1'000U ||
+                    *interval >
+                        static_cast<std::uint64_t>(maximum_inventory_refresh_interval.count()) * 60U * 60U * 1'000U) {
+                    return std::unexpected(configuration_error(
+                        "inventory_refresh_interval_ms must be between 1000 and 86400000", line_number));
+                }
+                configuration.inventory_refresh_interval =
+                    std::chrono::milliseconds {static_cast<std::chrono::milliseconds::rep>(*interval)};
             } else if (key == "require_hard_resolver_bounds") {
                 if (value != "true" && value != "false") {
                     return std::unexpected(
@@ -286,7 +297,8 @@ namespace rule_engine::python::windows {
             configuration.private_key_path.empty() || configuration.ca_path.empty() ||
             configuration.endpoints.empty() || configuration.server_name.empty() || configuration.server_uri.empty() ||
             configuration.server_fingerprint_sha256.empty() || configuration.peer.empty() ||
-            configuration.active_generation == 0U) {
+            configuration.active_generation == 0U ||
+            std::ranges::find(seen, "inventory_refresh_interval_ms") == seen.end()) {
             return std::unexpected(configuration_error("configuration is missing one or more required keys"));
         }
         if (!configuration.require_hard_resolver_bounds) {

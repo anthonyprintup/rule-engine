@@ -170,13 +170,13 @@ Every entry records impact, rationale, mitigation, observability, and revisit co
 - **Observability:** Agent counters distinguish accepted work, canceled work, deadline/provider failures, reconnects, and durable replay.
 - **Revisit:** Add a bounded owned dispatch scheduler and an independent control-frame reader only with explicit queue, worker, memory, and shutdown limits.
 
-## L-024 — Initial process inventory is once per agent process
+## L-024 — Process inventory refresh uses a fixed per-agent cadence
 
-- **Impact:** The agent publishes one authoritative process snapshot after its first successful session; it does not yet own a periodic inventory scheduler. Partial/failed enumeration publishes nothing, preserving the coordinator's last-good view.
-- **Rationale:** Inventory cadence and fleet-wide jitter are coordinator/operations policy, while this slice establishes the durable snapshot and provider trust boundaries.
-- **Mitigation:** A successful begin/chunk/commit projection is validated and inserted into SQLite atomically before any frame is sent. Pending rows replay after reconnect, and the snapshot is not regenerated during that process lifetime.
-- **Observability:** Snapshot rows, replay counts, provider inventory attempts, and absence of a new authoritative commit expose the current state without treating partial enumeration as deletion.
-- **Revisit:** Add a bounded, jittered reconciliation schedule with explicit cadence, overlap, and backpressure policy.
+- **Impact:** The agent publishes an immediate authoritative process snapshot and refreshes it every configured interval, but agents with identical start times and settings are not fleet-jittered. A very short fleet-wide cadence can therefore create synchronized enumeration and ingress load.
+- **Rationale:** One synchronous deadline-driven session owner preserves socket ordering, cancellation, and the single-writer spool boundary. The scheduler waits for either readable input or the next inventory deadline and never starts overlapping enumerations.
+- **Mitigation:** `inventory_refresh_interval_ms` is mandatory and accepts only 1,000 through 86,400,000 milliseconds. Each successful enumeration becomes a complete begin/chunk/commit batch, is validated, and is inserted into SQLite atomically before first transmission. Its checked monotonic inventory generation combines the active runtime generation with the durable spool sequence, starting above the legacy generation-only scheme so reconnect, upgrade, and process restart cannot reuse an acknowledged generation. Failed or partial enumeration publishes no batch, preserving the coordinator's last-good authority; pending rows replay normally after reconnect.
+- **Observability:** Agent run statistics distinguish refresh attempts, authoritative generations spooled, refreshes without authority, snapshot records, connections, and replay. The absence of a new authoritative commit is never interpreted as an empty inventory.
+- **Revisit:** Add bounded deterministic fleet jitter and exported cadence/lag metrics after production fleet-load measurements define an acceptable distribution policy.
 
 ## L-025 — Agent certificate revocation is not checked online
 

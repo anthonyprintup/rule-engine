@@ -331,7 +331,7 @@ receives a predicate, bytecode, or verdict; it enumerates typed subjects and
 returns requested facts, scans, inventory observations, or diagnostics.
 
 ```text
-schema_version = 1
+schema_version = 2
 spool_path = C:\ProgramData\RuleEngine\agent\spool.sqlite3
 certificate_path = C:\ProgramData\RuleEngine\agent\client.pem
 private_key_path = C:\ProgramData\RuleEngine\agent\client-key.pem
@@ -345,6 +345,7 @@ server_uri = urn:rule-engine:server
 server_fingerprint_sha256 = 64_LOWERCASE_HEX_DIGITS
 peer_id = peer:example-host
 active_generation = 1
+inventory_refresh_interval_ms = 300000
 ```
 
 All filesystem paths are absolute. `crl_path` and `require_crl = true` must be
@@ -359,6 +360,9 @@ atomically and restart the agent before its `nextUpdate`. The agent performs no
 OCSP or online CRL fetch and does not reload the file in place. Validate before
 running:
 
+Schema v2 makes the inventory interval explicit; schema-v1 agent files are
+rejected and must add the bounded interval during upgrade.
+
 ```powershell
 rule_engine_agent --config C:/ProgramData/RuleEngine/agent/agent.conf --validate-config
 rule_engine_agent --config C:/ProgramData/RuleEngine/agent/agent.conf
@@ -368,6 +372,25 @@ Accepted results and complete authoritative inventory snapshots are written to
 the SQLite spool before first transmission. Reconnect replays unacknowledged
 records; cumulative ACK is the deletion boundary. Sequence, generation,
 session, request, and fence mismatches are rejected rather than guessed.
+
+The agent enumerates process identities immediately after its first successful
+session and then at `inventory_refresh_interval_ms`. The value is mandatory and
+must be between 1,000 ms and 86,400,000 ms (24 hours). Each refresh is a complete
+authoritative begin/chunk/commit generation; the agent never overlaps two
+enumerations and never publishes a partial result. The checked generation
+combines the active runtime generation with the durable spool sequence, starts
+above the legacy generation-only scheme, and therefore lets unacknowledged
+batches replay with their exact identity after reconnect while a restarted or
+upgraded agent continues above its prior sequence. An enumeration failure emits
+no replacement snapshot, leaving the
+coordinator's last-good process view authoritative until a later refresh
+succeeds.
+
+Cadence is currently fixed per agent and has no fleet jitter. Stagger agent
+service starts when rolling out a short interval, monitor snapshot ingress and
+spool growth, and lengthen the interval before increasing spool limits. Never
+delete the spool to resolve refresh lag: doing so discards the durable epoch and
+sequence authority needed for safe replay.
 
 ## 6. Administration and observability
 

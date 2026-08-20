@@ -144,6 +144,16 @@ namespace rule_engine::python::windows {
                 return connection_->receive(cancellation);
             }
 
+            [[nodiscard]] std::expected<bool, ProtocolError>
+            wait_readable_until(const std::chrono::steady_clock::time_point deadline,
+                                const std::stop_token cancellation) noexcept override {
+                if (!connection_.has_value()) {
+                    return std::unexpected(
+                        session_error(ProtocolErrorCode::transport_error, "TLS agent session is disconnected"));
+                }
+                return connection_->wait_readable_until(deadline, cancellation);
+            }
+
             [[nodiscard]] std::expected<void, ProtocolError>
             send(const PeerEnvelope &envelope, const std::stop_token cancellation) noexcept override {
                 if (!connection_.has_value()) {
@@ -169,7 +179,7 @@ namespace rule_engine::python::windows {
 
         struct ProductionProviderRuntime final: IWindowsAgentProviderRuntime {
             explicit ProductionProviderRuntime(WindowsAgentRuntimeIdentity identity):
-                peer_ {identity.peer}, generation_ {identity.generation}, runtime_ {std::move(identity)} {}
+                peer_ {identity.peer}, runtime_ {std::move(identity)} {}
 
             [[nodiscard]] std::expected<WorkResultMessage, AgentRuntimeError>
             dispatch(const WorkLeaseMessage &work) override {
@@ -181,8 +191,8 @@ namespace rule_engine::python::windows {
             }
 
             [[nodiscard]] std::expected<std::optional<InventoryProjection>, AgentRuntimeError>
-            initial_process_inventory(std::string snapshot_id) override {
-                auto inventory = enumerate_process_inventory(peer_, generation_, unix_time_ms() + 15'000U);
+            process_inventory(std::string snapshot_id, const std::uint64_t inventory_generation) override {
+                auto inventory = enumerate_process_inventory(peer_, inventory_generation, unix_time_ms() + 15'000U);
                 if (!inventory.authoritative || inventory.status != FactTerminalStatus::value) {
                     return std::optional<InventoryProjection> {};
                 }
@@ -200,7 +210,6 @@ namespace rule_engine::python::windows {
 
         private:
             PeerId peer_;
-            std::uint64_t generation_ {};
             WindowsAgentProviderRuntime runtime_;
         };
 
@@ -387,14 +396,14 @@ namespace rule_engine::python::windows {
         spool_ {&spool},
         persistent_session_ {configuration_.peer, spool},
         session_ {std::move(session)},
-        providers_ {std::move(providers)},
-        inventory_snapshot_id_ {persistent_session_.agent_epoch() +
-                                ":windows.process:" + std::to_string(configuration_.active_generation)} {}
+        providers_ {std::move(providers)} {}
 
     std::expected<AgentRunStats, AgentFailure> WindowsAgentService::run(const std::stop_token cancellation) noexcept {
         if (spool_ == nullptr || session_ == nullptr || providers_ == nullptr || configuration_.peer.empty() ||
             configuration_.active_generation == 0U ||
-            configuration_.maximum_work_horizon <= std::chrono::milliseconds::zero()) {
+            configuration_.maximum_work_horizon <= std::chrono::milliseconds::zero() ||
+            configuration_.inventory_refresh_interval < minimum_inventory_refresh_interval ||
+            configuration_.inventory_refresh_interval > maximum_inventory_refresh_interval) {
             return std::unexpected(
                 AgentFailure {.code = AgentFailureCode::invariant, .message = "agent service is not fully configured"});
         }
@@ -445,12 +454,24 @@ namespace rule_engine::python::windows {
                 active_session_fence_ = 0U;
                 return std::unexpected(std::move(provider.error()));
             }
-            if (auto inventory = publish_initial_inventory(**provider); !inventory) {
+            if (!inventory_started_) {
+                if (auto inventory = publish_process_inventory(**provider); !inventory) {
+                    session_->shutdown();
+                    persistent_session_.disconnect();
+                    active_session_.reset();
+                    active_session_fence_ = 0U;
+                    return std::unexpected(std::move(inventory.error()));
+                }
+                inventory_started_ = true;
+                next_inventory_refresh_ = std::chrono::steady_clock::now() + configuration_.inventory_refresh_interval;
+            }
+            if (!next_inventory_refresh_.has_value()) {
                 session_->shutdown();
                 persistent_session_.disconnect();
                 active_session_.reset();
                 active_session_fence_ = 0U;
-                return std::unexpected(std::move(inventory.error()));
+                return std::unexpected(AgentFailure {.code = AgentFailureCode::invariant,
+                                                     .message = "inventory refresh schedule is not initialized"});
             }
 
             bool reconnect_required {};
@@ -465,6 +486,31 @@ namespace rule_engine::python::windows {
                     }
                     reconnect_required = flushed.error().code != AgentFailureCode::canceled;
                     break;
+                }
+                auto readable = session_->wait_readable_until(*next_inventory_refresh_, cancellation);
+                if (!readable) {
+                    const auto failure = protocol_failure(readable.error());
+                    if (!retryable(failure) && failure.code != AgentFailureCode::canceled) {
+                        session_->shutdown();
+                        persistent_session_.disconnect();
+                        active_session_.reset();
+                        active_session_fence_ = 0U;
+                        return std::unexpected(failure);
+                    }
+                    reconnect_required = failure.code != AgentFailureCode::canceled;
+                    break;
+                }
+                if (!*readable) {
+                    if (auto inventory = publish_process_inventory(**provider); !inventory) {
+                        session_->shutdown();
+                        persistent_session_.disconnect();
+                        active_session_.reset();
+                        active_session_fence_ = 0U;
+                        return std::unexpected(std::move(inventory.error()));
+                    }
+                    next_inventory_refresh_ =
+                        std::chrono::steady_clock::now() + configuration_.inventory_refresh_interval;
+                    continue;
                 }
                 auto envelope = session_->receive(cancellation);
                 if (!envelope) {
@@ -604,38 +650,48 @@ namespace rule_engine::python::windows {
     }
 
     std::expected<void, AgentFailure>
-    WindowsAgentService::publish_initial_inventory(IWindowsAgentProviderRuntime &provider) noexcept {
-        if (inventory_attempted_) {
-            return {};
+    WindowsAgentService::publish_process_inventory(IWindowsAgentProviderRuntime &provider) noexcept {
+        const auto next_sequence = spool_->next_sequence();
+        if (next_sequence == 0U ||
+            next_sequence > (std::numeric_limits<std::uint64_t>::max)() - configuration_.active_generation) {
+            return std::unexpected(
+                AgentFailure {.code = AgentFailureCode::persistence, .message = "inventory generation is unavailable"});
         }
-        auto pending = snapshot_is_pending(inventory_snapshot_id_);
+        // Configured generations are monotonic across activation. Adding the
+        // durable sequence starts above the legacy generation-only scheme and
+        // remains monotonic across reconnect and process restart.
+        const auto inventory_generation = configuration_.active_generation + next_sequence;
+        const auto snapshot_id =
+            persistent_session_.agent_epoch() + ":windows.process:" + std::to_string(inventory_generation);
+        auto pending = snapshot_is_pending(snapshot_id);
         if (!pending) {
             return std::unexpected(std::move(pending.error()));
         }
         if (*pending) {
-            inventory_attempted_ = true;
             return {};
         }
-        auto projection = provider.initial_process_inventory(inventory_snapshot_id_);
+        ++stats_.inventory_refreshes_attempted;
+        auto projection = provider.process_inventory(snapshot_id, inventory_generation);
         if (!projection) {
             return std::unexpected(provider_failure(projection.error()));
         }
-        inventory_attempted_ = true;
         if (!projection->has_value() || (*projection)->duplicate || (*projection)->durable_messages.empty()) {
+            ++stats_.inventory_refreshes_without_authority;
             return {};
         }
         if (!active_session_.has_value() ||
             !valid_snapshot_projection(**projection, *active_session_, configuration_.peer, active_session_fence_,
-                                       configuration_.active_generation, inventory_snapshot_id_)) {
+                                       inventory_generation, snapshot_id)) {
             return std::unexpected(
                 AgentFailure {.code = AgentFailureCode::provider,
-                              .message = "provider returned an invalid initial inventory projection"});
+                              .message = "provider returned an invalid process inventory projection"});
         }
         auto sequences = spool_->enqueue_batch((*projection)->durable_messages);
         if (!sequences) {
             return std::unexpected(protocol_failure(sequences.error()));
         }
         stats_.snapshot_records_spooled += sequences->size();
+        ++stats_.inventory_generations_spooled;
         return {};
     }
 
