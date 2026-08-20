@@ -255,6 +255,38 @@ accounting, immediate cross-node lease takeover, reset or retained-gap
 administration, exported retry metrics, live PostgreSQL, or multi-process state
 contention.
 
+## Production-gap continuation — 2026-08-20
+
+Implementation head `7bcabf5` was configured and built on the Windows host
+above after explicitly migrating the cached installed C++ package version to
+`2.0.0`. The complete Debug suite passed 38/38 tests in 203.20 seconds. That
+run includes the 92.68-second real relocated install/downstream smoke, the
+6.03-second install-fixture smoke, compiler/VM/protocol/cluster/tooling tests,
+Windows provider tests, and Windows agent tests.
+
+The exact private CPython 3.14.6 manifest validated independently. The
+repository-built pack tool produced the development authoring-tour archive at
+source digest
+`sha256:5f1f0d7bfd84f1d69a6f70a5e0cffe694a101c66e4059b1ae9f03e6caf039521`.
+The checker accepted four functions at semantic hash
+`fnv1a64:944e4e8325d1a3ad`, reported the seven expected fact routes, and kept
+the exact plan for all four rules. All six executable tools reported their
+separate tool/SDK contract version `1.0.0`; the installed C++ package uses the
+new exact `2.0.0` compatibility boundary and requires a coordinated rebuild of
+1.x consumers.
+
+This continuation evidence covers canonical scalar EventRecord constructor
+defaults under static compiler ABI v2, exact explicit event-field typing,
+periodic authoritative inventory and authenticated reconnect replay,
+mandatory bounded CRL-only server-certificate revocation checks, coherent
+process-local work-poll metrics, separately authorized registry observations,
+admin request/response wire v6/v4, and validate-before-mutate recoverable
+registry maintenance. It does not qualify DNS hostname endpoints, interruption
+inside `NtQuerySystemInformation`, Linux no-follow deletion behavior, real
+power-loss or hostile multi-process filesystem races, OCSP/online CRL refresh,
+Prometheus/OTLP export, live PostgreSQL, distributed activation, or production
+fleet/network scale.
+
 ## Artifact identity
 
 | Artifact | SHA-256 |
