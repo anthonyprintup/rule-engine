@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -320,20 +319,29 @@ namespace rule_engine::python::tools {
     struct ResidentApplicationService final: IResidentSessionHandler {
         ResidentApplicationService(ResidentServiceLimits limits, const protocol_v2::ITrustPolicy &peer_trust,
                                    IResidentAgentBackend &agents, IResidentAdminBackend &admin) noexcept;
+        ResidentApplicationService(const ResidentApplicationService &other) noexcept;
+        ResidentApplicationService(ResidentApplicationService &&other) noexcept;
+        ResidentApplicationService &operator=(const ResidentApplicationService &) = delete;
+        ResidentApplicationService &operator=(ResidentApplicationService &&) = delete;
+        ~ResidentApplicationService() override;
 
         void run(ResidentSessionJob job, std::stop_token cancellation) noexcept override;
         [[nodiscard]] ResidentWorkPollSnapshot work_poll_snapshot() const noexcept;
 
     private:
+        using WorkPollTestHook = void (*)(void *context) noexcept;
+
+        friend struct ResidentApplicationServiceTestAccess;
+
+        void set_work_poll_test_hooks(WorkPollTestHook before_delay_publish, WorkPollTestHook before_snapshot_lock,
+                                      void *context) noexcept;
         void run_agent(ResidentSessionJob &job, std::stop_token cancellation) noexcept;
         void run_admin(ResidentSessionJob &job, std::stop_token cancellation) noexcept;
 
-        ResidentServiceLimits limits_;
-        const protocol_v2::ITrustPolicy &peer_trust_;
-        IResidentAgentBackend &agents_;
-        IResidentAdminBackend &admin_;
-        mutable std::mutex work_poll_metrics_mutex_;
-        ResidentWorkPollSnapshot work_poll_metrics_;
+        // This installed type has one stable ownership member. Keep service
+        // state and future instrumentation behind the out-of-line boundary.
+        struct Impl;
+        std::unique_ptr<Impl> impl_;
     };
 
 } // namespace rule_engine::python::tools

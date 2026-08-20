@@ -1292,11 +1292,41 @@ namespace rule_engine::python::tools {
             (std::max) (delivery_delay_total_microseconds, delivery_delay_max_microseconds);
     }
 
+    struct ResidentApplicationService::Impl {
+        ResidentServiceLimits limits;
+        const protocol_v2::ITrustPolicy &peer_trust;
+        IResidentAgentBackend &agents;
+        IResidentAdminBackend &admin;
+        mutable std::mutex work_poll_metrics_mutex;
+        ResidentWorkPollSnapshot work_poll_metrics;
+        WorkPollTestHook before_delay_publish {};
+        WorkPollTestHook before_snapshot_lock {};
+        void *test_hook_context {};
+
+        Impl(ResidentServiceLimits service_limits, const protocol_v2::ITrustPolicy &trust,
+             IResidentAgentBackend &agent_backend, IResidentAdminBackend &admin_backend) noexcept:
+            limits {service_limits}, peer_trust {trust}, agents {agent_backend}, admin {admin_backend} {}
+
+        Impl(const Impl &other) noexcept:
+            limits {other.limits}, peer_trust {other.peer_trust}, agents {other.agents}, admin {other.admin} {
+            std::scoped_lock lock {other.work_poll_metrics_mutex};
+            work_poll_metrics = other.work_poll_metrics;
+        }
+    };
+
     ResidentApplicationService::ResidentApplicationService(ResidentServiceLimits limits,
                                                            const protocol_v2::ITrustPolicy &peer_trust,
                                                            IResidentAgentBackend &agents,
                                                            IResidentAdminBackend &admin) noexcept:
-        limits_ {limits}, peer_trust_ {peer_trust}, agents_ {agents}, admin_ {admin} {}
+        impl_ {std::make_unique<Impl>(limits, peer_trust, agents, admin)} {}
+
+    ResidentApplicationService::ResidentApplicationService(const ResidentApplicationService &other) noexcept:
+        impl_ {std::make_unique<Impl>(*other.impl_)} {}
+
+    ResidentApplicationService::ResidentApplicationService(ResidentApplicationService &&other) noexcept:
+        ResidentApplicationService {static_cast<const ResidentApplicationService &>(other)} {}
+
+    ResidentApplicationService::~ResidentApplicationService() = default;
 
     void ResidentApplicationService::run(ResidentSessionJob job, const std::stop_token cancellation) noexcept {
         if (job.channel == nullptr) {
@@ -1311,12 +1341,24 @@ namespace rule_engine::python::tools {
     }
 
     ResidentWorkPollSnapshot ResidentApplicationService::work_poll_snapshot() const noexcept {
-        std::scoped_lock lock {work_poll_metrics_mutex_};
-        return work_poll_metrics_;
+        if (impl_->before_snapshot_lock != nullptr) {
+            impl_->before_snapshot_lock(impl_->test_hook_context);
+        }
+        std::scoped_lock lock {impl_->work_poll_metrics_mutex};
+        return impl_->work_poll_metrics;
+    }
+
+    void ResidentApplicationService::set_work_poll_test_hooks(const WorkPollTestHook before_delay_publish,
+                                                              const WorkPollTestHook before_snapshot_lock,
+                                                              void *const context) noexcept {
+        std::scoped_lock lock {impl_->work_poll_metrics_mutex};
+        impl_->before_delay_publish = before_delay_publish;
+        impl_->before_snapshot_lock = before_snapshot_lock;
+        impl_->test_hook_context = context;
     }
 
     void ResidentApplicationService::run_agent(ResidentSessionJob &job, const std::stop_token cancellation) noexcept {
-        const auto session_deadline = std::chrono::steady_clock::now() + limits_.maximum_session_duration;
+        const auto session_deadline = std::chrono::steady_clock::now() + impl_->limits.maximum_session_duration;
         auto first = job.channel->receive_protocol(bounded_deadline(session_deadline), cancellation);
         if (!first || !std::holds_alternative<protocol_v2::AgentHelloMessage>(first->body) || first->session ||
             first->agent_sequence != 0U || first->protocol_major != protocol_v2::major_version) {
@@ -1325,28 +1367,28 @@ namespace rule_engine::python::tools {
         const auto &hello = std::get<protocol_v2::AgentHelloMessage>(first->body);
         if (hello.minimum_minor > protocol_v2::initial_minor_version || hello.maximum_minor < hello.minimum_minor ||
             hello.agent_epoch.empty() || hello.agent_epoch != first->agent_epoch || hello.next_sequence == 0U ||
-            !peer_trust_.authorize_capabilities(job.peer, hello.capabilities)) {
+            !impl_->peer_trust.authorize_capabilities(job.peer, hello.capabilities)) {
             return;
         }
-        auto session = agents_.establish(job.peer, hello, cancellation);
+        auto session = impl_->agents.establish(job.peer, hello, cancellation);
         if (!session) {
             return;
         }
-        const AgentSessionCloser close_session {.backend = agents_, .session = *session};
+        const AgentSessionCloser close_session {.backend = impl_->agents, .session = *session};
         if (session->authenticated_peer.tenant != job.peer.tenant ||
             session->authenticated_peer.peer != job.peer.peer || session->session.empty() ||
             session->session_fence == 0U || session->agent_epoch != hello.agent_epoch ||
             session->acknowledged_through >= hello.next_sequence ||
-            session->credit.bytes > limits_.inbound_credit.bytes ||
-            session->credit.messages > limits_.inbound_credit.messages ||
-            session->credit.work_attempts > limits_.inbound_credit.work_attempts ||
-            session->credit.snapshot_chunks > limits_.inbound_credit.snapshot_chunks) {
+            session->credit.bytes > impl_->limits.inbound_credit.bytes ||
+            session->credit.messages > impl_->limits.inbound_credit.messages ||
+            session->credit.work_attempts > impl_->limits.inbound_credit.work_attempts ||
+            session->credit.snapshot_chunks > impl_->limits.inbound_credit.snapshot_chunks) {
             return;
         }
         auto gate = runtime::ProtocolV2DurableSequenceGate::create(
             job.peer.peer, session->session, session->session_fence, session->agent_epoch,
             session->acknowledged_through, protocol_v2::initial_minor_version,
-            protocol_v2::ProtocolLimits {.maximum_frame_bytes = limits_.maximum_frame_bytes,
+            protocol_v2::ProtocolLimits {.maximum_frame_bytes = impl_->limits.maximum_frame_bytes,
                                          .maximum_sequence_gap = 1U});
         if (!gate) {
             return;
@@ -1360,7 +1402,7 @@ namespace rule_engine::python::tools {
             .schemas = session->schemas,
             .capabilities = session->capabilities,
             .credit = session->credit,
-            .heartbeat_interval_ms = static_cast<std::uint64_t>(limits_.maximum_session_duration.count()),
+            .heartbeat_interval_ms = static_cast<std::uint64_t>(impl_->limits.maximum_session_duration.count()),
         };
         if (auto sent = job.channel->send_protocol(
                 server_envelope(*session, "server:" + session->session.value + ":hello", welcome),
@@ -1370,7 +1412,7 @@ namespace rule_engine::python::tools {
         }
 
         std::map<std::string, protocol_v2::WorkLeaseMessage, std::less<>> outstanding;
-        const auto peer_work_limit = (std::min) ({limits_.maximum_inflight_work_per_session,
+        const auto peer_work_limit = (std::min) ({impl_->limits.maximum_inflight_work_per_session,
                                                   static_cast<std::size_t>(hello.receive_limit.work_attempts),
                                                   static_cast<std::size_t>(hello.receive_limit.messages)});
         std::uint64_t server_sequence {};
@@ -1387,13 +1429,13 @@ namespace rule_engine::python::tools {
                 IgnoreCancel cancel;
                 auto valid = runtime::ProtocolV2ProviderResponsePort::create(lease, cancel);
                 if (!valid || outstanding.contains(lease.work_id) ||
-                    outstanding.size() >= limits_.maximum_inflight_work_per_session) {
+                    outstanding.size() >= impl_->limits.maximum_inflight_work_per_session) {
                     return false;
                 }
                 const auto message_id = "server:" + session->session.value + ":work:" + std::to_string(server_sequence);
                 auto outbound = server_envelope(*session, message_id, lease);
                 auto measured = protocol_v2::encode_frame(
-                    outbound, protocol_v2::ProtocolLimits {.maximum_frame_bytes = limits_.maximum_frame_bytes});
+                    outbound, protocol_v2::ProtocolLimits {.maximum_frame_bytes = impl_->limits.maximum_frame_bytes});
                 if (!measured || sent_work_bytes > peer_byte_limit ||
                     measured->size() > peer_byte_limit - sent_work_bytes) {
                     return false;
@@ -1415,14 +1457,14 @@ namespace rule_engine::python::tools {
                 return true;
             }
             const auto poll_started = std::chrono::steady_clock::now();
-            auto work = agents_.take_work(*session, available, cancellation);
+            auto work = impl_->agents.take_work(*session, available, cancellation);
             if (!work) {
                 return false;
             }
             if (work->empty()) {
                 {
-                    std::scoped_lock lock {work_poll_metrics_mutex_};
-                    work_poll_metrics_.empty_polls = saturating_add(work_poll_metrics_.empty_polls, 1U);
+                    std::scoped_lock lock {impl_->work_poll_metrics_mutex};
+                    impl_->work_poll_metrics.empty_polls = saturating_add(impl_->work_poll_metrics.empty_polls, 1U);
                 }
                 if (!observed_idle_since) {
                     observed_idle_since = poll_started;
@@ -1431,29 +1473,32 @@ namespace rule_engine::python::tools {
             }
 
             if (work->size() > available) {
-                std::scoped_lock lock {work_poll_metrics_mutex_};
-                work_poll_metrics_.nonempty_polls = saturating_add(work_poll_metrics_.nonempty_polls, 1U);
+                std::scoped_lock lock {impl_->work_poll_metrics_mutex};
+                impl_->work_poll_metrics.nonempty_polls = saturating_add(impl_->work_poll_metrics.nonempty_polls, 1U);
                 return false;
             }
             std::size_t delivered {};
             const auto sent = send_work(std::move(*work), delivered);
             {
-                std::scoped_lock lock {work_poll_metrics_mutex_};
-                work_poll_metrics_.nonempty_polls = saturating_add(work_poll_metrics_.nonempty_polls, 1U);
-                work_poll_metrics_.delivered_work =
-                    saturating_add(work_poll_metrics_.delivered_work, static_cast<std::uint64_t>(delivered));
+                std::scoped_lock lock {impl_->work_poll_metrics_mutex};
+                impl_->work_poll_metrics.nonempty_polls = saturating_add(impl_->work_poll_metrics.nonempty_polls, 1U);
+                impl_->work_poll_metrics.delivered_work =
+                    saturating_add(impl_->work_poll_metrics.delivered_work, static_cast<std::uint64_t>(delivered));
                 if (delivered == 0U) {
                     return sent;
                 }
                 const auto delay = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - observed_idle_since.value_or(poll_started));
                 const auto delay_microseconds = delay.count() <= 0 ? 1U : static_cast<std::uint64_t>(delay.count());
-                work_poll_metrics_.delivery_delay_samples =
-                    saturating_add(work_poll_metrics_.delivery_delay_samples, 1U);
-                work_poll_metrics_.delivery_delay_total_microseconds =
-                    saturating_add(work_poll_metrics_.delivery_delay_total_microseconds, delay_microseconds);
-                work_poll_metrics_.delivery_delay_max_microseconds =
-                    (std::max) (work_poll_metrics_.delivery_delay_max_microseconds, delay_microseconds);
+                impl_->work_poll_metrics.delivery_delay_samples =
+                    saturating_add(impl_->work_poll_metrics.delivery_delay_samples, 1U);
+                if (impl_->before_delay_publish != nullptr) {
+                    impl_->before_delay_publish(impl_->test_hook_context);
+                }
+                impl_->work_poll_metrics.delivery_delay_total_microseconds =
+                    saturating_add(impl_->work_poll_metrics.delivery_delay_total_microseconds, delay_microseconds);
+                impl_->work_poll_metrics.delivery_delay_max_microseconds =
+                    (std::max) (impl_->work_poll_metrics.delivery_delay_max_microseconds, delay_microseconds);
             }
             observed_idle_since.reset();
             return sent;
@@ -1463,10 +1508,10 @@ namespace rule_engine::python::tools {
         }
 
         std::size_t received_messages {};
-        while (received_messages < limits_.maximum_messages_per_session &&
+        while (received_messages < impl_->limits.maximum_messages_per_session &&
                std::chrono::steady_clock::now() < session_deadline && !cancellation.stop_requested()) {
             auto readable = job.channel->wait_protocol_input(
-                bounded_deadline(session_deadline, limits_.work_poll_interval), cancellation);
+                bounded_deadline(session_deadline, impl_->limits.work_poll_interval), cancellation);
             if (!readable) {
                 break;
             }
@@ -1517,11 +1562,12 @@ namespace rule_engine::python::tools {
                         return;
                     }
                 }
-                auto durable = agents_.persist(*session, contiguous->sequence, contiguous->body, cancellation);
-                const auto credit_valid = durable && durable->credit.bytes <= limits_.inbound_credit.bytes &&
-                                          durable->credit.messages <= limits_.inbound_credit.messages &&
-                                          durable->credit.work_attempts <= limits_.inbound_credit.work_attempts &&
-                                          durable->credit.snapshot_chunks <= limits_.inbound_credit.snapshot_chunks;
+                auto durable = impl_->agents.persist(*session, contiguous->sequence, contiguous->body, cancellation);
+                const auto credit_valid =
+                    durable && durable->credit.bytes <= impl_->limits.inbound_credit.bytes &&
+                    durable->credit.messages <= impl_->limits.inbound_credit.messages &&
+                    durable->credit.work_attempts <= impl_->limits.inbound_credit.work_attempts &&
+                    durable->credit.snapshot_chunks <= impl_->limits.inbound_credit.snapshot_chunks;
                 if (!durable || durable->acknowledged_through != contiguous->sequence || !credit_valid) {
                     const auto reason =
                         durable ? protocol_v2::ProtocolErrorCode::persistence_error : durable.error().code;
@@ -1560,21 +1606,21 @@ namespace rule_engine::python::tools {
     }
 
     void ResidentApplicationService::run_admin(ResidentSessionJob &job, const std::stop_token cancellation) noexcept {
-        const auto session_deadline = std::chrono::steady_clock::now() + limits_.maximum_session_duration;
+        const auto session_deadline = std::chrono::steady_clock::now() + impl_->limits.maximum_session_duration;
         for (std::size_t count = 0U;
-             count < limits_.maximum_messages_per_session && std::chrono::steady_clock::now() < session_deadline &&
-             !cancellation.stop_requested();
+             count < impl_->limits.maximum_messages_per_session &&
+             std::chrono::steady_clock::now() < session_deadline && !cancellation.stop_requested();
              ++count) {
             auto payload = job.channel->receive_application_frame(bounded_deadline(session_deadline), cancellation);
-            if (!payload || payload->size() > limits_.maximum_frame_bytes) {
+            if (!payload || payload->size() > impl_->limits.maximum_frame_bytes) {
                 return;
             }
-            auto request = decode_resident_admin_request(*payload, limits_.maximum_frame_bytes);
+            auto request = decode_resident_admin_request(*payload, impl_->limits.maximum_frame_bytes);
             if (!request) {
                 return;
             }
-            auto response = admin_.execute(job.peer, *request);
-            auto encoded = encode_resident_admin_response(response, limits_.maximum_frame_bytes);
+            auto response = impl_->admin.execute(job.peer, *request);
+            auto encoded = encode_resident_admin_response(response, impl_->limits.maximum_frame_bytes);
             if (!encoded ||
                 !job.channel->send_application_frame(*encoded, bounded_deadline(session_deadline), cancellation)) {
                 return;

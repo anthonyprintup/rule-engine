@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -31,6 +32,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -49,6 +51,14 @@ namespace rule_engine::python::tools {
         static void install_maintenance_audit_hook(FilesystemResidentPackUploadBackend &backend,
                                                    bool (*hook)(void *) noexcept, void *context) noexcept {
             backend.set_maintenance_audit_hook_for_testing(hook, context);
+        }
+    };
+
+    struct ResidentApplicationServiceTestAccess {
+        static void set_work_poll_hooks(ResidentApplicationService &service,
+                                        void (*before_delay_publish)(void *) noexcept,
+                                        void (*before_snapshot_lock)(void *) noexcept, void *context) noexcept {
+            service.set_work_poll_test_hooks(before_delay_publish, before_snapshot_lock, context);
         }
     };
 
@@ -1405,6 +1415,31 @@ namespace {
         }
     };
 
+    struct WorkPollPublishGate {
+        std::atomic<bool> writer_paused {};
+        std::atomic<bool> reader_entered {};
+        std::atomic<bool> reader_completed {};
+        std::atomic<bool> release_writer {};
+
+        static void pause_writer(void *const context) noexcept {
+            auto &gate = *static_cast<WorkPollPublishGate *>(context);
+            gate.writer_paused.store(true, std::memory_order_release);
+            gate.writer_paused.notify_all();
+            gate.release_writer.wait(false, std::memory_order_acquire);
+        }
+
+        static void observe_reader(void *const context) noexcept {
+            auto &gate = *static_cast<WorkPollPublishGate *>(context);
+            gate.reader_entered.store(true, std::memory_order_release);
+            gate.reader_entered.notify_all();
+        }
+    };
+
+    static_assert(std::is_copy_constructible_v<tools::ResidentApplicationService>);
+    static_assert(std::is_move_constructible_v<tools::ResidentApplicationService>);
+    static_assert(!std::is_copy_assignable_v<tools::ResidentApplicationService>);
+    static_assert(!std::is_move_assignable_v<tools::ResidentApplicationService>);
+
 } // namespace
 
 TEST_CASE("resident agent service consumes framed bytes and ACKs only a durable facts-only result") {
@@ -1549,46 +1584,49 @@ TEST_CASE("resident work poll snapshots publish coherent concurrent delivery rec
     DurableFakeAgentBackend agents;
     agents.deliver_every_time = true;
     RejectAdmin admin;
-    auto limits = test_service_limits();
-    limits.maximum_session_duration = std::chrono::milliseconds {35};
-    tools::ResidentApplicationService service {limits, trust, agents, admin};
-    std::atomic<std::size_t> completed {};
-    std::vector<std::jthread> sessions;
-    constexpr std::size_t session_count = 8U;
-    sessions.reserve(session_count);
-    for (std::size_t index = 0U; index < session_count; ++index) {
-        auto state = std::make_shared<FakeChannelState>();
-        enqueue_protocol(state, agent_hello_envelope());
-        sessions.emplace_back([&, state] {
-            service.run({.role = tools::ResidentSessionRole::agent,
-                         .peer = {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:test"}},
-                         .channel = std::make_unique<FakeByteChannel>(state)},
-                        {});
-            completed.fetch_add(1U);
-        });
-    }
+    tools::ResidentApplicationService service {test_service_limits(), trust, agents, admin};
+    WorkPollPublishGate gate;
+    tools::ResidentApplicationServiceTestAccess::set_work_poll_hooks(service, &WorkPollPublishGate::pause_writer,
+                                                                     &WorkPollPublishGate::observe_reader, &gate);
+    auto state = std::make_shared<FakeChannelState>();
+    std::stop_source stop;
+    state->stop_after_work = &stop;
+    enqueue_protocol(state, agent_hello_envelope());
 
-    while (completed.load() < session_count) {
-        const auto snapshot = service.work_poll_snapshot();
-        CHECK(snapshot.delivery_delay_samples <= snapshot.nonempty_polls);
-        CHECK(snapshot.delivery_delay_samples <= snapshot.delivered_work);
-        if (snapshot.delivery_delay_samples == 0U) {
-            CHECK(snapshot.delivery_delay_total_microseconds == 0U);
-            CHECK(snapshot.delivery_delay_max_microseconds == 0U);
-        } else {
-            CHECK(snapshot.delivery_delay_total_microseconds >= snapshot.delivery_delay_max_microseconds);
-            CHECK(snapshot.delivery_delay_max_microseconds > 0U);
-        }
-        std::this_thread::sleep_for(std::chrono::microseconds {50});
-    }
-    sessions.clear();
+    std::jthread session {[&] {
+        service.run({.role = tools::ResidentSessionRole::agent,
+                     .peer = {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:test"}},
+                     .channel = std::make_unique<FakeByteChannel>(state)},
+                    stop.get_token());
+    }};
+    gate.writer_paused.wait(false, std::memory_order_acquire);
 
-    const auto snapshot = service.work_poll_snapshot();
-    CHECK(snapshot.nonempty_polls == session_count);
-    CHECK(snapshot.delivered_work == session_count);
-    CHECK(snapshot.delivery_delay_samples == session_count);
-    CHECK(snapshot.delivery_delay_total_microseconds >= snapshot.delivery_delay_max_microseconds);
-    CHECK(snapshot.delivery_delay_max_microseconds > 0U);
+    tools::ResidentWorkPollSnapshot concurrent_snapshot;
+    std::jthread reader {[&] {
+        concurrent_snapshot = service.work_poll_snapshot();
+        gate.reader_completed.store(true, std::memory_order_release);
+        gate.reader_completed.notify_all();
+    }};
+    gate.reader_entered.wait(false, std::memory_order_acquire);
+    CHECK_FALSE(gate.reader_completed.load(std::memory_order_acquire));
+
+    gate.release_writer.store(true, std::memory_order_release);
+    gate.release_writer.notify_all();
+    session.join();
+    reader.join();
+    tools::ResidentApplicationServiceTestAccess::set_work_poll_hooks(service, nullptr, nullptr, nullptr);
+
+    REQUIRE(gate.reader_completed.load(std::memory_order_acquire));
+    CHECK(concurrent_snapshot.nonempty_polls == 1U);
+    CHECK(concurrent_snapshot.delivered_work == 1U);
+    CHECK(concurrent_snapshot.delivery_delay_samples == 1U);
+    CHECK(concurrent_snapshot.delivery_delay_total_microseconds >= concurrent_snapshot.delivery_delay_max_microseconds);
+    CHECK(concurrent_snapshot.delivery_delay_max_microseconds > 0U);
+
+    auto copied = service;
+    CHECK(copied.work_poll_snapshot().delivered_work == 1U);
+    tools::ResidentApplicationService moved {std::move(copied)};
+    CHECK(moved.work_poll_snapshot().delivered_work == 1U);
 }
 
 TEST_CASE("resident work polling cancellation adds no false samples") {

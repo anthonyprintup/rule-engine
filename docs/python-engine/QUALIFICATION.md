@@ -216,9 +216,13 @@ retains the negotiated outstanding-work and byte ceilings. The loopback mTLS
 test proves the readiness wait reports no data without consuming input, then
 reports and preserves a subsequently replayed frame. Configuration coverage
 rejects intervals below 10 ms or longer than the session, and cancellation
-still closes the established session. This is byte-faithful component evidence,
-not a live many-peer backend-load or database-notification qualification. The
-warning-clean complete Debug graph passed all 38 tests in 175.81 seconds.
+still closes the established session. Metrics coverage deterministically
+pauses a delivery receipt between its sample-count and delay-total updates,
+admits a concurrent snapshot reader, and proves that the reader cannot observe
+the partial update. It also locks the installed service's copy/move
+constructibility contract. This is byte-faithful component evidence, not a live
+many-peer backend-load or database-notification qualification. The warning-clean
+complete Debug graph passed all 38 tests in 175.81 seconds.
 
 The progressive authoring-example slice adds a source-only `authoring_tour`
 pack with four compiler-supported process, lazy-filter, scalar-state, and typed
