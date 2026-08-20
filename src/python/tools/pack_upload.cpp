@@ -33,10 +33,14 @@ namespace rule_engine::python::tools {
         constexpr std::uint64_t maximum_upload_bytes = balanced_v1.compile.source_closure_bytes;
         constexpr std::uint64_t maximum_reserved_bytes = 256U * mebibyte;
         constexpr std::size_t maximum_metadata_bytes = 4U * kibibyte;
+        constexpr std::size_t maximum_maintenance_journal_bytes = 1U * mebibyte;
         constexpr std::size_t maximum_maintenance_audit_records = 32U;
+        constexpr std::size_t maximum_maintenance_targets =
+            maximum_completion_records * 2U + maximum_upload_sessions * 2U;
         constexpr std::string_view metadata_header {"rule-engine.pack-upload.v2"};
         constexpr std::string_view completion_header {"rule-engine.pack-upload-complete.v2"};
         constexpr std::string_view maintenance_audit_header {"rule-engine.pack-registry-maintenance.v1"};
+        constexpr std::string_view maintenance_journal_header {"rule-engine.pack-registry-maintenance-pending.v1"};
 
         [[nodiscard]] protocol_v2::ProtocolError upload_error(const protocol_v2::ProtocolErrorCode code,
                                                               std::string message) {
@@ -251,6 +255,51 @@ namespace rule_engine::python::tools {
             std::vector<std::pair<std::uint64_t, ResidentPackRegistryMaintenanceReceipt>> records;
         };
 
+        enum struct MaintenanceTargetKind : std::uint8_t { partial, metadata, object, completion };
+
+        struct MaintenanceTarget {
+            MaintenanceTargetKind kind {MaintenanceTargetKind::partial};
+            std::string filename;
+            std::uint64_t expected_bytes {};
+        };
+
+        struct MaintenanceJournal {
+            std::uint64_t base_successful_runs {};
+            std::uint64_t at_unix_ms {};
+            ResidentPackRegistryMaintenanceReceipt receipt;
+            std::vector<MaintenanceTarget> targets;
+        };
+
+        [[nodiscard]] bool canonical_hash_filename(const std::string_view filename,
+                                                   const std::string_view extension) noexcept {
+            if (!filename.ends_with(extension) || filename.size() != 64U + extension.size()) {
+                return false;
+            }
+            return std::ranges::all_of(filename.substr(0U, 64U), [](const char character) {
+                return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
+            });
+        }
+
+        [[nodiscard]] char target_code(const MaintenanceTargetKind kind) noexcept {
+            switch (kind) {
+                case MaintenanceTargetKind::partial: return 'P';
+                case MaintenanceTargetKind::metadata: return 'M';
+                case MaintenanceTargetKind::object: return 'O';
+                case MaintenanceTargetKind::completion: return 'C';
+                default: return '?';
+            }
+        }
+
+        [[nodiscard]] std::optional<MaintenanceTargetKind> parse_target_code(const char code) noexcept {
+            switch (code) {
+                case 'P': return MaintenanceTargetKind::partial;
+                case 'M': return MaintenanceTargetKind::metadata;
+                case 'O': return MaintenanceTargetKind::object;
+                case 'C': return MaintenanceTargetKind::completion;
+                default: return std::nullopt;
+            }
+        }
+
         [[nodiscard]] std::optional<std::pair<std::uint64_t, ResidentPackRegistryMaintenanceReceipt>>
         parse_maintenance_record(const std::string_view line) {
             std::array<std::uint64_t, 5U> values {};
@@ -336,6 +385,100 @@ namespace rule_engine::python::tools {
                                                     "registry maintenance audit aggregate is inconsistent"));
             }
             return result;
+        }
+
+        [[nodiscard]] std::string serialize_maintenance_journal(const MaintenanceJournal &journal) {
+            std::string text =
+                std::string {maintenance_journal_header} + '\n' + std::to_string(journal.base_successful_runs) + '\n' +
+                std::to_string(journal.at_unix_ms) + '\n' + std::to_string(journal.receipt.expired_partial_sessions) +
+                '\n' + std::to_string(journal.receipt.removed_completion_records) + '\n' +
+                std::to_string(journal.receipt.removed_objects) + '\n' +
+                std::to_string(journal.receipt.reclaimed_bytes) + '\n' + std::to_string(journal.targets.size()) + '\n';
+            for (const auto &target : journal.targets) {
+                text.push_back(target_code(target.kind));
+                text.push_back(':');
+                text += std::to_string(target.expected_bytes);
+                text.push_back(':');
+                text += target.filename;
+                text.push_back('\n');
+            }
+            return text;
+        }
+
+        [[nodiscard]] std::expected<std::optional<MaintenanceJournal>, protocol_v2::ProtocolError>
+        read_maintenance_journal(const std::filesystem::path &path) {
+            std::error_code filesystem_error;
+            const auto status = std::filesystem::symlink_status(path, filesystem_error);
+            if (filesystem_error == std::errc::no_such_file_or_directory) {
+                return std::optional<MaintenanceJournal> {};
+            }
+            if (filesystem_error || !std::filesystem::is_regular_file(status) || std::filesystem::is_symlink(status)) {
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                                                    "registry maintenance journal is unavailable"));
+            }
+            const auto size = std::filesystem::file_size(path, filesystem_error);
+            if (filesystem_error || size == 0U || size > maximum_maintenance_journal_bytes) {
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::limit_exceeded,
+                                                    "registry maintenance journal exceeds its byte bound"));
+            }
+            auto text = read_text(path);
+            if (!text) {
+                return std::unexpected(std::move(text.error()));
+            }
+            const auto fields = lines(*text);
+            if (fields.size() < 8U || fields[0] != maintenance_journal_header) {
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::malformed,
+                                                    "registry maintenance journal is malformed"));
+            }
+            std::array<std::uint64_t, 7U> values {};
+            for (std::size_t index = 0U; index < values.size(); ++index) {
+                const auto parsed = parse_unsigned(fields[index + 1U]);
+                if (!parsed) {
+                    return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::malformed,
+                                                        "registry maintenance journal is malformed"));
+                }
+                values[index] = *parsed;
+            }
+            if (values[1] == 0U || values[6] > maximum_maintenance_targets || fields.size() != 8U + values[6]) {
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::limit_exceeded,
+                                                    "registry maintenance journal exceeds its target bound"));
+            }
+            MaintenanceJournal journal {
+                .base_successful_runs = values[0],
+                .at_unix_ms = values[1],
+                .receipt = {.expired_partial_sessions = values[2],
+                            .removed_completion_records = values[3],
+                            .removed_objects = values[4],
+                            .reclaimed_bytes = values[5]},
+                .targets = {},
+            };
+            journal.targets.reserve(static_cast<std::size_t>(values[6]));
+            for (std::size_t index = 0U; index < values[6]; ++index) {
+                const auto field = fields[8U + index];
+                if (field.size() < 4U || field[1] != ':') {
+                    return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::malformed,
+                                                        "registry maintenance journal target is malformed"));
+                }
+                const auto second = field.find(':', 2U);
+                const auto kind = parse_target_code(field[0]);
+                const auto bytes = second == std::string_view::npos ? std::optional<std::uint64_t> {} :
+                                                                      parse_unsigned(field.substr(2U, second - 2U));
+                const auto filename =
+                    second == std::string_view::npos ? std::string_view {} : field.substr(second + 1U);
+                const auto extension = kind == MaintenanceTargetKind::partial  ? ".part" :
+                                       kind == MaintenanceTargetKind::metadata ? ".meta" :
+                                       kind == MaintenanceTargetKind::object   ? ".rpack" :
+                                                                                 ".done";
+                if (!kind || !bytes || !canonical_hash_filename(filename, extension) ||
+                    ((*kind == MaintenanceTargetKind::metadata || *kind == MaintenanceTargetKind::completion) &&
+                     *bytes != 0U)) {
+                    return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::malformed,
+                                                        "registry maintenance journal target is malformed"));
+                }
+                journal.targets.push_back(
+                    MaintenanceTarget {.kind = *kind, .filename = std::string {filename}, .expected_bytes = *bytes});
+            }
+            return std::optional<MaintenanceJournal> {std::move(journal)};
         }
 
         [[nodiscard]] std::expected<CompletionMetadata, protocol_v2::ProtocolError>
@@ -475,6 +618,25 @@ namespace rule_engine::python::tools {
             return {};
         }
 
+        [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
+        remove_maintenance_record(const std::filesystem::path &path) {
+            std::error_code filesystem_error;
+            if (!std::filesystem::remove(path, filesystem_error) || filesystem_error) {
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                                                    "registry maintenance journal cannot be removed"));
+            }
+#ifndef _WIN32
+            const auto directory = ::open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            const auto directory_synced = directory >= 0 && ::fsync(directory) == 0;
+            const auto directory_closed = directory >= 0 && ::close(directory) == 0;
+            if (!directory_synced || !directory_closed) {
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                                                    "registry maintenance journal removal cannot be synced"));
+            }
+#endif
+            return {};
+        }
+
         [[nodiscard]] std::expected<std::uint64_t, protocol_v2::ProtocolError>
         partial_size(const std::filesystem::path &path) {
             std::error_code filesystem_error;
@@ -577,8 +739,11 @@ namespace rule_engine::python::tools {
         std::mutex mutex;
         void (*maintenance_lock_hook)(void *) noexcept {};
         void *maintenance_lock_hook_context {};
+        bool (*maintenance_audit_hook)(void *) noexcept {};
+        void *maintenance_audit_hook_context {};
 
         [[nodiscard]] std::filesystem::path maintenance_audit_path() const { return spool / ".maintenance.audit"; }
+        [[nodiscard]] std::filesystem::path maintenance_journal_path() const { return spool / ".maintenance.pending"; }
 
         [[nodiscard]] std::expected<ResidentPackRegistryObservation, protocol_v2::ProtocolError>
         observe_maintenance() const {
@@ -590,11 +755,29 @@ namespace rule_engine::python::tools {
         }
 
         [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
-        record_maintenance(const std::uint64_t at_unix_ms,
+        record_maintenance(const std::uint64_t expected_base_runs, const std::uint64_t at_unix_ms,
                            const ResidentPackRegistryMaintenanceReceipt &receipt) const {
             auto audit = read_maintenance_audit(maintenance_audit_path());
             if (!audit) {
                 return std::unexpected(std::move(audit.error()));
+            }
+            const auto same_receipt = [&] {
+                if (audit->records.empty()) {
+                    return false;
+                }
+                const auto &[record_at, record] = audit->records.back();
+                return record_at == at_unix_ms && record.expired_partial_sessions == receipt.expired_partial_sessions &&
+                       record.removed_completion_records == receipt.removed_completion_records &&
+                       record.removed_objects == receipt.removed_objects &&
+                       record.reclaimed_bytes == receipt.reclaimed_bytes;
+            };
+            if (expected_base_runs != (std::numeric_limits<std::uint64_t>::max)() &&
+                audit->aggregate.successful_maintenance_runs == expected_base_runs + 1U && same_receipt()) {
+                return {};
+            }
+            if (audit->aggregate.successful_maintenance_runs != expected_base_runs) {
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                                                    "registry maintenance journal conflicts with its audit"));
             }
             const auto add = [](const std::uint64_t left, const std::uint64_t right) -> std::optional<std::uint64_t> {
                 if (left > (std::numeric_limits<std::uint64_t>::max)() - right) {
@@ -639,6 +822,62 @@ namespace rule_engine::python::tools {
                                                     "registry maintenance audit exceeds its byte bound"));
             }
             return replace_text(maintenance_audit_path(), text);
+        }
+
+        [[nodiscard]] std::filesystem::path maintenance_target_path(const MaintenanceTarget &target) const {
+            if (target.kind == MaintenanceTargetKind::object) {
+                return registry / "sha256" / target.filename;
+            }
+            return spool / target.filename;
+        }
+
+        [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
+        apply_maintenance_journal(const MaintenanceJournal &journal) const {
+            std::error_code filesystem_error;
+            for (const auto &target : journal.targets) {
+                const auto path = maintenance_target_path(target);
+                const auto status = std::filesystem::symlink_status(path, filesystem_error);
+                if (filesystem_error == std::errc::no_such_file_or_directory) {
+                    filesystem_error.clear();
+                    continue;
+                }
+                if (filesystem_error || !std::filesystem::is_regular_file(status) ||
+                    std::filesystem::is_symlink(status)) {
+                    return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                                                        "registry maintenance target is unavailable or unsafe"));
+                }
+                if (target.kind == MaintenanceTargetKind::partial || target.kind == MaintenanceTargetKind::object) {
+                    const auto size = std::filesystem::file_size(path, filesystem_error);
+                    if (filesystem_error || size != target.expected_bytes) {
+                        return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                                                            "registry maintenance target changed after planning"));
+                    }
+                }
+                if (!std::filesystem::remove(path, filesystem_error) || filesystem_error) {
+                    return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                                                        "registry maintenance target cannot be removed"));
+                }
+            }
+            return {};
+        }
+
+        [[nodiscard]] std::expected<void, protocol_v2::ProtocolError> recover_maintenance() const {
+            auto pending = read_maintenance_journal(maintenance_journal_path());
+            if (!pending) {
+                return std::unexpected(std::move(pending.error()));
+            }
+            if (!*pending) {
+                return {};
+            }
+            if (auto applied = apply_maintenance_journal(**pending); !applied) {
+                return applied;
+            }
+            if (auto recorded =
+                    record_maintenance((*pending)->base_successful_runs, (*pending)->at_unix_ms, (*pending)->receipt);
+                !recorded) {
+                return recorded;
+            }
+            return remove_maintenance_record(maintenance_journal_path());
         }
 
         [[nodiscard]] std::expected<std::optional<ResidentPackUploadReceipt>, protocol_v2::ProtocolError>
@@ -712,11 +951,27 @@ namespace rule_engine::python::tools {
             return result;
         }
 
-        [[nodiscard]] std::expected<ResidentPackRegistryMaintenanceReceipt, protocol_v2::ProtocolError>
-        expire_partials(const std::uint64_t now_unix_ms) const {
-            ResidentPackRegistryMaintenanceReceipt result;
+        [[nodiscard]] std::expected<MaintenanceJournal, protocol_v2::ProtocolError>
+        plan_maintenance(const std::span<const SourceDigest> reachable_source_digests,
+                         const std::uint64_t now_unix_ms) const {
+            auto audit = read_maintenance_audit(maintenance_audit_path());
+            if (!audit || audit->aggregate.successful_maintenance_runs == (std::numeric_limits<std::uint64_t>::max)()) {
+                return std::unexpected(audit ? upload_error(protocol_v2::ProtocolErrorCode::limit_exceeded,
+                                                            "registry maintenance counters overflowed") :
+                                               std::move(audit.error()));
+            }
+            MaintenanceJournal journal {.base_successful_runs = audit->aggregate.successful_maintenance_runs,
+                                        .at_unix_ms = now_unix_ms,
+                                        .receipt = {},
+                                        .targets = {}};
+            const auto add_bytes = [&](const std::uint64_t size) -> bool {
+                if (journal.receipt.reclaimed_bytes > (std::numeric_limits<std::uint64_t>::max)() - size) {
+                    return false;
+                }
+                journal.receipt.reclaimed_bytes += size;
+                return true;
+            };
             std::error_code filesystem_error;
-            std::vector<std::filesystem::path> expired_metadata;
             for (const auto &entry : std::filesystem::directory_iterator {spool, filesystem_error}) {
                 if (filesystem_error) {
                     break;
@@ -729,31 +984,108 @@ namespace rule_engine::python::tools {
                     return std::unexpected(std::move(metadata.error()));
                 }
                 if (elapsed(now_unix_ms, metadata->created_at_unix_ms, limits.partial_session_ttl)) {
-                    expired_metadata.push_back(entry.path());
+                    const auto partial = entry.path().parent_path() / (entry.path().stem().string() + ".part");
+                    const auto partial_status = std::filesystem::symlink_status(partial, filesystem_error);
+                    if (filesystem_error != std::errc::no_such_file_or_directory) {
+                        if (filesystem_error || !std::filesystem::is_regular_file(partial_status) ||
+                            std::filesystem::is_symlink(partial_status)) {
+                            return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                                                                "expired upload partial is unavailable or unsafe"));
+                        }
+                        const auto size = std::filesystem::file_size(partial, filesystem_error);
+                        if (filesystem_error || !add_bytes(size)) {
+                            return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::limit_exceeded,
+                                                                "registry maintenance counters overflowed"));
+                        }
+                        journal.targets.push_back({.kind = MaintenanceTargetKind::partial,
+                                                   .filename = partial.filename().string(),
+                                                   .expected_bytes = size});
+                    }
+                    filesystem_error.clear();
+                    journal.targets.push_back({.kind = MaintenanceTargetKind::metadata,
+                                               .filename = entry.path().filename().string(),
+                                               .expected_bytes = 0U});
+                    ++journal.receipt.expired_partial_sessions;
                 }
             }
             if (filesystem_error) {
                 return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
                                                     "upload spool cannot be enumerated"));
             }
-            for (const auto &metadata : expired_metadata) {
-                const auto partial = metadata.parent_path() / (metadata.stem().string() + ".part");
-                if (std::filesystem::exists(partial, filesystem_error)) {
-                    const auto size = std::filesystem::file_size(partial, filesystem_error);
-                    if (filesystem_error || !std::filesystem::remove(partial, filesystem_error) || filesystem_error) {
-                        return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
-                                                            "expired upload partial cannot be removed"));
-                    }
-                    result.reclaimed_bytes += size;
+
+            std::set<std::string, std::less<>> reachable;
+            for (const auto &digest : reachable_source_digests) { reachable.insert(digest.value); }
+            struct CompletionGroup {
+                std::uint64_t newest_published_at {};
+                std::vector<std::filesystem::path> paths;
+            };
+            std::map<std::string, CompletionGroup, std::less<>> completions;
+            for (const auto &entry : std::filesystem::directory_iterator {spool, filesystem_error}) {
+                if (filesystem_error) {
+                    break;
+                }
+                if (entry.path().extension() != ".done") {
+                    continue;
+                }
+                auto completion = read_completion(entry.path());
+                if (!completion) {
+                    return std::unexpected(std::move(completion.error()));
+                }
+                auto &group = completions[completion->source_digest.value];
+                group.newest_published_at = (std::max) (group.newest_published_at, completion->published_at_unix_ms);
+                group.paths.push_back(entry.path());
+            }
+            if (filesystem_error) {
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                                                    "registry completion inventory is unavailable"));
+            }
+
+            for (const auto &[digest_value, group] : completions) {
+                if (reachable.contains(digest_value) ||
+                    !elapsed(now_unix_ms, group.newest_published_at, limits.unreferenced_retention)) {
+                    continue;
+                }
+                auto object = packaging::content_addressed_source_pack_path(registry, SourceDigest {digest_value});
+                if (!object) {
+                    return std::unexpected(
+                        upload_error(protocol_v2::ProtocolErrorCode::malformed, "registry digest is invalid"));
+                }
+                const auto status = std::filesystem::symlink_status(*object, filesystem_error);
+                const auto missing = filesystem_error == std::errc::no_such_file_or_directory;
+                if (!missing && (filesystem_error || !std::filesystem::is_regular_file(status) ||
+                                 std::filesystem::is_symlink(status))) {
+                    return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                                                        "unreferenced registry object is unavailable or unsafe"));
                 }
                 filesystem_error.clear();
-                if (!std::filesystem::remove(metadata, filesystem_error) || filesystem_error) {
-                    return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
-                                                        "expired upload metadata cannot be removed"));
+                if (!missing) {
+                    const auto size = std::filesystem::file_size(*object, filesystem_error);
+                    if (filesystem_error || !add_bytes(size)) {
+                        return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::limit_exceeded,
+                                                            "registry maintenance counters overflowed"));
+                    }
+                    journal.targets.push_back({.kind = MaintenanceTargetKind::object,
+                                               .filename = object->filename().string(),
+                                               .expected_bytes = size});
+                    ++journal.receipt.removed_objects;
                 }
-                ++result.expired_partial_sessions;
+                for (const auto &completion_path : group.paths) {
+                    journal.targets.push_back({.kind = MaintenanceTargetKind::completion,
+                                               .filename = completion_path.filename().string(),
+                                               .expected_bytes = 0U});
+                    ++journal.receipt.removed_completion_records;
+                }
             }
-            return result;
+            if (journal.targets.size() > maximum_maintenance_targets) {
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::limit_exceeded,
+                                                    "registry maintenance plan exceeds its target bound"));
+            }
+            const auto text = serialize_maintenance_journal(journal);
+            if (text.size() > maximum_maintenance_journal_bytes) {
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::limit_exceeded,
+                                                    "registry maintenance journal exceeds its byte bound"));
+            }
+            return journal;
         }
     };
 
@@ -769,6 +1101,16 @@ namespace rule_engine::python::tools {
         std::scoped_lock lock {impl_->mutex};
         impl_->maintenance_lock_hook = hook;
         impl_->maintenance_lock_hook_context = context;
+    }
+
+    void FilesystemResidentPackUploadBackend::set_maintenance_audit_hook_for_testing(bool (*hook)(void *) noexcept,
+                                                                                     void *context) noexcept {
+        if (impl_ == nullptr) {
+            return;
+        }
+        std::scoped_lock lock {impl_->mutex};
+        impl_->maintenance_audit_hook = hook;
+        impl_->maintenance_audit_hook_context = context;
     }
 
     std::expected<std::unique_ptr<FilesystemResidentPackUploadBackend>, protocol_v2::ProtocolError>
@@ -811,6 +1153,13 @@ namespace rule_engine::python::tools {
         impl->trust = std::move(trust_policy);
         impl->crypto_library = std::move(crypto_library);
         impl->limits = limits;
+        auto spool_lock = ScopedSpoolLock::acquire(impl->spool / ".spool.lock");
+        if (!spool_lock) {
+            return std::unexpected(std::move(spool_lock.error()));
+        }
+        if (auto recovered = impl->recover_maintenance(); !recovered) {
+            return std::unexpected(std::move(recovered.error()));
+        }
         return std::unique_ptr<FilesystemResidentPackUploadBackend> {
             new FilesystemResidentPackUploadBackend {std::move(impl)}};
     }
@@ -829,8 +1178,8 @@ namespace rule_engine::python::tools {
         if (!spool_lock) {
             return std::unexpected(std::move(spool_lock.error()));
         }
-        if (auto expired = impl_->expire_partials(current_unix_ms()); !expired) {
-            return std::unexpected(std::move(expired.error()));
+        if (auto recovered = impl_->recover_maintenance(); !recovered) {
+            return std::unexpected(std::move(recovered.error()));
         }
         const auto paths = paths_for(impl_->spool, tenant, upload_id);
         auto completed = impl_->completed(paths, tenant, pack);
@@ -941,6 +1290,9 @@ namespace rule_engine::python::tools {
         if (!spool_lock) {
             return std::unexpected(std::move(spool_lock.error()));
         }
+        if (auto recovered = impl_->recover_maintenance(); !recovered) {
+            return std::unexpected(std::move(recovered.error()));
+        }
         const auto paths = paths_for(impl_->spool, tenant, upload_id);
         auto completed = impl_->completed(paths, tenant, pack);
         if (!completed) {
@@ -995,6 +1347,9 @@ namespace rule_engine::python::tools {
         auto spool_lock = ScopedSpoolLock::acquire(impl_->spool / ".spool.lock");
         if (!spool_lock) {
             return std::unexpected(std::move(spool_lock.error()));
+        }
+        if (auto recovered = impl_->recover_maintenance(); !recovered) {
+            return std::unexpected(std::move(recovered.error()));
         }
         const auto paths = paths_for(impl_->spool, tenant, upload_id);
         auto completed = impl_->completed(paths, tenant, pack);
@@ -1059,80 +1414,34 @@ namespace rule_engine::python::tools {
         if (impl_->maintenance_lock_hook != nullptr) {
             impl_->maintenance_lock_hook(impl_->maintenance_lock_hook_context);
         }
-        auto result = impl_->expire_partials(now_unix_ms);
-        if (!result) {
-            return std::unexpected(std::move(result.error()));
+        if (auto recovered = impl_->recover_maintenance(); !recovered) {
+            return std::unexpected(std::move(recovered.error()));
         }
-
-        std::set<std::string, std::less<>> reachable;
-        for (const auto &digest : reachable_source_digests) { reachable.insert(digest.value); }
-        struct CompletionGroup {
-            std::uint64_t newest_published_at {};
-            std::vector<std::filesystem::path> paths;
-        };
-        std::map<std::string, CompletionGroup, std::less<>> completions;
-        std::error_code filesystem_error;
-        for (const auto &entry : std::filesystem::directory_iterator {impl_->spool, filesystem_error}) {
-            if (filesystem_error) {
-                break;
-            }
-            if (entry.path().extension() != ".done") {
-                continue;
-            }
-            auto completion = read_completion(entry.path());
-            if (!completion) {
-                return std::unexpected(std::move(completion.error()));
-            }
-            auto &group = completions[completion->source_digest.value];
-            group.newest_published_at = (std::max) (group.newest_published_at, completion->published_at_unix_ms);
-            group.paths.push_back(entry.path());
+        auto journal = impl_->plan_maintenance(reachable_source_digests, now_unix_ms);
+        if (!journal) {
+            return std::unexpected(std::move(journal.error()));
         }
-        if (filesystem_error) {
+        const auto journal_text = serialize_maintenance_journal(*journal);
+        if (auto written = replace_text(impl_->maintenance_journal_path(), journal_text); !written) {
+            return std::unexpected(std::move(written.error()));
+        }
+        if (auto applied = impl_->apply_maintenance_journal(*journal); !applied) {
+            return std::unexpected(std::move(applied.error()));
+        }
+        if (impl_->maintenance_audit_hook != nullptr &&
+            !impl_->maintenance_audit_hook(impl_->maintenance_audit_hook_context)) {
             return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
-                                                "registry completion inventory is unavailable"));
+                                                "registry maintenance audit is unavailable"));
         }
-
-        for (const auto &[digest_value, group] : completions) {
-            if (reachable.contains(digest_value) ||
-                !elapsed(now_unix_ms, group.newest_published_at, impl_->limits.unreferenced_retention)) {
-                continue;
-            }
-            const SourceDigest digest {digest_value};
-            auto object = packaging::content_addressed_source_pack_path(impl_->registry, digest);
-            if (!object) {
-                return std::unexpected(
-                    upload_error(protocol_v2::ProtocolErrorCode::malformed, "registry digest is invalid"));
-            }
-            const auto status = std::filesystem::symlink_status(*object, filesystem_error);
-            const auto missing = filesystem_error == std::errc::no_such_file_or_directory;
-            if (!missing && (filesystem_error || !std::filesystem::is_regular_file(status) ||
-                             std::filesystem::is_symlink(status))) {
-                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
-                                                    "unreferenced registry object is unavailable or unsafe"));
-            }
-            filesystem_error.clear();
-            std::uint64_t size {};
-            if (!missing) {
-                size = std::filesystem::file_size(*object, filesystem_error);
-                if (filesystem_error || !std::filesystem::remove(*object, filesystem_error) || filesystem_error) {
-                    return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
-                                                        "unreferenced registry object cannot be removed"));
-                }
-                ++result->removed_objects;
-                result->reclaimed_bytes += size;
-            }
-            for (const auto &completion_path : group.paths) {
-                if (!std::filesystem::remove(completion_path, filesystem_error) || filesystem_error) {
-                    return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
-                                                        "registry completion record cannot be removed"));
-                }
-                ++result->removed_completion_records;
-            }
-        }
-        if (auto recorded = impl_->record_maintenance(now_unix_ms, *result); !recorded) {
+        if (auto recorded =
+                impl_->record_maintenance(journal->base_successful_runs, journal->at_unix_ms, journal->receipt);
+            !recorded) {
             return std::unexpected(std::move(recorded.error()));
         }
-        return result;
+        if (auto removed = remove_maintenance_record(impl_->maintenance_journal_path()); !removed) {
+            return std::unexpected(std::move(removed.error()));
+        }
+        return journal->receipt;
     }
 
     std::expected<ResidentPackRegistryObservation, protocol_v2::ProtocolError>
@@ -1149,6 +1458,12 @@ namespace rule_engine::python::tools {
         auto spool_lock = ScopedSpoolLock::acquire(impl_->spool / ".spool.lock");
         if (!spool_lock) {
             return std::unexpected(std::move(spool_lock.error()));
+        }
+        auto pending = read_maintenance_journal(impl_->maintenance_journal_path());
+        if (!pending || *pending) {
+            return std::unexpected(pending ? upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                                                          "registry maintenance recovery is pending") :
+                                             std::move(pending.error()));
         }
         return impl_->observe_maintenance();
     }

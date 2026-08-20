@@ -54,6 +54,7 @@ namespace rule_engine::python::tools {
         struct Impl;
         explicit FilesystemResidentPackUploadBackend(std::unique_ptr<Impl> impl) noexcept;
         void set_maintenance_lock_hook_for_testing(void (*hook)(void *) noexcept, void *context) noexcept;
+        void set_maintenance_audit_hook_for_testing(bool (*hook)(void *) noexcept, void *context) noexcept;
         std::unique_ptr<Impl> impl_;
     };
 

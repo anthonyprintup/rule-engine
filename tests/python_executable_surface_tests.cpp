@@ -45,6 +45,11 @@ namespace rule_engine::python::tools {
                                                   void (*hook)(void *) noexcept, void *context) noexcept {
             backend.set_maintenance_lock_hook_for_testing(hook, context);
         }
+
+        static void install_maintenance_audit_hook(FilesystemResidentPackUploadBackend &backend,
+                                                   bool (*hook)(void *) noexcept, void *context) noexcept {
+            backend.set_maintenance_audit_hook_for_testing(hook, context);
+        }
     };
 
 } // namespace rule_engine::python::tools
@@ -1936,6 +1941,38 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
     CHECK(store.commits == 0U);
 }
 
+TEST_CASE("legacy admin requests fail before authorization or store access") {
+    const tools::ResidentAdminRequest request {.kind = tools::ResidentAdminRequestKind::pack_snapshot,
+                                               .request_id = "request:legacy-version",
+                                               .tenant = py::TenantId {"tenant:test"},
+                                               .pack = py::PackId {"pack:test"},
+                                               .at_unix_ms = 10U};
+    auto legacy = tools::encode_resident_admin_request(request, 4U * py::kibibyte);
+    REQUIRE(legacy);
+    REQUIRE_FALSE(legacy->empty());
+    (*legacy)[0] = std::byte {5U};
+
+    CountingControlStore store;
+    AllowAdminPolicy policy;
+    RecordingUploadBackend uploads;
+    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, &uploads};
+    AllowTrust trust;
+    DurableFakeAgentBackend agents;
+    tools::ResidentApplicationService service {test_service_limits(), trust, agents, backend};
+    auto channel = std::make_shared<FakeChannelState>();
+    channel->application_input.push_back(std::move(*legacy));
+    service.run({.role = tools::ResidentSessionRole::administrator,
+                 .peer = {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:admin"}},
+                 .channel = std::make_unique<FakeByteChannel>(channel)},
+                {});
+
+    CHECK(channel->application_output.empty());
+    CHECK(policy.operations.empty());
+    CHECK(store.reads == 0U);
+    CHECK(store.commits == 0U);
+    CHECK(uploads.observation_reads == 0U);
+}
+
 TEST_CASE("standalone admin client maps explicit lifecycle commands without trusting an actor field") {
     const std::string source_digest {"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"};
     tools::AdminCommand stage {.action = tools::AdminAction::stage,
@@ -2418,6 +2455,74 @@ TEST_CASE("filesystem upload enforces tenant reservation quota and expires aband
     auto admitted = (*backend)->begin(tenant, pack, "upload:blocked", 1U);
     REQUIRE(admitted);
     CHECK(admitted->received_bytes == 0U);
+}
+
+TEST_CASE("filesystem maintenance recovers an audit failure after durable deletion planning") {
+    TemporaryDirectory temporary;
+    const std::filesystem::path crypto_library {RULE_ENGINE_PYTHON_SERVER_PATH};
+    py::packaging::TrustPolicy trust {
+        .mode = py::packaging::TrustMode::development,
+        .allow_unsigned_packs = true,
+        .allow_unsigned_generators = false,
+        .signers = {},
+    };
+    const tools::PackRegistryLimits limits {
+        .maximum_published_bytes = 32U * py::mebibyte,
+        .maximum_tenant_bytes = 16U * py::mebibyte,
+        .partial_session_ttl = std::chrono::minutes {1},
+        .unreferenced_retention = std::chrono::hours {1},
+    };
+    auto registry = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library, limits);
+    REQUIRE(registry);
+
+    auto archive = unsigned_upload_archive();
+    auto encoded = py::packaging::encode_canonical_source_pack(archive);
+    REQUIRE(encoded);
+    const py::TenantId tenant {"tenant:recovery"};
+    const py::PackId pack {"com.acme.upload"};
+    auto begun = (*registry)->begin(tenant, pack, "upload:recovery", encoded->size());
+    REQUIRE(begun);
+    auto appended = (*registry)->append(tenant, pack, "upload:recovery", 0U, *encoded);
+    REQUIRE(appended);
+    auto finalized = (*registry)->finalize(tenant, pack, "upload:recovery");
+    REQUIRE(finalized);
+    REQUIRE(finalized->source_digest);
+    auto object = py::packaging::content_addressed_source_pack_path(temporary.path, *finalized->source_digest);
+    REQUIRE(object);
+    REQUIRE(std::filesystem::is_regular_file(*object));
+
+    struct FailAuditOnce {
+        static bool fail(void *context) noexcept {
+            *static_cast<bool *>(context) = true;
+            return false;
+        }
+    };
+    bool audit_attempted {};
+    tools::FilesystemResidentPackUploadTestAccess::install_maintenance_audit_hook(**registry, &FailAuditOnce::fail,
+                                                                                  &audit_attempted);
+    const auto maintenance_now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                                std::chrono::system_clock::now().time_since_epoch())
+                                                                .count()) +
+                                 2U * 60U * 60U * 1'000U;
+    auto failed = (*registry)->maintain({}, maintenance_now);
+    REQUIRE_FALSE(failed);
+    CHECK(audit_attempted);
+    CHECK_FALSE(std::filesystem::exists(*object));
+    auto unavailable = (*registry)->observe_maintenance();
+    REQUIRE_FALSE(unavailable);
+    CHECK(std::filesystem::is_regular_file(temporary.path / ".uploads" / ".maintenance.pending"));
+
+    registry->reset();
+    registry = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library, limits);
+    REQUIRE(registry);
+    auto observed = (*registry)->observe_maintenance();
+    REQUIRE(observed);
+    CHECK(observed->successful_maintenance_runs == 1U);
+    CHECK(observed->last_maintenance_unix_ms == maintenance_now);
+    CHECK(observed->removed_completion_records == 1U);
+    CHECK(observed->removed_objects == 1U);
+    CHECK(observed->reclaimed_bytes == encoded->size());
+    CHECK_FALSE(std::filesystem::exists(temporary.path / ".uploads" / ".maintenance.pending"));
 }
 
 TEST_CASE("authorized registry observation does not wait behind filesystem maintenance") {

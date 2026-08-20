@@ -219,7 +219,12 @@ cumulative counts and last-success timestamp only after both the normal
 pack-scoped `pack.read` authorization and a separate global `registry.read`
 authorization succeed. An ordinary pack reader still receives the pack
 snapshot, but the registry fields remain absent and the registry is not read.
-An authorized audit read or update failure fails closed. These fields are
+Before deleting anything, maintenance durably writes a bounded pending plan
+containing only canonical hashed filenames, expected object sizes, and the
+aggregate receipt. Startup and every upload operation replay that plan under
+the cross-process registry lock, finish idempotent deletion, commit the audit
+exactly once, and clear the plan. Observation remains unavailable while a plan
+is pending. An authorized audit read or update failure fails closed. These fields are
 operational counters, not a Prometheus time series; alert on a stale
 last-success timestamp and corroborate non-zero reclamation with capacity
 monitoring.
@@ -435,8 +440,10 @@ bounded snapshot whose first line is `rule-engine.operator-bindings.v1` and
 whose remaining tab-separated rows contain tenant, peer, principal, principal
 kind, home tenant, pack prefix, and an explicit comma-separated capability
 set. Peers and principals are unique; tenant, pack prefix, principal kind, and
-capability must all authorize the exact resource. The version-5 canonical
-admin request wire and standalone client expose pack/operation reads, verified
+capability must all authorize the exact resource. The version-6 canonical
+admin request wire and version-4 response wire are a coordinated-upgrade
+boundary: deploy the matching server and CLI together. Mixed versions reject
+the request before authorization or mutation. The standalone client exposes pack/operation reads, verified
 resumable upload, server-owned distributed stage, bounded operation polling,
 forward rollback restaging, and activation preview, drain, explicit straggler
 fencing, and atomic flip. `pack.stage`, `pack.activate`, and `pack.rollback`

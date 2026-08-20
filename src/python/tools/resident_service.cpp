@@ -473,7 +473,7 @@ namespace rule_engine::python::tools {
             return std::unexpected(error(protocol_v2::ProtocolErrorCode::malformed, "admin request is invalid"));
         }
         Writer writer {.bytes = {}, .maximum = maximum_frame_bytes};
-        if (!writer.append_u8(5U) || !writer.append_u8(static_cast<std::uint8_t>(request.kind)) ||
+        if (!writer.append_u8(6U) || !writer.append_u8(static_cast<std::uint8_t>(request.kind)) ||
             !writer.append_string(request.request_id) || !writer.append_string(request.tenant.value) ||
             !writer.append_string(request.pack.value) || !writer.append_string(request.operation_id) ||
             !writer.append_string(request.idempotency_key) || !writer.append_u64(request.expected_pack_version) ||
@@ -532,7 +532,7 @@ namespace rule_engine::python::tools {
         auto source_digest = reader.read_string();
         auto state_schema_hash = reader.read_string();
         auto state_namespace = reader.read_string();
-        if (!version || *version != 5U || !kind || *kind < 1U || *kind > 13U || !request_id || !tenant || !pack ||
+        if (!version || *version != 6U || !kind || *kind < 1U || *kind > 13U || !request_id || !tenant || !pack ||
             !operation || !idempotency || !expected || !at || !reason || !target_generation || !drain_boundary ||
             !rollback_source_generation || !work_count || work_ids.size() != *work_count || !upload_offset ||
             !upload_total || !upload_payload || !source_digest || !state_schema_hash || !state_namespace ||

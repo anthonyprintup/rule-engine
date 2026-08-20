@@ -110,7 +110,7 @@ fresh leased targets are frozen, compilation resumes after restart, and the
 existing drain/fence/flip lifecycle activates the new forward generation.
 Negative coverage proves that a report whose semantic hash differs from the
 retained generation fails the rollback without changing the active generation.
-Executable-surface coverage proves v5 codec and CLI mappings plus the
+Executable-surface coverage proves v6 request/v4 response codecs and CLI mappings plus the
 authenticated backend transition; production operator bindings now authorize
 stage and rollback only through separate `pack.stage` and `pack.rollback`
 capabilities. Non-carry state transitions remain deliberately unavailable.

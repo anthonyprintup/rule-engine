@@ -178,7 +178,7 @@ namespace rule_engine::python::tools {
                 command.action != AdminAction::stage && command.action != AdminAction::activate &&
                 command.action != AdminAction::rollback) {
                 return std::unexpected(failure(ToolFailureKind::operation, "ADMIN-NOT-IMPLEMENTED",
-                                               "admin command is not available on the resident v5 control channel"));
+                                               "admin command is not available on the resident v6 control channel"));
             }
             if ((command.action == AdminAction::stage || command.action == AdminAction::activate ||
                  command.action == AdminAction::rollback) &&
