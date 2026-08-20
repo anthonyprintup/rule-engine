@@ -180,11 +180,11 @@ Every entry records impact, rationale, mitigation, observability, and revisit co
 
 ## L-025 — Agent certificate revocation is not checked online
 
-- **Impact:** The production agent validates the TLS chain, DNS name, exact URI SAN, and pinned SHA-256 certificate fingerprint, but this slice does not configure CRL files or OCSP fetching.
-- **Rationale:** Online revocation checks can add unbounded network dependencies, while a required local CRL needs a separately specified refresh and fail-closed expiry lifecycle.
-- **Mitigation:** Operators rotate the exact configured fingerprint and trust bundle through deployment configuration; startup fails closed when either does not match or credentials cannot be loaded.
-- **Observability:** Authentication failures expose only the failure class and never certificate, private-key, or trust-bundle contents.
-- **Revisit:** Add an operator-managed, expiry-checked local CRL or a separately bounded stapled-status design before claiming revocation coverage.
+- **Impact:** The production agent can enforce an operator-provisioned local CRL, but it does not fetch OCSP/CRL data or reload a replaced CRL while running. An agent without explicit local-CRL enablement still relies on its exact certificate fingerprint and trust bundle.
+- **Rationale:** Ambient online revocation introduces an independently failure-prone and potentially unbounded network dependency. Local files keep acquisition and refresh under deployment control while OpenSSL performs deterministic verification during the bounded TLS handshake.
+- **Mitigation:** Configure `crl_path` and `require_crl = true` together. Startup rejects a missing or malformed CRL, and full-chain CRL verification rejects missing issuer coverage, a stale CRL, a wrong issuer, or a revoked server certificate. Publish refreshed CRLs atomically and restart agents before `nextUpdate`; continue rotating the exact fingerprint and trust bundle through controlled deployment.
+- **Observability:** Configuration and authentication failures expose only the failure class and never certificate, private-key, CRL, or trust-bundle contents.
+- **Revisit:** Add a bounded atomic local-file reload lifecycle or separately bounded stapled-status design before claiming live refresh or online revocation coverage.
 
 ## L-026 — Container and iteration frontend is intentionally partial
 

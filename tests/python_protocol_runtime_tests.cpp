@@ -186,6 +186,11 @@ namespace {
         std::filesystem::path client_key;
         std::filesystem::path wrong_eku_certificate;
         std::filesystem::path wrong_eku_key;
+        std::filesystem::path clean_crl;
+        std::filesystem::path revoked_crl;
+        std::filesystem::path stale_crl;
+        std::filesystem::path wrong_issuer_crl;
+        std::filesystem::path malformed_crl;
 
         [[nodiscard]] static std::optional<CertificateFixture> generate(const std::filesystem::path &root) {
             CertificateFixture result {
@@ -197,6 +202,11 @@ namespace {
                 .client_key = root / "client.key",
                 .wrong_eku_certificate = root / "wrong-eku.pem",
                 .wrong_eku_key = root / "wrong-eku.key",
+                .clean_crl = root / "clean.crl.pem",
+                .revoked_crl = root / "revoked.crl.pem",
+                .stale_crl = root / "stale.crl.pem",
+                .wrong_issuer_crl = root / "wrong-issuer.crl.pem",
+                .malformed_crl = root / "malformed.crl.pem",
             };
             const auto ca_key = root / "ca.key";
             const auto alternate_key = root / "alternate-ca.key";
@@ -241,6 +251,50 @@ namespace {
                              " -out " + quoted(result.wrong_eku_certificate))) {
                 return std::nullopt;
             }
+
+            const auto write_ca_config = [&](const std::filesystem::path &path,
+                                             const std::filesystem::path &certificate, const std::filesystem::path &key,
+                                             const std::string_view stem) {
+                const auto database = root / (std::string {stem} + "-index.txt");
+                const auto serial_path = root / (std::string {stem} + "-serial");
+                const auto crl_number = root / (std::string {stem} + "-crlnumber");
+                const auto new_certificates = root / (std::string {stem} + "-newcerts");
+                std::error_code error;
+                std::filesystem::create_directories(new_certificates, error);
+                std::ofstream {database, std::ios::binary};
+                std::ofstream {serial_path, std::ios::binary} << "1000\n";
+                std::ofstream {crl_number, std::ios::binary} << "1000\n";
+                std::ofstream output {path, std::ios::binary};
+                output << "[ca]\n"
+                          "default_ca = CA_default\n"
+                          "[CA_default]\n"
+                          "database = \""
+                       << database.generic_string() << "\"\nnew_certs_dir = \"" << new_certificates.generic_string()
+                       << "\"\ncertificate = \"" << certificate.generic_string() << "\"\nprivate_key = \""
+                       << key.generic_string() << "\"\nserial = \"" << serial_path.generic_string()
+                       << "\"\ncrlnumber = \"" << crl_number.generic_string()
+                       << "\"\ndefault_md = sha256\ndefault_days = 30\ndefault_crl_days = 1\n"
+                          "unique_subject = no\npolicy = policy_any\n[policy_any]\ncommonName = supplied\n";
+                return !error && output.good();
+            };
+
+            const auto ca_config = root / "ca.cnf";
+            const auto alternate_config = root / "alternate-ca.cnf";
+            if (!write_ca_config(ca_config, result.ca, ca_key, "ca") ||
+                !write_ca_config(alternate_config, result.alternate_ca, alternate_key, "alternate") ||
+                !run_openssl("ca -batch -gencrl -config " + quoted(ca_config) + " -out " + quoted(result.clean_crl)) ||
+                !run_openssl("ca -batch -gencrl -config " + quoted(ca_config) +
+                             " -crl_lastupdate 20200101000000Z -crl_nextupdate 20200102000000Z -out " +
+                             quoted(result.stale_crl)) ||
+                !run_openssl("ca -batch -gencrl -config " + quoted(alternate_config) + " -out " +
+                             quoted(result.wrong_issuer_crl)) ||
+                !run_openssl("ca -batch -config " + quoted(ca_config) + " -revoke " +
+                             quoted(result.server_certificate)) ||
+                !run_openssl("ca -batch -gencrl -config " + quoted(ca_config) + " -out " +
+                             quoted(result.revoked_crl))) {
+                return std::nullopt;
+            }
+            std::ofstream {result.malformed_crl, std::ios::binary} << "not a PEM CRL\n";
             return result;
         }
     };
@@ -807,6 +861,30 @@ namespace {
         auto missing_crl = server_configuration(certificates->server_certificate, certificates->server_key);
         missing_crl.require_crl = true;
         REQUIRE_FALSE(OpenSslTlsContext::create(std::move(missing_crl)).has_value());
+        auto disabled_crl = server_configuration(certificates->server_certificate, certificates->server_key);
+        disabled_crl.crl_pem = certificates->clean_crl.string();
+        REQUIRE_FALSE(OpenSslTlsContext::create(std::move(disabled_crl)).has_value());
+
+        const auto client_with_crl = [&](const std::filesystem::path &path) {
+            auto configuration =
+                client_configuration(certificates->ca, certificates->client_certificate, certificates->client_key);
+            configuration.crl_pem = path.string();
+            configuration.require_crl = true;
+            return configuration;
+        };
+        REQUIRE(succeeds(server_configuration(certificates->server_certificate, certificates->server_key),
+                         client_with_crl(certificates->clean_crl)));
+
+        auto missing_crl_file = client_with_crl(temporary.path / "missing.crl.pem");
+        REQUIRE_FALSE(OpenSslTlsContext::create(std::move(missing_crl_file)).has_value());
+        auto malformed_crl = client_with_crl(certificates->malformed_crl);
+        REQUIRE_FALSE(OpenSslTlsContext::create(std::move(malformed_crl)).has_value());
+        REQUIRE_FALSE(succeeds(server_configuration(certificates->server_certificate, certificates->server_key),
+                               client_with_crl(certificates->stale_crl)));
+        REQUIRE_FALSE(succeeds(server_configuration(certificates->server_certificate, certificates->server_key),
+                               client_with_crl(certificates->wrong_issuer_crl)));
+        REQUIRE_FALSE(succeeds(server_configuration(certificates->server_certificate, certificates->server_key),
+                               client_with_crl(certificates->revoked_crl)));
 #endif
     }
 

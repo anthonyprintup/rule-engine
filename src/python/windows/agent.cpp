@@ -316,14 +316,19 @@ namespace rule_engine::python::windows {
             return std::unexpected(AgentFailure {.code = AgentFailureCode::configuration,
                                                  .message = "production TLS session requires hard resolver bounds"});
         }
+        if (configuration.require_crl != !configuration.crl_path.empty()) {
+            return std::unexpected(
+                AgentFailure {.code = AgentFailureCode::configuration,
+                              .message = "crl_path and require_crl = true must be configured together"});
+        }
         auto context = protocol_v2::OpenSslTlsContext::create(protocol_v2::TlsConfiguration {
             .role = protocol_v2::TlsEndpointRole::client,
             .trust_anchors_pem = configuration.ca_path.string(),
             .certificate_chain_pem = configuration.certificate_path.string(),
             .private_key_pem = configuration.private_key_path.string(),
-            .crl_pem = {},
+            .crl_pem = configuration.crl_path.string(),
             .expected_server_name = configuration.server_name,
-            .require_crl = false,
+            .require_crl = configuration.require_crl,
             .verification_time_unix_seconds = std::nullopt,
             .protocol_limits = configuration.protocol_limits,
         });

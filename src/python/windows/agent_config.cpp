@@ -218,6 +218,12 @@ namespace rule_engine::python::windows {
                     return std::unexpected(std::move(parsed.error()));
                 }
                 configuration.ca_path = std::move(*parsed);
+            } else if (key == "crl_path") {
+                auto parsed = absolute_path(value, line_number, key);
+                if (!parsed) {
+                    return std::unexpected(std::move(parsed.error()));
+                }
+                configuration.crl_path = std::move(*parsed);
             } else if (key == "server_endpoint") {
                 if (configuration.endpoints.size() >= maximum_endpoints) {
                     return std::unexpected(configuration_error("server_endpoint count exceeds eight", line_number));
@@ -265,6 +271,11 @@ namespace rule_engine::python::windows {
                 }
                 configuration.require_hard_resolver_bounds = value == "true";
                 configuration.reconnect_policy.require_hard_resolver_bounds = value == "true";
+            } else if (key == "require_crl") {
+                if (value != "true" && value != "false") {
+                    return std::unexpected(configuration_error("require_crl must be true or false", line_number));
+                }
+                configuration.require_crl = value == "true";
             } else {
                 return std::unexpected(
                     configuration_error("unknown configuration key: " + std::string {key}, line_number));
@@ -281,6 +292,9 @@ namespace rule_engine::python::windows {
         if (!configuration.require_hard_resolver_bounds) {
             return std::unexpected(
                 configuration_error("production agent requires require_hard_resolver_bounds = true"));
+        }
+        if (configuration.require_crl != !configuration.crl_path.empty()) {
+            return std::unexpected(configuration_error("crl_path and require_crl = true must be configured together"));
         }
         return configuration;
     }
@@ -306,9 +320,15 @@ namespace rule_engine::python::windows {
 
     std::expected<void, AgentFailure>
     validate_windows_agent_config_files(const WindowsAgentConfig &configuration) noexcept {
+        if (configuration.require_crl != !configuration.crl_path.empty()) {
+            return std::unexpected(configuration_error("crl_path and require_crl = true must be configured together"));
+        }
         const std::array tls_files {&configuration.certificate_path, &configuration.private_key_path,
-                                    &configuration.ca_path};
+                                    &configuration.ca_path, &configuration.crl_path};
         for (const auto *path : tls_files) {
+            if (path->empty()) {
+                continue;
+            }
             std::error_code error;
             if (!std::filesystem::is_regular_file(*path, error) || error) {
                 return std::unexpected(
@@ -332,6 +352,9 @@ namespace rule_engine::python::windows {
 
     std::expected<void, AgentFailure>
     validate_windows_agent_dependencies(const WindowsAgentConfig &configuration) noexcept {
+        if (configuration.require_crl != !configuration.crl_path.empty()) {
+            return std::unexpected(configuration_error("crl_path and require_crl = true must be configured together"));
+        }
         const auto tls = protocol_v2::tls_backend_status();
         if (!tls.available) {
             return std::unexpected(AgentFailure {.code = AgentFailureCode::dependency, .message = tls.diagnostic});
@@ -345,9 +368,9 @@ namespace rule_engine::python::windows {
             .trust_anchors_pem = configuration.ca_path.string(),
             .certificate_chain_pem = configuration.certificate_path.string(),
             .private_key_pem = configuration.private_key_path.string(),
-            .crl_pem = {},
+            .crl_pem = configuration.crl_path.string(),
             .expected_server_name = configuration.server_name,
-            .require_crl = false,
+            .require_crl = configuration.require_crl,
             .verification_time_unix_seconds = std::nullopt,
             .protocol_limits = configuration.protocol_limits,
         });

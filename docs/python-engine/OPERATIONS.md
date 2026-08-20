@@ -336,6 +336,8 @@ spool_path = C:\ProgramData\RuleEngine\agent\spool.sqlite3
 certificate_path = C:\ProgramData\RuleEngine\agent\client.pem
 private_key_path = C:\ProgramData\RuleEngine\agent\client-key.pem
 ca_path = C:\ProgramData\RuleEngine\agent\ca.pem
+crl_path = C:\ProgramData\RuleEngine\agent\server.crl.pem
+require_crl = true
 server_endpoint = 192.0.2.10:7443
 server_endpoint = [2001:db8::10]:7443
 server_name = coordinator.example
@@ -345,8 +347,17 @@ peer_id = peer:example-host
 active_generation = 1
 ```
 
-All filesystem paths are absolute. The TLS chain, DNS name, exact URI SAN, and
-SHA-256 leaf fingerprint must agree. Validate before running:
+All filesystem paths are absolute. `crl_path` and `require_crl = true` must be
+configured together; omitting both leaves local-CRL enforcement disabled. When
+enabled, OpenSSL checks the full certificate chain and rejects missing issuer
+coverage, malformed or stale CRLs, a wrong CRL issuer, and revoked server
+certificates. The TLS chain, DNS name, exact URI SAN, and SHA-256 leaf
+fingerprint must still agree.
+
+CRL acquisition remains an operator responsibility: publish a refreshed file
+atomically and restart the agent before its `nextUpdate`. The agent performs no
+OCSP or online CRL fetch and does not reload the file in place. Validate before
+running:
 
 ```powershell
 rule_engine_agent --config C:/ProgramData/RuleEngine/agent/agent.conf --validate-config

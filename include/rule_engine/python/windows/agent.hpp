@@ -43,6 +43,7 @@ namespace rule_engine::python::windows {
         std::filesystem::path certificate_path;
         std::filesystem::path private_key_path;
         std::filesystem::path ca_path;
+        std::filesystem::path crl_path;
         std::vector<protocol_v2::TcpEndpoint> endpoints;
         std::string server_name;
         std::string server_uri;
@@ -50,6 +51,7 @@ namespace rule_engine::python::windows {
         PeerId peer;
         std::uint64_t active_generation {};
         bool require_hard_resolver_bounds {true};
+        bool require_crl {};
         protocol_v2::ProtocolLimits protocol_limits;
         protocol_v2::AgentSpoolLimits spool_limits;
         protocol_v2::SocketTimeouts socket_timeouts;

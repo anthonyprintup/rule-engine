@@ -374,11 +374,22 @@ TEST_CASE("Windows agent configuration and command line are strict and productio
     CHECK(parsed->endpoints.size() == 2U);
     CHECK(parsed->require_hard_resolver_bounds);
     CHECK(parsed->reconnect_policy.require_hard_resolver_bounds);
+    CHECK_FALSE(parsed->require_crl);
+    CHECK(parsed->crl_path.empty());
+
+    const auto with_crl = valid + "crl_path = C:\\agent\\server.crl.pem\nrequire_crl = true\n";
+    const auto parsed_crl = win::parse_windows_agent_config(with_crl);
+    REQUIRE(parsed_crl.has_value());
+    CHECK(parsed_crl->require_crl);
+    CHECK(parsed_crl->crl_path == std::filesystem::path {"C:\\agent\\server.crl.pem"});
 
     CHECK_FALSE(win::parse_windows_agent_config(valid + "unknown_key = value\n").has_value());
     CHECK_FALSE(win::parse_windows_agent_config(valid + "peer_id = duplicate\n").has_value());
     auto unsafe = valid + "require_hard_resolver_bounds = false\n";
     CHECK_FALSE(win::parse_windows_agent_config(unsafe).has_value());
+    CHECK_FALSE(win::parse_windows_agent_config(valid + "require_crl = true\n").has_value());
+    CHECK_FALSE(win::parse_windows_agent_config(valid + "crl_path = C:\\agent\\server.crl.pem\n").has_value());
+    CHECK_FALSE(win::parse_windows_agent_config(valid + "crl_path = server.crl.pem\nrequire_crl = true\n").has_value());
     auto dns = valid;
     dns.replace(dns.find("127.0.0.1:7443"), std::string_view {"127.0.0.1:7443"}.size(), "example.test:7443");
     CHECK_FALSE(win::parse_windows_agent_config(dns).has_value());
@@ -393,6 +404,16 @@ TEST_CASE("Windows agent configuration and command line are strict and productio
     REQUIRE(win::parse_windows_agent_command(run).has_value());
     REQUIRE(win::parse_windows_agent_command(validate).has_value());
     CHECK_FALSE(win::parse_windows_agent_command(reordered).has_value());
+
+    TemporarySpool temporary;
+    auto missing_crl = test_configuration(temporary.path);
+    const auto existing_file = std::filesystem::path {__FILE__};
+    missing_crl.certificate_path = existing_file;
+    missing_crl.private_key_path = existing_file;
+    missing_crl.ca_path = existing_file;
+    missing_crl.crl_path = temporary.path.string() + ".crl.pem";
+    missing_crl.require_crl = true;
+    CHECK_FALSE(win::validate_windows_agent_config_files(missing_crl).has_value());
 }
 
 TEST_CASE("Windows agent spools an entire typed inventory projection before its first send") {

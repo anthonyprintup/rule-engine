@@ -328,7 +328,7 @@ namespace rule_engine::python::protocol_v2 {
         if (configuration.trust_anchors_pem.empty() || configuration.certificate_chain_pem.empty() ||
             configuration.private_key_pem.empty() ||
             (configuration.role == TlsEndpointRole::client && configuration.expected_server_name.empty()) ||
-            (configuration.require_crl && configuration.crl_pem.empty())) {
+            (configuration.require_crl != !configuration.crl_pem.empty())) {
             return std::unexpected(transport_error(ProtocolErrorCode::malformed, "TLS configuration is incomplete"));
         }
 
@@ -360,7 +360,7 @@ namespace rule_engine::python::protocol_v2 {
         }
 
         auto *store = SSL_CTX_get_cert_store(impl->context);
-        if (!impl->configuration.crl_pem.empty()) {
+        if (impl->configuration.require_crl) {
             if (X509_STORE_load_file(store, impl->configuration.crl_pem.c_str()) != 1 ||
                 X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL) != 1) {
                 return std::unexpected(
