@@ -12,6 +12,8 @@ namespace rule_engine::python::tools {
 
     inline constexpr std::uint64_t maximum_pack_registry_bytes = 1ULL << 50U;
 
+    struct FilesystemResidentPackUploadTestAccess;
+
     struct PackRegistryLimits {
         std::uint64_t maximum_published_bytes {};
         std::uint64_t maximum_tenant_bytes {};
@@ -47,8 +49,11 @@ namespace rule_engine::python::tools {
         observe_maintenance() noexcept override;
 
     private:
+        friend struct FilesystemResidentPackUploadTestAccess;
+
         struct Impl;
         explicit FilesystemResidentPackUploadBackend(std::unique_ptr<Impl> impl) noexcept;
+        void set_maintenance_lock_hook_for_testing(void (*hook)(void *) noexcept, void *context) noexcept;
         std::unique_ptr<Impl> impl_;
     };
 

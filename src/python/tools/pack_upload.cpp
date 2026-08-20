@@ -575,6 +575,8 @@ namespace rule_engine::python::tools {
         std::filesystem::path crypto_library;
         PackRegistryLimits limits;
         std::mutex mutex;
+        void (*maintenance_lock_hook)(void *) noexcept {};
+        void *maintenance_lock_hook_context {};
 
         [[nodiscard]] std::filesystem::path maintenance_audit_path() const { return spool / ".maintenance.audit"; }
 
@@ -758,6 +760,16 @@ namespace rule_engine::python::tools {
     FilesystemResidentPackUploadBackend::FilesystemResidentPackUploadBackend(std::unique_ptr<Impl> impl) noexcept:
         impl_ {std::move(impl)} {}
     FilesystemResidentPackUploadBackend::~FilesystemResidentPackUploadBackend() = default;
+
+    void FilesystemResidentPackUploadBackend::set_maintenance_lock_hook_for_testing(void (*hook)(void *) noexcept,
+                                                                                    void *context) noexcept {
+        if (impl_ == nullptr) {
+            return;
+        }
+        std::scoped_lock lock {impl_->mutex};
+        impl_->maintenance_lock_hook = hook;
+        impl_->maintenance_lock_hook_context = context;
+    }
 
     std::expected<std::unique_ptr<FilesystemResidentPackUploadBackend>, protocol_v2::ProtocolError>
     FilesystemResidentPackUploadBackend::create(std::filesystem::path registry_root,
@@ -1043,6 +1055,9 @@ namespace rule_engine::python::tools {
         auto spool_lock = ScopedSpoolLock::acquire(impl_->spool / ".spool.lock");
         if (!spool_lock) {
             return std::unexpected(std::move(spool_lock.error()));
+        }
+        if (impl_->maintenance_lock_hook != nullptr) {
+            impl_->maintenance_lock_hook(impl_->maintenance_lock_hook_context);
         }
         auto result = impl_->expire_partials(now_unix_ms);
         if (!result) {

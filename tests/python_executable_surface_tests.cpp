@@ -38,6 +38,17 @@
 #include <sys/wait.h>
 #endif
 
+namespace rule_engine::python::tools {
+
+    struct FilesystemResidentPackUploadTestAccess {
+        static void install_maintenance_lock_hook(FilesystemResidentPackUploadBackend &backend,
+                                                  void (*hook)(void *) noexcept, void *context) noexcept {
+            backend.set_maintenance_lock_hook_for_testing(hook, context);
+        }
+    };
+
+} // namespace rule_engine::python::tools
+
 namespace {
 
     struct TemporaryDirectory {
@@ -2311,37 +2322,42 @@ TEST_CASE("authorized registry observation does not wait behind filesystem maint
                                                .tenant = py::TenantId {"tenant:test"},
                                                .pack = py::PackId {"pack:test"},
                                                .at_unix_ms = 10U};
-    std::atomic<bool> started {};
-    std::atomic<bool> finished {};
-    std::atomic<bool> maintenance_failed {};
-    std::jthread maintainer {[&] {
-        started.store(true, std::memory_order_release);
-        for (std::uint64_t pass = 0U; pass < 32U; ++pass) {
-            if (!(*registry)->maintain({}, 1'000U + pass)) {
-                maintenance_failed.store(true, std::memory_order_release);
-                break;
-            }
-        }
-        finished.store(true, std::memory_order_release);
-    }};
-    while (!started.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+    struct MaintenancePause {
+        std::atomic<bool> entered {};
+        std::atomic<bool> release {};
 
-    bool rejected_busy {};
-    while (!finished.load(std::memory_order_acquire)) {
-        const auto response = admin.execute(peer, request);
-        if (response.status == tools::ResidentAdminResponseStatus::unavailable &&
-            response.code == "ADMIN-REGISTRY-OBSERVATION-UNAVAILABLE") {
-            rejected_busy = true;
-            break;
+        static void after_lock(void *context) noexcept {
+            auto &pause = *static_cast<MaintenancePause *>(context);
+            pause.entered.store(true, std::memory_order_release);
+            while (!pause.release.load(std::memory_order_acquire)) { std::this_thread::yield(); }
         }
+    } pause;
+    tools::FilesystemResidentPackUploadTestAccess::install_maintenance_lock_hook(**registry,
+                                                                                 &MaintenancePause::after_lock, &pause);
+    std::atomic<bool> maintenance_succeeded {};
+    std::jthread maintainer {
+        [&] { maintenance_succeeded.store((*registry)->maintain({}, 1'000U).has_value(), std::memory_order_release); }};
+    const auto entry_deadline = std::chrono::steady_clock::now() + std::chrono::seconds {5};
+    while (!pause.entered.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < entry_deadline) {
+        std::this_thread::yield();
     }
+    const auto entered = pause.entered.load(std::memory_order_acquire);
+    if (!entered) {
+        pause.release.store(true, std::memory_order_release);
+        maintainer.join();
+    }
+    REQUIRE(entered);
+
+    const auto response = admin.execute(peer, request);
+    CHECK(response.status == tools::ResidentAdminResponseStatus::unavailable);
+    CHECK(response.code == "ADMIN-REGISTRY-OBSERVATION-UNAVAILABLE");
+    pause.release.store(true, std::memory_order_release);
     maintainer.join();
 
-    CHECK_FALSE(maintenance_failed.load(std::memory_order_acquire));
-    CHECK(rejected_busy);
+    CHECK(maintenance_succeeded.load(std::memory_order_acquire));
     const auto observed = (*registry)->observe_maintenance();
     REQUIRE(observed);
-    CHECK(observed->successful_maintenance_runs == 32U);
+    CHECK(observed->successful_maintenance_runs == 1U);
 }
 
 TEST_CASE("resident admin v2 activation sequence is durable and idempotent across lost responses") {
