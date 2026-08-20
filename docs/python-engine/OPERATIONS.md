@@ -219,15 +219,27 @@ cumulative counts and last-success timestamp only after both the normal
 pack-scoped `pack.read` authorization and a separate global `registry.read`
 authorization succeed. An ordinary pack reader still receives the pack
 snapshot, but the registry fields remain absent and the registry is not read.
-Before deleting anything, maintenance durably writes a bounded pending plan
-containing only canonical hashed filenames, expected object sizes, and the
-aggregate receipt. Startup and every upload operation replay that plan under
-the cross-process registry lock, finish idempotent deletion, commit the audit
-exactly once, and clear the plan. Observation remains unavailable while a plan
-is pending. An authorized audit read or update failure fails closed. These fields are
-operational counters, not a Prometheus time series; alert on a stale
-last-success timestamp and corroborate non-zero reclamation with capacity
-monitoring.
+Before deleting anything, maintenance durably writes a bounded v2 pending plan
+containing only canonical hashed filenames, expected object sizes, pinned
+spool/object-directory identities, and the aggregate receipt. It validates the
+audit base, target uniqueness and partial-to-metadata pairing, exact receipt
+totals, target bounds, and every possible aggregate-counter overflow before the
+first unlink. The server pins both registry directories without following a
+reparse point or symlink, deletes only verified regular children relative to
+those handles, and refuses a replaced directory tree. POSIX synchronizes each
+mutated parent directory; Windows uses write-through deletion handles before
+the audit is advanced or the journal is cleared.
+
+Startup and every upload operation replay the plan under the cross-process
+registry lock, finish idempotent deletion, commit the audit exactly once, and
+clear the plan only after object and spool deletion metadata is durable.
+Observation remains unavailable while a plan is pending. The v1 pending-plan
+format is intentionally not replayed by this server; during upgrade, finish
+maintenance first or have an operator inspect and reconcile the protected
+spool rather than deleting the record blindly. An authorized audit read or
+update failure fails closed. These fields are operational counters, not a
+Prometheus time series; alert on a stale last-success timestamp and corroborate
+non-zero reclamation with capacity monitoring.
 
 The capability inventory is a bounded UTF-8 file whose exact first line is
 `rule-engine.resident-capabilities.v1`. Every following non-comment line is one

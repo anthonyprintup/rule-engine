@@ -7,7 +7,9 @@ set(
     CACHE STRING
     "Installed Rule Engine component exercised by the downstream smoke"
 )
-find_package(rule_engine 1 CONFIG REQUIRED COMPONENTS "${RULE_ENGINE_DOWNSTREAM_COMPONENT}")
+set(RULE_ENGINE_DOWNSTREAM_PACKAGE_VERSION "2.0.0" CACHE STRING "Exact installed C++ package ABI version")
+find_package(rule_engine ${RULE_ENGINE_DOWNSTREAM_PACKAGE_VERSION} EXACT CONFIG REQUIRED
+             COMPONENTS "${RULE_ENGINE_DOWNSTREAM_COMPONENT}")
 
 add_executable(rule_engine_downstream_smoke main.cpp)
 target_link_libraries(

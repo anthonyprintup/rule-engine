@@ -5,6 +5,9 @@ foreach(required IN ITEMS RULE_ENGINE_SOURCE_DIR RULE_ENGINE_BINARY_ROOT)
         message(FATAL_ERROR "${required} is required")
     endif()
 endforeach()
+if(NOT DEFINED RULE_ENGINE_DOWNSTREAM_PACKAGE_VERSION OR RULE_ENGINE_DOWNSTREAM_PACKAGE_VERSION STREQUAL "")
+    set(RULE_ENGINE_DOWNSTREAM_PACKAGE_VERSION "2.0.0")
+endif()
 
 cmake_path(ABSOLUTE_PATH RULE_ENGINE_SOURCE_DIR NORMALIZE OUTPUT_VARIABLE source_root)
 cmake_path(ABSOLUTE_PATH RULE_ENGINE_BINARY_ROOT NORMALIZE OUTPUT_VARIABLE binary_root)
@@ -113,6 +116,7 @@ run_checked(
     ${generator_args}
     ${toolchain_args}
     "-DRULE_ENGINE_SOURCE_ROOT=${source_root}"
+    "-DRULE_ENGINE_PACKAGE_VERSION=${RULE_ENGINE_DOWNSTREAM_PACKAGE_VERSION}"
     "-DCMAKE_INSTALL_PREFIX=${configured_prefix}"
     -DCMAKE_BUILD_TYPE=Release
 )
@@ -251,6 +255,7 @@ run_checked(
     ${generator_args}
     ${toolchain_args}
     "-DCMAKE_PREFIX_PATH=${prefix}"
+    "-DRULE_ENGINE_DOWNSTREAM_PACKAGE_VERSION=${RULE_ENGINE_DOWNSTREAM_PACKAGE_VERSION}"
     -DCMAKE_BUILD_TYPE=Release
 )
 run_checked("downstream build" "${CMAKE_COMMAND}" --build "${downstream_build}" --config Release)

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.31)
-project(rule_engine_install_fixture VERSION 1.0.0 LANGUAGES CXX)
+project(rule_engine_install_fixture VERSION 2.0.0 LANGUAGES CXX)
 
 if(NOT RULE_ENGINE_SOURCE_ROOT)
     message(FATAL_ERROR "RULE_ENGINE_SOURCE_ROOT is required")

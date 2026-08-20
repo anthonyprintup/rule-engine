@@ -48,9 +48,23 @@ be header-only or gains link directories/options that cannot be flattened.
 Downstream CMake consumers use:
 
 ```cmake
-find_package(rule_engine 1 CONFIG REQUIRED COMPONENTS python_contract)
+find_package(rule_engine 2.0.0 EXACT CONFIG REQUIRED COMPONENTS python_contract)
 target_link_libraries(app PRIVATE rule_engine::python_contract)
 ```
+
+The installed C++ package uses the exact `2.0.0` compatibility boundary. This
+major was introduced because resident-admin response layout changed; binaries
+built against the 1.x headers must be rebuilt together with the server and CLI.
+The package version file deliberately uses `ExactVersion`, and install
+configuration rejects attempts to publish this API as a pre-2.0 package. The
+authoring SDK and executable tool protocol retain their separately versioned
+`1.0.0` contracts; those versions do not promise C++ ABI compatibility.
+
+Registry maintenance observation is exposed through the optional
+`IResidentPackRegistryObserver` interface. Existing source implementations of
+`IResidentPackUploadBackend` do not need a new virtual method, although any
+binary linked against the installed 1.x C++ libraries still requires the
+coordinated rebuild above.
 
 The config also exposes relocatable `rule_engine_PYTHON_SDK_DIR`,
 `rule_engine_PYTHON_WORKER`, `rule_engine_DOCUMENTATION_DIR`, and

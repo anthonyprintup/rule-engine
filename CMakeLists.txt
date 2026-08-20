@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.31)
-project(rule_engine VERSION 1.0.0 LANGUAGES C CXX)
+project(rule_engine VERSION 2.0.0 LANGUAGES C CXX)
 
 if(WIN32 AND CMAKE_GENERATOR MATCHES "^Ninja")
     execute_process(

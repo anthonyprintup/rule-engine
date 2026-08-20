@@ -229,6 +229,13 @@ namespace rule_engine::python::tools {
         finalize(const TenantId &tenant, const PackId &pack, std::string_view upload_id) noexcept = 0;
         [[nodiscard]] virtual std::expected<ResidentPackRegistryMaintenanceReceipt, protocol_v2::ProtocolError>
         maintain(std::span<const SourceDigest> reachable_source_digests, std::uint64_t now_unix_ms) noexcept = 0;
+    };
+
+    // Separate from the installed upload interface so registry observation is
+    // an optional capability and existing upload backend implementations remain
+    // source-compatible.
+    struct IResidentPackRegistryObserver {
+        virtual ~IResidentPackRegistryObserver() = default;
         [[nodiscard]] virtual std::expected<ResidentPackRegistryObservation, protocol_v2::ProtocolError>
         observe_maintenance() noexcept = 0;
     };
@@ -246,7 +253,8 @@ namespace rule_engine::python::tools {
                                        cluster::IAdminSecurityAuditSink *security_audit = nullptr,
                                        IResidentPackUploadBackend *uploads = nullptr,
                                        IResidentStageSourceBackend *stages = nullptr,
-                                       IResidentAgentBackend *activation_target = nullptr) noexcept;
+                                       IResidentAgentBackend *activation_target = nullptr,
+                                       IResidentPackRegistryObserver *registry_observer = nullptr) noexcept;
 
         [[nodiscard]] ResidentAdminResponse execute(const protocol_v2::AuthenticatedPeer &peer,
                                                     const ResidentAdminRequest &request) noexcept override;
@@ -258,6 +266,7 @@ namespace rule_engine::python::tools {
         IResidentPackUploadBackend *uploads_ {};
         IResidentStageSourceBackend *stages_ {};
         IResidentAgentBackend *activation_target_ {};
+        IResidentPackRegistryObserver *registry_observer_ {};
     };
 
     struct ResidentSessionJob {

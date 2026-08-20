@@ -25,7 +25,8 @@ namespace rule_engine::python::tools {
     // evidence: finalize re-parses the canonical archive, verifies signer
     // policy, checks the authorized pack identity, and performs immutable
     // content-addressed publication.
-    struct FilesystemResidentPackUploadBackend final: IResidentPackUploadBackend {
+    struct FilesystemResidentPackUploadBackend final: IResidentPackUploadBackend,
+                                                      IResidentPackRegistryObserver {
         [[nodiscard]] static std::expected<std::unique_ptr<FilesystemResidentPackUploadBackend>,
                                            protocol_v2::ProtocolError>
         create(std::filesystem::path registry_root, packaging::TrustPolicy trust_policy,
@@ -54,6 +55,7 @@ namespace rule_engine::python::tools {
         struct Impl;
         explicit FilesystemResidentPackUploadBackend(std::unique_ptr<Impl> impl) noexcept;
         void set_maintenance_lock_hook_for_testing(void (*hook)(void *) noexcept, void *context) noexcept;
+        void set_maintenance_apply_hook_for_testing(bool (*hook)(void *) noexcept, void *context) noexcept;
         void set_maintenance_audit_hook_for_testing(bool (*hook)(void *) noexcept, void *context) noexcept;
         std::unique_ptr<Impl> impl_;
     };

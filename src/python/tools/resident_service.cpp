@@ -737,18 +737,18 @@ namespace rule_engine::python::tools {
         return response;
     }
 
-    AuthorizedResidentAdminBackend::AuthorizedResidentAdminBackend(cluster::IActivationControlStore &store,
-                                                                   const IResidentAdminAccessPolicy &policy,
-                                                                   cluster::IAdminSecurityAuditSink *security_audit,
-                                                                   IResidentPackUploadBackend *uploads,
-                                                                   IResidentStageSourceBackend *stages,
-                                                                   IResidentAgentBackend *activation_target) noexcept:
+    AuthorizedResidentAdminBackend::AuthorizedResidentAdminBackend(
+        cluster::IActivationControlStore &store, const IResidentAdminAccessPolicy &policy,
+        cluster::IAdminSecurityAuditSink *security_audit, IResidentPackUploadBackend *uploads,
+        IResidentStageSourceBackend *stages, IResidentAgentBackend *activation_target,
+        IResidentPackRegistryObserver *registry_observer) noexcept:
         durable_ {store},
         policy_ {policy},
         security_audit_ {security_audit},
         uploads_ {uploads},
         stages_ {stages},
-        activation_target_ {activation_target} {}
+        activation_target_ {activation_target},
+        registry_observer_ {registry_observer} {}
 
     ResidentAdminResponse AuthorizedResidentAdminBackend::execute(const protocol_v2::AuthenticatedPeer &peer,
                                                                   const ResidentAdminRequest &request) noexcept {
@@ -827,8 +827,8 @@ namespace rule_engine::python::tools {
                 return rejected_response(request, snapshot.error());
             }
             std::optional<ResidentPackRegistryObservation> registry;
-            if (uploads_ != nullptr && admin.authorize_registry_observation(context)) {
-                auto observed = uploads_->observe_maintenance();
+            if (registry_observer_ != nullptr && admin.authorize_registry_observation(context)) {
+                auto observed = registry_observer_->observe_maintenance();
                 if (!observed) {
                     auto response = unavailable_after_commit();
                     response.code = "ADMIN-REGISTRY-OBSERVATION-UNAVAILABLE";

@@ -53,6 +53,11 @@ namespace rule_engine::python::tools {
                                                    bool (*hook)(void *) noexcept, void *context) noexcept {
             backend.set_maintenance_audit_hook_for_testing(hook, context);
         }
+
+        static void install_maintenance_apply_hook(FilesystemResidentPackUploadBackend &backend,
+                                                   bool (*hook)(void *) noexcept, void *context) noexcept {
+            backend.set_maintenance_apply_hook_for_testing(hook, context);
+        }
     };
 
     struct ResidentApplicationServiceTestAccess {
@@ -1078,7 +1083,32 @@ namespace {
         }
     };
 
-    struct RecordingUploadBackend final: tools::IResidentPackUploadBackend {
+    // A backend written against the pre-observation upload contract remains a
+    // concrete implementation. Registry-wide observation is an independent,
+    // operator-only capability rather than a new upload-backend requirement.
+    struct LegacyUploadBackend final: tools::IResidentPackUploadBackend {
+        [[nodiscard]] std::expected<tools::ResidentPackUploadReceipt, proto::ProtocolError>
+        begin(const py::TenantId &, const py::PackId &, std::string_view, std::uint64_t) noexcept override {
+            return tools::ResidentPackUploadReceipt {};
+        }
+        [[nodiscard]] std::expected<tools::ResidentPackUploadReceipt, proto::ProtocolError>
+        append(const py::TenantId &, const py::PackId &, std::string_view, std::uint64_t,
+               std::span<const std::byte>) noexcept override {
+            return tools::ResidentPackUploadReceipt {};
+        }
+        [[nodiscard]] std::expected<tools::ResidentPackUploadReceipt, proto::ProtocolError>
+        finalize(const py::TenantId &, const py::PackId &, std::string_view) noexcept override {
+            return tools::ResidentPackUploadReceipt {};
+        }
+        [[nodiscard]] std::expected<tools::ResidentPackRegistryMaintenanceReceipt, proto::ProtocolError>
+        maintain(std::span<const py::SourceDigest>, std::uint64_t) noexcept override {
+            return tools::ResidentPackRegistryMaintenanceReceipt {};
+        }
+    };
+    static_assert(!std::is_abstract_v<LegacyUploadBackend>);
+
+    struct RecordingUploadBackend final: tools::IResidentPackUploadBackend,
+                                         tools::IResidentPackRegistryObserver {
         std::vector<tools::ResidentAdminRequestKind> calls;
         std::vector<std::byte> bytes;
         std::uint64_t total_bytes {};
@@ -1842,7 +1872,8 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
     CountingControlStore store;
     DenyAdminPolicy policy;
     RecordingUploadBackend denied_uploads;
-    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, &denied_uploads};
+    tools::AuthorizedResidentAdminBackend backend {store,   policy,  nullptr,        &denied_uploads,
+                                                   nullptr, nullptr, &denied_uploads};
     const std::array requests {
         tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::pack_snapshot,
                                      .request_id = "request:pack",
@@ -2063,7 +2094,7 @@ TEST_CASE("legacy admin requests fail before authorization or store access") {
     CountingControlStore store;
     AllowAdminPolicy policy;
     RecordingUploadBackend uploads;
-    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, &uploads};
+    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, &uploads, nullptr, nullptr, &uploads};
     AllowTrust trust;
     DurableFakeAgentBackend agents;
     tools::ResidentApplicationService service {test_service_limits(), trust, agents, backend};
@@ -2270,7 +2301,7 @@ TEST_CASE("resident upload authorizes every phase before touching the bounded ba
     CountingControlStore store;
     AllowAdminPolicy policy;
     RecordingUploadBackend uploads;
-    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, &uploads};
+    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, &uploads, nullptr, nullptr, &uploads};
     const proto::AuthenticatedPeer peer {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:admin"}};
     tools::ResidentAdminRequest request {
         .kind = tools::ResidentAdminRequestKind::upload_begin,
@@ -2330,7 +2361,7 @@ TEST_CASE("authorized pack snapshots expose aggregate registry maintenance witho
                            .removed_completion_records = 3U,
                            .removed_objects = 2U,
                            .reclaimed_bytes = 1024U};
-    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, &uploads};
+    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, &uploads, nullptr, nullptr, &uploads};
     const auto response = backend.execute({.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:admin"}},
                                           {.kind = tools::ResidentAdminRequestKind::pack_snapshot,
                                            .request_id = "request:pack:registry",
@@ -2368,7 +2399,7 @@ TEST_CASE("pack snapshots omit global registry observations when registry author
                            .removed_completion_records = 3U,
                            .removed_objects = 2U,
                            .reclaimed_bytes = 1024U};
-    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, &uploads};
+    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, &uploads, nullptr, nullptr, &uploads};
     const auto response = backend.execute({.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:admin"}},
                                           {.kind = tools::ResidentAdminRequestKind::pack_snapshot,
                                            .request_id = "request:pack:no-registry-authority",
@@ -2633,6 +2664,182 @@ TEST_CASE("filesystem maintenance recovers an audit failure after durable deleti
     CHECK_FALSE(std::filesystem::exists(temporary.path / ".uploads" / ".maintenance.pending"));
 }
 
+TEST_CASE("filesystem maintenance validates a durable journal before deleting on reopen") {
+    TemporaryDirectory temporary;
+    const std::filesystem::path crypto_library {RULE_ENGINE_PYTHON_SERVER_PATH};
+    py::packaging::TrustPolicy trust {
+        .mode = py::packaging::TrustMode::development,
+        .allow_unsigned_packs = true,
+        .allow_unsigned_generators = false,
+        .signers = {},
+    };
+    const tools::PackRegistryLimits limits {
+        .maximum_published_bytes = 32U * py::mebibyte,
+        .maximum_tenant_bytes = 16U * py::mebibyte,
+        .partial_session_ttl = std::chrono::minutes {1},
+        .unreferenced_retention = std::chrono::hours {1},
+    };
+    auto registry = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library, limits);
+    REQUIRE(registry);
+
+    auto archive = unsigned_upload_archive();
+    auto encoded = py::packaging::encode_canonical_source_pack(archive);
+    REQUIRE(encoded);
+    const py::TenantId tenant {"tenant:journal-validation"};
+    const py::PackId pack {"com.acme.upload"};
+    REQUIRE((*registry)->begin(tenant, pack, "upload:journal-validation", encoded->size()));
+    REQUIRE((*registry)->append(tenant, pack, "upload:journal-validation", 0U, *encoded));
+    auto finalized = (*registry)->finalize(tenant, pack, "upload:journal-validation");
+    REQUIRE(finalized);
+    REQUIRE(finalized->source_digest);
+    auto object = py::packaging::content_addressed_source_pack_path(temporary.path, *finalized->source_digest);
+    REQUIRE(object);
+    REQUIRE(std::filesystem::is_regular_file(*object));
+
+    struct StopBeforeApply {
+        static bool stop(void *) noexcept { return false; }
+    };
+    tools::FilesystemResidentPackUploadTestAccess::install_maintenance_apply_hook(**registry, &StopBeforeApply::stop,
+                                                                                  nullptr);
+    const auto maintenance_now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                                std::chrono::system_clock::now().time_since_epoch())
+                                                                .count()) +
+                                 2U * 60U * 60U * 1'000U;
+    REQUIRE_FALSE((*registry)->maintain({}, maintenance_now));
+    const auto journal_path = temporary.path / ".uploads" / ".maintenance.pending";
+    REQUIRE(std::filesystem::is_regular_file(journal_path));
+    REQUIRE(std::filesystem::is_regular_file(*object));
+    registry->reset();
+
+    const auto original_journal = read_file(journal_path);
+    const auto split_lines = [](const std::string_view text) {
+        std::vector<std::string> result;
+        std::size_t begin {};
+        while (begin < text.size()) {
+            const auto end = text.find('\n', begin);
+            REQUIRE(end != std::string_view::npos);
+            result.emplace_back(text.substr(begin, end - begin));
+            begin = end + 1U;
+        }
+        return result;
+    };
+    const auto join_lines = [](const std::vector<std::string> &lines) {
+        std::string result;
+        for (const auto &line : lines) { result += line + '\n'; }
+        return result;
+    };
+    const auto original_lines = split_lines(original_journal);
+    REQUIRE(original_lines.size() >= 12U);
+
+    const auto reject_without_deletion = [&](std::vector<std::string> lines) {
+        write_file(journal_path, join_lines(lines));
+        auto reopened =
+            tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library, limits);
+        CHECK_FALSE(reopened);
+        CHECK(std::filesystem::is_regular_file(*object));
+    };
+
+    auto wrong_base = original_lines;
+    wrong_base[3] = "1";
+    reject_without_deletion(std::move(wrong_base));
+
+    auto duplicate_target = original_lines;
+    duplicate_target.push_back(duplicate_target.back());
+    duplicate_target[9] = std::to_string(duplicate_target.size() - 10U);
+    reject_without_deletion(std::move(duplicate_target));
+
+    auto wrong_receipt = original_lines;
+    wrong_receipt[7] = "0";
+    reject_without_deletion(std::move(wrong_receipt));
+
+    write_file(journal_path, original_journal);
+    write_file(temporary.path / ".uploads" / ".maintenance.audit", "rule-engine.pack-registry-maintenance.v1\n"
+                                                                   "0\n0\n0\n0\n0\n18446744073709551615\n0\n");
+    auto overflow = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library, limits);
+    CHECK_FALSE(overflow);
+    CHECK(std::filesystem::is_regular_file(*object));
+
+    write_file(journal_path, original_journal);
+    const auto receipt_record = std::to_string(maintenance_now) + ":0:1:1:" + std::to_string(encoded->size()) + "\n";
+    write_file(temporary.path / ".uploads" / ".maintenance.audit",
+               "rule-engine.pack-registry-maintenance.v1\n1\n" + std::to_string(maintenance_now) + "\n0\n1\n1\n" +
+                   std::to_string(encoded->size()) + "\n1\n" + receipt_record);
+    registry = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library, limits);
+    REQUIRE(registry);
+    CHECK_FALSE(std::filesystem::exists(*object));
+    CHECK_FALSE(std::filesystem::exists(journal_path));
+    auto observed = (*registry)->observe_maintenance();
+    REQUIRE(observed);
+    CHECK(observed->successful_maintenance_runs == 1U);
+    CHECK(observed->removed_completion_records == 1U);
+    CHECK(observed->removed_objects == 1U);
+    CHECK(observed->reclaimed_bytes == encoded->size());
+}
+
+TEST_CASE("filesystem maintenance refuses a replaced object directory without touching either tree") {
+    TemporaryDirectory temporary;
+    const std::filesystem::path crypto_library {RULE_ENGINE_PYTHON_SERVER_PATH};
+    py::packaging::TrustPolicy trust {
+        .mode = py::packaging::TrustMode::development,
+        .allow_unsigned_packs = true,
+        .allow_unsigned_generators = false,
+        .signers = {},
+    };
+    const tools::PackRegistryLimits limits {
+        .maximum_published_bytes = 32U * py::mebibyte,
+        .maximum_tenant_bytes = 16U * py::mebibyte,
+        .partial_session_ttl = std::chrono::minutes {1},
+        .unreferenced_retention = std::chrono::hours {1},
+    };
+    auto registry = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library, limits);
+    REQUIRE(registry);
+
+    auto archive = unsigned_upload_archive();
+    auto encoded = py::packaging::encode_canonical_source_pack(archive);
+    REQUIRE(encoded);
+    const py::TenantId tenant {"tenant:directory-swap"};
+    const py::PackId pack {"com.acme.upload"};
+    REQUIRE((*registry)->begin(tenant, pack, "upload:directory-swap", encoded->size()));
+    REQUIRE((*registry)->append(tenant, pack, "upload:directory-swap", 0U, *encoded));
+    auto finalized = (*registry)->finalize(tenant, pack, "upload:directory-swap");
+    REQUIRE(finalized);
+    REQUIRE(finalized->source_digest);
+    auto configured_object =
+        py::packaging::content_addressed_source_pack_path(temporary.path, *finalized->source_digest);
+    REQUIRE(configured_object);
+    REQUIRE(std::filesystem::is_regular_file(*configured_object));
+
+    const auto configured_directory = temporary.path / "sha256";
+    const auto pinned_directory = temporary.path / "sha256-pinned";
+    std::error_code filesystem_error;
+    std::filesystem::rename(configured_directory, pinned_directory, filesystem_error);
+    REQUIRE_FALSE(filesystem_error);
+    REQUIRE(std::filesystem::create_directory(configured_directory, filesystem_error));
+    REQUIRE_FALSE(filesystem_error);
+    write_file(*configured_object, "do-not-delete-from-replacement");
+    const auto pinned_object = pinned_directory / configured_object->filename();
+    REQUIRE(std::filesystem::is_regular_file(pinned_object));
+
+    const auto maintenance_now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                                std::chrono::system_clock::now().time_since_epoch())
+                                                                .count()) +
+                                 2U * 60U * 60U * 1'000U;
+    auto rejected = (*registry)->maintain({}, maintenance_now);
+    CHECK_FALSE(rejected);
+    CHECK(read_file(*configured_object) == "do-not-delete-from-replacement");
+    CHECK(std::filesystem::is_regular_file(pinned_object));
+
+    registry->reset();
+    REQUIRE(std::filesystem::remove(*configured_object, filesystem_error));
+    REQUIRE_FALSE(filesystem_error);
+    REQUIRE(std::filesystem::remove(configured_directory, filesystem_error));
+    REQUIRE_FALSE(filesystem_error);
+    std::filesystem::rename(pinned_directory, configured_directory, filesystem_error);
+    REQUIRE_FALSE(filesystem_error);
+    registry = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library, limits);
+    REQUIRE(registry);
+}
+
 TEST_CASE("authorized registry observation does not wait behind filesystem maintenance") {
     TemporaryDirectory temporary;
     const std::filesystem::path crypto_library {RULE_ENGINE_PYTHON_SERVER_PATH};
@@ -2652,7 +2859,8 @@ TEST_CASE("authorized registry observation does not wait behind filesystem maint
     REQUIRE(registry);
     CountingControlStore store;
     AllowAdminPolicy policy;
-    tools::AuthorizedResidentAdminBackend admin {store, policy, nullptr, registry->get()};
+    tools::AuthorizedResidentAdminBackend admin {store,   policy,  nullptr,        registry->get(),
+                                                 nullptr, nullptr, registry->get()};
     const proto::AuthenticatedPeer peer {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:admin"}};
     const tools::ResidentAdminRequest request {.kind = tools::ResidentAdminRequestKind::pack_snapshot,
                                                .request_id = "request:registry:concurrent",

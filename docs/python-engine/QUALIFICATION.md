@@ -144,6 +144,20 @@ it does not qualify a remote object store, exported maintenance metrics/audit,
 generation-metadata pruning, Linux filesystem behavior, or multi-process
 failure injection.
 
+On 2026-08-20, the registry-maintenance hardening rerun passed 870 assertions
+across all 39 executable-surface cases and 703 assertions across all 29 cluster
+cases on Windows. Focused reopen tests corrupt the pending plan's audit base,
+duplicate a target, contradict its receipt, and force aggregate overflow; every
+variant is rejected before the object is removed, while the original valid plan
+replays once and records the exact receipt. A directory-replacement regression
+proves maintenance refuses a different `sha256` directory without touching its
+contents. The relocated fixture install smoke passed in 7.41 seconds, and the
+offline real-target-graph install/downstream smoke passed in 94.53 seconds
+using the exact 2.0.0 C++ package boundary. This is deterministic Windows-local
+component evidence. Linux `openat`/`unlinkat` and directory-`fsync` behavior,
+real power-loss injection, and hostile multi-process filesystem races remain
+unqualified.
+
 The versioned resident-capability slice then passed the complete 38-test Debug
 graph in 155.20 seconds. Executable-surface coverage proves schema-v3
 configuration, exact `rule-engine.resident-capabilities.v1` header handling,

@@ -3069,9 +3069,9 @@ policy mutation remains fail-closed.
         FileAdminSecurityAudit admin_security_audit {config->audit_path};
         FilesystemResidentStageSourceBackend stages {config->pack_registry_path, *pack_trust_policy, *runtime,
                                                      *activation_policy};
-        AuthorizedResidentAdminBackend staged_admin_backend {**activation_store,     **operator_bindings,
-                                                             &admin_security_audit,  uploads->get(),
-                                                             std::addressof(stages), std::addressof(agent_backend)};
+        AuthorizedResidentAdminBackend staged_admin_backend {
+            **activation_store,     **operator_bindings,           &admin_security_audit, uploads->get(),
+            std::addressof(stages), std::addressof(agent_backend), uploads->get()};
         const ResidentServerContext context {
             .config = *config,
             .store = **store,

@@ -27,7 +27,7 @@ set(
 if(PROJECT_VERSION)
     set(_rule_engine_default_package_version "${PROJECT_VERSION}")
 else()
-    set(_rule_engine_default_package_version "1.0.0")
+    set(_rule_engine_default_package_version "2.0.0")
 endif()
 set(
     RULE_ENGINE_PACKAGE_VERSION
@@ -372,6 +372,9 @@ function(rule_engine_configure_install)
     if(NOT package_version MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+([.-][0-9A-Za-z.-]+)?$")
         message(FATAL_ERROR "RULE_ENGINE_PACKAGE_VERSION is not a supported semantic version: ${package_version}")
     endif()
+    if(package_version VERSION_LESS "2.0.0")
+        message(FATAL_ERROR "The installed C++ API/ABI requires package version 2.0.0 or newer")
+    endif()
 
     if(ARG_TARGETS)
         set(candidate_libraries ${ARG_TARGETS})
@@ -579,7 +582,7 @@ function(rule_engine_configure_install)
     write_basic_package_version_file(
         "${config_build_dir}/rule_engineConfigVersion.cmake"
         VERSION "${package_version}"
-        COMPATIBILITY SameMajorVersion
+        COMPATIBILITY ExactVersion
     )
     install(
         EXPORT rule_engineTargets
@@ -634,6 +637,7 @@ function(rule_engine_configure_install)
                 "-DRULE_ENGINE_C_COMPILER=${CMAKE_C_COMPILER}"
                 "-DRULE_ENGINE_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
                 "-DRULE_ENGINE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+                "-DRULE_ENGINE_DOWNSTREAM_PACKAGE_VERSION=${package_version}"
                 -P "${source_root}/cmake/RuleEngineInstallSmoke.cmake"
         )
         set_tests_properties(
@@ -696,6 +700,7 @@ function(rule_engine_configure_install)
                 "-DRULE_ENGINE_PROTOCYTE_SOURCE_DIR=${real_smoke_protocyte_source}"
                 "-DRULE_ENGINE_PROTOBUF_SOURCE_DIR=${real_smoke_protobuf_source}"
                 "-DRULE_ENGINE_EXPECTED_TOOL_NAMES=${expected_tool_names_argument}"
+                "-DRULE_ENGINE_DOWNSTREAM_PACKAGE_VERSION=${package_version}"
                 -P "${source_root}/cmake/RuleEngineRealInstallSmoke.cmake"
         )
         set_tests_properties(
