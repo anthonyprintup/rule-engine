@@ -360,6 +360,7 @@ The VM joins labels from operands and the current control-dependency label. Sink
 - Every external service request/response, action/acknowledgement, custom event, and persisted state record subclasses the corresponding `WireRecord` family and has `@schema("stable.id")`.
 - Every serialized field uses `wire_field(id=N, ...)`, where `N` is in `1..536870911`, excluding protobuf's reserved `19000..19999` range. IDs are unique and never reused within a schema lineage.
 - A compatible revision may add an optional field with a default. Removing a field, changing its type/cardinality/meaning, making it required, or reusing its ID requires a new schema ID.
+- The currently implemented scalar `EventRecord` default is constructor-only: the compiler materializes it into every constructed record, and the field remains wire-required. It is not the optional-field evolution mechanism above, so adding such a field requires a new schema ID.
 - The compiler creates canonical machine descriptors and schema hashes. Activation negotiates these hashes; runtime values are validated before entering the VM and before persistence/dispatch.
 - Unknown fields are preserved in envelope storage and forwarding but are not exposed to a rule compiled against an older descriptor. This permits additive compatibility without dynamic reflection.
 

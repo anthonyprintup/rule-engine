@@ -95,6 +95,8 @@ exact-type canonical `bool`, `int`, `float`, `str`, or `bytes` default parsed
 directly from AST data. The compiler evaluates supplied keyword values in
 Python order, materializes omitted scalar defaults, stages all values in
 canonical field-ID order, and emits a schema/hash-pinned `build_record`. A
+scalar default is constructor-only: the resulting field remains present and
+wire-required, so adding it is not compatible optional schema evolution. A
 standalone `telemetry.emit(record)` becomes `emit_event`; ambiguous schemas,
 missing required or extra fields, dynamic/aggregate or wrong-type defaults,
 wrong constructor value types, and receipt use fail at compile time.

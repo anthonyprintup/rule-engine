@@ -12,11 +12,12 @@ from rule_engine import (
 )
 
 
-@schema("com.example.unsigned-process-alert.v1")
+@schema("com.example.unsigned-process-alert.v2")
 class UnsignedProcessAlert(EventRecord):
     process_id: int = wire_field(id=1)
     creation_time: int = wire_field(id=2)
     reason: str = wire_field(id=3)
+    severity: str = wire_field(id=4, default="medium")
 
 
 @correlation(

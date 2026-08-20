@@ -1588,6 +1588,22 @@ namespace rule_engine::python::compiler {
                        (actual.kind == StaticTypeKind::boolean && expected.kind == StaticTypeKind::integer);
             }
 
+            [[nodiscard]] static bool event_constructor_assignable(const StaticType &actual,
+                                                                   const StaticType &expected) {
+                const auto scalar = [](const StaticTypeKind kind) {
+                    return kind == StaticTypeKind::none || kind == StaticTypeKind::boolean ||
+                           kind == StaticTypeKind::integer || kind == StaticTypeKind::floating ||
+                           kind == StaticTypeKind::string || kind == StaticTypeKind::bytes;
+                };
+                if (actual.kind == StaticTypeKind::unknown || expected.kind == StaticTypeKind::unknown) {
+                    return true;
+                }
+                if (scalar(actual.kind) || scalar(expected.kind)) {
+                    return actual.kind == expected.kind;
+                }
+                return assignable(actual, expected);
+            }
+
             [[nodiscard]] static bool numeric(const StaticTypeKind kind) noexcept {
                 return kind == StaticTypeKind::boolean || kind == StaticTypeKind::integer ||
                        kind == StaticTypeKind::floating;
@@ -2116,7 +2132,7 @@ namespace rule_engine::python::compiler {
                 if (schema.value == "float") {
                     return {.kind = StaticTypeKind::floating, .qualified_name = "float"};
                 }
-                if (schema.value == "str") {
+                if (schema.value == "str" || schema.value == "text") {
                     return {.kind = StaticTypeKind::string, .qualified_name = "str"};
                 }
                 if (schema.value == "bytes") {
@@ -2170,7 +2186,7 @@ namespace rule_engine::python::compiler {
                     const auto exact_model = expected.kind != StaticTypeKind::model ||
                                              lowered->type.kind == StaticTypeKind::unknown ||
                                              lowered->type.qualified_name == expected.qualified_name;
-                    if (!assignable(lowered->type, expected) || !exact_model) {
+                    if (!event_constructor_assignable(lowered->type, expected) || !exact_model) {
                         diagnostics.push_back(make_diagnostic(
                             "PY-EVENT-CONSTRUCTOR", "EventRecord constructor field has an incompatible value type",
                             value->span));

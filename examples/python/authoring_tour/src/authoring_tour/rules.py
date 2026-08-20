@@ -24,7 +24,7 @@ class Process(Model):
     thread_count: int = provider_fact(route="process.thread_count")
 
 
-@schema("com.example.unsigned-process-alert.v1")
+@schema("com.example.unsigned-process-alert.v2")
 class UnsignedProcessAlert(EventRecord):
     process_id: int = wire_field(id=1)
     creation_time: int = wire_field(id=2)

@@ -97,8 +97,10 @@ return True
 The event must have a stable `@schema`; each field has a unique positive
 `wire_field` ID; construction is by keyword; and `telemetry.emit(...)` is a
 standalone statement. In the full source, `severity` is omitted here and the
-compiler materializes its declared canonical string default. A failed or
-cancelled attempt publishes neither the verdict nor the event.
+compiler materializes its declared canonical string default. That default is a
+constructor convenience only: `severity` remains present and required in the
+wire record, so adding it required the example's new `v2` schema ID. A failed
+or cancelled attempt publishes neither the verdict nor the event.
 
 This is different from posting to an external system. External posts use a
 durable outbox and remain a contract example below.

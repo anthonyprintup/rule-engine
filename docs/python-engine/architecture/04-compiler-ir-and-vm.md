@@ -406,8 +406,9 @@ limitations and revisit conditions are recorded as L-028.
 Custom event construction and emission are engine-owned operations. The
 compiler evaluates supplied keyword expressions in Python order, materializes
 permitted omitted canonical scalar defaults, and stages a complete field window
-for `build_record` in canonical field-ID order. Its `immediate` pins the event
-schema ID and canonical hash, `operand_a` begins that contiguous register
+for `build_record` in canonical field-ID order. These defaults are constructor
+conveniences; every field remains present and wire-required. Its `immediate`
+pins the event schema ID and canonical hash, `operand_a` begins that contiguous register
 window, and `operand_b` is the exact active descriptor field count. The
 verifier rejects an unknown schema, a non-event descriptor, a hash or
 field-count mismatch, an invalid window, or any field register not initialized

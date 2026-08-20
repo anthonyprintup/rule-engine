@@ -756,6 +756,17 @@ namespace {
                "\n"
                "@schema(\"com.example.alert.v1\")\n"
                "class Alert(EventRecord):\n"
+               "    value: int = wire_field(id=1)\n"
+               "\n"
+               "@rule(\"com.example.invalid-event\")\n"
+               "def invalid_event() -> bool:\n"
+               "    telemetry.emit(Alert(value=True))\n"
+               "    return True\n",
+               "PY-EVENT-CONSTRUCTOR");
+        reject("from rule_engine import EventRecord, rule, schema, telemetry, wire_field\n"
+               "\n"
+               "@schema(\"com.example.alert.v1\")\n"
+               "class Alert(EventRecord):\n"
                "    process_id: int = wire_field(id=1)\n"
                "\n"
                "@rule(\"com.example.invalid-event\")\n"

@@ -832,6 +832,31 @@ TEST_CASE("verified build_record constructs an active event payload from runtime
                               [](const Diagnostic &diagnostic) { return diagnostic.code == "PYC0116"; }));
 }
 
+TEST_CASE("build_record preserves exact scalar types at the event boundary") {
+    auto schema = alert_schema();
+    schema.fields[0].type = SchemaId {"int"};
+    auto pack = pack_with({make_fact(true), make_fact(true),
+                           make_event_operand(SchemaId {"alert.v1"}, "sha256:alert-v1"), make_fact(true)},
+                          {function("rule.main", 4U,
+                                    {
+                                        instruction(Opcode::load_const, 0U, 0U, 0U, 0U),
+                                        instruction(Opcode::load_const, 1U, 0U, 0U, 1U),
+                                        instruction(Opcode::build_record, 2U, 0U, 2U, 2U),
+                                        instruction(Opcode::emit_event, 0U, 2U, 0U, 2U),
+                                        instruction(Opcode::load_const, 3U, 0U, 0U, 3U),
+                                        instruction(Opcode::return_value, 0U, 3U),
+                                    })});
+    pack.schemas = SchemaCatalog {.descriptors = {std::move(schema)}, .canonical_hash = "sha256:event-schemas"};
+    REQUIRE(verify_bytecode(pack).has_value());
+
+    auto session = start(pack);
+    const auto faulted = session->step({});
+    REQUIRE(faulted.state == VmStepState::faulted);
+    REQUIRE(faulted.result.has_value());
+    CHECK(faulted.result->committed_events.empty());
+    CHECK(session->event_journal_size() == 0U);
+}
+
 TEST_CASE("event journal rolls back nested transactions and uncaught exceptions") {
     SECTION("inner rollback preserves only the outer event") {
         const auto pack = event_pack({alert_record(), make_event_operand(SchemaId {"alert.v1"}, "sha256:alert-v1"),
