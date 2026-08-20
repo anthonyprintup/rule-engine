@@ -3569,7 +3569,7 @@ namespace rule_engine::python::compiler {
                                  const std::vector<FactRequirement> &requirements) {
             std::ostringstream output;
             output.imbue(std::locale::classic());
-            output << "python-static-compiler-v1\n";
+            output << "python-static-compiler-v2\n";
             canonical_token(output, pack.pack.value);
             canonical_token(output, pack.version.value);
             canonical_token(output, pack.source_digest.value);
@@ -3644,7 +3644,7 @@ namespace rule_engine::python::compiler {
     StaticCompiler::compile(const VerifiedRulePack &pack, const std::span<const std::byte> ast_payload,
                             const SchemaCatalog &schemas, const OperatorBindings &bindings) const {
         DiagnosticSet diagnostics;
-        if (pack.manifest.compiler_abi != python_static_compiler_abi_v1) {
+        if (pack.manifest.compiler_abi != python_static_compiler_abi_v2) {
             diagnostics.push_back(make_diagnostic(
                 "PY-COMPILER-ABI", "verified pack compiler ABI does not select the exact static compiler"));
         }
@@ -3735,7 +3735,7 @@ namespace rule_engine::python::compiler {
             .pack = pack.manifest.pack,
             .version = pack.manifest.version,
             .source_digest = pack.closure_digest,
-            .compiler_abi = std::string {python_static_compiler_abi_v1},
+            .compiler_abi = std::string {python_static_compiler_abi_v2},
             .semantic_hash = {},
             .state_schema_hash = canonical_state_schema_hash(state_keys),
             .schemas = std::move(merged_schemas),

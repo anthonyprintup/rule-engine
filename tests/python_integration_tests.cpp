@@ -102,7 +102,7 @@ namespace {
                 PackManifest {
                     .pack = PackId {"com.example.integration"},
                     .version = PackVersion {"1.0.0"},
-                    .compiler_abi = std::string {python_static_compiler_abi_v1},
+                    .compiler_abi = std::string {python_static_compiler_abi_v2},
                     .budget_profile = "balanced.v1",
                     .entry_modules = {module_name},
                 },
@@ -212,7 +212,7 @@ TEST_CASE("verified source-pack ABI interoperates with the exact static compiler
     UnusedSignatureVerifier verifier;
     const auto loaded = packaging::verify_and_load_source_pack(packaged_source_archive(), development_policy, verifier);
     REQUIRE(loaded.has_value());
-    REQUIRE(loaded->contract_pack.manifest.compiler_abi == python_static_compiler_abi_v1);
+    REQUIRE(loaded->contract_pack.manifest.compiler_abi == python_static_compiler_abi_v2);
 
     auto ast = constant_rule_ast(true);
     ast.source_digest = loaded->contract_pack.closure_digest;
@@ -224,7 +224,7 @@ TEST_CASE("verified source-pack ABI interoperates with the exact static compiler
 
     const auto compiled = StaticCompiler {}.compile(loaded->contract_pack, *encoded, {}, {});
     REQUIRE(compiled.has_value());
-    CHECK(compiled->pack.compiler_abi == python_static_compiler_abi_v1);
+    CHECK(compiled->pack.compiler_abi == python_static_compiler_abi_v2);
 }
 
 TEST_CASE("static Python AST compiles, executes in the register VM, and commits atomically") {

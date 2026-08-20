@@ -1337,7 +1337,7 @@ namespace rule_engine::python::packaging {
         PackManifest contract_manifest {
             .pack = manifest->pack,
             .version = manifest->version,
-            .compiler_abi = std::string {python_static_compiler_abi_v1},
+            .compiler_abi = std::string {python_static_compiler_abi_v2},
             .budget_profile = manifest->budget_profile,
             .entry_modules = manifest->entry_modules,
             .dependency_digests = {},

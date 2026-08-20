@@ -14,7 +14,7 @@
 namespace rule_engine::python {
 
     inline constexpr std::string_view python_ast_schema_v1 = "rule-engine.ast/1";
-    inline constexpr std::string_view python_static_compiler_abi_v1 = "python-3.14.6/static-compiler-v1";
+    inline constexpr std::string_view python_static_compiler_abi_v2 = "python-3.14.6/static-compiler-v2";
     inline constexpr std::string_view python_event_operand_schema_v1 = "rule-engine.vm.event-operand.v1";
 
     enum struct SchemaKind : std::uint8_t {

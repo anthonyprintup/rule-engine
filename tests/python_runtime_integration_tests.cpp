@@ -370,7 +370,7 @@ namespace {
             .pack = PackId {"pack"},
             .version = PackVersion {"1"},
             .source_digest = SourceDigest {"sha256:source"},
-            .compiler_abi = std::string {python_static_compiler_abi_v1},
+            .compiler_abi = std::string {python_static_compiler_abi_v2},
             .semantic_hash = "sha256:semantic",
             .schemas =
                 SchemaCatalog {
@@ -439,7 +439,7 @@ namespace {
             .pack = PackId {"pack"},
             .version = PackVersion {"1"},
             .source_digest = SourceDigest {"sha256:source"},
-            .compiler_abi = std::string {python_static_compiler_abi_v1},
+            .compiler_abi = std::string {python_static_compiler_abi_v2},
             .semantic_hash = "sha256:semantic",
             .constants =
                 {

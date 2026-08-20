@@ -618,7 +618,7 @@ namespace {
             .pack = PackId {"pack-a"},
             .version = PackVersion {"1.0.1"},
             .source_digest = SourceDigest {"sha256:signed-source"},
-            .compiler_abi = std::string {python_static_compiler_abi_v1},
+            .compiler_abi = std::string {python_static_compiler_abi_v2},
             .semantic_hash = "fnv1a64:0000000000000001",
             .state_schema_hash = "state-schema-v1",
             .schemas = {.descriptors = {}, .canonical_hash = "fnv1a64:0000000000000002"},
@@ -651,6 +651,12 @@ namespace {
             .failure = {},
         };
         REQUIRE(qualify_resident_compilation(active, "node-a", "windows-x64-v1", compiled).has_value());
+
+        auto legacy_compiler = compiled;
+        legacy_compiler.compiler_abi = "python-3.14.6/static-compiler-v1";
+        const auto rejected_legacy = qualify_resident_compilation(active, "node-a", "windows-x64-v1", legacy_compiler);
+        REQUIRE_FALSE(rejected_legacy.has_value());
+        REQUIRE(rejected_legacy.error().code == StoreErrorCode::constraint_violation);
 
         auto changed = compiled;
         changed.semantic_hash = "fnv1a64:0000000000000003";

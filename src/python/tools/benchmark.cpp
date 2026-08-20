@@ -132,7 +132,7 @@ Options:
                     {
                         .pack = PackId {"benchmark.python"},
                         .version = PackVersion {"1.0.0"},
-                        .compiler_abi = "python-3.14.6/static-compiler-v1",
+                        .compiler_abi = std::string {python_static_compiler_abi_v2},
                         .budget_profile = "balanced.v1",
                         .entry_modules = {std::string {source_name}},
                         .dependency_digests = {},

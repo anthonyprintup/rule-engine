@@ -43,7 +43,7 @@ namespace rule_engine::python::cluster {
         }
         if (compiled.pack != generation.request.pack || compiled.version != generation.request.version ||
             compiled.source_digest != generation.request.source_digest ||
-            compiled.compiler_abi != python_static_compiler_abi_v1) {
+            compiled.compiler_abi != python_static_compiler_abi_v2) {
             return reject(StoreErrorCode::constraint_violation,
                           "resident compiled pack does not match the durable source generation");
         }

@@ -40,7 +40,7 @@ namespace {
             .pack = PackId {"com.example.resident"},
             .version = PackVersion {"1.0.0"},
             .source_digest = SourceDigest {"sha256:source"},
-            .compiler_abi = std::string {python_static_compiler_abi_v1},
+            .compiler_abi = std::string {python_static_compiler_abi_v2},
             .semantic_hash = "fnv1a64:semantic",
             .schemas = {.descriptors = {{.id = SchemaId {"bool"},
                                          .kind = SchemaKind::fact,

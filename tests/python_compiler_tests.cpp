@@ -58,7 +58,7 @@ namespace {
                 {
                     .pack = PackId {"com.example.rules"},
                     .version = PackVersion {"1.0.0"},
-                    .compiler_abi = std::string {python_static_compiler_abi_v1},
+                    .compiler_abi = std::string {python_static_compiler_abi_v2},
                     .budget_profile = "balanced.v1",
                     .entry_modules = {"rules.main"},
                     .dependency_digests = {},
@@ -407,6 +407,18 @@ namespace {
         REQUIRE(oversized.error().front().code == "PY-AST-LIMIT");
     }
 
+    TEST_CASE("static compiler rejects artifacts selecting the legacy event-default ABI") {
+        auto legacy_pack = pack();
+        legacy_pack.manifest.compiler_abi = "python-3.14.6/static-compiler-v1";
+        const auto payload = encode_ast_envelope(envelope(constant_rule_nodes(false)));
+        REQUIRE(payload.has_value());
+
+        const auto compiled = StaticCompiler {}.compile(legacy_pack, *payload, {}, {});
+        REQUIRE_FALSE(compiled.has_value());
+        REQUIRE(std::ranges::any_of(compiled.error(),
+                                    [](const Diagnostic &diagnostic) { return diagnostic.code == "PY-COMPILER-ABI"; }));
+    }
+
     TEST_CASE("static pack compiler consumes the exact worker payload contract", "[compiler-vm-progress]") {
         if (!shared_runtime().runtime) {
             if (!shared_runtime().staging_failure.empty()) {
@@ -429,7 +441,7 @@ namespace {
         const auto compiled = compiler.compile(rule_pack, {}, bindings);
         INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
         REQUIRE(compiled.has_value());
-        CHECK(compiled->compiler_abi == python_static_compiler_abi_v1);
+        CHECK(compiled->compiler_abi == python_static_compiler_abi_v2);
         REQUIRE(compiled->functions.size() == 1U);
         const auto &function = compiled->functions.front();
         REQUIRE(function.id == ExecutableId {"com.example.constant"});
@@ -1830,7 +1842,7 @@ namespace {
             .pack = PackId {"com.example.interop"},
             .version = PackVersion {"1.0.0"},
             .source_digest = SourceDigest {"sha256:interop"},
-            .compiler_abi = std::string {python_static_compiler_abi_v1},
+            .compiler_abi = std::string {python_static_compiler_abi_v2},
             .semantic_hash = "fnv1a64:interop",
             .schemas = {},
             .constants =
@@ -2333,7 +2345,7 @@ namespace {
             .pack = PackId {"com.example.rules"},
             .version = PackVersion {"1.0.0"},
             .source_digest = SourceDigest {"sha256:source"},
-            .compiler_abi = std::string {python_static_compiler_abi_v1},
+            .compiler_abi = std::string {python_static_compiler_abi_v2},
             .semantic_hash = "fnv1a64:0000000000000001",
             .state_schema_hash = "sha256:state-a",
             .schemas = {.descriptors = {}, .canonical_hash = "fnv1a64:0000000000000002"},
