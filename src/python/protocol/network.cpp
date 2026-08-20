@@ -24,6 +24,11 @@ namespace asio::detail {
 #include <unordered_set>
 #include <utility>
 
+#ifndef _WIN32
+#include <cerrno>
+#include <poll.h>
+#endif
+
 namespace rule_engine::python::protocol_v2 {
     namespace {
         using asio::ip::tcp;
@@ -91,6 +96,56 @@ namespace rule_engine::python::protocol_v2 {
         [[nodiscard]] Clock::time_point bounded_deadline(const Clock::time_point overall,
                                                          const std::chrono::milliseconds duration) noexcept {
             return (std::min) (overall, deadline_after(duration));
+        }
+
+        [[nodiscard]] std::expected<bool, ProtocolError>
+        wait_socket_readable(tcp::socket &socket, const Clock::time_point deadline,
+                             const std::stop_token cancellation) noexcept {
+            constexpr auto cancellation_poll = std::chrono::milliseconds {10};
+            while (true) {
+                if (cancellation.stop_requested()) {
+                    return std::unexpected(canceled_error("TLS input wait"));
+                }
+                const auto now = Clock::now();
+                if (deadline != Clock::time_point::max() && now >= deadline) {
+                    return false;
+                }
+                auto wait = cancellation_poll;
+                if (deadline != Clock::time_point::max()) {
+                    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+                    if (remaining <= std::chrono::milliseconds::zero()) {
+                        return false;
+                    }
+                    wait = (std::min) (wait, remaining);
+                }
+                const auto wait_ms = static_cast<int>(wait.count());
+
+#ifdef _WIN32
+                WSAPOLLFD descriptor {
+                    .fd = socket.native_handle(), .events = static_cast<SHORT>(POLLRDNORM), .revents = 0};
+                const auto result = WSAPoll(&descriptor, 1, wait_ms);
+                if (result > 0) {
+                    // Payload, orderly FIN, reset, and socket errors all wake
+                    // the owner so its following TLS receive can classify the
+                    // transport outcome without consuming bytes here.
+                    return true;
+                }
+                if (result < 0 && WSAGetLastError() != WSAEINTR) {
+                    return std::unexpected(
+                        network_error(ProtocolErrorCode::transport_error, "TLS input socket wait failed"));
+                }
+#else
+                pollfd descriptor {.fd = socket.native_handle(), .events = static_cast<short>(POLLIN), .revents = 0};
+                const auto result = poll(&descriptor, 1, wait_ms);
+                if (result > 0) {
+                    return true;
+                }
+                if (result < 0 && errno != EINTR) {
+                    return std::unexpected(
+                        network_error(ProtocolErrorCode::transport_error, "TLS input socket wait failed"));
+                }
+#endif
+            }
         }
 
         [[nodiscard]] std::expected<void, ProtocolError> interruptible_delay(const std::chrono::milliseconds delay,
@@ -428,35 +483,10 @@ namespace rule_engine::python::protocol_v2 {
         if (cancellation.stop_requested()) {
             return std::unexpected(canceled_error("TLS input wait"));
         }
-
-        std::mutex mutex;
-        std::condition_variable condition;
-        std::stop_callback on_stop {cancellation, [&] {
-                                        std::scoped_lock lock {mutex};
-                                        condition.notify_all();
-                                    }};
-        std::unique_lock lock {mutex};
-        constexpr auto readiness_poll = std::chrono::milliseconds {10};
-        while (!cancellation.stop_requested()) {
-            if (impl_->tls.pending_input()) {
-                return true;
-            }
-            asio::error_code error;
-            const auto available = impl_->socket.available(error);
-            if (error) {
-                return std::unexpected(asio_error("TLS input readiness", error));
-            }
-            if (available != 0U) {
-                return true;
-            }
-            const auto now = Clock::now();
-            if (now >= deadline) {
-                return false;
-            }
-            condition.wait_until(lock, (std::min) (deadline, now + readiness_poll),
-                                 [&cancellation] { return cancellation.stop_requested(); });
+        if (impl_->tls.pending_input()) {
+            return true;
         }
-        return std::unexpected(canceled_error("TLS input wait"));
+        return wait_socket_readable(impl_->socket, deadline, cancellation);
     }
 
     std::expected<void, ProtocolError>

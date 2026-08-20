@@ -97,7 +97,8 @@ namespace rule_engine::python::windows {
                   std::stop_token cancellation) noexcept = 0;
         [[nodiscard]] virtual std::expected<protocol_v2::PeerEnvelope, protocol_v2::ProtocolError>
         receive(std::stop_token cancellation) noexcept = 0;
-        // Returns false at the deadline without consuming TLS or frame bytes.
+        // Returns true for input, EOF, or socket error; returns false only at
+        // the deadline and never consumes TLS or frame bytes.
         [[nodiscard]] virtual std::expected<bool, protocol_v2::ProtocolError>
         wait_readable_until(std::chrono::steady_clock::time_point deadline, std::stop_token cancellation) noexcept = 0;
         [[nodiscard]] virtual std::expected<void, protocol_v2::ProtocolError>

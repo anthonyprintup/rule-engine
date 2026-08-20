@@ -888,7 +888,7 @@ namespace {
 #endif
     }
 
-    TEST_CASE("owned TLS orchestration authenticates loopback peers and replays the durable agent spool") {
+    TEST_CASE("owned TLS orchestration replays the durable agent spool and wakes on idle peer close") {
         if (!tls_backend_status().available || !spool_backend_status().available) {
             SUCCEED("TLS and SQLite backends are required for the reconnect integration test");
             return;
@@ -1006,6 +1006,15 @@ namespace {
         auto connected = dialer->reconnect(persistent, runtime_agent_hello());
         server.join();
         REQUIRE(connected.has_value());
+        const auto close_wait_started = std::chrono::steady_clock::now();
+        auto peer_closed = connected->connection.wait_readable_until(close_wait_started + std::chrono::seconds {2});
+        REQUIRE(peer_closed.has_value());
+        REQUIRE(*peer_closed);
+        CHECK(std::chrono::steady_clock::now() - close_wait_started < std::chrono::seconds {1});
+        auto eof =
+            connected->connection.receive_until(std::chrono::steady_clock::now() + std::chrono::milliseconds {250});
+        REQUIRE_FALSE(eof.has_value());
+        CHECK(eof.error().code == ProtocolErrorCode::transport_error);
         REQUIRE_FALSE(server_error.has_value());
         REQUIRE(authenticated_peer.has_value());
         REQUIRE(authenticated_peer->tenant.value == "tenant-1");

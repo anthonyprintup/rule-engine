@@ -609,6 +609,31 @@ TEST_CASE("Windows agent reconnects and replays a durable result without duplica
     CHECK(std::holds_alternative<proto::WorkResultMessage>(session_state->sent.front().body));
 }
 
+TEST_CASE("Windows agent reconnects when a readable idle peer reports transport EOF") {
+    if (!proto::spool_backend_status().available) {
+        SKIP("SQLite spool backend is unavailable");
+    }
+    TemporarySpool temporary;
+    auto configuration = test_configuration(temporary.path);
+    auto spool = open_spool(configuration);
+    REQUIRE(spool.has_value());
+    const auto first = hello("session:idle-close", 7U);
+    const auto second = hello("session:after-idle-close", 8U);
+    auto session_state = std::make_shared<FakeSessionState>();
+    session_state->hellos = {first, second};
+    session_state->incoming_by_connection = {{failure(disconnected())}, {failure(canceled())}};
+    session_state->spool = &*spool;
+    auto provider_state = std::make_shared<FakeProviderState>();
+
+    win::WindowsAgentService service {configuration, *spool, std::make_unique<FakeSession>(session_state),
+                                      std::make_unique<FakeProviderFactory>(provider_state)};
+    const auto result = service.run({});
+    REQUIRE(result.has_value());
+    CHECK(result->successful_connections == 2U);
+    CHECK(provider_state->inventories == 1U);
+    CHECK(provider_state->dispatches == 0U);
+}
+
 TEST_CASE("Windows agent deduplicates a repeated lease and forwards cancellation only to the data provider") {
     if (!proto::spool_backend_status().available) {
         SKIP("SQLite spool backend is unavailable");
