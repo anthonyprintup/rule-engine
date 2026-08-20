@@ -23,6 +23,24 @@ namespace rule_engine::python::tools {
         constexpr std::size_t queued_session_reservation_bytes = 16U * kibibyte;
         constexpr std::size_t worker_fixed_reservation_bytes = 64U * kibibyte;
 
+        [[nodiscard]] constexpr std::uint64_t saturating_add(const std::uint64_t left,
+                                                             const std::uint64_t right) noexcept {
+            constexpr auto maximum = (std::numeric_limits<std::uint64_t>::max)();
+            return left > maximum - right ? maximum : left + right;
+        }
+
+        void saturating_atomic_add(std::atomic<std::uint64_t> &target, const std::uint64_t increment) noexcept {
+            auto current = target.load(std::memory_order_relaxed);
+            while (!target.compare_exchange_weak(current, saturating_add(current, increment), std::memory_order_relaxed,
+                                                 std::memory_order_relaxed)) {}
+        }
+
+        void atomic_max(std::atomic<std::uint64_t> &target, const std::uint64_t candidate) noexcept {
+            auto current = target.load(std::memory_order_relaxed);
+            while (current < candidate && !target.compare_exchange_weak(current, candidate, std::memory_order_relaxed,
+                                                                        std::memory_order_relaxed)) {}
+        }
+
         [[nodiscard]] bool printable_ascii(const std::string_view value, const bool allow_empty = true) noexcept {
             return (allow_empty || !value.empty()) && std::ranges::all_of(value, [](const unsigned char character) {
                        return character >= 0x20U && character <= 0x7eU;
@@ -1230,6 +1248,17 @@ namespace rule_engine::python::tools {
                 .stopping = impl_->stopping};
     }
 
+    void ResidentWorkPollSnapshot::merge(const ResidentWorkPollSnapshot &other) noexcept {
+        empty_polls = saturating_add(empty_polls, other.empty_polls);
+        nonempty_polls = saturating_add(nonempty_polls, other.nonempty_polls);
+        delivered_work = saturating_add(delivered_work, other.delivered_work);
+        delivery_delay_samples = saturating_add(delivery_delay_samples, other.delivery_delay_samples);
+        delivery_delay_total_microseconds =
+            saturating_add(delivery_delay_total_microseconds, other.delivery_delay_total_microseconds);
+        delivery_delay_max_microseconds =
+            (std::max) (delivery_delay_max_microseconds, other.delivery_delay_max_microseconds);
+    }
+
     ResidentApplicationService::ResidentApplicationService(ResidentServiceLimits limits,
                                                            const protocol_v2::ITrustPolicy &peer_trust,
                                                            IResidentAgentBackend &agents,
@@ -1246,6 +1275,17 @@ namespace rule_engine::python::tools {
             run_admin(job, cancellation);
         }
         job.channel->shutdown();
+    }
+
+    ResidentWorkPollSnapshot ResidentApplicationService::work_poll_snapshot() const noexcept {
+        return {
+            .empty_polls = empty_work_polls_.load(std::memory_order_relaxed),
+            .nonempty_polls = nonempty_work_polls_.load(std::memory_order_relaxed),
+            .delivered_work = delivered_work_.load(std::memory_order_relaxed),
+            .delivery_delay_samples = delivery_delay_samples_.load(std::memory_order_relaxed),
+            .delivery_delay_total_microseconds = delivery_delay_total_microseconds_.load(std::memory_order_relaxed),
+            .delivery_delay_max_microseconds = delivery_delay_max_microseconds_.load(std::memory_order_relaxed),
+        };
     }
 
     void ResidentApplicationService::run_agent(ResidentSessionJob &job, const std::stop_token cancellation) noexcept {
@@ -1311,7 +1351,7 @@ namespace rule_engine::python::tools {
         constexpr auto maximum_size = (std::numeric_limits<std::size_t>::max)();
         const auto peer_byte_limit =
             static_cast<std::size_t>((std::min) (hello.receive_limit.bytes, static_cast<std::uint64_t>(maximum_size)));
-        const auto send_work = [&](std::vector<protocol_v2::WorkLeaseMessage> work) {
+        const auto send_work = [&](std::vector<protocol_v2::WorkLeaseMessage> work, std::size_t &delivered) {
             for (auto &lease : work) {
                 lease.session = session->session;
                 lease.peer = job.peer.peer;
@@ -1337,16 +1377,46 @@ namespace rule_engine::python::tools {
                     return false;
                 }
                 outstanding.emplace(lease.work_id, std::move(lease));
+                ++delivered;
+                saturating_atomic_add(delivered_work_, 1U);
             }
             return true;
         };
+        std::optional<std::chrono::steady_clock::time_point> observed_idle_since;
         const auto poll_work = [&]() {
             const auto available = peer_work_limit - outstanding.size();
             if (available == 0U) {
                 return true;
             }
+            const auto poll_started = std::chrono::steady_clock::now();
             auto work = agents_.take_work(*session, available, cancellation);
-            return work && work->size() <= available && send_work(std::move(*work));
+            if (!work) {
+                return false;
+            }
+            if (work->empty()) {
+                saturating_atomic_add(empty_work_polls_, 1U);
+                if (!observed_idle_since) {
+                    observed_idle_since = poll_started;
+                }
+                return true;
+            }
+
+            saturating_atomic_add(nonempty_work_polls_, 1U);
+            if (work->size() > available) {
+                return false;
+            }
+            std::size_t delivered {};
+            const auto sent = send_work(std::move(*work), delivered);
+            if (delivered > 0U) {
+                const auto delay = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - observed_idle_since.value_or(poll_started));
+                const auto delay_microseconds = delay.count() <= 0 ? 0U : static_cast<std::uint64_t>(delay.count());
+                saturating_atomic_add(delivery_delay_samples_, 1U);
+                saturating_atomic_add(delivery_delay_total_microseconds_, delay_microseconds);
+                atomic_max(delivery_delay_max_microseconds_, delay_microseconds);
+                observed_idle_since.reset();
+            }
+            return sent;
         };
         if (!poll_work()) {
             return;

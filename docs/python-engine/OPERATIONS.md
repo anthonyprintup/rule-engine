@@ -272,6 +272,25 @@ configured outstanding-work ceiling. Choose the interval as an explicit
 delivery-latency versus backend-load tradeoff: shorter intervals reduce idle
 delivery delay but multiply empty durable-store checks across connected peers.
 
+`ResidentApplicationService::work_poll_snapshot()` exposes process-local,
+payload-free tuning evidence: successful empty and nonempty backend polls,
+successfully sent work leases, delivery-delay sample count, cumulative delay,
+and maximum delay. Counters and the cumulative delay saturate at `uint64_t`
+maximum rather than wrapping, and snapshots may be read while sessions run.
+Delay begins at the first observed empty poll in an idle period and ends after
+the last successfully sent lease in the later nonempty poll. If the initial
+poll is already nonempty, it begins when that poll starts. It is therefore an
+observed idle-to-send service delay, not durable queue age or agent execution
+latency. Compare empty-poll rate and delay while tuning
+`service.work_poll_interval_ms`; do not infer source contents, rule outcomes,
+or endpoint performance from these aggregate values.
+
+This receipt is currently an inspectable in-process surface. The standalone
+server does not yet export it to Prometheus or OTLP, and the counters reset on
+process restart. Operators must use an embedding/export adapter if they need
+long-term rates, percentiles, or cross-node aggregation; snapshot merging is
+saturating and preserves the maximum observed delay.
+
 Current operations must account for three evaluator limits: one VM provider
 turn stays on one agent route, capability/service/history host turns fail
 closed, and no VM heap/frame checkpoint survives a server process crash. A

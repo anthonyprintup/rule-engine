@@ -4,6 +4,7 @@
 #include "rule_engine/python/protocol/network.hpp"
 #include "rule_engine/python/tools/active_pack.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -262,6 +263,22 @@ namespace rule_engine::python::tools {
         bool stopping {};
     };
 
+    // Process-local, payload-free polling evidence. Totals saturate instead of
+    // wrapping so a long-running resident never reports deceptively small
+    // values. Delay is measured from the first observed empty poll in an idle
+    // period (or the start of an immediately nonempty poll) through the last
+    // successfully sent lease in that poll.
+    struct ResidentWorkPollSnapshot {
+        std::uint64_t empty_polls {};
+        std::uint64_t nonempty_polls {};
+        std::uint64_t delivered_work {};
+        std::uint64_t delivery_delay_samples {};
+        std::uint64_t delivery_delay_total_microseconds {};
+        std::uint64_t delivery_delay_max_microseconds {};
+
+        void merge(const ResidentWorkPollSnapshot &other) noexcept;
+    };
+
     struct ResidentServiceScheduler {
         [[nodiscard]] static std::expected<std::unique_ptr<ResidentServiceScheduler>, protocol_v2::ProtocolError>
         create(ResidentServiceLimits limits, IResidentSessionHandler &handler);
@@ -286,6 +303,7 @@ namespace rule_engine::python::tools {
                                    IResidentAgentBackend &agents, IResidentAdminBackend &admin) noexcept;
 
         void run(ResidentSessionJob job, std::stop_token cancellation) noexcept override;
+        [[nodiscard]] ResidentWorkPollSnapshot work_poll_snapshot() const noexcept;
 
     private:
         void run_agent(ResidentSessionJob &job, std::stop_token cancellation) noexcept;
@@ -295,6 +313,12 @@ namespace rule_engine::python::tools {
         const protocol_v2::ITrustPolicy &peer_trust_;
         IResidentAgentBackend &agents_;
         IResidentAdminBackend &admin_;
+        std::atomic<std::uint64_t> empty_work_polls_ {};
+        std::atomic<std::uint64_t> nonempty_work_polls_ {};
+        std::atomic<std::uint64_t> delivered_work_ {};
+        std::atomic<std::uint64_t> delivery_delay_samples_ {};
+        std::atomic<std::uint64_t> delivery_delay_total_microseconds_ {};
+        std::atomic<std::uint64_t> delivery_delay_max_microseconds_ {};
     };
 
 } // namespace rule_engine::python::tools
