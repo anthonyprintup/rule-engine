@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -33,6 +34,9 @@ namespace rule_engine::python {
         SchemaId type;
         bool optional {};
         DataLabel label;
+        // Compiler-recognized authoring default. Event construction always
+        // materializes this value before build_record reaches the VM.
+        std::optional<FactValue> constructor_default;
     };
 
     struct SchemaDescriptor {

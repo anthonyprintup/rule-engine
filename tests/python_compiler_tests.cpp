@@ -760,6 +760,100 @@ namespace {
                "PY-EVENT-EMIT");
     }
 
+    TEST_CASE("exact worker materializes canonical scalar EventRecord defaults") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+        const auto compiled =
+            compile_exact_source(*runtime.runtime, runtime.temporary_parent,
+                                 "from rule_engine import EventRecord, rule, schema, telemetry, wire_field\n"
+                                 "\n"
+                                 "@schema(\"com.example.default-alert.v1\")\n"
+                                 "class Alert(EventRecord):\n"
+                                 "    process_id: int = wire_field(id=1)\n"
+                                 "    enabled: bool = wire_field(id=2, default=True)\n"
+                                 "    score: int = wire_field(id=3, default=-7)\n"
+                                 "    ratio: float = wire_field(id=4, default=-0.5)\n"
+                                 "    reason: str = wire_field(id=5, default=\"unsigned\")\n"
+                                 "    marker: bytes = wire_field(id=6, default=b\"ok\")\n"
+                                 "\n"
+                                 "@rule(\"com.example.emit-default-alert\")\n"
+                                 "def emit_default_alert() -> bool:\n"
+                                 "    telemetry.emit(Alert(process_id=42))\n"
+                                 "    return True\n",
+                                 "com.example.emit-default-alert");
+        INFO((compiled.has_value() ? std::string {} : diagnostic_text(compiled.error())));
+        REQUIRE(compiled.has_value());
+        REQUIRE(verify_bytecode(*compiled).has_value());
+        const auto descriptor = std::ranges::find(compiled->schemas.descriptors,
+                                                  SchemaId {"com.example.default-alert.v1"}, &SchemaDescriptor::id);
+        REQUIRE(descriptor != compiled->schemas.descriptors.end());
+        REQUIRE(descriptor->fields.size() == 6U);
+        CHECK_FALSE(descriptor->fields[0].constructor_default.has_value());
+        REQUIRE(descriptor->fields[1].constructor_default.has_value());
+        CHECK(std::get<bool>(descriptor->fields[1].constructor_default->node->data));
+        REQUIRE(descriptor->fields[2].constructor_default.has_value());
+        CHECK(std::get<IntegerValue>(descriptor->fields[2].constructor_default->node->data).decimal == "-7");
+        REQUIRE(descriptor->fields[3].constructor_default.has_value());
+        CHECK(std::get<double>(descriptor->fields[3].constructor_default->node->data) == -0.5);
+
+        auto event_invocation = invocation();
+        event_invocation.root_event = EventId {"root-event"};
+        auto session = vm::RegisterVmSession::create(*compiled, event_invocation);
+        REQUIRE(session.has_value());
+        const auto completed = (*session)->step({});
+        REQUIRE(completed.state == VmStepState::complete);
+        REQUIRE(completed.result.has_value());
+        REQUIRE(completed.result->committed_events.size() == 1U);
+        const auto *record =
+            std::get_if<FactRecord>(&completed.result->committed_events.front().payload.value.node->data);
+        REQUIRE(record != nullptr);
+        REQUIRE(record->fields.size() == 6U);
+        CHECK(std::get<IntegerValue>(record->fields[0].value.node->data).decimal == "42");
+        CHECK(std::get<bool>(record->fields[1].value.node->data));
+        CHECK(std::get<IntegerValue>(record->fields[2].value.node->data).decimal == "-7");
+        CHECK(std::get<double>(record->fields[3].value.node->data) == -0.5);
+        CHECK(std::get<UnicodeValue>(record->fields[4].value.node->data).utf8 == "unsigned");
+        CHECK(std::get<BytesValue>(record->fields[5].value.node->data).bytes ==
+              std::vector<std::byte> {std::byte {'o'}, std::byte {'k'}});
+    }
+
+    TEST_CASE("event defaults reject dynamic aggregate and incompatible values") {
+        auto &runtime = shared_runtime();
+        if (!runtime.runtime) {
+            if (!runtime.staging_failure.empty()) {
+                FAIL_CHECK(runtime.staging_failure);
+                return;
+            }
+            WARN("SKIPPED: " << runtime.unavailable_reason);
+            return;
+        }
+        const auto reject_default = [&](const std::string_view declaration) {
+            const auto compiled = compile_exact_source(
+                *runtime.runtime, runtime.temporary_parent,
+                "from rule_engine import EventRecord, rule, schema, wire_field\n\n"
+                "@schema(\"com.example.invalid-default.v1\")\n"
+                "class Alert(EventRecord):\n    value: str = " +
+                    std::string {declaration} +
+                    "\n\n@rule(\"com.example.invalid-event\")\ndef invalid_event() -> bool:\n    return True\n",
+                "com.example.invalid-event");
+            REQUIRE_FALSE(compiled.has_value());
+            INFO(diagnostic_text(compiled.error()));
+            CHECK(std::ranges::any_of(
+                compiled.error(), [](const Diagnostic &diagnostic) { return diagnostic.code == "PY-EVENT-FIELD"; }));
+        };
+        reject_default("wire_field(id=1, default=1)");
+        reject_default("wire_field(id=1, default=[\"dynamic\"])");
+        reject_default("wire_field(id=1, default=str(1))");
+        reject_default("wire_field(1, default=\"positional-id\")");
+    }
+
     TEST_CASE("exact worker lowers fresh container displays and subscription mutation into verified bytecode",
               "[compiler-vm-progress]") {
         auto &runtime = shared_runtime();

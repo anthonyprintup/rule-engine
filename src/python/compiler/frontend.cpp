@@ -468,6 +468,67 @@ namespace rule_engine::python::compiler {
 
         std::string stable_digest(std::string_view canonical);
         SchemaId schema_for_type(const StaticType &type);
+        void canonical_fact(std::ostringstream &output, const FactValue &fact);
+
+        struct ScalarDefault {
+            FactValue value;
+            StaticType type;
+        };
+
+        [[nodiscard]] std::optional<ScalarDefault> scalar_default(const AstIndex &index, const AstNode *node) {
+            if (node == nullptr) {
+                return std::nullopt;
+            }
+            const AstNode *constant = node;
+            bool negate {};
+            if (node->kind == "UnaryOp") {
+                const auto *operation = index.reference(*node, "op");
+                constant = index.reference(*node, "operand");
+                if (operation == nullptr || constant == nullptr || constant->kind != "Constant" ||
+                    (operation->kind != "UAdd" && operation->kind != "USub")) {
+                    return std::nullopt;
+                }
+                negate = operation->kind == "USub";
+            } else if (node->kind != "Constant") {
+                return std::nullopt;
+            }
+            const auto *field = index.field(*constant, "value");
+            if (field == nullptr) {
+                return std::nullopt;
+            }
+            if (const auto *value = std::get_if<bool>(&field->value.data); value != nullptr && constant == node) {
+                return ScalarDefault {.value = make_fact(*value),
+                                      .type = {.kind = StaticTypeKind::boolean, .qualified_name = "bool"}};
+            }
+            if (const auto *value = std::get_if<IntegerValue>(&field->value.data)) {
+                auto decimal = value->decimal;
+                if (negate && decimal != "0") {
+                    decimal.insert(decimal.begin(), '-');
+                }
+                return ScalarDefault {.value = make_fact(IntegerValue {.decimal = std::move(decimal)}),
+                                      .type = {.kind = StaticTypeKind::integer, .qualified_name = "int"}};
+            }
+            if (const auto *value = std::get_if<AstFloatBits>(&field->value.data)) {
+                auto bits = value->bits;
+                if (negate) {
+                    bits ^= std::uint64_t {1} << 63U;
+                }
+                return ScalarDefault {.value = make_fact(std::bit_cast<double>(bits)),
+                                      .type = {.kind = StaticTypeKind::floating, .qualified_name = "float"}};
+            }
+            if (constant != node) {
+                return std::nullopt;
+            }
+            if (const auto *value = std::get_if<UnicodeValue>(&field->value.data)) {
+                return ScalarDefault {.value = make_fact(*value),
+                                      .type = {.kind = StaticTypeKind::string, .qualified_name = "str"}};
+            }
+            if (const auto *value = std::get_if<BytesValue>(&field->value.data)) {
+                return ScalarDefault {.value = make_fact(*value),
+                                      .type = {.kind = StaticTypeKind::bytes, .qualified_name = "bytes"}};
+            }
+            return std::nullopt;
+        }
 
         struct StateKeyModel {
             std::string module;
@@ -780,6 +841,7 @@ namespace rule_engine::python::compiler {
                 }
                 auto storage = std::string {"eager"};
                 auto field_id = static_cast<std::uint32_t>(descriptor.fields.size() + 1U);
+                std::optional<FactValue> constructor_default;
                 if (event_record) {
                     const auto *value = index.reference(*statement, "value");
                     const auto *field_target = value == nullptr ? nullptr : index.reference(*value, "func");
@@ -787,19 +849,47 @@ namespace rule_engine::python::compiler {
                         value == nullptr ? std::vector<const AstNode *> {} : index.sequence(*value, "keywords");
                     if (value == nullptr || value->kind != "Call" || field_target == nullptr ||
                         root_name(index, *field_target) != "wire_field" || !index.sequence(*value, "args").empty() ||
-                        keywords.size() != 1U || index.string(*keywords.front(), "arg") != "id") {
+                        keywords.empty() || keywords.size() > 2U) {
                         diagnostics.push_back(make_diagnostic(
                             "PY-EVENT-FIELD",
-                            "EventRecord fields require wire_field(id=POSITIVE_INTEGER) without a default",
+                            "EventRecord fields require wire_field(id=POSITIVE_INTEGER, default=SCALAR_LITERAL)",
                             statement->span));
                         continue;
                     }
-                    const auto parsed_id = positive_field_id(index.reference(*keywords.front(), "value"));
+                    const AstNode *id_value {};
+                    const AstNode *default_value {};
+                    bool invalid_keyword {};
+                    for (const auto *keyword : keywords) {
+                        const auto keyword_name = index.string(*keyword, "arg").value_or(std::string {});
+                        if (keyword_name == "id" && id_value == nullptr) {
+                            id_value = index.reference(*keyword, "value");
+                        } else if (keyword_name == "default" && default_value == nullptr) {
+                            default_value = index.reference(*keyword, "value");
+                        } else {
+                            invalid_keyword = true;
+                        }
+                    }
+                    const auto parsed_id = invalid_keyword ? std::nullopt : positive_field_id(id_value);
                     if (!parsed_id || !field_ids.insert(*parsed_id).second) {
                         diagnostics.push_back(make_diagnostic("PY-EVENT-FIELD",
                                                               "EventRecord wire field IDs must be positive and unique",
                                                               statement->span));
                         continue;
+                    }
+                    if (default_value != nullptr) {
+                        const auto parsed_default = scalar_default(index, default_value);
+                        const auto compatible =
+                            parsed_default && (parsed_default->type.kind == type.kind ||
+                                               (parsed_default->type.kind == StaticTypeKind::boolean &&
+                                                type.kind == StaticTypeKind::integer));
+                        if (!compatible) {
+                            diagnostics.push_back(make_diagnostic(
+                                "PY-EVENT-FIELD",
+                                "EventRecord default must be a statically canonical type-correct scalar literal",
+                                default_value->span));
+                            continue;
+                        }
+                        constructor_default = parsed_default->value;
                     }
                     field_id = *parsed_id;
                     storage = "wire";
@@ -840,6 +930,7 @@ namespace rule_engine::python::compiler {
                     .type = schema_for_type(type),
                     .optional = false,
                     .label = {.classification = annotation_classification(index, annotation), .categories = {}},
+                    .constructor_default = std::move(constructor_default),
                 });
                 field_storage.push_back(std::move(storage));
             }
@@ -850,8 +941,12 @@ namespace rule_engine::python::compiler {
             for (std::size_t position = 0; position < descriptor.fields.size(); ++position) {
                 const auto &field = descriptor.fields[position];
                 canonical << field.field_id << ':' << field.name << ':' << field.type.value << ':'
-                          << static_cast<unsigned int>(field.label.classification) << ':' << field_storage[position]
-                          << '|';
+                          << static_cast<unsigned int>(field.label.classification) << ':' << field_storage[position];
+                if (field.constructor_default) {
+                    canonical << ":default:";
+                    canonical_fact(canonical, *field.constructor_default);
+                }
+                canonical << '|';
             }
             descriptor.canonical_hash = stable_digest(std::move(canonical).str());
             generated_schemas.descriptors.push_back(std::move(descriptor));
@@ -2087,20 +2182,30 @@ namespace rule_engine::python::compiler {
                     values.emplace(*name, *lowered);
                 }
                 if (values.size() != descriptor.fields.size()) {
-                    diagnostics.push_back(
-                        make_diagnostic("PY-EVENT-CONSTRUCTOR",
-                                        "EventRecord constructor must supply every declared wire field", node.span));
-                    return std::nullopt;
+                    const auto missing_required = std::ranges::any_of(descriptor.fields, [&](const auto &field) {
+                        return !values.contains(field.name) && !field.constructor_default.has_value();
+                    });
+                    if (missing_required) {
+                        diagnostics.push_back(make_diagnostic(
+                            "PY-EVENT-CONSTRUCTOR",
+                            "EventRecord constructor must supply every wire field without a default", node.span));
+                        return std::nullopt;
+                    }
+                }
+                for (const auto &field : descriptor.fields) {
+                    if (values.contains(field.name)) {
+                        continue;
+                    }
+                    const auto constant_index = static_cast<std::uint32_t>(pack.constants.size());
+                    pack.constants.push_back(*field.constructor_default);
+                    const auto default_register = allocate();
+                    emit(Opcode::load_const, default_register, 0U, 0U, constant_index, node.span);
+                    values.emplace(field.name,
+                                   ExpressionResult {.reg = default_register, .type = type_for_schema(field.type)});
                 }
                 const auto first_field = bytecode.register_count;
                 for (const auto &field : descriptor.fields) {
                     const auto value = values.find(field.name);
-                    if (value == values.end()) {
-                        diagnostics.push_back(make_diagnostic("PY-EVENT-CONSTRUCTOR",
-                                                              "EventRecord constructor omitted a declared wire field",
-                                                              node.span));
-                        return std::nullopt;
-                    }
                     const auto staging = allocate();
                     emit(Opcode::move, staging, value->second.reg, 0U, 0U, node.span);
                 }
@@ -3487,6 +3592,10 @@ namespace rule_engine::python::compiler {
                     canonical_token(output, field.type.value);
                     output << field.optional << '|' << static_cast<unsigned int>(field.label.classification) << '|';
                     for (const auto &category : field.label.categories) { canonical_token(output, category); }
+                    if (field.constructor_default) {
+                        output << "default|";
+                        canonical_fact(output, *field.constructor_default);
+                    }
                     output << '\n';
                 }
             }
