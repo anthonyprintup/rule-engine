@@ -878,10 +878,7 @@ namespace rule_engine::python::compiler {
                     }
                     if (default_value != nullptr) {
                         const auto parsed_default = scalar_default(index, default_value);
-                        const auto compatible =
-                            parsed_default && (parsed_default->type.kind == type.kind ||
-                                               (parsed_default->type.kind == StaticTypeKind::boolean &&
-                                                type.kind == StaticTypeKind::integer));
+                        const auto compatible = parsed_default && parsed_default->type.kind == type.kind;
                         if (!compatible) {
                             diagnostics.push_back(make_diagnostic(
                                 "PY-EVENT-FIELD",

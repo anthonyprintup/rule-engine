@@ -834,13 +834,13 @@ namespace {
             WARN("SKIPPED: " << runtime.unavailable_reason);
             return;
         }
-        const auto reject_default = [&](const std::string_view declaration) {
+        const auto reject_default = [&](const std::string_view annotation, const std::string_view declaration) {
             const auto compiled = compile_exact_source(
                 *runtime.runtime, runtime.temporary_parent,
                 "from rule_engine import EventRecord, rule, schema, wire_field\n\n"
                 "@schema(\"com.example.invalid-default.v1\")\n"
-                "class Alert(EventRecord):\n    value: str = " +
-                    std::string {declaration} +
+                "class Alert(EventRecord):\n    value: " +
+                    std::string {annotation} + " = " + std::string {declaration} +
                     "\n\n@rule(\"com.example.invalid-event\")\ndef invalid_event() -> bool:\n    return True\n",
                 "com.example.invalid-event");
             REQUIRE_FALSE(compiled.has_value());
@@ -848,10 +848,11 @@ namespace {
             CHECK(std::ranges::any_of(
                 compiled.error(), [](const Diagnostic &diagnostic) { return diagnostic.code == "PY-EVENT-FIELD"; }));
         };
-        reject_default("wire_field(id=1, default=1)");
-        reject_default("wire_field(id=1, default=[\"dynamic\"])");
-        reject_default("wire_field(id=1, default=str(1))");
-        reject_default("wire_field(1, default=\"positional-id\")");
+        reject_default("str", "wire_field(id=1, default=1)");
+        reject_default("int", "wire_field(id=1, default=True)");
+        reject_default("str", "wire_field(id=1, default=[\"dynamic\"])");
+        reject_default("str", "wire_field(id=1, default=str(1))");
+        reject_default("str", "wire_field(1, default=\"positional-id\")");
     }
 
     TEST_CASE("exact worker lowers fresh container displays and subscription mutation into verified bytecode",
