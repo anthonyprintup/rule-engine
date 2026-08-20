@@ -1463,10 +1463,11 @@ TEST_CASE("resident work poll snapshots are concurrent and saturating") {
     agents.deliver_on_take_call = (std::numeric_limits<std::size_t>::max)();
     RejectAdmin admin;
     auto limits = test_service_limits();
-    limits.maximum_session_duration = std::chrono::milliseconds {35};
+    limits.maximum_session_duration = std::chrono::seconds {1};
     tools::ResidentApplicationService service {limits, trust, agents, admin};
     auto first = std::make_shared<FakeChannelState>();
     auto second = std::make_shared<FakeChannelState>();
+    std::stop_source stop;
     enqueue_protocol(first, agent_hello_envelope());
     enqueue_protocol(second, agent_hello_envelope());
 
@@ -1474,20 +1475,27 @@ TEST_CASE("resident work poll snapshots are concurrent and saturating") {
         service.run({.role = tools::ResidentSessionRole::agent,
                      .peer = {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:test"}},
                      .channel = std::make_unique<FakeByteChannel>(first)},
-                    {});
+                    stop.get_token());
     }};
     std::jthread second_session {[&] {
         service.run({.role = tools::ResidentSessionRole::agent,
                      .peer = {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:test"}},
                      .channel = std::make_unique<FakeByteChannel>(second)},
-                    {});
+                    stop.get_token());
     }};
-    static_cast<void>(service.work_poll_snapshot());
+    const auto poll_deadline = std::chrono::steady_clock::now() + std::chrono::seconds {2};
+    while (agents.take_calls.load() < 4U && std::chrono::steady_clock::now() < poll_deadline) {
+        static_cast<void>(service.work_poll_snapshot());
+        std::this_thread::yield();
+    }
+    const auto observed_polls = agents.take_calls.load();
+    stop.request_stop();
     first_session.join();
     second_session.join();
 
+    REQUIRE(observed_polls >= 4U);
     const auto polls = service.work_poll_snapshot();
-    CHECK(polls.empty_polls >= 4U);
+    CHECK(polls.empty_polls == agents.take_calls.load());
     CHECK(polls.nonempty_polls == 0U);
     CHECK(polls.delivered_work == 0U);
     CHECK(polls.delivery_delay_samples == 0U);
