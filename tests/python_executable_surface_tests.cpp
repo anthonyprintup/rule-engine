@@ -1034,6 +1034,8 @@ namespace {
         std::vector<tools::ResidentAdminRequestKind> calls;
         std::vector<std::byte> bytes;
         std::uint64_t total_bytes {};
+        tools::ResidentPackRegistryObservation observation {};
+        std::size_t observation_reads {};
 
         [[nodiscard]] std::expected<tools::ResidentPackUploadReceipt, proto::ProtocolError>
         begin(const py::TenantId &, const py::PackId &, std::string_view, const std::uint64_t total) noexcept override {
@@ -1074,6 +1076,12 @@ namespace {
         [[nodiscard]] std::expected<tools::ResidentPackRegistryMaintenanceReceipt, proto::ProtocolError>
         maintain(std::span<const py::SourceDigest>, std::uint64_t) noexcept override {
             return tools::ResidentPackRegistryMaintenanceReceipt {};
+        }
+
+        [[nodiscard]] std::expected<tools::ResidentPackRegistryObservation, proto::ProtocolError>
+        observe_maintenance() noexcept override {
+            ++observation_reads;
+            return observation;
         }
     };
 
@@ -1182,6 +1190,21 @@ namespace {
                 .upload_total_bytes = 0U,
                 .source_digest = std::nullopt,
             };
+        }
+    };
+
+    struct RegistryObservationTransport final: tools::IResidentAdminRequestTransport {
+        [[nodiscard]] std::expected<tools::ResidentAdminResponse, tools::ToolFailure>
+        exchange(const tools::AdminEndpointConfiguration &, const tools::ResidentAdminRequest &request) override {
+            return tools::ResidentAdminResponse {.status = tools::ResidentAdminResponseStatus::ok,
+                                                 .request_id = request.request_id,
+                                                 .code = "OK",
+                                                 .registry_maintenance_runs = 7U,
+                                                 .registry_last_maintenance_unix_ms = 900U,
+                                                 .registry_expired_partial_sessions = 4U,
+                                                 .registry_removed_completion_records = 3U,
+                                                 .registry_removed_objects = 2U,
+                                                 .registry_reclaimed_bytes = 1024U};
         }
     };
 
@@ -1620,7 +1643,8 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
 
     CountingControlStore store;
     DenyAdminPolicy policy;
-    tools::AuthorizedResidentAdminBackend backend {store, policy};
+    RecordingUploadBackend denied_uploads;
+    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, &denied_uploads};
     const std::array requests {
         tools::ResidentAdminRequest {.kind = tools::ResidentAdminRequestKind::pack_snapshot,
                                      .request_id = "request:pack",
@@ -1763,6 +1787,7 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
     }
     CHECK(store.reads == 0U);
     CHECK(store.commits == 0U);
+    CHECK(denied_uploads.observation_reads == 0U);
 
     const tools::ResidentAdminResponse rich_response {
         .status = tools::ResidentAdminResponseStatus::ok,
@@ -1781,6 +1806,12 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
         .upload_received_bytes = 17U,
         .upload_total_bytes = 17U,
         .source_digest = py::SourceDigest {"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+        .registry_maintenance_runs = 4U,
+        .registry_last_maintenance_unix_ms = 1234U,
+        .registry_expired_partial_sessions = 3U,
+        .registry_removed_completion_records = 5U,
+        .registry_removed_objects = 2U,
+        .registry_reclaimed_bytes = 4096U,
     };
     const auto rich_bytes = tools::encode_resident_admin_response(rich_response, 4U * py::kibibyte);
     REQUIRE(rich_bytes);
@@ -1795,6 +1826,12 @@ TEST_CASE("resident application codecs reject malformed frames and deny admin mu
     CHECK(rich_decoded->upload_total_bytes == 17U);
     REQUIRE(rich_decoded->source_digest);
     CHECK(*rich_decoded->source_digest == *rich_response.source_digest);
+    CHECK(rich_decoded->registry_maintenance_runs == 4U);
+    CHECK(rich_decoded->registry_last_maintenance_unix_ms == 1234U);
+    CHECK(rich_decoded->registry_expired_partial_sessions == 3U);
+    CHECK(rich_decoded->registry_removed_completion_records == 5U);
+    CHECK(rich_decoded->registry_removed_objects == 2U);
+    CHECK(rich_decoded->registry_reclaimed_bytes == 4096U);
 
     AllowTrust trust;
     DurableFakeAgentBackend agents;
@@ -2053,6 +2090,61 @@ TEST_CASE("resident upload authorizes every phase before touching the bounded ba
     CHECK(store.commits == 0U);
 }
 
+TEST_CASE("authorized pack snapshots expose aggregate registry maintenance without source inventory") {
+    CountingControlStore store;
+    AllowAdminPolicy policy;
+    RecordingUploadBackend uploads;
+    uploads.observation = {.successful_maintenance_runs = 7U,
+                           .last_maintenance_unix_ms = 900U,
+                           .expired_partial_sessions = 4U,
+                           .removed_completion_records = 3U,
+                           .removed_objects = 2U,
+                           .reclaimed_bytes = 1024U};
+    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, &uploads};
+    const auto response = backend.execute({.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:admin"}},
+                                          {.kind = tools::ResidentAdminRequestKind::pack_snapshot,
+                                           .request_id = "request:pack:registry",
+                                           .tenant = py::TenantId {"tenant:test"},
+                                           .pack = py::PackId {"pack:test"},
+                                           .at_unix_ms = 10U});
+
+    REQUIRE(response.status == tools::ResidentAdminResponseStatus::ok);
+    CHECK(policy.operations == std::vector {py::cluster::AdminControlOperation::pack_read});
+    CHECK(store.reads == 1U);
+    CHECK(uploads.observation_reads == 1U);
+    CHECK(response.registry_maintenance_runs == 7U);
+    CHECK(response.registry_last_maintenance_unix_ms == 900U);
+    CHECK(response.registry_expired_partial_sessions == 4U);
+    CHECK(response.registry_removed_completion_records == 3U);
+    CHECK(response.registry_removed_objects == 2U);
+    CHECK(response.registry_reclaimed_bytes == 1024U);
+    CHECK_FALSE(response.source_digest);
+}
+
+TEST_CASE("standalone admin pack output renders only bounded registry aggregate fields") {
+    RegistryObservationTransport transport;
+    tools::ResidentAdminClientAdapter client {&transport};
+    const auto result = client.execute({}, {.action = tools::AdminAction::packs,
+                                            .operands = {"pack:test"},
+                                            .options = {{"tenant", "tenant:test"}},
+                                            .request_id = "request:registry"});
+
+    REQUIRE(result);
+    REQUIRE(result->success);
+    const auto field = [&](const std::string_view name) -> const tools::DisplayField * {
+        const auto found = std::ranges::find(result->fields, name, &tools::DisplayField::name);
+        return found == result->fields.end() ? nullptr : std::addressof(*found);
+    };
+    REQUIRE(field("registry_maintenance_runs") != nullptr);
+    CHECK(field("registry_maintenance_runs")->value == "7");
+    CHECK(field("registry_last_maintenance_unix_ms")->value == "900");
+    CHECK(field("registry_expired_partial_sessions")->value == "4");
+    CHECK(field("registry_removed_completion_records")->value == "3");
+    CHECK(field("registry_removed_objects")->value == "2");
+    CHECK(field("registry_reclaimed_bytes")->value == "1024");
+    CHECK(field("source_digest") == nullptr);
+}
+
 TEST_CASE("filesystem upload resumes exact bytes and replays immutable publication evidence") {
     TemporaryDirectory temporary;
     const std::filesystem::path crypto_library {RULE_ENGINE_PYTHON_SERVER_PATH};
@@ -2129,6 +2221,20 @@ TEST_CASE("filesystem upload resumes exact bytes and replays immutable publicati
     CHECK(collected->removed_objects == 1U);
     CHECK(collected->reclaimed_bytes == encoded->size());
     CHECK_FALSE(std::filesystem::exists(*destination));
+    auto observed = (*backend)->observe_maintenance();
+    REQUIRE(observed);
+    CHECK(observed->successful_maintenance_runs == 2U);
+    CHECK(observed->last_maintenance_unix_ms == after_retention);
+    CHECK(observed->removed_completion_records == 1U);
+    CHECK(observed->removed_objects == 1U);
+    CHECK(observed->reclaimed_bytes == encoded->size());
+
+    backend->reset();
+    backend = tools::FilesystemResidentPackUploadBackend::create(temporary.path, trust, crypto_library, limits);
+    REQUIRE(backend);
+    auto reopened_observation = (*backend)->observe_maintenance();
+    REQUIRE(reopened_observation);
+    CHECK(*reopened_observation == *observed);
 
     std::error_code filesystem_error;
     std::size_t partial_files {};

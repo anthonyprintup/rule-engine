@@ -210,6 +210,17 @@ v1 is not accepted by current servers; finish uploads before upgrade or clear
 only the ACL-protected `.uploads` spool after confirming no upload is in
 progress. Never delete `sha256` objects manually to recover quota.
 
+Each successful maintenance pass atomically updates an aggregate-only audit and
+retains the latest 32 pass records. The record contains only its timestamp and
+expiry/removal/reclaimed-byte counts; it never contains source bytes, digests,
+tenant or pack identities, or filesystem paths. The
+`rule_engine_admin packs PACK_ID --tenant TENANT_ID` command returns the
+cumulative counts and last-success timestamp only
+after the normal authenticated `pack_read` authorization succeeds. An audit read
+or update failure fails closed. These fields are operational counters, not a
+Prometheus time series; alert on a stale last-success timestamp and corroborate
+non-zero reclamation with capacity monitoring.
+
 The capability inventory is a bounded UTF-8 file whose exact first line is
 `rule-engine.resident-capabilities.v1`. Every following non-comment line is one
 canonical capability ID, for example:

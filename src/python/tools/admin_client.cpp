@@ -521,6 +521,18 @@ namespace rule_engine::python::tools {
             if (response.source_digest) {
                 add_field(result.fields, "source_digest", response.source_digest->value);
             }
+            if (response.registry_maintenance_runs != 0U) {
+                add_field(result.fields, "registry_maintenance_runs",
+                          std::to_string(response.registry_maintenance_runs));
+                add_field(result.fields, "registry_last_maintenance_unix_ms",
+                          std::to_string(response.registry_last_maintenance_unix_ms));
+                add_field(result.fields, "registry_expired_partial_sessions",
+                          std::to_string(response.registry_expired_partial_sessions));
+                add_field(result.fields, "registry_removed_completion_records",
+                          std::to_string(response.registry_removed_completion_records));
+                add_field(result.fields, "registry_removed_objects", std::to_string(response.registry_removed_objects));
+                add_field(result.fields, "registry_reclaimed_bytes", std::to_string(response.registry_reclaimed_bytes));
+            }
             if (!result.success) {
                 result.diagnostics.push_back(Diagnostic {
                     .code = response.code,

@@ -1,5 +1,6 @@
 #include "rule_engine/python/tools/pack_upload.hpp"
 
+#include <array>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -32,8 +33,10 @@ namespace rule_engine::python::tools {
         constexpr std::uint64_t maximum_upload_bytes = balanced_v1.compile.source_closure_bytes;
         constexpr std::uint64_t maximum_reserved_bytes = 256U * mebibyte;
         constexpr std::size_t maximum_metadata_bytes = 4U * kibibyte;
+        constexpr std::size_t maximum_maintenance_audit_records = 32U;
         constexpr std::string_view metadata_header {"rule-engine.pack-upload.v2"};
         constexpr std::string_view completion_header {"rule-engine.pack-upload-complete.v2"};
+        constexpr std::string_view maintenance_audit_header {"rule-engine.pack-registry-maintenance.v1"};
 
         [[nodiscard]] protocol_v2::ProtocolError upload_error(const protocol_v2::ProtocolErrorCode code,
                                                               std::string message) {
@@ -243,6 +246,98 @@ namespace rule_engine::python::tools {
             std::uint64_t published_at_unix_ms {};
         };
 
+        struct MaintenanceAudit {
+            ResidentPackRegistryObservation aggregate;
+            std::vector<std::pair<std::uint64_t, ResidentPackRegistryMaintenanceReceipt>> records;
+        };
+
+        [[nodiscard]] std::optional<std::pair<std::uint64_t, ResidentPackRegistryMaintenanceReceipt>>
+        parse_maintenance_record(const std::string_view line) {
+            std::array<std::uint64_t, 5U> values {};
+            std::size_t begin {};
+            for (std::size_t index = 0U; index < values.size(); ++index) {
+                const auto end = index + 1U == values.size() ? line.size() : line.find(':', begin);
+                if (end == std::string_view::npos) {
+                    return std::nullopt;
+                }
+                const auto parsed = parse_unsigned(line.substr(begin, end - begin));
+                if (!parsed) {
+                    return std::nullopt;
+                }
+                values[index] = *parsed;
+                begin = end + 1U;
+            }
+            if (begin != line.size() + 1U || values[0] == 0U) {
+                return std::nullopt;
+            }
+            return std::pair {
+                values[0],
+                ResidentPackRegistryMaintenanceReceipt {.expired_partial_sessions = values[1],
+                                                        .removed_completion_records = values[2],
+                                                        .removed_objects = values[3],
+                                                        .reclaimed_bytes = values[4]},
+            };
+        }
+
+        [[nodiscard]] std::expected<MaintenanceAudit, protocol_v2::ProtocolError>
+        read_maintenance_audit(const std::filesystem::path &path) {
+            std::error_code filesystem_error;
+            const auto status = std::filesystem::symlink_status(path, filesystem_error);
+            if (filesystem_error == std::errc::no_such_file_or_directory) {
+                return MaintenanceAudit {};
+            }
+            if (filesystem_error || !std::filesystem::is_regular_file(status) || std::filesystem::is_symlink(status)) {
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                                                    "registry maintenance audit is unavailable"));
+            }
+            auto text = read_text(path);
+            if (!text) {
+                return std::unexpected(std::move(text.error()));
+            }
+            const auto fields = lines(*text);
+            if (fields.size() < 8U || fields[0] != maintenance_audit_header) {
+                return std::unexpected(
+                    upload_error(protocol_v2::ProtocolErrorCode::malformed, "registry maintenance audit is malformed"));
+            }
+            std::array<std::uint64_t, 7U> values {};
+            for (std::size_t index = 0U; index < values.size(); ++index) {
+                const auto parsed = parse_unsigned(fields[index + 1U]);
+                if (!parsed) {
+                    return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::malformed,
+                                                        "registry maintenance audit is malformed"));
+                }
+                values[index] = *parsed;
+            }
+            if (values[6] > maximum_maintenance_audit_records || fields.size() != 8U + values[6]) {
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::limit_exceeded,
+                                                    "registry maintenance audit exceeds its record bound"));
+            }
+            MaintenanceAudit result {
+                .aggregate = {.successful_maintenance_runs = values[0],
+                              .last_maintenance_unix_ms = values[1],
+                              .expired_partial_sessions = values[2],
+                              .removed_completion_records = values[3],
+                              .removed_objects = values[4],
+                              .reclaimed_bytes = values[5]},
+                .records = {},
+            };
+            result.records.reserve(static_cast<std::size_t>(values[6]));
+            for (std::size_t index = 0U; index < values[6]; ++index) {
+                auto record = parse_maintenance_record(fields[8U + index]);
+                if (!record) {
+                    return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::malformed,
+                                                        "registry maintenance audit record is malformed"));
+                }
+                result.records.push_back(std::move(*record));
+            }
+            if ((result.aggregate.successful_maintenance_runs == 0U) != result.records.empty() ||
+                (!result.records.empty() && result.records.back().first != result.aggregate.last_maintenance_unix_ms)) {
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::malformed,
+                                                    "registry maintenance audit aggregate is inconsistent"));
+            }
+            return result;
+        }
+
         [[nodiscard]] std::expected<CompletionMetadata, protocol_v2::ProtocolError>
         read_completion(const std::filesystem::path &path) {
             auto text = read_text(path);
@@ -350,6 +445,27 @@ namespace rule_engine::python::tools {
             return {};
         }
 
+        [[nodiscard]] std::expected<void, protocol_v2::ProtocolError> replace_text(const std::filesystem::path &path,
+                                                                                   const std::string_view content) {
+            auto temporary = path;
+            temporary += ".new";
+            std::error_code ignored;
+            std::filesystem::remove(temporary, ignored);
+            if (auto written = write_text(temporary, content); !written) {
+                return written;
+            }
+#ifdef _WIN32
+            if (MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
+#else
+            if (::rename(temporary.c_str(), path.c_str()) != 0) {
+#endif
+                std::filesystem::remove(temporary, ignored);
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                                                    "registry maintenance audit cannot be replaced durably"));
+            }
+            return {};
+        }
+
         [[nodiscard]] std::expected<std::uint64_t, protocol_v2::ProtocolError>
         partial_size(const std::filesystem::path &path) {
             std::error_code filesystem_error;
@@ -450,6 +566,69 @@ namespace rule_engine::python::tools {
         std::filesystem::path crypto_library;
         PackRegistryLimits limits;
         std::mutex mutex;
+
+        [[nodiscard]] std::filesystem::path maintenance_audit_path() const { return spool / ".maintenance.audit"; }
+
+        [[nodiscard]] std::expected<ResidentPackRegistryObservation, protocol_v2::ProtocolError>
+        observe_maintenance() const {
+            auto audit = read_maintenance_audit(maintenance_audit_path());
+            if (!audit) {
+                return std::unexpected(std::move(audit.error()));
+            }
+            return audit->aggregate;
+        }
+
+        [[nodiscard]] std::expected<void, protocol_v2::ProtocolError>
+        record_maintenance(const std::uint64_t at_unix_ms,
+                           const ResidentPackRegistryMaintenanceReceipt &receipt) const {
+            auto audit = read_maintenance_audit(maintenance_audit_path());
+            if (!audit) {
+                return std::unexpected(std::move(audit.error()));
+            }
+            const auto add = [](const std::uint64_t left, const std::uint64_t right) -> std::optional<std::uint64_t> {
+                if (left > (std::numeric_limits<std::uint64_t>::max)() - right) {
+                    return std::nullopt;
+                }
+                return left + right;
+            };
+            const auto runs = add(audit->aggregate.successful_maintenance_runs, 1U);
+            const auto expired = add(audit->aggregate.expired_partial_sessions, receipt.expired_partial_sessions);
+            const auto completions =
+                add(audit->aggregate.removed_completion_records, receipt.removed_completion_records);
+            const auto objects = add(audit->aggregate.removed_objects, receipt.removed_objects);
+            const auto bytes = add(audit->aggregate.reclaimed_bytes, receipt.reclaimed_bytes);
+            if (!runs || !expired || !completions || !objects || !bytes) {
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::limit_exceeded,
+                                                    "registry maintenance counters overflowed"));
+            }
+            audit->aggregate = {.successful_maintenance_runs = *runs,
+                                .last_maintenance_unix_ms = at_unix_ms,
+                                .expired_partial_sessions = *expired,
+                                .removed_completion_records = *completions,
+                                .removed_objects = *objects,
+                                .reclaimed_bytes = *bytes};
+            audit->records.emplace_back(at_unix_ms, receipt);
+            if (audit->records.size() > maximum_maintenance_audit_records) {
+                audit->records.erase(
+                    audit->records.begin(),
+                    audit->records.begin() +
+                        static_cast<std::ptrdiff_t>(audit->records.size() - maximum_maintenance_audit_records));
+            }
+            std::string text = std::string {maintenance_audit_header} + '\n' + std::to_string(*runs) + '\n' +
+                               std::to_string(at_unix_ms) + '\n' + std::to_string(*expired) + '\n' +
+                               std::to_string(*completions) + '\n' + std::to_string(*objects) + '\n' +
+                               std::to_string(*bytes) + '\n' + std::to_string(audit->records.size()) + '\n';
+            for (const auto &[record_at, record] : audit->records) {
+                text += std::to_string(record_at) + ':' + std::to_string(record.expired_partial_sessions) + ':' +
+                        std::to_string(record.removed_completion_records) + ':' +
+                        std::to_string(record.removed_objects) + ':' + std::to_string(record.reclaimed_bytes) + '\n';
+            }
+            if (text.size() > maximum_metadata_bytes) {
+                return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::limit_exceeded,
+                                                    "registry maintenance audit exceeds its byte bound"));
+            }
+            return replace_text(maintenance_audit_path(), text);
+        }
 
         [[nodiscard]] std::expected<std::optional<ResidentPackUploadReceipt>, protocol_v2::ProtocolError>
         completed(const UploadPaths &paths, const TenantId &tenant, const PackId &pack) const {
@@ -926,7 +1105,24 @@ namespace rule_engine::python::tools {
                 ++result->removed_completion_records;
             }
         }
+        if (auto recorded = impl_->record_maintenance(now_unix_ms, *result); !recorded) {
+            return std::unexpected(std::move(recorded.error()));
+        }
         return result;
+    }
+
+    std::expected<ResidentPackRegistryObservation, protocol_v2::ProtocolError>
+    FilesystemResidentPackUploadBackend::observe_maintenance() noexcept {
+        if (impl_ == nullptr) {
+            return std::unexpected(upload_error(protocol_v2::ProtocolErrorCode::dependency_unavailable,
+                                                "registry maintenance observation is unavailable"));
+        }
+        std::scoped_lock lock {impl_->mutex};
+        auto spool_lock = ScopedSpoolLock::acquire(impl_->spool / ".spool.lock");
+        if (!spool_lock) {
+            return std::unexpected(std::move(spool_lock.error()));
+        }
+        return impl_->observe_maintenance();
     }
 
 } // namespace rule_engine::python::tools

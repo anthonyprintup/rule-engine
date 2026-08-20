@@ -605,7 +605,7 @@ namespace rule_engine::python::tools {
         const auto flags = static_cast<std::uint8_t>((response.active_generation ? 1U : 0U) |
                                                      (response.previous_active_generation ? 2U : 0U) |
                                                      (response.source_digest ? 4U : 0U));
-        if (!writer.append_u8(3U) || !writer.append_u8(static_cast<std::uint8_t>(response.status)) ||
+        if (!writer.append_u8(4U) || !writer.append_u8(static_cast<std::uint8_t>(response.status)) ||
             !writer.append_u8(flags) || !writer.append_string(response.request_id) ||
             !writer.append_string(response.code) || !writer.append_string(response.diagnostic) ||
             !writer.append_u64(response.storage_revision) || !writer.append_u64(response.resource_version) ||
@@ -618,7 +618,13 @@ namespace rule_engine::python::tools {
                                  [&](const std::string &work_id) { return writer.append_string(work_id); }) ||
             !writer.append_u64(response.upload_received_bytes) || !writer.append_u64(response.upload_total_bytes) ||
             !writer.append_string(response.source_digest ? std::string_view {response.source_digest->value} :
-                                                           std::string_view {})) {
+                                                           std::string_view {}) ||
+            !writer.append_u64(response.registry_maintenance_runs) ||
+            !writer.append_u64(response.registry_last_maintenance_unix_ms) ||
+            !writer.append_u64(response.registry_expired_partial_sessions) ||
+            !writer.append_u64(response.registry_removed_completion_records) ||
+            !writer.append_u64(response.registry_removed_objects) ||
+            !writer.append_u64(response.registry_reclaimed_bytes)) {
             return std::unexpected(
                 error(protocol_v2::ProtocolErrorCode::limit_exceeded, "admin response exceeds its frame bound"));
         }
@@ -662,11 +668,18 @@ namespace rule_engine::python::tools {
         const auto upload_received = reader.read_u64();
         const auto upload_total = reader.read_u64();
         auto source_digest = reader.read_string();
-        if (!version || *version != 3U || !status || *status > 2U || !flags || (*flags & 0xf8U) != 0U || !request_id ||
+        const auto maintenance_runs = reader.read_u64();
+        const auto last_maintenance = reader.read_u64();
+        const auto expired_partials = reader.read_u64();
+        const auto removed_completions = reader.read_u64();
+        const auto removed_objects = reader.read_u64();
+        const auto reclaimed_bytes = reader.read_u64();
+        if (!version || *version != 4U || !status || *status > 2U || !flags || (*flags & 0xf8U) != 0U || !request_id ||
             !code || !diagnostic || !storage || !resource || !active || !previous || !operation_phase ||
             !target_generation || !drain_boundary || !assignment_fence || !work_count ||
             work_ids.size() != *work_count || !upload_received || !upload_total || !source_digest ||
-            (((*flags & 4U) != 0U) == source_digest->empty()) || reader.offset != payload.size()) {
+            !maintenance_runs || !last_maintenance || !expired_partials || !removed_completions || !removed_objects ||
+            !reclaimed_bytes || (((*flags & 4U) != 0U) == source_digest->empty()) || reader.offset != payload.size()) {
             return std::unexpected(
                 error(protocol_v2::ProtocolErrorCode::malformed, "admin response frame is malformed"));
         }
@@ -689,6 +702,12 @@ namespace rule_engine::python::tools {
             .source_digest = (*flags & 4U) != 0U ?
                                  std::optional<SourceDigest> {SourceDigest {std::move(*source_digest)}} :
                                  std::nullopt,
+            .registry_maintenance_runs = *maintenance_runs,
+            .registry_last_maintenance_unix_ms = *last_maintenance,
+            .registry_expired_partial_sessions = *expired_partials,
+            .registry_removed_completion_records = *removed_completions,
+            .registry_removed_objects = *removed_objects,
+            .registry_reclaimed_bytes = *reclaimed_bytes,
         };
         auto canonical = encode_resident_admin_response(response, maximum_frame_bytes);
         if (!canonical || *canonical != std::vector<std::byte> {payload.begin(), payload.end()}) {
@@ -786,22 +805,39 @@ namespace rule_engine::python::tools {
             if (!snapshot) {
                 return rejected_response(request, snapshot.error());
             }
-            ResidentAdminResponse response {.status = ResidentAdminResponseStatus::ok,
-                                            .request_id = request.request_id,
-                                            .code = "OK",
-                                            .diagnostic = {},
-                                            .storage_revision = snapshot->storage_revision,
-                                            .resource_version = 0U,
-                                            .active_generation = std::nullopt,
-                                            .previous_active_generation = std::nullopt,
-                                            .operation_phase = {},
-                                            .target_generation = 0U,
-                                            .drain_boundary = 0U,
-                                            .assignment_fence = 0U,
-                                            .work_ids = {},
-                                            .upload_received_bytes = 0U,
-                                            .upload_total_bytes = 0U,
-                                            .source_digest = std::nullopt};
+            std::optional<ResidentPackRegistryObservation> registry;
+            if (uploads_ != nullptr) {
+                auto observed = uploads_->observe_maintenance();
+                if (!observed) {
+                    auto response = unavailable_after_commit();
+                    response.code = "ADMIN-REGISTRY-OBSERVATION-UNAVAILABLE";
+                    return response;
+                }
+                registry = std::move(*observed);
+            }
+            ResidentAdminResponse response {
+                .status = ResidentAdminResponseStatus::ok,
+                .request_id = request.request_id,
+                .code = "OK",
+                .diagnostic = {},
+                .storage_revision = snapshot->storage_revision,
+                .resource_version = 0U,
+                .active_generation = std::nullopt,
+                .previous_active_generation = std::nullopt,
+                .operation_phase = {},
+                .target_generation = 0U,
+                .drain_boundary = 0U,
+                .assignment_fence = 0U,
+                .work_ids = {},
+                .upload_received_bytes = 0U,
+                .upload_total_bytes = 0U,
+                .source_digest = std::nullopt,
+                .registry_maintenance_runs = registry ? registry->successful_maintenance_runs : 0U,
+                .registry_last_maintenance_unix_ms = registry ? registry->last_maintenance_unix_ms : 0U,
+                .registry_expired_partial_sessions = registry ? registry->expired_partial_sessions : 0U,
+                .registry_removed_completion_records = registry ? registry->removed_completion_records : 0U,
+                .registry_removed_objects = registry ? registry->removed_objects : 0U,
+                .registry_reclaimed_bytes = registry ? registry->reclaimed_bytes : 0U};
             if (snapshot->control) {
                 response.resource_version = snapshot->control->resource_version;
                 response.active_generation = snapshot->control->active_generation;

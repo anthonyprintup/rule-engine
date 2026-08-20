@@ -43,6 +43,8 @@ namespace rule_engine::python::tools {
         finalize(const TenantId &tenant, const PackId &pack, std::string_view upload_id) noexcept override;
         [[nodiscard]] std::expected<ResidentPackRegistryMaintenanceReceipt, protocol_v2::ProtocolError>
         maintain(std::span<const SourceDigest> reachable_source_digests, std::uint64_t now_unix_ms) noexcept override;
+        [[nodiscard]] std::expected<ResidentPackRegistryObservation, protocol_v2::ProtocolError>
+        observe_maintenance() noexcept override;
 
     private:
         struct Impl;
