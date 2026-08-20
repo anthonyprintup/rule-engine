@@ -794,7 +794,7 @@ namespace rule_engine::python::tools {
                 return rejected_response(request, snapshot.error());
             }
             std::optional<ResidentPackRegistryObservation> registry;
-            if (uploads_ != nullptr) {
+            if (uploads_ != nullptr && admin.authorize_registry_observation(context)) {
                 auto observed = uploads_->observe_maintenance();
                 if (!observed) {
                     auto response = unavailable_after_commit();

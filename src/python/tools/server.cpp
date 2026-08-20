@@ -987,6 +987,7 @@ policy mutation remains fail-closed.
                 case pack_upload: return "pack.upload";
                 case operation_read: return "operation.read";
                 case pack_inspect: return "pack.read";
+                case registry_read: return "registry.read";
                 case activation_preview:
                 case activation_drain:
                 case activation_fence:
@@ -1037,8 +1038,10 @@ policy mutation remains fail-closed.
                     };
                 }
                 const auto capability = admin_capability(request.operation);
-                const auto tenant_matches = request.resource.tenant == found->principal.home_tenant;
-                const auto pack_matches = request.resource.pack.value.starts_with(found->pack_prefix);
+                const auto global_registry = request.resource.kind == cluster::AdminResourceKind::source_registry;
+                const auto tenant_matches = global_registry || request.resource.tenant == found->principal.home_tenant;
+                const auto pack_matches =
+                    global_registry || request.resource.pack.value.starts_with(found->pack_prefix);
                 const auto allowed =
                     !capability.empty() && found->capabilities.contains(capability) && tenant_matches && pack_matches;
                 return cluster::AdminAuthorizationDecision {
@@ -1090,7 +1093,7 @@ policy mutation remains fail-closed.
                 std::set<std::string, std::less<>> named;
                 for (const auto capability : capabilities) {
                     if ((capability != "pack.read" && capability != "pack.upload" && capability != "operation.read" &&
-                         capability != "pack.stage" && capability != "pack.activate" &&
+                         capability != "registry.read" && capability != "pack.stage" && capability != "pack.activate" &&
                          capability != "pack.rollback") ||
                         !named.insert(std::string {capability}).second) {
                         return std::unexpected(unavailable("SRV-OPERATOR-BINDING-MALFORMED",

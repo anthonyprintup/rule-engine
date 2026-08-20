@@ -37,9 +37,10 @@ namespace rule_engine::python::cluster {
         pack_read,
         operation_read,
         pack_inspect,
+        registry_read,
     };
 
-    enum struct AdminResourceKind : std::uint8_t { pack, pack_operation };
+    enum struct AdminResourceKind : std::uint8_t { pack, pack_operation, source_registry };
 
     struct AdminResource {
         TenantId tenant;
@@ -179,6 +180,8 @@ namespace rule_engine::python::cluster {
         pack_snapshot(const AdminCallContext &context, const TenantId &tenant, const PackId &pack) const;
         [[nodiscard]] std::expected<void, AuthorizedAdminError>
         authorize_pack_upload(const AdminCallContext &context, const TenantId &tenant, const PackId &pack) const;
+        [[nodiscard]] std::expected<void, AuthorizedAdminError>
+        authorize_registry_observation(const AdminCallContext &context) const;
         [[nodiscard]] std::expected<void, AuthorizedAdminError>
         authorize_stage_source(const AdminCallContext &context, const TenantId &tenant, const PackId &pack,
                                std::string_view operation_id, bool apply) const;

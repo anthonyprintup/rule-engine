@@ -1024,6 +1024,8 @@ namespace {
 
     struct AllowAdminPolicy final: tools::IResidentAdminAccessPolicy {
         mutable std::vector<py::cluster::AdminControlOperation> operations;
+        mutable std::vector<py::cluster::AdminAuthorizationRequest> requests;
+        std::vector<py::cluster::AdminControlOperation> denied_operations;
 
         [[nodiscard]] std::expected<py::cluster::AuthenticatedAdminPrincipal, py::cluster::AuthorizedAdminError>
         principal_for(const proto::AuthenticatedPeer &) const noexcept override {
@@ -1037,10 +1039,13 @@ namespace {
         authorize(const py::cluster::AuthenticatedAdminPrincipal &,
                   const py::cluster::AdminAuthorizationRequest &request) const override {
             operations.push_back(request.operation);
+            requests.push_back(request);
+            const auto denied = std::ranges::contains(denied_operations, request.operation);
             return py::cluster::AdminAuthorizationDecision {
-                .outcome = py::cluster::AdminAuthorizationOutcome::allowed,
-                .decision_id = "test-allow-" + std::to_string(operations.size()),
-                .detail = "allowed",
+                .outcome = denied ? py::cluster::AdminAuthorizationOutcome::denied :
+                                    py::cluster::AdminAuthorizationOutcome::allowed,
+                .decision_id = std::string {denied ? "test-deny-" : "test-allow-"} + std::to_string(operations.size()),
+                .detail = denied ? "denied" : "allowed",
             };
         }
     };
@@ -1220,6 +1225,16 @@ namespace {
                                                  .registry_removed_completion_records = 3U,
                                                  .registry_removed_objects = 2U,
                                                  .registry_reclaimed_bytes = 1024U};
+        }
+    };
+
+    struct StaticAdminResponseTransport final: tools::IResidentAdminRequestTransport {
+        tools::ResidentAdminResponse response;
+
+        [[nodiscard]] std::expected<tools::ResidentAdminResponse, tools::ToolFailure>
+        exchange(const tools::AdminEndpointConfiguration &, const tools::ResidentAdminRequest &request) override {
+            response.request_id = request.request_id;
+            return response;
         }
     };
 
@@ -2179,7 +2194,13 @@ TEST_CASE("authorized pack snapshots expose aggregate registry maintenance witho
                                            .at_unix_ms = 10U});
 
     REQUIRE(response.status == tools::ResidentAdminResponseStatus::ok);
-    CHECK(policy.operations == std::vector {py::cluster::AdminControlOperation::pack_read});
+    CHECK(policy.operations == std::vector {py::cluster::AdminControlOperation::pack_read,
+                                            py::cluster::AdminControlOperation::registry_read});
+    REQUIRE(policy.requests.size() == 2U);
+    CHECK(policy.requests.back().resource.kind == py::cluster::AdminResourceKind::source_registry);
+    CHECK(policy.requests.back().resource.tenant.value.empty());
+    CHECK(policy.requests.back().resource.pack.value.empty());
+    CHECK(policy.requests.back().resource.operation_id.empty());
     CHECK(store.reads == 1U);
     CHECK(uploads.observation_reads == 1U);
     CHECK(response.registry_maintenance_runs == 7U);
@@ -2189,6 +2210,50 @@ TEST_CASE("authorized pack snapshots expose aggregate registry maintenance witho
     CHECK(response.registry_removed_objects == 2U);
     CHECK(response.registry_reclaimed_bytes == 1024U);
     CHECK_FALSE(response.source_digest);
+}
+
+TEST_CASE("pack snapshots omit global registry observations when registry authority is denied") {
+    CountingControlStore store;
+    AllowAdminPolicy policy;
+    policy.denied_operations = {py::cluster::AdminControlOperation::registry_read};
+    RecordingUploadBackend uploads;
+    uploads.observation = {.successful_maintenance_runs = 7U,
+                           .last_maintenance_unix_ms = 900U,
+                           .expired_partial_sessions = 4U,
+                           .removed_completion_records = 3U,
+                           .removed_objects = 2U,
+                           .reclaimed_bytes = 1024U};
+    tools::AuthorizedResidentAdminBackend backend {store, policy, nullptr, &uploads};
+    const auto response = backend.execute({.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:admin"}},
+                                          {.kind = tools::ResidentAdminRequestKind::pack_snapshot,
+                                           .request_id = "request:pack:no-registry-authority",
+                                           .tenant = py::TenantId {"tenant:test"},
+                                           .pack = py::PackId {"pack:test"},
+                                           .at_unix_ms = 10U});
+
+    REQUIRE(response.status == tools::ResidentAdminResponseStatus::ok);
+    CHECK(policy.operations == std::vector {py::cluster::AdminControlOperation::pack_read,
+                                            py::cluster::AdminControlOperation::registry_read});
+    CHECK(store.reads == 1U);
+    CHECK(uploads.observation_reads == 0U);
+    CHECK(response.registry_maintenance_runs == 0U);
+    CHECK(response.registry_last_maintenance_unix_ms == 0U);
+    CHECK(response.registry_expired_partial_sessions == 0U);
+    CHECK(response.registry_removed_completion_records == 0U);
+    CHECK(response.registry_removed_objects == 0U);
+    CHECK(response.registry_reclaimed_bytes == 0U);
+
+    StaticAdminResponseTransport transport;
+    transport.response = response;
+    tools::ResidentAdminClientAdapter client {&transport};
+    const auto result = client.execute({}, {.action = tools::AdminAction::packs,
+                                            .operands = {"pack:test"},
+                                            .options = {{"tenant", "tenant:test"}},
+                                            .request_id = "request:client:no-registry-authority"});
+    REQUIRE(result);
+    REQUIRE(result->success);
+    CHECK(std::ranges::none_of(result->fields,
+                               [](const tools::DisplayField &field) { return field.name.starts_with("registry_"); }));
 }
 
 TEST_CASE("standalone admin pack output renders only bounded registry aggregate fields") {

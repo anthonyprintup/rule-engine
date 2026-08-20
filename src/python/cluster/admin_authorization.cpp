@@ -35,12 +35,13 @@ namespace rule_engine::python::cluster {
         }
 
         bool valid_resource(const AdminResource &resource) {
-            if (resource.tenant.empty() || resource.pack.empty()) {
-                return false;
-            }
             switch (resource.kind) {
-                case AdminResourceKind::pack: return resource.operation_id.empty();
-                case AdminResourceKind::pack_operation: return !resource.operation_id.empty();
+                case AdminResourceKind::pack:
+                    return !resource.tenant.empty() && !resource.pack.empty() && resource.operation_id.empty();
+                case AdminResourceKind::pack_operation:
+                    return !resource.tenant.empty() && !resource.pack.empty() && !resource.operation_id.empty();
+                case AdminResourceKind::source_registry:
+                    return resource.tenant.empty() && resource.pack.empty() && resource.operation_id.empty();
                 default: return false;
             }
         }
@@ -355,6 +356,18 @@ namespace rule_engine::python::cluster {
         const AdminAuthorizationRequest authorization {
             .operation = AdminControlOperation::pack_upload,
             .resource = pack_resource(tenant, pack),
+        };
+        if (auto authorized = authorize(context, authorization); !authorized) {
+            return std::unexpected(authorized.error());
+        }
+        return {};
+    }
+
+    std::expected<void, AuthorizedAdminError>
+    AuthorizedActivationAdmin::authorize_registry_observation(const AdminCallContext &context) const {
+        const AdminAuthorizationRequest authorization {
+            .operation = AdminControlOperation::registry_read,
+            .resource = {.tenant = {}, .pack = {}, .kind = AdminResourceKind::source_registry, .operation_id = {}},
         };
         if (auto authorized = authorize(context, authorization); !authorized) {
             return std::unexpected(authorized.error());

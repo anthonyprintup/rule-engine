@@ -152,6 +152,7 @@ reports, blockers, progress, warnings, terminal result, and audit IDs.
 Named capabilities are intentionally narrow:
 
 - pack.read, pack.upload, pack.stage, pack.activate, pack.rollback;
+- registry.read (global aggregate maintenance observation only);
 - policy.read, policy.write;
 - quarantine.read, quarantine.clear, quarantine.force;
 - trace.read, trace.arm, capture.authorize;
