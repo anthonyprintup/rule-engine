@@ -96,8 +96,9 @@ return True
 
 The event must have a stable `@schema`; each field has a unique positive
 `wire_field` ID; construction is by keyword; and `telemetry.emit(...)` is a
-standalone statement. A failed or cancelled attempt publishes neither the
-verdict nor the event.
+standalone statement. In the full source, `severity` is omitted here and the
+compiler materializes its declared canonical string default. A failed or
+cancelled attempt publishes neither the verdict nor the event.
 
 This is different from posting to an external system. External posts use a
 durable outbox and remain a contract example below.

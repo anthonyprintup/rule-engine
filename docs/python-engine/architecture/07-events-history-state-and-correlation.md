@@ -90,11 +90,14 @@ Correlation subscriptions and correlation-to-correlation emissions form a static
 
 The static frontend recognizes only an `EventRecord` subclass with one literal
 stable `@schema` decorator and explicit unique `wire_field` IDs. Construction is
-complete and keyword-only. The compiler evaluates keyword values in Python
-order, stages them in canonical field-ID order, and emits a schema/hash-pinned
-`build_record`. A standalone `telemetry.emit(record)` becomes `emit_event`;
-ambiguous schemas, missing/extra fields, wrong types, and receipt use fail at
-compile time.
+keyword-only. A field may be omitted only when its declaration has an
+exact-type canonical `bool`, `int`, `float`, `str`, or `bytes` default parsed
+directly from AST data. The compiler evaluates supplied keyword values in
+Python order, materializes omitted scalar defaults, stages all values in
+canonical field-ID order, and emits a schema/hash-pinned `build_record`. A
+standalone `telemetry.emit(record)` becomes `emit_event`; ambiguous schemas,
+missing required or extra fields, dynamic/aggregate or wrong-type defaults,
+wrong constructor value types, and receipt use fail at compile time.
 
 The runtime represents that emission as an ordered `EventIntent`, not as an
 `EventEnvelope` supplied by a caller.
@@ -124,8 +127,8 @@ effect dispatch.
 The implemented envelope currently records one root `causation` field and
 inherits the root ingest timestamp for both emitted timestamps because the
 store API has no commit-clock assignment. Immediate-parent/depth metadata,
-constructor defaults, and materialized in-rule receipts remain the explicit
-residual described in `LIMITATIONS.md`.
+dynamic or aggregate constructor defaults, and materialized in-rule receipts
+remain the explicit residual described in `LIMITATIONS.md`.
 
 ## 5. Correlation declarations and scheduling
 

@@ -29,6 +29,7 @@ class UnsignedProcessAlert(EventRecord):
     process_id: int = wire_field(id=1)
     creation_time: int = wire_field(id=2)
     reason: str = wire_field(id=3)
+    severity: str = wire_field(id=4, default="medium")
 
 
 SEEN_UNSIGNED = StateKey(

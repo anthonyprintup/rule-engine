@@ -404,14 +404,15 @@ limitations and revisit conditions are recorded as L-028.
 ### 5.10 Typed custom-event emission opcode
 
 Custom event construction and emission are engine-owned operations. The
-compiler lowers a complete keyword-only `EventRecord` constructor to
-`build_record`. Its `immediate` pins the event schema ID and canonical hash,
-`operand_a` begins a contiguous register window ordered by canonical field ID,
-and `operand_b` is the exact active descriptor field count. The verifier rejects
-an unknown schema, a non-event descriptor, a hash or field-count mismatch, an
-invalid window, or any field register not initialized on every path. The VM
-uses field IDs from the active descriptor; source never supplies runtime field
-IDs or a nominal class-name shortcut.
+compiler evaluates supplied keyword expressions in Python order, materializes
+permitted omitted canonical scalar defaults, and stages a complete field window
+for `build_record` in canonical field-ID order. Its `immediate` pins the event
+schema ID and canonical hash, `operand_a` begins that contiguous register
+window, and `operand_b` is the exact active descriptor field count. The
+verifier rejects an unknown schema, a non-event descriptor, a hash or
+field-count mismatch, an invalid window, or any field register not initialized
+on every path. The VM uses field IDs from the active descriptor; source never
+supplies runtime field IDs or a nominal class-name shortcut.
 
 The resulting record can enter the verified `emit_event` instruction:
 

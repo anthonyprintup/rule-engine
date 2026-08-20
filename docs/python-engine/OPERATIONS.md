@@ -370,13 +370,13 @@ the full certificate chain and additionally rejects missing issuer coverage, a
 wrong CRL issuer, and revoked server certificates. The TLS chain, DNS name,
 exact URI SAN, and SHA-256 leaf fingerprint must still agree.
 
+Schema v2 makes the inventory interval explicit; schema-v1 agent files are
+rejected and must add the bounded interval during upgrade.
+
 CRL acquisition remains an operator responsibility: publish a refreshed file
 atomically and restart the agent before its `nextUpdate`. The agent performs no
 OCSP or online CRL fetch and does not reload the file in place. Validate before
 running:
-
-Schema v2 makes the inventory interval explicit; schema-v1 agent files are
-rejected and must add the bounded interval during upgrade.
 
 ```powershell
 rule_engine_agent --config C:/ProgramData/RuleEngine/agent/agent.conf --validate-config
