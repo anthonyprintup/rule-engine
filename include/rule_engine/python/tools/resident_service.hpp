@@ -4,12 +4,12 @@
 #include "rule_engine/python/protocol/network.hpp"
 #include "rule_engine/python/tools/active_pack.hpp"
 
-#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -332,12 +332,8 @@ namespace rule_engine::python::tools {
         const protocol_v2::ITrustPolicy &peer_trust_;
         IResidentAgentBackend &agents_;
         IResidentAdminBackend &admin_;
-        std::atomic<std::uint64_t> empty_work_polls_ {};
-        std::atomic<std::uint64_t> nonempty_work_polls_ {};
-        std::atomic<std::uint64_t> delivered_work_ {};
-        std::atomic<std::uint64_t> delivery_delay_samples_ {};
-        std::atomic<std::uint64_t> delivery_delay_total_microseconds_ {};
-        std::atomic<std::uint64_t> delivery_delay_max_microseconds_ {};
+        mutable std::mutex work_poll_metrics_mutex_;
+        ResidentWorkPollSnapshot work_poll_metrics_;
     };
 
 } // namespace rule_engine::python::tools

@@ -288,6 +288,9 @@ payload-free tuning evidence: successful empty and nonempty backend polls,
 successfully sent work leases, delivery-delay sample count, cumulative delay,
 and maximum delay. Counters and the cumulative delay saturate at `uint64_t`
 maximum rather than wrapping, and snapshots may be read while sessions run.
+Each snapshot is coherent: delivered-work and its delay count, total, and
+maximum publish together, including sub-microsecond samples rounded up to one
+microsecond.
 Delay begins at the first observed empty poll in an idle period and ends after
 the last successfully sent lease in the later nonempty poll. If the initial
 poll is already nonempty, it begins when that poll starts. It is therefore an

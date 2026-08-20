@@ -835,6 +835,7 @@ namespace {
         std::size_t work_batch_size {1U};
         std::atomic<std::size_t> activation_fences {};
         bool return_invalid_session {};
+        bool deliver_every_time {};
         std::atomic<bool> work_delivered {};
 
         [[nodiscard]] std::expected<tools::ResidentAgentSession, proto::ProtocolError>
@@ -854,6 +855,9 @@ namespace {
         [[nodiscard]] std::expected<std::vector<proto::WorkLeaseMessage>, proto::ProtocolError>
         take_work(const tools::ResidentAgentSession &, std::size_t, std::stop_token) noexcept override {
             const auto call = take_calls.fetch_add(1U) + 1U;
+            if (deliver_every_time) {
+                return std::vector<proto::WorkLeaseMessage>(work_batch_size, service_work());
+            }
             if (work_delivered.load() || call < deliver_on_take_call) {
                 return std::vector<proto::WorkLeaseMessage> {};
             }
@@ -1510,6 +1514,53 @@ TEST_CASE("resident work poll snapshots are concurrent and saturating") {
     CHECK(aggregate.delivery_delay_samples == maximum);
     CHECK(aggregate.delivery_delay_total_microseconds == maximum);
     CHECK(aggregate.delivery_delay_max_microseconds == 13U);
+}
+
+TEST_CASE("resident work poll snapshots publish coherent concurrent delivery receipts") {
+    AllowTrust trust;
+    DurableFakeAgentBackend agents;
+    agents.deliver_every_time = true;
+    RejectAdmin admin;
+    auto limits = test_service_limits();
+    limits.maximum_session_duration = std::chrono::milliseconds {35};
+    tools::ResidentApplicationService service {limits, trust, agents, admin};
+    std::atomic<std::size_t> completed {};
+    std::vector<std::jthread> sessions;
+    constexpr std::size_t session_count = 8U;
+    sessions.reserve(session_count);
+    for (std::size_t index = 0U; index < session_count; ++index) {
+        auto state = std::make_shared<FakeChannelState>();
+        enqueue_protocol(state, agent_hello_envelope());
+        sessions.emplace_back([&, state] {
+            service.run({.role = tools::ResidentSessionRole::agent,
+                         .peer = {.tenant = py::TenantId {"tenant:test"}, .peer = py::PeerId {"peer:test"}},
+                         .channel = std::make_unique<FakeByteChannel>(state)},
+                        {});
+            completed.fetch_add(1U);
+        });
+    }
+
+    while (completed.load() < session_count) {
+        const auto snapshot = service.work_poll_snapshot();
+        CHECK(snapshot.delivery_delay_samples <= snapshot.nonempty_polls);
+        CHECK(snapshot.delivery_delay_samples <= snapshot.delivered_work);
+        if (snapshot.delivery_delay_samples == 0U) {
+            CHECK(snapshot.delivery_delay_total_microseconds == 0U);
+            CHECK(snapshot.delivery_delay_max_microseconds == 0U);
+        } else {
+            CHECK(snapshot.delivery_delay_total_microseconds >= snapshot.delivery_delay_max_microseconds);
+            CHECK(snapshot.delivery_delay_max_microseconds > 0U);
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds {50});
+    }
+    sessions.clear();
+
+    const auto snapshot = service.work_poll_snapshot();
+    CHECK(snapshot.nonempty_polls == session_count);
+    CHECK(snapshot.delivered_work == session_count);
+    CHECK(snapshot.delivery_delay_samples == session_count);
+    CHECK(snapshot.delivery_delay_total_microseconds >= snapshot.delivery_delay_max_microseconds);
+    CHECK(snapshot.delivery_delay_max_microseconds > 0U);
 }
 
 TEST_CASE("resident work polling cancellation adds no false samples") {

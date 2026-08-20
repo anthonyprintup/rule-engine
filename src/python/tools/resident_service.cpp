@@ -29,18 +29,6 @@ namespace rule_engine::python::tools {
             return left > maximum - right ? maximum : left + right;
         }
 
-        void saturating_atomic_add(std::atomic<std::uint64_t> &target, const std::uint64_t increment) noexcept {
-            auto current = target.load(std::memory_order_relaxed);
-            while (!target.compare_exchange_weak(current, saturating_add(current, increment), std::memory_order_relaxed,
-                                                 std::memory_order_relaxed)) {}
-        }
-
-        void atomic_max(std::atomic<std::uint64_t> &target, const std::uint64_t candidate) noexcept {
-            auto current = target.load(std::memory_order_relaxed);
-            while (current < candidate && !target.compare_exchange_weak(current, candidate, std::memory_order_relaxed,
-                                                                        std::memory_order_relaxed)) {}
-        }
-
         [[nodiscard]] bool printable_ascii(const std::string_view value, const bool allow_empty = true) noexcept {
             return (allow_empty || !value.empty()) && std::ranges::all_of(value, [](const unsigned char character) {
                        return character >= 0x20U && character <= 0x7eU;
@@ -1293,6 +1281,15 @@ namespace rule_engine::python::tools {
             saturating_add(delivery_delay_total_microseconds, other.delivery_delay_total_microseconds);
         delivery_delay_max_microseconds =
             (std::max) (delivery_delay_max_microseconds, other.delivery_delay_max_microseconds);
+        if (delivery_delay_samples == 0U) {
+            delivery_delay_total_microseconds = 0U;
+            delivery_delay_max_microseconds = 0U;
+            return;
+        }
+        delivery_delay_total_microseconds = (std::max) (delivery_delay_total_microseconds, std::uint64_t {1U});
+        delivery_delay_max_microseconds = (std::max) (delivery_delay_max_microseconds, std::uint64_t {1U});
+        delivery_delay_total_microseconds =
+            (std::max) (delivery_delay_total_microseconds, delivery_delay_max_microseconds);
     }
 
     ResidentApplicationService::ResidentApplicationService(ResidentServiceLimits limits,
@@ -1314,14 +1311,8 @@ namespace rule_engine::python::tools {
     }
 
     ResidentWorkPollSnapshot ResidentApplicationService::work_poll_snapshot() const noexcept {
-        return {
-            .empty_polls = empty_work_polls_.load(std::memory_order_relaxed),
-            .nonempty_polls = nonempty_work_polls_.load(std::memory_order_relaxed),
-            .delivered_work = delivered_work_.load(std::memory_order_relaxed),
-            .delivery_delay_samples = delivery_delay_samples_.load(std::memory_order_relaxed),
-            .delivery_delay_total_microseconds = delivery_delay_total_microseconds_.load(std::memory_order_relaxed),
-            .delivery_delay_max_microseconds = delivery_delay_max_microseconds_.load(std::memory_order_relaxed),
-        };
+        std::scoped_lock lock {work_poll_metrics_mutex_};
+        return work_poll_metrics_;
     }
 
     void ResidentApplicationService::run_agent(ResidentSessionJob &job, const std::stop_token cancellation) noexcept {
@@ -1414,7 +1405,6 @@ namespace rule_engine::python::tools {
                 }
                 outstanding.emplace(lease.work_id, std::move(lease));
                 ++delivered;
-                saturating_atomic_add(delivered_work_, 1U);
             }
             return true;
         };
@@ -1430,28 +1420,42 @@ namespace rule_engine::python::tools {
                 return false;
             }
             if (work->empty()) {
-                saturating_atomic_add(empty_work_polls_, 1U);
+                {
+                    std::scoped_lock lock {work_poll_metrics_mutex_};
+                    work_poll_metrics_.empty_polls = saturating_add(work_poll_metrics_.empty_polls, 1U);
+                }
                 if (!observed_idle_since) {
                     observed_idle_since = poll_started;
                 }
                 return true;
             }
 
-            saturating_atomic_add(nonempty_work_polls_, 1U);
             if (work->size() > available) {
+                std::scoped_lock lock {work_poll_metrics_mutex_};
+                work_poll_metrics_.nonempty_polls = saturating_add(work_poll_metrics_.nonempty_polls, 1U);
                 return false;
             }
             std::size_t delivered {};
             const auto sent = send_work(std::move(*work), delivered);
-            if (delivered > 0U) {
+            {
+                std::scoped_lock lock {work_poll_metrics_mutex_};
+                work_poll_metrics_.nonempty_polls = saturating_add(work_poll_metrics_.nonempty_polls, 1U);
+                work_poll_metrics_.delivered_work =
+                    saturating_add(work_poll_metrics_.delivered_work, static_cast<std::uint64_t>(delivered));
+                if (delivered == 0U) {
+                    return sent;
+                }
                 const auto delay = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - observed_idle_since.value_or(poll_started));
-                const auto delay_microseconds = delay.count() <= 0 ? 0U : static_cast<std::uint64_t>(delay.count());
-                saturating_atomic_add(delivery_delay_samples_, 1U);
-                saturating_atomic_add(delivery_delay_total_microseconds_, delay_microseconds);
-                atomic_max(delivery_delay_max_microseconds_, delay_microseconds);
-                observed_idle_since.reset();
+                const auto delay_microseconds = delay.count() <= 0 ? 1U : static_cast<std::uint64_t>(delay.count());
+                work_poll_metrics_.delivery_delay_samples =
+                    saturating_add(work_poll_metrics_.delivery_delay_samples, 1U);
+                work_poll_metrics_.delivery_delay_total_microseconds =
+                    saturating_add(work_poll_metrics_.delivery_delay_total_microseconds, delay_microseconds);
+                work_poll_metrics_.delivery_delay_max_microseconds =
+                    (std::max) (work_poll_metrics_.delivery_delay_max_microseconds, delay_microseconds);
             }
+            observed_idle_since.reset();
             return sent;
         };
         if (!poll_work()) {
